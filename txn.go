@@ -38,6 +38,12 @@ func (e *Engine) ReadTxn(fn func(tx *Txn) error) error {
 	})
 }
 
+// Table returns the descriptor for a table name in the transaction's
+// catalog snapshot, or nil if absent.
+func (t *Txn) Table(name string) *TableDesc {
+	return t.tables[name]
+}
+
 func (t *Txn) desc(table string) (*TableDesc, error) {
 	d := t.tables[table]
 	if d == nil {

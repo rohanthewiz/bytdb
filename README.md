@@ -12,7 +12,7 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestone 1: the storage foundation.
+Milestones 1–5: a working relational store, queryable in SQL.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -38,8 +38,10 @@ Milestone 1: the storage foundation.
   `DropColumn` touch only the descriptor: old rows read added columns
   as NULL, dropped-column data is skipped on decode, and a re-added
   name gets a fresh ID so stale data can never resurface.
-
-No SQL yet — the API is Go calls. See Roadmap.
+- **SQL frontend** — the `sql` package parses, plans, and executes a
+  small Postgres-flavored dialect over the engine: full DDL, INSERT,
+  single-table SELECT/UPDATE/DELETE, with a planner that pushes WHERE
+  predicates down to point gets and bounded key scans.
 
 ## Example
 
@@ -81,6 +83,63 @@ err = e.WriteTxn(func(tx *bytdb.Txn) error {
     return err // nil commits both; error rolls both back
 })
 ```
+
+## SQL
+
+```go
+import bsql "github.com/rohanthewiz/bytdb/sql"
+
+db := bsql.New(e)
+
+_, err = db.Exec(`CREATE TABLE users (id int PRIMARY KEY, name text, age int, city text)`)
+_, err = db.Exec(`CREATE INDEX by_city ON users (city)`)
+_, err = db.Exec(`INSERT INTO users VALUES (1, 'ada', 36, 'london'), (2, 'grace', 45, 'nyc')`)
+
+res, err := db.Exec(`SELECT name, age FROM users WHERE city = 'london' ORDER BY age DESC LIMIT 10`)
+for _, row := range res.Rows {
+    fmt.Println(row[0], row[1]) // values typed per res.Types
+}
+
+res, err = db.Exec(`UPDATE users SET city = 'sf' WHERE id = 2`) // res.RowsAffected == 1
+```
+
+The dialect is deliberately small and Postgres-flavored — `'string'`
+literals, `"quoted"` identifiers (unquoted ones fold to lowercase),
+`--` and `/* */` comments, and Postgres type names as aliases
+(`bigint`/`int8` → int, `double precision`/`real` → float, `text`/
+`varchar(n)` → string, `boolean` → bool, `bytea` → bytes).
+
+Supported statements:
+
+```sql
+CREATE TABLE t (id int PRIMARY KEY, ...)          -- or PRIMARY KEY (a, b)
+DROP TABLE t
+ALTER TABLE t ADD COLUMN c type | DROP COLUMN c
+CREATE [UNIQUE] INDEX idx ON t (c, ...)
+DROP INDEX idx [ON t]
+INSERT INTO t [(cols)] VALUES (...), (...)
+SELECT * | cols FROM t [WHERE ...] [ORDER BY c [DESC], ...] [LIMIT n] [OFFSET n]
+UPDATE t SET c = v, ... [WHERE ...]
+DELETE FROM t [WHERE ...]
+```
+
+A WHERE clause is AND-ed predicates — `column op literal` (`=`, `!=`,
+`<>`, `<`, `<=`, `>`, `>=`) or `column IS [NOT] NULL`. The planner is
+the roadmap's "filter pushdown" made real: equality on every
+primary-key column becomes a point `Get`; an equality prefix (plus at
+most one range column) of the primary key or of a secondary index
+becomes a bounded ordered scan with early termination; everything else
+falls back to a filtered full scan. Every predicate is also re-checked
+row by row, so pushdown only narrows what is visited — correctness
+never depends on it.
+
+Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
+runs in one engine transaction and rolls back entirely on error.
+Deferred, roughly in order: aggregates and GROUP BY, OR and richer
+expressions, joins, prepared statements (`$1` placeholders already
+lex), and a `bytdb-pgwire` module speaking the Postgres wire protocol
+— the embedded `Exec` result shape (columns + types + rows) is exactly
+what that layer needs.
 
 ## How it maps onto the key space
 
@@ -127,8 +186,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 2**: secondary indexes as key ranges, backfilled and maintained in the same atomic commit as the row; unique indexes (NULLs exempt); `ScanIndex` with partial-prefix bounds
 - [x] **Milestone 3**: `Update` by primary key (pk moves included) with check-before-write index maintenance; `WriteTxn`/`ReadTxn` engine transactions over btypedb's — serializable via single-writer, catalog snapshotted at begin (DDL stays outside transactions)
 - [x] **Milestone 4**: column-ID-tagged sparse row values; `AddColumn`/`DropColumn` as metadata-only changes (no row rewrites), with never-reused column IDs
-- [ ] **Milestone 5**: SQL frontend — either a hand-rolled subset or the [go-mysql-server](https://github.com/dolthub/go-mysql-server) storage interface for a full dialect
-- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN-able planner with filter pushdown to key ranges
+- [x] **Milestone 5**: SQL frontend — a hand-rolled Postgres-flavored dialect (zero new dependencies): lexer → recursive-descent parser → planner with filter pushdown to point gets and bounded key scans → executor over engine transactions
+- [ ] Later: aggregates/GROUP BY, OR and expression trees, joins, prepared statements, a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
 
 ## Design notes
 
