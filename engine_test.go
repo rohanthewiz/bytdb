@@ -20,7 +20,7 @@ func openEngine(t *testing.T, path string) *Engine {
 func usersTable(t *testing.T, e *Engine) *TableDesc {
 	t.Helper()
 	desc, err := e.CreateTable("users", []Column{
-		{"id", TInt}, {"name", TString}, {"score", TFloat}, {"active", TBool}, {"blob", TBytes},
+		{Name: "id", Type: TInt}, {Name: "name", Type: TString}, {Name: "score", Type: TFloat}, {Name: "active", Type: TBool}, {Name: "blob", Type: TBytes},
 	}, "id")
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestCompositePKAndRange(t *testing.T) {
 	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
 	defer e.Close()
 	_, err := e.CreateTable("events", []Column{
-		{"org", TString}, {"seq", TInt}, {"note", TString},
+		{Name: "org", Type: TString}, {Name: "seq", Type: TInt}, {Name: "note", Type: TString},
 	}, "org", "seq")
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +194,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	// New tables after reopen must not reuse IDs.
-	d2, err := e2.CreateTable("orgs", []Column{{"id", TInt}}, "id")
+	d2, err := e2.CreateTable("orgs", []Column{{Name: "id", Type: TInt}}, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestDeleteAndDrop(t *testing.T) {
 	}
 
 	// A second table must be untouched by dropping the first.
-	if _, err := e.CreateTable("keep", []Column{{"k", TString}}, "k"); err != nil {
+	if _, err := e.CreateTable("keep", []Column{{Name: "k", Type: TString}}, "k"); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.Insert("keep", "x"); err != nil {
@@ -251,7 +251,7 @@ func TestDeleteAndDrop(t *testing.T) {
 func TestCreateTableValidation(t *testing.T) {
 	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
 	defer e.Close()
-	cols := []Column{{"id", TInt}}
+	cols := []Column{{Name: "id", Type: TInt}}
 
 	for _, c := range []struct {
 		name  string
@@ -264,8 +264,8 @@ func TestCreateTableValidation(t *testing.T) {
 		{"t", cols, nil, "no pk"},
 		{"t", cols, []string{"nope"}, "unknown pk column"},
 		{"t", cols, []string{"id", "id"}, "duplicate pk column"},
-		{"t", []Column{{"a", TInt}, {"a", TInt}}, []string{"a"}, "duplicate column"},
-		{"t", []Column{{"a", "jsonb"}}, []string{"a"}, "unknown type"},
+		{"t", []Column{{Name: "a", Type: TInt}, {Name: "a", Type: TInt}}, []string{"a"}, "duplicate column"},
+		{"t", []Column{{Name: "a", Type: "jsonb"}}, []string{"a"}, "unknown type"},
 	} {
 		if _, err := e.CreateTable(c.name, c.cols, c.pk...); err == nil {
 			t.Fatalf("CreateTable accepted %s", c.descr)

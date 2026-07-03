@@ -41,6 +41,10 @@ func (e *Engine) CreateTable(name string, cols []Column, pk ...string) (*TableDe
 			return nil, serr.New("unknown column type", "table", name, "column", c.Name, "type", string(c.Type))
 		}
 	}
+	for i := range desc.Columns {
+		desc.Columns[i].ID = uint32(i + 1)
+	}
+	desc.NextColID = uint32(len(desc.Columns) + 1)
 	for _, p := range pk {
 		ord := desc.ColIndex(p)
 		if ord < 0 {
@@ -108,6 +112,102 @@ func (e *Engine) DropTable(name string) error {
 		return serr.Wrap(err, "op", "drop table", "table", name)
 	}
 	return nil
+}
+
+// AddColumn appends a column to a table. No rows are rewritten:
+// existing rows read the new column as NULL. Subsequent inserts must
+// supply the new arity.
+func (e *Engine) AddColumn(table string, col Column) error {
+	e.ddlMu.Lock()
+	defer e.ddlMu.Unlock()
+	old := e.Table(table)
+	if old == nil {
+		return serr.New("no such table", "table", table)
+	}
+	if col.Name == "" {
+		return serr.New("column name is required", "table", table)
+	}
+	if old.ColIndex(col.Name) >= 0 {
+		return serr.New("column already exists", "table", table, "column", col.Name)
+	}
+	if !validTypes[col.Type] {
+		return serr.New("unknown column type", "table", table, "column", col.Name, "type", string(col.Type))
+	}
+	desc := old.clone()
+	col.ID = desc.NextColID
+	desc.NextColID++
+	desc.Columns = append(desc.Columns, col)
+	if err := e.writeDesc(table, desc); err != nil {
+		return serr.Wrap(err, "op", "add column", "table", table, "column", col.Name)
+	}
+	return nil
+}
+
+// DropColumn removes a column from a table. No rows are rewritten:
+// the column's data stays in old row values under its retired ID,
+// skipped on decode, and ages out as rows are updated. Key and indexed
+// columns cannot be dropped (drop the index first). A later AddColumn
+// with the same name gets a fresh ID, so the old data can never
+// resurface.
+func (e *Engine) DropColumn(table, name string) error {
+	e.ddlMu.Lock()
+	defer e.ddlMu.Unlock()
+	old := e.Table(table)
+	if old == nil {
+		return serr.New("no such table", "table", table)
+	}
+	ord := old.ColIndex(name)
+	if ord < 0 {
+		return serr.New("no such column", "table", table, "column", name)
+	}
+	if old.isPK(ord) {
+		return serr.New("cannot drop a primary key column", "table", table, "column", name)
+	}
+	for i := range old.Indexes {
+		if slices.Contains(old.Indexes[i].Cols, ord) {
+			return serr.New("cannot drop an indexed column; drop the index first",
+				"table", table, "column", name, "index", old.Indexes[i].Name)
+		}
+	}
+	desc := old.clone()
+	desc.Columns = slices.Delete(desc.Columns, ord, ord+1)
+	// Ordinal references above the removed column shift down by one.
+	for i, p := range desc.PKCols {
+		if p > ord {
+			desc.PKCols[i] = p - 1
+		}
+	}
+	for i := range desc.Indexes {
+		cols := slices.Clone(desc.Indexes[i].Cols)
+		for j, c := range cols {
+			if c > ord {
+				cols[j] = c - 1
+			}
+		}
+		desc.Indexes[i].Cols = cols
+	}
+	if err := e.writeDesc(table, desc); err != nil {
+		return serr.Wrap(err, "op", "drop column", "table", table, "column", name)
+	}
+	return nil
+}
+
+// writeDesc persists an updated descriptor and publishes it as the
+// last step inside the transaction (callers hold ddlMu).
+func (e *Engine) writeDesc(table string, desc *TableDesc) error {
+	return e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+		blob, err := json.Marshal(desc)
+		if err != nil {
+			return serr.Wrap(err, "op", "encode table descriptor")
+		}
+		if err := tx.Set(descKey(table), blob); err != nil {
+			return err
+		}
+		e.mu.Lock()
+		e.tables[table] = desc
+		e.mu.Unlock()
+		return nil
+	})
 }
 
 // Tables returns the names of all tables, sorted.

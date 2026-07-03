@@ -11,7 +11,7 @@ import (
 func peopleTable(t *testing.T, e *Engine) {
 	t.Helper()
 	_, err := e.CreateTable("people", []Column{
-		{"id", TInt}, {"name", TString}, {"age", TInt}, {"email", TString},
+		{Name: "id", Type: TInt}, {Name: "name", Type: TString}, {Name: "age", Type: TInt}, {Name: "email", Type: TString},
 	}, "id")
 	if err != nil {
 		t.Fatal(err)

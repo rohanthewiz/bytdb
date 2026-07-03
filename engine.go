@@ -44,10 +44,15 @@ const (
 	TBytes  ColType = "bytes"
 )
 
-// Column describes one table column.
+// Column describes one table column. ID is assigned by the engine
+// when the column is created and is never reused within its table —
+// row values are stored as (column ID, value) pairs, which is what
+// lets AddColumn and DropColumn skip rewriting rows. Leave ID zero
+// when declaring columns; input values are ignored.
 type Column struct {
 	Name string  `json:"name"`
 	Type ColType `json:"type"`
+	ID   uint32  `json:"id"`
 }
 
 // TableDesc describes a table: its columns in declared order, which of
@@ -55,11 +60,12 @@ type Column struct {
 // secondary indexes. Descriptors are persisted as JSON rows of the
 // system descriptors table.
 type TableDesc struct {
-	ID      uint64      `json:"id"`
-	Name    string      `json:"name"`
-	Columns []Column    `json:"columns"`
-	PKCols  []int       `json:"pk_cols"`
-	Indexes []IndexDesc `json:"indexes,omitempty"`
+	ID        uint64      `json:"id"`
+	Name      string      `json:"name"`
+	Columns   []Column    `json:"columns"`
+	PKCols    []int       `json:"pk_cols"`
+	Indexes   []IndexDesc `json:"indexes,omitempty"`
+	NextColID uint32      `json:"next_col_id"`
 }
 
 // IndexDesc describes one secondary index: which columns (by ordinal)
@@ -95,6 +101,18 @@ func (d *TableDesc) clone() *TableDesc {
 func (d *TableDesc) ColIndex(name string) int {
 	for i, c := range d.Columns {
 		if c.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// colOrdinalByID returns the ordinal of the column with the given
+// stable ID, or -1 — the not-found case is normal: it means a row
+// value carries data for a since-dropped column.
+func (d *TableDesc) colOrdinalByID(id uint32) int {
+	for i := range d.Columns {
+		if d.Columns[i].ID == id {
 			return i
 		}
 	}

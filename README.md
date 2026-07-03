@@ -33,6 +33,11 @@ Milestone 1: the storage foundation.
   moved and uniqueness re-checked before anything is written;
   `WriteTxn`/`ReadTxn` run multi-statement work on a serializable
   snapshot of data and catalog, with own-write visibility.
+- **schema changes without rewrites** — row values are sparse
+  (column ID, value) pairs with NULLs omitted, so `AddColumn` and
+  `DropColumn` touch only the descriptor: old rows read added columns
+  as NULL, dropped-column data is skipped on decode, and a re-added
+  name gets a fresh ID so stale data can never resurface.
 
 No SQL yet — the API is Go calls. See Roadmap.
 
@@ -43,7 +48,7 @@ e, err := bytdb.Open("app.db")
 defer e.Close()
 
 _, err = e.CreateTable("events", []bytdb.Column{
-    {"org", bytdb.TString}, {"seq", bytdb.TInt}, {"note", bytdb.TString},
+    {Name: "org", Type: bytdb.TString}, {Name: "seq", Type: bytdb.TInt}, {Name: "note", Type: bytdb.TString},
 }, "org", "seq") // composite primary key
 
 err = e.Insert("events", "acme", 1, "signup")
@@ -82,12 +87,16 @@ err = e.WriteTxn(func(tx *bytdb.Txn) error {
 Everything lives in a single `btypedb.DB[string, []byte]`:
 
 ```
-tuple(tableID, 1, pk cols...)             → tuple(non-pk cols...)  table rows (primary index)
-tuple(tableID, idxID, indexed..., pk...)  → ()                     secondary index entry
-tuple(tableID, idxID, indexed...)         → tuple(pk cols...)      unique index entry
-tuple(1, 1, tableName)                    → JSON descriptor        catalog
-tuple(0)                                  → next table ID          ID sequence
+tuple(tableID, 1, pk cols...)             → tuple(colID, val, ...)  table rows (primary index)
+tuple(tableID, idxID, indexed..., pk...)  → ()                      secondary index entry
+tuple(tableID, idxID, indexed...)         → tuple(pk cols...)       unique index entry
+tuple(1, 1, tableName)                    → JSON descriptor         catalog
+tuple(0)                                  → next table ID           ID sequence
 ```
+
+Row values tag every non-NULL, non-key column with its stable column
+ID rather than relying on position — the CRDB value-encoding idea that
+makes `ALTER TABLE` metadata-only.
 
 A unique index enforces uniqueness by key collision — the primary key
 moves into the value. Rows with NULL in an indexed column fall back to
@@ -117,7 +126,7 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 1**: order-preserving tuple encoding; catalog; create/drop table; insert/get/delete; ordered scans with range bounds
 - [x] **Milestone 2**: secondary indexes as key ranges, backfilled and maintained in the same atomic commit as the row; unique indexes (NULLs exempt); `ScanIndex` with partial-prefix bounds
 - [x] **Milestone 3**: `Update` by primary key (pk moves included) with check-before-write index maintenance; `WriteTxn`/`ReadTxn` engine transactions over btypedb's — serializable via single-writer, catalog snapshotted at begin (DDL stays outside transactions)
-- [ ] **Milestone 4**: column-ID-tagged row values so `ALTER TABLE ADD COLUMN` needs no rewrite
+- [x] **Milestone 4**: column-ID-tagged sparse row values; `AddColumn`/`DropColumn` as metadata-only changes (no row rewrites), with never-reused column IDs
 - [ ] **Milestone 5**: SQL frontend — either a hand-rolled subset or the [go-mysql-server](https://github.com/dolthub/go-mysql-server) storage interface for a full dialect
 - [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN-able planner with filter pushdown to key ranges
 

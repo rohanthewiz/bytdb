@@ -448,24 +448,30 @@ func coercePK(desc *TableDesc, pkVals []any) ([]any, error) {
 	return out, nil
 }
 
-// encodeRowValue encodes the non-key columns, in declared order, as
-// the row's stored value. Key columns live in the key alone.
+// encodeRowValue encodes the non-key columns as the row's stored
+// value: a sparse sequence of (column ID, value) pairs, NULL columns
+// omitted. Key columns live in the key alone. Tagging by stable ID —
+// not position — is what lets AddColumn and DropColumn leave rows
+// untouched.
 func encodeRowValue(desc *TableDesc, row []any) ([]byte, error) {
-	var rest []any
-	for i, v := range row {
-		if !desc.isPK(i) {
-			rest = append(rest, v)
+	buf := []byte{}
+	var err error
+	for i := range desc.Columns {
+		if desc.isPK(i) || row[i] == nil {
+			continue
+		}
+		if buf, err = tuple.Append(buf, int64(desc.Columns[i].ID), row[i]); err != nil {
+			return nil, serr.Wrap(err, "op", "encode row value", "column", desc.Columns[i].Name)
 		}
 	}
-	val, err := tuple.Encode(rest...)
-	if err != nil {
-		return nil, serr.Wrap(err, "op", "encode row value")
-	}
-	return val, nil
+	return buf, nil
 }
 
 // decodeRow reassembles a full row from its key and value: key columns
-// from the key tuple, the rest from the value tuple.
+// from the key tuple, the rest from the value's (column ID, value)
+// pairs. Columns absent from the value read as NULL (never written, or
+// added after the row was); pairs with unknown IDs are skipped (their
+// column was dropped).
 func decodeRow(desc *TableDesc, key string, val []byte) (Row, error) {
 	keyVals, err := tuple.Decode([]byte(key))
 	if err != nil {
@@ -474,22 +480,24 @@ func decodeRow(desc *TableDesc, key string, val []byte) (Row, error) {
 	if len(keyVals) != 2+len(desc.PKCols) {
 		return Row{}, serr.New("row key has wrong arity", "table", desc.Name)
 	}
-	restVals, err := tuple.Decode(val)
+	pairs, err := tuple.Decode(val)
 	if err != nil {
 		return Row{}, serr.Wrap(err, "op", "decode row value", "table", desc.Name)
 	}
-	if len(restVals) != len(desc.Columns)-len(desc.PKCols) {
-		return Row{}, serr.New("row value has wrong arity", "table", desc.Name)
+	if len(pairs)%2 != 0 {
+		return Row{}, serr.New("row value has dangling column tag", "table", desc.Name)
 	}
 	vals := make([]any, len(desc.Columns))
 	for i, ord := range desc.PKCols {
 		vals[ord] = keyVals[2+i]
 	}
-	next := 0
-	for i := range desc.Columns {
-		if !desc.isPK(i) {
-			vals[i] = restVals[next]
-			next++
+	for j := 0; j < len(pairs); j += 2 {
+		id, ok := pairs[j].(int64)
+		if !ok {
+			return Row{}, serr.New("row value column tag is not an ID", "table", desc.Name)
+		}
+		if ord := desc.colOrdinalByID(uint32(id)); ord >= 0 {
+			vals[ord] = pairs[j+1]
 		}
 	}
 	return Row{Desc: desc, Vals: vals}, nil
