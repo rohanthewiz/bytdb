@@ -25,26 +25,26 @@ func planDesc() *bytdb.TableDesc {
 }
 
 func TestPlanPointGet(t *testing.T) {
-	p, err := planScan(planDesc(), []Pred{
-		{Col: "id", Op: OpEQ, Val: int64(7)},
-		{Col: "city", Op: OpEQ, Val: "Reno"},
-	})
+	p, err := planScan(planDesc(), and(
+		cpred("id", OpEQ, int64(7)),
+		cpred("city", OpEQ, "Reno"),
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(p.get, []any{int64(7)}) {
 		t.Fatalf("want point get, got %#v", p)
 	}
-	if len(p.preds) != 2 {
-		t.Fatal("residual filter must keep every predicate")
+	if p.filter == nil {
+		t.Fatal("residual filter must keep the whole WHERE tree")
 	}
 }
 
 func TestPlanPKRange(t *testing.T) {
-	p, err := planScan(planDesc(), []Pred{
-		{Col: "id", Op: OpGE, Val: int64(10)},
-		{Col: "id", Op: OpLT, Val: int64(20)},
-	})
+	p, err := planScan(planDesc(), and(
+		cpred("id", OpGE, int64(10)),
+		cpred("id", OpLT, int64(20)),
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,11 +60,11 @@ func TestPlanPKRange(t *testing.T) {
 }
 
 func TestPlanIndexEqPrefixPlusRange(t *testing.T) {
-	p, err := planScan(planDesc(), []Pred{
-		{Col: "name", Op: OpEQ, Val: "ada"},
-		{Col: "age", Op: OpGT, Val: int64(21)},
-		{Col: "age", Op: OpLE, Val: int64(65)},
-	})
+	p, err := planScan(planDesc(), and(
+		cpred("name", OpEQ, "ada"),
+		cpred("age", OpGT, int64(21)),
+		cpred("age", OpLE, int64(65)),
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,10 +83,10 @@ func TestPlanPrimaryWinsTies(t *testing.T) {
 	// eq on id (pk) and eq on city (indexed) score equally at one
 	// equality column... they don't: pk eq is a point get. Use a range
 	// on id vs a range on city instead: equal scores, primary wins.
-	p, err := planScan(planDesc(), []Pred{
-		{Col: "id", Op: OpGE, Val: int64(1)},
-		{Col: "city", Op: OpGE, Val: "a"},
-	})
+	p, err := planScan(planDesc(), and(
+		cpred("id", OpGE, int64(1)),
+		cpred("city", OpGE, "a"),
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,23 +97,67 @@ func TestPlanPrimaryWinsTies(t *testing.T) {
 
 func TestPlanFullScanFallback(t *testing.T) {
 	// A float literal does not fit an int key column: nothing pushes.
-	p, err := planScan(planDesc(), []Pred{
-		{Col: "id", Op: OpEQ, Val: 1.5},
-		{Col: "age", Op: OpNE, Val: int64(3)},
-	})
+	p, err := planScan(planDesc(), and(
+		cpred("id", OpEQ, 1.5),
+		cpred("age", OpNE, int64(3)),
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p.get != nil || p.index != "" || p.from != nil || p.stops != nil {
 		t.Fatalf("want unbounded primary scan, got %#v", p)
 	}
-	if len(p.preds) != 2 {
-		t.Fatal("residual filter must keep every predicate")
+	if p.filter == nil {
+		t.Fatal("residual filter must keep the whole WHERE tree")
 	}
 }
 
 func TestPlanUnknownColumn(t *testing.T) {
-	if _, err := planScan(planDesc(), []Pred{{Col: "nope", Op: OpEQ, Val: int64(1)}}); err == nil {
+	if _, err := planScan(planDesc(), cpred("nope", OpEQ, int64(1))); err == nil {
 		t.Fatal("expected error")
+	}
+	// Columns are validated even under OR and NOT.
+	bad := or(cpred("id", OpEQ, int64(1)), &Not{Expr: cpred("nope", OpEQ, int64(1))})
+	if _, err := planScan(planDesc(), bad); err == nil {
+		t.Fatal("expected error inside OR/NOT")
+	}
+}
+
+func TestPlanORIsResidualOnly(t *testing.T) {
+	// A top-level OR pushes nothing, even when every branch touches
+	// the primary key.
+	p, err := planScan(planDesc(), or(
+		cpred("id", OpEQ, int64(1)),
+		cpred("id", OpEQ, int64(2)),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.get != nil || p.from != nil || p.stops != nil || p.index != "" {
+		t.Fatalf("want unbounded primary scan, got %#v", p)
+	}
+
+	// NOT blocks pushdown of its subtree too.
+	p, err = planScan(planDesc(), &Not{Expr: cpred("id", OpLT, int64(5))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.from != nil || p.stops != nil {
+		t.Fatalf("want unbounded scan, got %#v", p)
+	}
+}
+
+func TestPlanConjunctBesideOR(t *testing.T) {
+	// id >= 10 AND (city = 'a' OR age > 3): the conjunct still pushes;
+	// the OR stays residual.
+	p, err := planScan(planDesc(), and(
+		cpred("id", OpGE, int64(10)),
+		or(cpred("city", OpEQ, "a"), cpred("age", OpGT, int64(3))),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.index != "" || !reflect.DeepEqual(p.from, []any{int64(10)}) || p.stops != nil {
+		t.Fatalf("got %#v", p)
 	}
 }

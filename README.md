@@ -12,7 +12,7 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–6: a working relational store, queryable in SQL.
+Milestones 1–7: a working relational store, queryable in SQL.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -138,23 +138,27 @@ WHERE age > 18 GROUP BY city HAVING count(*) >= 2
 ORDER BY count(*) DESC LIMIT 3
 ```
 
-A WHERE clause is AND-ed predicates — `column op literal` (`=`, `!=`,
-`<>`, `<`, `<=`, `>`, `>=`) or `column IS [NOT] NULL`. The planner is
-the roadmap's "filter pushdown" made real: equality on every
-primary-key column becomes a point `Get`; an equality prefix (plus at
-most one range column) of the primary key or of a secondary index
-becomes a bounded ordered scan with early termination; everything else
-falls back to a filtered full scan. Every predicate is also re-checked
-row by row, so pushdown only narrows what is visited — correctness
-never depends on it.
+WHERE and HAVING are boolean expressions: predicates — `column op
+literal` (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, either operand
+order) or `column IS [NOT] NULL` — combined with `AND`, `OR`, and
+`NOT` (standard precedence, parentheses group), evaluated with SQL
+three-valued logic, so `NOT v = 1` still excludes NULL rows. The
+planner is the roadmap's "filter pushdown" made real: equality on
+every primary-key column becomes a point `Get`; an equality prefix
+(plus at most one range column) of the primary key or of a secondary
+index becomes a bounded ordered scan with early termination — using
+only predicates that are top-level `AND` conjuncts (anything under
+`OR`/`NOT` stays filter-only); everything else falls back to a
+filtered full scan. The whole condition is also re-checked row by
+row, so pushdown only narrows what is visited — correctness never
+depends on it.
 
 Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 runs in one engine transaction and rolls back entirely on error.
-Deferred, roughly in order: OR and richer expressions, joins,
-prepared statements (`$1` placeholders already lex), and a
-`bytdb-pgwire` module speaking the Postgres wire protocol — the
-embedded `Exec` result shape (columns + types + rows) is exactly what
-that layer needs.
+Deferred, roughly in order: joins, prepared statements (`$1`
+placeholders already lex), and a `bytdb-pgwire` module speaking the
+Postgres wire protocol — the embedded `Exec` result shape (columns +
+types + rows) is exactly what that layer needs.
 
 ## How it maps onto the key space
 
@@ -203,7 +207,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 4**: column-ID-tagged sparse row values; `AddColumn`/`DropColumn` as metadata-only changes (no row rewrites), with never-reused column IDs
 - [x] **Milestone 5**: SQL frontend — a hand-rolled Postgres-flavored dialect (zero new dependencies): lexer → recursive-descent parser → planner with filter pushdown to point gets and bounded key scans → executor over engine transactions
 - [x] **Milestone 6**: aggregates — COUNT/SUM/AVG/MIN/MAX, GROUP BY (hash aggregation keyed by the order-preserving tuple encoding, so groups emit in order), HAVING, ORDER BY over grouped columns and aggregates
-- [ ] Later: OR and expression trees, joins, prepared statements, a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
+- [x] **Milestone 7**: boolean expressions — AND/OR/NOT with parentheses in WHERE and HAVING, SQL three-valued logic, pushdown restricted to top-level AND conjuncts
+- [ ] Later: joins, prepared statements, a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
 
 ## Design notes
 

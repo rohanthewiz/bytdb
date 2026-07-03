@@ -265,6 +265,68 @@ func TestSQLDDLRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSQLBoolExprs(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+
+	res := exec(t, d, `select id from users where city = 'austin' or age > 42 order by id`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(2)}, {int64(4)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// AND binds tighter than OR.
+	res = exec(t, d, `select id from users where city = 'nyc' and age > 40 or id = 1 order by id`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(1)}, {int64(2)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// Parens override.
+	res = exec(t, d, `select id from users where city = 'nyc' and (age > 40 or id = 5) order by id`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(2)}, {int64(5)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// NOT.
+	res = exec(t, d, `select id from users where not (city = 'london' or city = 'nyc') order by id`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(4)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// A pushable conjunct beside an OR narrows the scan but keeps OR
+	// semantics.
+	res = exec(t, d, `select id from users where id >= 3 and (city = 'nyc' or age = 41) order by id`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(3)}, {int64(5)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// UPDATE/DELETE take boolean expressions too.
+	if res := exec(t, d, `update users set city = 'x' where id = 1 or id = 4`); res.RowsAffected != 2 {
+		t.Fatalf("update affected %d", res.RowsAffected)
+	}
+	if res := exec(t, d, `delete from users where not city = 'x'`); res.RowsAffected != 3 {
+		t.Fatalf("delete affected %d", res.RowsAffected)
+	}
+}
+
+func TestSQLThreeValuedLogic(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, v int)`)
+	exec(t, d, `insert into t (id, v) values (1, 1), (2, 2), (3, null)`)
+
+	// NOT over an unknown comparison stays unknown: the NULL row never
+	// matches, in either direction.
+	if res := exec(t, d, `select id from t where not v = 1 order by id`); !reflect.DeepEqual(res.Rows, [][]any{{int64(2)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// The classic: v = 1 OR v != 1 still excludes NULL.
+	if res := exec(t, d, `select id from t where v = 1 or v != 1 order by id`); len(res.Rows) != 2 {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// Unknown OR true is true.
+	if res := exec(t, d, `select id from t where v = 99 or id = 3`); !reflect.DeepEqual(res.Rows, [][]any{{int64(3)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// NOT (v IS NULL) is definite, not unknown.
+	if res := exec(t, d, `select id from t where not v is null order by id`); len(res.Rows) != 2 {
+		t.Fatalf("got %v", res.Rows)
+	}
+}
+
 func TestSQLAggregates(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)
@@ -295,6 +357,17 @@ func TestSQLAggregates(t *testing.T) {
 	// HAVING filters groups; ORDER BY an aggregate.
 	res = exec(t, d, `select city from users group by city having count(*) >= 2 order by count(*) desc, city`)
 	if !reflect.DeepEqual(res.Rows, [][]any{{"london"}, {"nyc"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// HAVING takes boolean expressions: OR over aggregates and group
+	// columns.
+	res = exec(t, d, `select city from users group by city having count(*) >= 2 or city = 'austin' order by city`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"austin"}, {"london"}, {"nyc"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	res = exec(t, d, `select city from users group by city having not count(*) >= 2 order by city`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"austin"}}) {
 		t.Fatalf("got %v", res.Rows)
 	}
 

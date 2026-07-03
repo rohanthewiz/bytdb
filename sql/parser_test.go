@@ -16,6 +16,18 @@ func mustParse(t *testing.T, src string) Statement {
 	return st
 }
 
+// tree-building helpers for expected values
+func cpred(col string, op PredOp, val any) *Pred {
+	return &Pred{Item: SelectItem{Col: col}, Op: op, Val: val}
+}
+
+func apred(item SelectItem, op PredOp, val any) *Pred {
+	return &Pred{Item: item, Op: op, Val: val}
+}
+
+func and(es ...BoolExpr) *And { return &And{Exprs: es} }
+func or(es ...BoolExpr) *Or   { return &Or{Exprs: es} }
+
 func TestParseCreateTable(t *testing.T) {
 	st := mustParse(t, `CREATE TABLE Users (
 		id BIGINT PRIMARY KEY,
@@ -63,12 +75,12 @@ func TestParseSelect(t *testing.T) {
 	want := &Select{
 		Table: "users",
 		Items: []SelectItem{{Col: "name"}, {Col: "age"}},
-		Where: []Pred{
-			{Col: "age", Op: OpGE, Val: int64(21)},
-			{Col: "score", Op: OpLT, Val: int64(100)}, // flipped
-			{Col: "city", Op: OpEQ, Val: "Reno"},
-			{Col: "note", Op: OpIsNotNull},
-		},
+		Where: and(
+			cpred("age", OpGE, int64(21)),
+			cpred("score", OpLT, int64(100)), // flipped
+			cpred("city", OpEQ, "Reno"),
+			cpred("note", OpIsNotNull, nil),
+		),
 		OrderBy: []OrderItem{
 			{SelectItem: SelectItem{Col: "age"}, Desc: true},
 			{SelectItem: SelectItem{Col: "name"}},
@@ -82,7 +94,7 @@ func TestParseSelect(t *testing.T) {
 
 	st = mustParse(t, `select * from t where a is null offset 2 limit 3`)
 	s := st.(*Select)
-	if !s.Star || s.Limit != 3 || s.Offset != 2 || s.Where[0].Op != OpIsNull {
+	if !s.Star || s.Limit != 3 || s.Offset != 2 || s.Where.(*Pred).Op != OpIsNull {
 		t.Fatalf("got %#v", s)
 	}
 	if mustParse(t, `select * from t`).(*Select).Limit != -1 {
@@ -113,12 +125,49 @@ func TestParseUpdateDelete(t *testing.T) {
 	st := mustParse(t, `UPDATE users SET city = 'Reno', age = 30 WHERE id = 7`)
 	u := st.(*Update)
 	if u.Table != "users" || u.Set["city"] != "Reno" || u.Set["age"] != int64(30) ||
-		!reflect.DeepEqual(u.Where, []Pred{{Col: "id", Op: OpEQ, Val: int64(7)}}) {
+		!reflect.DeepEqual(u.Where, cpred("id", OpEQ, int64(7))) {
 		t.Fatalf("got %#v", u)
 	}
 	d := mustParse(t, `delete from users where id != 3`).(*Delete)
-	if d.Where[0].Op != OpNE {
+	if d.Where.(*Pred).Op != OpNE {
 		t.Fatalf("got %#v", d)
+	}
+}
+
+func TestParseBoolExprs(t *testing.T) {
+	// AND binds tighter than OR; NOT tighter still; parens group.
+	s := mustParse(t, `select * from t where a = 1 or b = 2 and not c = 3`).(*Select)
+	want := or(
+		cpred("a", OpEQ, int64(1)),
+		and(cpred("b", OpEQ, int64(2)), &Not{Expr: cpred("c", OpEQ, int64(3))}),
+	)
+	if !reflect.DeepEqual(s.Where, BoolExpr(want)) {
+		t.Fatalf("got %#v", s.Where)
+	}
+
+	s = mustParse(t, `select * from t where (a = 1 or b = 2) and c = 3`).(*Select)
+	want2 := and(
+		or(cpred("a", OpEQ, int64(1)), cpred("b", OpEQ, int64(2))),
+		cpred("c", OpEQ, int64(3)),
+	)
+	if !reflect.DeepEqual(s.Where, BoolExpr(want2)) {
+		t.Fatalf("got %#v", s.Where)
+	}
+
+	// Same-operator chains flatten to one n-ary node.
+	s = mustParse(t, `select * from t where a = 1 or b = 2 or c = 3`).(*Select)
+	if len(s.Where.(*Or).Exprs) != 3 {
+		t.Fatalf("got %#v", s.Where)
+	}
+
+	// NOT applies to a whole parenthesized expression, and stacks.
+	s = mustParse(t, `select * from t where not (a = 1 and not b is null)`).(*Select)
+	inner := s.Where.(*Not).Expr.(*And)
+	if len(inner.Exprs) != 2 {
+		t.Fatalf("got %#v", s.Where)
+	}
+	if _, ok := inner.Exprs[1].(*Not); !ok {
+		t.Fatalf("got %#v", inner.Exprs[1])
 	}
 }
 
@@ -165,7 +214,7 @@ func TestParseErrors(t *testing.T) {
 
 func TestParseQuotedIdents(t *testing.T) {
 	s := mustParse(t, `select "Weird Col" from "MyTable" where "true" = 1`).(*Select)
-	if s.Table != "MyTable" || s.Items[0].Col != "Weird Col" || s.Where[0].Col != "true" {
+	if s.Table != "MyTable" || s.Items[0].Col != "Weird Col" || s.Where.(*Pred).Item.Col != "true" {
 		t.Fatalf("got %#v", s)
 	}
 }
@@ -181,12 +230,12 @@ func TestParseAggregates(t *testing.T) {
 			{Agg: AggCount, Star: true},
 			{Agg: AggAvg, Col: "age"},
 		},
-		Where:   []Pred{{Col: "age", Op: OpGT, Val: int64(18)}},
+		Where:   cpred("age", OpGT, int64(18)),
 		GroupBy: []string{"city"},
-		Having: []AggPred{
-			{Item: SelectItem{Agg: AggCount, Star: true}, Op: OpGE, Val: int64(2)},
-			{Item: SelectItem{Agg: AggMin, Col: "age"}, Op: OpIsNotNull},
-		},
+		Having: and(
+			apred(SelectItem{Agg: AggCount, Star: true}, OpGE, int64(2)),
+			apred(SelectItem{Agg: AggMin, Col: "age"}, OpIsNotNull, nil),
+		),
 		OrderBy: []OrderItem{
 			{SelectItem: SelectItem{Agg: AggCount, Star: true}, Desc: true},
 			{SelectItem: SelectItem{Col: "city"}},

@@ -396,7 +396,7 @@ func (p *parser) selectStmt() (Statement, error) {
 		return nil, err
 	}
 	if p.acceptKw("where") {
-		if s.Where, err = p.wherePreds(); err != nil {
+		if s.Where, err = p.boolExpr(false); err != nil {
 			return nil, err
 		}
 	}
@@ -416,15 +416,8 @@ func (p *parser) selectStmt() (Statement, error) {
 		}
 	}
 	if p.acceptKw("having") {
-		for {
-			pr, err := p.aggPred()
-			if err != nil {
-				return nil, err
-			}
-			s.Having = append(s.Having, pr)
-			if !p.acceptKw("and") {
-				break
-			}
+		if s.Having, err = p.boolExpr(true); err != nil {
+			return nil, err
 		}
 	}
 	if p.acceptKw("order") {
@@ -507,7 +500,7 @@ func (p *parser) update() (Statement, error) {
 		}
 	}
 	if p.acceptKw("where") {
-		if u.Where, err = p.wherePreds(); err != nil {
+		if u.Where, err = p.boolExpr(false); err != nil {
 			return nil, err
 		}
 	}
@@ -524,7 +517,7 @@ func (p *parser) deleteStmt() (Statement, error) {
 	}
 	d := &Delete{Table: table}
 	if p.acceptKw("where") {
-		if d.Where, err = p.wherePreds(); err != nil {
+		if d.Where, err = p.boolExpr(false); err != nil {
 			return nil, err
 		}
 	}
@@ -568,110 +561,132 @@ func (p *parser) peekOp(op string) bool {
 	return t.kind == tOp && t.text == op
 }
 
-// aggPred parses one HAVING conjunct: item op literal, or item IS
-// [NOT] NULL.
-func (p *parser) aggPred() (AggPred, error) {
-	item, err := p.selectItem()
-	if err != nil {
-		return AggPred{}, err
-	}
-	if p.acceptKw("is") {
-		op := OpIsNull
-		if p.acceptKw("not") {
-			op = OpIsNotNull
-		}
-		if err := p.expectKw("null"); err != nil {
-			return AggPred{}, err
-		}
-		return AggPred{Item: item, Op: op}, nil
-	}
-	op, err := p.cmpOp()
-	if err != nil {
-		return AggPred{}, err
-	}
-	val, err := p.literal()
-	if err != nil {
-		return AggPred{}, err
-	}
-	if val == nil {
-		return AggPred{}, serr.New("cannot compare with NULL; use IS [NOT] NULL")
-	}
-	return AggPred{Item: item, Op: op, Val: val}, nil
-}
+// --- boolean expressions (WHERE / HAVING) ---
 
-// --- WHERE ---
-
-func (p *parser) wherePreds() ([]Pred, error) {
-	var preds []Pred
-	for {
-		pr, err := p.pred()
+// boolExpr parses a boolean expression with SQL precedence — OR
+// binds loosest, then AND, then NOT, then predicates; parentheses
+// group. allowAgg permits aggregate calls in predicates (HAVING).
+func (p *parser) boolExpr(allowAgg bool) (BoolExpr, error) {
+	e, err := p.boolAnd(allowAgg)
+	if err != nil {
+		return nil, err
+	}
+	for p.acceptKw("or") {
+		r, err := p.boolAnd(allowAgg)
 		if err != nil {
 			return nil, err
 		}
-		preds = append(preds, pr)
-		if !p.acceptKw("and") {
-			break
+		if or, ok := e.(*Or); ok {
+			or.Exprs = append(or.Exprs, r)
+		} else {
+			e = &Or{Exprs: []BoolExpr{e, r}}
 		}
 	}
-	return preds, nil
+	return e, nil
 }
 
-// pred parses one predicate: column op literal (either order; a
-// literal-first comparison is flipped), or column IS [NOT] NULL.
-func (p *parser) pred() (Pred, error) {
-	lCol, lVal, lIsCol, err := p.operand()
+func (p *parser) boolAnd(allowAgg bool) (BoolExpr, error) {
+	e, err := p.boolNot(allowAgg)
 	if err != nil {
-		return Pred{}, err
+		return nil, err
 	}
-	if lIsCol && p.acceptKw("is") {
+	for p.acceptKw("and") {
+		r, err := p.boolNot(allowAgg)
+		if err != nil {
+			return nil, err
+		}
+		if and, ok := e.(*And); ok {
+			and.Exprs = append(and.Exprs, r)
+		} else {
+			e = &And{Exprs: []BoolExpr{e, r}}
+		}
+	}
+	return e, nil
+}
+
+func (p *parser) boolNot(allowAgg bool) (BoolExpr, error) {
+	if p.acceptKw("not") {
+		e, err := p.boolNot(allowAgg)
+		if err != nil {
+			return nil, err
+		}
+		return &Not{Expr: e}, nil
+	}
+	if p.acceptOp("(") {
+		e, err := p.boolExpr(allowAgg)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		return e, nil
+	}
+	return p.predLeaf(allowAgg)
+}
+
+// predLeaf parses one predicate: item op literal (either operand
+// order; a literal-first comparison is flipped), or item IS [NOT]
+// NULL.
+func (p *parser) predLeaf(allowAgg bool) (BoolExpr, error) {
+	lItem, lVal, lIsItem, err := p.predOperand(allowAgg)
+	if err != nil {
+		return nil, err
+	}
+	if lIsItem && p.acceptKw("is") {
 		op := OpIsNull
 		if p.acceptKw("not") {
 			op = OpIsNotNull
 		}
 		if err := p.expectKw("null"); err != nil {
-			return Pred{}, err
+			return nil, err
 		}
-		return Pred{Col: lCol, Op: op}, nil
+		return &Pred{Item: lItem, Op: op}, nil
 	}
 	op, err := p.cmpOp()
 	if err != nil {
-		return Pred{}, err
+		return nil, err
 	}
-	rCol, rVal, rIsCol, err := p.operand()
+	rItem, rVal, rIsItem, err := p.predOperand(allowAgg)
 	if err != nil {
-		return Pred{}, err
+		return nil, err
 	}
 	switch {
-	case lIsCol && !rIsCol:
+	case lIsItem && !rIsItem:
 		if rVal == nil {
-			return Pred{}, serr.New("cannot compare with NULL; use IS [NOT] NULL", "column", lCol)
+			return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
 		}
-		return Pred{Col: lCol, Op: op, Val: rVal}, nil
-	case !lIsCol && rIsCol:
+		return &Pred{Item: lItem, Op: op, Val: rVal}, nil
+	case !lIsItem && rIsItem:
 		if lVal == nil {
-			return Pred{}, serr.New("cannot compare with NULL; use IS [NOT] NULL", "column", rCol)
+			return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
 		}
-		return Pred{Col: rCol, Op: flip(op), Val: lVal}, nil
+		return &Pred{Item: rItem, Op: flip(op), Val: lVal}, nil
 	}
-	return Pred{}, serr.New("a predicate must compare a column with a literal")
+	return nil, serr.New("a predicate must compare a column with a literal")
 }
 
-// operand parses a column reference or a literal.
-func (p *parser) operand() (col string, val any, isCol bool, err error) {
+// predOperand parses a column, an aggregate call (HAVING only), or a
+// literal.
+func (p *parser) predOperand(allowAgg bool) (item SelectItem, val any, isItem bool, err error) {
 	t := p.cur()
 	if t.kind == tIdent && (t.text == "true" || t.text == "false" || t.text == "null") {
 		val, err = p.literal()
-		return "", val, false, err
+		return SelectItem{}, val, false, err
 	}
 	if t.kind == tIdent && aggNames[t.text] != AggNone && p.peekOp("(") {
-		return "", nil, false, serr.New("aggregates are not allowed in WHERE; use HAVING", "function", t.text)
+		if !allowAgg {
+			return SelectItem{}, nil, false, serr.New("aggregates are not allowed in WHERE; use HAVING", "function", t.text)
+		}
+		item, err = p.selectItem()
+		return item, nil, true, err
 	}
 	if t.kind == tIdent || t.kind == tQIdent {
-		col, err = p.ident("a column name")
-		return col, nil, true, err
+		col, err := p.ident("a column name")
+		return SelectItem{Col: col}, nil, true, err
 	}
 	val, err = p.literal()
-	return "", val, false, err
+	return SelectItem{}, val, false, err
 }
 
 func (p *parser) cmpOp() (PredOp, error) {

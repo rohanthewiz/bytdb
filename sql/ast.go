@@ -19,14 +19,56 @@ const (
 	OpIsNotNull
 )
 
-// Pred is one WHERE conjunct: column op literal, or column IS [NOT]
-// NULL. The grammar allows only AND-ed predicates with a column on one
-// side and a literal on the other (a reversed comparison is normalized
-// at parse time), so a WHERE clause is a flat slice.
+// BoolExpr is a WHERE or HAVING condition: a tree of AND/OR/NOT over
+// Pred leaves, evaluated with SQL three-valued logic (a comparison
+// against NULL is unknown; a row or group matches only when the tree
+// is definitely true).
+type BoolExpr interface{ boolExpr() }
+
+// And and Or are n-ary: the parser flattens chains of the same
+// operator.
+type And struct{ Exprs []BoolExpr }
+type Or struct{ Exprs []BoolExpr }
+type Not struct{ Expr BoolExpr }
+
+// Pred is a leaf predicate: item op literal, or item IS [NOT] NULL.
+// The item is a plain column in WHERE; in HAVING it may also be an
+// aggregate call. One side must be the item and the other a literal —
+// a reversed comparison is normalized at parse time.
 type Pred struct {
-	Col string
-	Op  PredOp
-	Val any // literal value; nil for IS [NOT] NULL
+	Item SelectItem
+	Op   PredOp
+	Val  any // literal value; nil for IS [NOT] NULL
+}
+
+func (*And) boolExpr()  {}
+func (*Or) boolExpr()   {}
+func (*Not) boolExpr()  {}
+func (*Pred) boolExpr() {}
+
+// walkPreds visits every leaf predicate in the tree.
+func walkPreds(e BoolExpr, visit func(*Pred) error) error {
+	switch n := e.(type) {
+	case nil:
+		return nil
+	case *Pred:
+		return visit(n)
+	case *Not:
+		return walkPreds(n.Expr, visit)
+	case *And:
+		for _, sub := range n.Exprs {
+			if err := walkPreds(sub, visit); err != nil {
+				return err
+			}
+		}
+	case *Or:
+		for _, sub := range n.Exprs {
+			if err := walkPreds(sub, visit); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // AggFunc is an aggregate function in a select list, HAVING, or
@@ -61,14 +103,6 @@ type SelectItem struct {
 	Col  string
 	Agg  AggFunc
 	Star bool // COUNT(*)
-}
-
-// AggPred is one HAVING conjunct: item op literal, or item IS [NOT]
-// NULL, where the item may be an aggregate or a grouped column.
-type AggPred struct {
-	Item SelectItem
-	Op   PredOp
-	Val  any
 }
 
 // ColDef is one column of a CREATE TABLE or ALTER TABLE ADD COLUMN.
@@ -130,9 +164,9 @@ type Select struct {
 	Table   string
 	Star    bool
 	Items   []SelectItem
-	Where   []Pred
+	Where   BoolExpr // nil: all rows
 	GroupBy []string
-	Having  []AggPred
+	Having  BoolExpr // nil: all groups; leaves may be aggregates
 	OrderBy []OrderItem
 	Limit   int64 // -1: no limit
 	Offset  int64
@@ -142,13 +176,13 @@ type Select struct {
 type Update struct {
 	Table string
 	Set   map[string]any
-	Where []Pred
+	Where BoolExpr
 }
 
 // Delete is DELETE FROM t [WHERE ...].
 type Delete struct {
 	Table string
-	Where []Pred
+	Where BoolExpr
 }
 
 func (*CreateTable) stmt() {}

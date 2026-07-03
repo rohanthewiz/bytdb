@@ -16,12 +16,16 @@
 //	UPDATE t SET c = v, ... [WHERE ...]
 //	DELETE FROM t [WHERE ...]
 //
-// A WHERE clause is AND-ed predicates: column op literal (=, !=, <>,
-// <, <=, >, >=, either operand order) or column IS [NOT] NULL. The
-// planner turns equality and range predicates on a prefix of the
-// primary key or of a secondary index into point gets or bounded
-// ordered scans; every predicate is still re-checked per row, so
-// pushdown only narrows what is visited.
+// WHERE and HAVING are boolean expressions — predicates combined with
+// AND, OR, and NOT (standard precedence; parentheses group), evaluated
+// with SQL three-valued logic: a comparison against NULL is unknown,
+// and only definitely-true rows match. A predicate is column op
+// literal (=, !=, <>, <, <=, >, >=, either operand order) or column
+// IS [NOT] NULL. The planner turns equality and range predicates that
+// are top-level AND conjuncts on a prefix of the primary key or of a
+// secondary index into point gets or bounded ordered scans (anything
+// under OR or NOT stays filter-only); the whole condition is still
+// re-checked per row, so pushdown only narrows what is visited.
 //
 // Select items are columns or aggregates: COUNT(*), COUNT(c), SUM(c),
 // AVG(c), MIN(c), MAX(c). Any aggregate, GROUP BY, or HAVING makes

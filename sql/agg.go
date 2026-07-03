@@ -104,21 +104,16 @@ type aggQuery struct {
 	groupOrds []int
 	accums    []accum // templates, cloned per group
 
-	outputs []aggRef
-	having  []aggHavingCheck
-	sorts   []aggSortKey
+	outputs    []aggRef
+	having     BoolExpr            // leaves resolved via havingRefs
+	havingRefs map[*Pred]aggRef
+	sorts      []aggSortKey
 }
 
 // aggRef points at a group-by column (acc < 0) or an accumulator.
 type aggRef struct {
 	group int // index into groupOrds
 	acc   int // index into accums, or -1
-}
-
-type aggHavingCheck struct {
-	ref aggRef
-	op  PredOp
-	val any
 }
 
 type aggSortKey struct {
@@ -194,12 +189,17 @@ func resolveAgg(desc *bytdb.TableDesc, s *Select) (*aggQuery, error) {
 		}
 		q.outputs = append(q.outputs, r)
 	}
-	for _, h := range s.Having {
-		r, err := ref(h.Item)
+	q.having = s.Having
+	q.havingRefs = map[*Pred]aggRef{}
+	if err := walkPreds(s.Having, func(pr *Pred) error {
+		r, err := ref(pr.Item)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		q.having = append(q.having, aggHavingCheck{ref: r, op: h.Op, val: h.Val})
+		q.havingRefs[pr] = r
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	for _, o := range s.OrderBy {
 		r, err := ref(o.SelectItem)
@@ -321,15 +321,14 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	}
 	slices.Sort(keys)
 	kept := make([]*group, 0, len(groups))
-nextGroup:
 	for _, k := range keys {
 		g := groups[k]
-		for _, h := range q.having {
-			if !checkPred(q.valueOf(g, h.ref), h.op, h.val) {
-				continue nextGroup
-			}
+		ok := evalBool(q.having, func(pr *Pred) tri {
+			return checkPred(q.valueOf(g, q.havingRefs[pr]), pr.Op, pr.Val)
+		})
+		if ok == triTrue {
+			kept = append(kept, g)
 		}
-		kept = append(kept, g)
 	}
 	if len(q.sorts) > 0 {
 		slices.SortStableFunc(kept, func(a, b *group) int {
@@ -364,34 +363,4 @@ nextGroup:
 		res.Rows[i] = out
 	}
 	return res, nil
-}
-
-// checkPred applies one comparison with SQL semantics: NULL on either
-// side of an ordering comparison is false.
-func checkPred(v any, op PredOp, lit any) bool {
-	switch op {
-	case OpIsNull:
-		return v == nil
-	case OpIsNotNull:
-		return v != nil
-	}
-	c, ok := compareVals(v, lit)
-	if !ok {
-		return false
-	}
-	switch op {
-	case OpEQ:
-		return c == 0
-	case OpNE:
-		return c != 0
-	case OpLT:
-		return c < 0
-	case OpLE:
-		return c <= 0
-	case OpGT:
-		return c > 0
-	case OpGE:
-		return c >= 0
-	}
-	return false
 }

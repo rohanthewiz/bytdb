@@ -7,17 +7,17 @@ import (
 
 // plan is the access strategy for one table read: which path to use,
 // the lower bound pushed into the ordered scan, where the scan can
-// stop early, and the residual filter. Every WHERE predicate stays in
+// stop early, and the residual filter. The whole WHERE tree stays in
 // the residual filter — pushdown only narrows what is visited, so
 // correctness never depends on it.
 type plan struct {
 	desc *bytdb.TableDesc
 
-	get   []any  // full-PK point lookup (values in key order); nil when scanning
-	index string // secondary index to scan; "" scans the primary index
-	from  []any  // inclusive lower bound pushed into the scan; nil is unbounded
-	stops []stop // early-termination checks, in key-column order
-	preds []Pred // residual filter: the full WHERE clause
+	get    []any    // full-PK point lookup (values in key order); nil when scanning
+	index  string   // secondary index to scan; "" scans the primary index
+	from   []any    // inclusive lower bound pushed into the scan; nil is unbounded
+	stops  []stop   // early-termination checks, in key-column order
+	filter BoolExpr // residual filter: the full WHERE clause (nil: all rows)
 }
 
 type stopKind int
@@ -43,19 +43,28 @@ type stop struct {
 // a point Get when every primary-key column has an equality predicate,
 // else the primary index or the secondary index with the longest
 // equality prefix (plus at most one range column), else a full scan.
-func planScan(desc *bytdb.TableDesc, preds []Pred) (*plan, error) {
-	p := &plan{desc: desc, preds: preds}
+// Only predicates that are top-level AND conjuncts push down; anything
+// under OR or NOT is residual-only.
+func planScan(desc *bytdb.TableDesc, where BoolExpr) (*plan, error) {
+	p := &plan{desc: desc, filter: where}
 
-	// First usable predicate per column, by kind. Only literals that
+	// Every column referenced anywhere in the tree must exist.
+	if err := walkPreds(where, func(pr *Pred) error {
+		if desc.ColIndex(pr.Item.Col) < 0 {
+			return serr.New("no such column", "table", desc.Name, "column", pr.Item.Col)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// First usable conjunct per column, by kind. Only literals that
 	// fit the column type are pushed; the rest stay residual-only.
 	eq := map[int]any{}
-	lo := map[int]Pred{}
-	hi := map[int]Pred{}
-	for _, pr := range preds {
-		ord := desc.ColIndex(pr.Col)
-		if ord < 0 {
-			return nil, serr.New("no such column", "table", desc.Name, "column", pr.Col)
-		}
+	lo := map[int]*Pred{}
+	hi := map[int]*Pred{}
+	for _, pr := range conjuncts(where) {
+		ord := desc.ColIndex(pr.Item.Col)
 		if pr.Val == nil || !litFits(pr.Val, desc.Columns[ord].Type) {
 			continue
 		}
@@ -121,6 +130,23 @@ func planScan(desc *bytdb.TableDesc, preds []Pred) (*plan, error) {
 	return p, nil
 }
 
+// conjuncts flattens the predicates that must hold for every matching
+// row: leaves of top-level AND chains. OR and NOT subtrees contribute
+// nothing (their predicates are not individually required).
+func conjuncts(e BoolExpr) []*Pred {
+	switch n := e.(type) {
+	case *Pred:
+		return []*Pred{n}
+	case *And:
+		var out []*Pred
+		for _, sub := range n.Exprs {
+			out = append(out, conjuncts(sub)...)
+		}
+		return out
+	}
+	return nil
+}
+
 // eqPrefix is the number of leading key columns with an equality
 // predicate.
 func eqPrefix(cols []int, eq map[int]any) int {
@@ -134,7 +160,7 @@ func eqPrefix(cols []int, eq map[int]any) int {
 	return k
 }
 
-func pathScore(cols []int, eq map[int]any, lo, hi map[int]Pred) int {
+func pathScore(cols []int, eq map[int]any, lo, hi map[int]*Pred) int {
 	k := eqPrefix(cols, eq)
 	score := 4 * k
 	if k < len(cols) {

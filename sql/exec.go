@@ -18,7 +18,7 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, yield func(bytdb.Row) bool) 
 		if err != nil {
 			return err
 		}
-		if ok && matches(p.preds, row) {
+		if ok && matches(p.filter, row) {
 			yield(row)
 		}
 		return nil
@@ -36,7 +36,7 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, yield func(bytdb.Row) bool) 
 		if stopped(p.stops, row) {
 			return nil
 		}
-		if !matches(p.preds, row) {
+		if !matches(p.filter, row) {
 			continue
 		}
 		if !yield(row) {
@@ -76,16 +76,110 @@ func stopped(stops []stop, row bytdb.Row) bool {
 	return false
 }
 
-// matches evaluates every predicate against a row. A comparison
-// against NULL, or between incomparable kinds, is false — so rows with
-// NULL never match anything but IS NULL, per SQL.
-func matches(preds []Pred, row bytdb.Row) bool {
-	for _, pr := range preds {
-		if !checkPred(row.Col(pr.Col), pr.Op, pr.Val) {
-			return false
-		}
+// tri is a three-valued SQL truth value: a comparison against NULL
+// (or between incomparable kinds) is unknown, NOT preserves unknown,
+// and AND/OR treat it per Kleene logic. A row or group matches a
+// condition only when it evaluates to definitely true.
+type tri int8
+
+const (
+	triFalse tri = iota
+	triTrue
+	triUnknown
+)
+
+func (t tri) not() tri {
+	switch t {
+	case triTrue:
+		return triFalse
+	case triFalse:
+		return triTrue
 	}
-	return true
+	return triUnknown
+}
+
+// evalBool evaluates a boolean expression; leaf values each Pred.
+// A nil expression is true (no WHERE / no HAVING).
+func evalBool(e BoolExpr, leaf func(*Pred) tri) tri {
+	switch n := e.(type) {
+	case nil:
+		return triTrue
+	case *Pred:
+		return leaf(n)
+	case *Not:
+		return evalBool(n.Expr, leaf).not()
+	case *And:
+		out := triTrue
+		for _, sub := range n.Exprs {
+			switch evalBool(sub, leaf) {
+			case triFalse:
+				return triFalse
+			case triUnknown:
+				out = triUnknown
+			}
+		}
+		return out
+	case *Or:
+		out := triFalse
+		for _, sub := range n.Exprs {
+			switch evalBool(sub, leaf) {
+			case triTrue:
+				return triTrue
+			case triUnknown:
+				out = triUnknown
+			}
+		}
+		return out
+	}
+	return triUnknown
+}
+
+// checkPred applies one predicate to the item's value. IS [NOT] NULL
+// is always definite; a comparison involving NULL or incomparable
+// kinds is unknown.
+func checkPred(v any, op PredOp, lit any) tri {
+	switch op {
+	case OpIsNull:
+		if v == nil {
+			return triTrue
+		}
+		return triFalse
+	case OpIsNotNull:
+		if v != nil {
+			return triTrue
+		}
+		return triFalse
+	}
+	c, ok := compareVals(v, lit)
+	if !ok {
+		return triUnknown
+	}
+	hit := false
+	switch op {
+	case OpEQ:
+		hit = c == 0
+	case OpNE:
+		hit = c != 0
+	case OpLT:
+		hit = c < 0
+	case OpLE:
+		hit = c <= 0
+	case OpGT:
+		hit = c > 0
+	case OpGE:
+		hit = c >= 0
+	}
+	if hit {
+		return triTrue
+	}
+	return triFalse
+}
+
+// matches reports whether a row definitely satisfies the filter.
+func matches(filter BoolExpr, row bytdb.Row) bool {
+	return evalBool(filter, func(p *Pred) tri {
+		return checkPred(row.Col(p.Item.Col), p.Op, p.Val)
+	}) == triTrue
 }
 
 // compareVals orders two non-NULL values. ok is false for NULLs and
