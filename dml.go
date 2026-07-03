@@ -26,27 +26,43 @@ func (r Row) Col(name string) any {
 // Insert stores one row, vals in declared column order. Values are
 // coerced to their column types (any Go int width into an int column,
 // ints into float columns); nil is allowed in non-key columns. The
-// primary key must not already exist.
+// primary key must not already exist. The row and its entry in every
+// secondary index commit atomically.
+//
+// The descriptor is resolved inside the write transaction, so an
+// insert serialized after a CreateIndex maintains the new index.
 func (e *Engine) Insert(table string, vals ...any) error {
-	desc, err := e.desc(table)
-	if err != nil {
-		return err
-	}
-	row, err := coerceRow(desc, vals)
-	if err != nil {
-		return err
-	}
-	key, err := rowKey(desc, pkValues(desc, row))
-	if err != nil {
-		return err
-	}
-	val, err := encodeRowValue(desc, row)
-	if err != nil {
-		return err
-	}
-	err = e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+		desc, err := e.desc(table)
+		if err != nil {
+			return err
+		}
+		row, err := coerceRow(desc, vals)
+		if err != nil {
+			return err
+		}
+		key, err := rowKey(desc, pkValues(desc, row))
+		if err != nil {
+			return err
+		}
+		val, err := encodeRowValue(desc, row)
+		if err != nil {
+			return err
+		}
 		if tx.Contains(key) {
 			return serr.New("duplicate primary key", "table", table)
+		}
+		for i := range desc.Indexes {
+			ek, ev, enforced, err := indexEntry(desc, &desc.Indexes[i], row)
+			if err != nil {
+				return err
+			}
+			if enforced && tx.Contains(ek) {
+				return serr.New("unique index violation", "table", table, "index", desc.Indexes[i].Name)
+			}
+			if err := tx.Set(ek, ev); err != nil {
+				return err
+			}
 		}
 		return tx.Set(key, val)
 	})
@@ -74,18 +90,41 @@ func (e *Engine) Get(table string, pkVals ...any) (Row, bool, error) {
 	return row, err == nil, err
 }
 
-// Delete removes the row with the given primary-key values, reporting
-// whether it existed.
+// Delete removes the row with the given primary-key values — and its
+// secondary-index entries, atomically — reporting whether it existed.
 func (e *Engine) Delete(table string, pkVals ...any) (bool, error) {
-	desc, err := e.desc(table)
-	if err != nil {
-		return false, err
-	}
-	key, err := fullPKKey(desc, pkVals)
-	if err != nil {
-		return false, err
-	}
-	existed, err := e.kv.Delete(key)
+	existed := false
+	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+		desc, err := e.desc(table)
+		if err != nil {
+			return err
+		}
+		key, err := fullPKKey(desc, pkVals)
+		if err != nil {
+			return err
+		}
+		val, ok := tx.Get(key)
+		if !ok {
+			return nil
+		}
+		if len(desc.Indexes) > 0 {
+			row, err := decodeRow(desc, key, val)
+			if err != nil {
+				return err
+			}
+			for i := range desc.Indexes {
+				ek, _, _, err := indexEntry(desc, &desc.Indexes[i], row.Vals)
+				if err != nil {
+					return err
+				}
+				if _, err := tx.Delete(ek); err != nil {
+					return err
+				}
+			}
+		}
+		existed, err = tx.Delete(key)
+		return err
+	})
 	if err != nil {
 		return false, serr.Wrap(err, "op", "delete", "table", table)
 	}

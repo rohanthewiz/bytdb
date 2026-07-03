@@ -52,9 +52,9 @@ func (e *Engine) CreateTable(name string, cols []Column, pk ...string) (*TableDe
 		desc.PKCols = append(desc.PKCols, ord)
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.tables[name] != nil {
+	e.ddlMu.Lock()
+	defer e.ddlMu.Unlock()
+	if e.Table(name) != nil {
 		return nil, serr.New("table already exists", "table", name)
 	}
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
@@ -76,30 +76,37 @@ func (e *Engine) CreateTable(name string, cols []Column, pk ...string) (*TableDe
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "create table", "table", name)
 	}
+	e.mu.Lock()
 	e.tables[name] = desc
+	e.mu.Unlock()
 	return desc, nil
 }
 
-// DropTable removes a table's descriptor and all its rows atomically.
+// DropTable removes a table — descriptor, rows, and every index —
+// atomically.
 func (e *Engine) DropTable(name string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	desc := e.tables[name]
+	e.ddlMu.Lock()
+	defer e.ddlMu.Unlock()
+	desc := e.Table(name)
 	if desc == nil {
 		return serr.New("no such table", "table", name)
 	}
-	prefix := tablePrefix(desc.ID)
+	prefix := tableSpace(desc.ID)
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
 		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
 			return err
 		}
-		_, err := tx.Delete(descKey(name))
-		return err
+		if _, err := tx.Delete(descKey(name)); err != nil {
+			return err
+		}
+		e.mu.Lock()
+		delete(e.tables, name)
+		e.mu.Unlock()
+		return nil
 	})
 	if err != nil {
 		return serr.Wrap(err, "op", "drop table", "table", name)
 	}
-	delete(e.tables, name)
 	return nil
 }
 

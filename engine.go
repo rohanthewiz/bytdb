@@ -14,6 +14,7 @@ package bytdb
 
 import (
 	"encoding/json"
+	"slices"
 	"sync"
 
 	"github.com/rohanthewiz/btypedb"
@@ -47,14 +48,45 @@ type Column struct {
 	Type ColType `json:"type"`
 }
 
-// TableDesc describes a table: its columns in declared order and which
-// of them (by ordinal) form the primary key, in key order. Descriptors
-// are persisted as JSON rows of the system descriptors table.
+// TableDesc describes a table: its columns in declared order, which of
+// them (by ordinal) form the primary key in key order, and its
+// secondary indexes. Descriptors are persisted as JSON rows of the
+// system descriptors table.
 type TableDesc struct {
-	ID      uint64   `json:"id"`
-	Name    string   `json:"name"`
-	Columns []Column `json:"columns"`
-	PKCols  []int    `json:"pk_cols"`
+	ID      uint64      `json:"id"`
+	Name    string      `json:"name"`
+	Columns []Column    `json:"columns"`
+	PKCols  []int       `json:"pk_cols"`
+	Indexes []IndexDesc `json:"indexes,omitempty"`
+}
+
+// IndexDesc describes one secondary index: which columns (by ordinal)
+// it orders, in key order. A unique index rejects two rows with equal
+// indexed values, except that rows with NULL in any indexed column
+// never conflict (SQL semantics).
+type IndexDesc struct {
+	ID     uint64 `json:"id"`
+	Name   string `json:"name"`
+	Cols   []int  `json:"cols"`
+	Unique bool   `json:"unique"`
+}
+
+// Index returns the named index's descriptor, or nil.
+func (d *TableDesc) Index(name string) *IndexDesc {
+	for i := range d.Indexes {
+		if d.Indexes[i].Name == name {
+			return &d.Indexes[i]
+		}
+	}
+	return nil
+}
+
+func (d *TableDesc) clone() *TableDesc {
+	c := *d
+	c.Columns = slices.Clone(d.Columns)
+	c.PKCols = slices.Clone(d.PKCols)
+	c.Indexes = slices.Clone(d.Indexes)
+	return &c
 }
 
 // ColIndex returns the ordinal of the named column, or -1.
@@ -80,6 +112,13 @@ func (d *TableDesc) isPK(ordinal int) bool {
 // for concurrent use.
 type Engine struct {
 	kv *btypedb.DB[string, []byte]
+
+	// ddlMu serializes schema changes against each other. Schema
+	// visibility for DML is handled differently: writes resolve their
+	// descriptor inside their own kv transaction, and DDL publishes the
+	// new descriptor (under mu) as the last step inside its own — so a
+	// write serialized after an index creation always sees the index.
+	ddlMu sync.Mutex
 
 	mu     sync.RWMutex
 	tables map[string]*TableDesc
@@ -140,10 +179,21 @@ func mustEncode(vals ...any) []byte {
 	return b
 }
 
+// tableSpace is the key prefix covering a table's entire key space:
+// primary rows and every secondary index.
+func tableSpace(tableID uint64) []byte {
+	return mustEncode(int64(tableID))
+}
+
+// indexPrefix is the key prefix covering one index of one table.
+func indexPrefix(tableID, indexID uint64) []byte {
+	return mustEncode(int64(tableID), int64(indexID))
+}
+
 // tablePrefix is the key prefix covering every row of a table's
 // primary index.
 func tablePrefix(tableID uint64) []byte {
-	return mustEncode(int64(tableID), int64(primaryIndexID))
+	return indexPrefix(tableID, primaryIndexID)
 }
 
 func descTablePrefix() string {

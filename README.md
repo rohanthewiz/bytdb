@@ -24,6 +24,10 @@ Milestone 1: the storage foundation.
   coercion and PK uniqueness, `Get`/`Delete` by primary key, and
   `Scan`/`ScanRange` in primary-key order with partial-prefix bounds on
   composite keys.
+- **secondary indexes** — `CreateIndex` (with atomic backfill over
+  existing rows), `DropIndex`, unique indexes, and `ScanIndex` with
+  range bounds; every insert and delete maintains all indexes in the
+  same atomic commit as the row.
 
 No SQL yet — the API is Go calls. See Roadmap.
 
@@ -47,6 +51,13 @@ for row, err := range e.ScanRange("events", []any{"acme"}, []any{"acmf"}) {
     if err != nil { break }
     fmt.Println(row.Col("seq"), row.Col("note"))
 }
+
+// Secondary index: backfilled from existing rows, then maintained by
+// every write in the same atomic commit.
+_, err = e.CreateIndex("events", "by-note", false, "note")
+for row, err := range e.ScanIndex("events", "by-note", []any{"s"}, []any{"t"}) {
+    // notes in ["s", "t"), note order
+}
 ```
 
 ## How it maps onto the key space
@@ -54,10 +65,18 @@ for row, err := range e.ScanRange("events", []any{"acme"}, []any{"acmf"}) {
 Everything lives in a single `btypedb.DB[string, []byte]`:
 
 ```
-tuple(tableID, 1, pk cols...) → tuple(non-pk cols...)   table rows (primary index)
-tuple(1, 1, tableName)        → JSON descriptor          catalog
-tuple(0)                      → next table ID             ID sequence
+tuple(tableID, 1, pk cols...)             → tuple(non-pk cols...)  table rows (primary index)
+tuple(tableID, idxID, indexed..., pk...)  → ()                     secondary index entry
+tuple(tableID, idxID, indexed...)         → tuple(pk cols...)      unique index entry
+tuple(1, 1, tableName)                    → JSON descriptor        catalog
+tuple(0)                                  → next table ID          ID sequence
 ```
+
+A unique index enforces uniqueness by key collision — the primary key
+moves into the value. Rows with NULL in an indexed column fall back to
+the pk-suffixed form even in a unique index, so NULLs never conflict
+(SQL semantics); the two entry forms are distinguished by tuple arity
+on decode.
 
 The `tuple` encoding is what makes this work: integers are
 sign-flipped big-endian so negatives sort first, floats get the
@@ -79,7 +98,7 @@ fsync-before-ack durability with group commit.
 ## Roadmap
 
 - [x] **Milestone 1**: order-preserving tuple encoding; catalog; create/drop table; insert/get/delete; ordered scans with range bounds
-- [ ] **Milestone 2**: secondary indexes as key ranges (`tuple(tableID, indexID, indexed cols..., pk...)`), maintained in the same atomic commit; unique indexes
+- [x] **Milestone 2**: secondary indexes as key ranges, backfilled and maintained in the same atomic commit as the row; unique indexes (NULLs exempt); `ScanIndex` with partial-prefix bounds
 - [ ] **Milestone 3**: engine-level transactions mapped onto btypedb transactions (serializable via single-writer); UPDATE with index maintenance
 - [ ] **Milestone 4**: column-ID-tagged row values so `ALTER TABLE ADD COLUMN` needs no rewrite
 - [ ] **Milestone 5**: SQL frontend — either a hand-rolled subset or the [go-mysql-server](https://github.com/dolthub/go-mysql-server) storage interface for a full dialect
