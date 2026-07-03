@@ -1,0 +1,319 @@
+package bytdb
+
+import (
+	"fmt"
+	"iter"
+
+	"github.com/rohanthewiz/btypedb"
+	"github.com/rohanthewiz/bytdb/tuple"
+	"github.com/rohanthewiz/serr"
+)
+
+// Row is one decoded table row: values in declared column order.
+type Row struct {
+	Desc *TableDesc
+	Vals []any
+}
+
+// Col returns the value of the named column, or nil if no such column.
+func (r Row) Col(name string) any {
+	if i := r.Desc.ColIndex(name); i >= 0 {
+		return r.Vals[i]
+	}
+	return nil
+}
+
+// Insert stores one row, vals in declared column order. Values are
+// coerced to their column types (any Go int width into an int column,
+// ints into float columns); nil is allowed in non-key columns. The
+// primary key must not already exist.
+func (e *Engine) Insert(table string, vals ...any) error {
+	desc, err := e.desc(table)
+	if err != nil {
+		return err
+	}
+	row, err := coerceRow(desc, vals)
+	if err != nil {
+		return err
+	}
+	key, err := rowKey(desc, pkValues(desc, row))
+	if err != nil {
+		return err
+	}
+	val, err := encodeRowValue(desc, row)
+	if err != nil {
+		return err
+	}
+	err = e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+		if tx.Contains(key) {
+			return serr.New("duplicate primary key", "table", table)
+		}
+		return tx.Set(key, val)
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "insert", "table", table)
+	}
+	return nil
+}
+
+// Get returns the row with the given primary-key values.
+func (e *Engine) Get(table string, pkVals ...any) (Row, bool, error) {
+	desc, err := e.desc(table)
+	if err != nil {
+		return Row{}, false, err
+	}
+	key, err := fullPKKey(desc, pkVals)
+	if err != nil {
+		return Row{}, false, err
+	}
+	val, ok := e.kv.Get(key)
+	if !ok {
+		return Row{}, false, nil
+	}
+	row, err := decodeRow(desc, key, val)
+	return row, err == nil, err
+}
+
+// Delete removes the row with the given primary-key values, reporting
+// whether it existed.
+func (e *Engine) Delete(table string, pkVals ...any) (bool, error) {
+	desc, err := e.desc(table)
+	if err != nil {
+		return false, err
+	}
+	key, err := fullPKKey(desc, pkVals)
+	if err != nil {
+		return false, err
+	}
+	existed, err := e.kv.Delete(key)
+	if err != nil {
+		return false, serr.Wrap(err, "op", "delete", "table", table)
+	}
+	return existed, nil
+}
+
+// Scan iterates every row of the table in primary-key order. A decode
+// failure is yielded once as the error and ends the sequence.
+func (e *Engine) Scan(table string) iter.Seq2[Row, error] {
+	return e.ScanRange(table, nil, nil)
+}
+
+// ScanRange iterates rows with fromPK <= pk < toPK in primary-key
+// order. Bounds may be partial prefixes of a composite key (e.g. just
+// the first key column); a nil bound is unbounded on that side.
+func (e *Engine) ScanRange(table string, fromPK, toPK []any) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		desc, err := e.desc(table)
+		if err != nil {
+			yield(Row{}, err)
+			return
+		}
+		prefix := tablePrefix(desc.ID)
+		start := string(prefix)
+		end := string(tuple.PrefixEnd(prefix))
+		if fromPK != nil {
+			if start, err = boundKey(desc, prefix, fromPK); err != nil {
+				yield(Row{}, err)
+				return
+			}
+		}
+		if toPK != nil {
+			if end, err = boundKey(desc, prefix, toPK); err != nil {
+				yield(Row{}, err)
+				return
+			}
+		}
+		for k, v := range e.kv.Ascend(start) {
+			if k >= end {
+				return
+			}
+			row, err := decodeRow(desc, k, v)
+			if !yield(row, err) || err != nil {
+				return
+			}
+		}
+	}
+}
+
+// --- row/key plumbing ---
+
+// coerceRow validates arity and coerces every value to its column
+// type, rejecting nil in primary-key columns.
+func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
+	if len(vals) != len(desc.Columns) {
+		return nil, serr.New("wrong number of values",
+			"table", desc.Name, "want", fmt.Sprint(len(desc.Columns)), "got", fmt.Sprint(len(vals)))
+	}
+	out := make([]any, len(vals))
+	for i, v := range vals {
+		c := desc.Columns[i]
+		cv, err := coerce(v, c.Type)
+		if err != nil {
+			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
+		}
+		if cv == nil && desc.isPK(i) {
+			return nil, serr.New("primary key column may not be NULL",
+				"table", desc.Name, "column", c.Name)
+		}
+		out[i] = cv
+	}
+	return out, nil
+}
+
+// coerce maps v onto the canonical Go type for a column type.
+func coerce(v any, t ColType) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch t {
+	case TBool:
+		if b, ok := v.(bool); ok {
+			return b, nil
+		}
+	case TInt:
+		switch n := v.(type) {
+		case int:
+			return int64(n), nil
+		case int8:
+			return int64(n), nil
+		case int16:
+			return int64(n), nil
+		case int32:
+			return int64(n), nil
+		case int64:
+			return n, nil
+		case uint8:
+			return int64(n), nil
+		case uint16:
+			return int64(n), nil
+		case uint32:
+			return int64(n), nil
+		}
+	case TFloat:
+		switch n := v.(type) {
+		case float64:
+			return n, nil
+		case float32:
+			return float64(n), nil
+		case int:
+			return float64(n), nil
+		case int64:
+			return float64(n), nil
+		}
+	case TString:
+		if s, ok := v.(string); ok {
+			return s, nil
+		}
+	case TBytes:
+		if b, ok := v.([]byte); ok {
+			return b, nil
+		}
+	}
+	return nil, serr.New("value does not fit column type",
+		"type", string(t), "value_type", fmt.Sprintf("%T", v))
+}
+
+// pkValues extracts the key columns from a full coerced row, in key
+// order.
+func pkValues(desc *TableDesc, row []any) []any {
+	pk := make([]any, len(desc.PKCols))
+	for i, ord := range desc.PKCols {
+		pk[i] = row[ord]
+	}
+	return pk
+}
+
+// fullPKKey coerces user-supplied PK values and builds the row key.
+// All key columns are required (unlike scan bounds, which may be
+// partial).
+func fullPKKey(desc *TableDesc, pkVals []any) (string, error) {
+	if len(pkVals) != len(desc.PKCols) {
+		return "", serr.New("wrong number of primary key values",
+			"table", desc.Name, "want", fmt.Sprint(len(desc.PKCols)), "got", fmt.Sprint(len(pkVals)))
+	}
+	coerced, err := coercePK(desc, pkVals)
+	if err != nil {
+		return "", err
+	}
+	return rowKey(desc, coerced)
+}
+
+// boundKey encodes a possibly-partial PK tuple as a scan bound.
+func boundKey(desc *TableDesc, prefix []byte, pkVals []any) (string, error) {
+	if len(pkVals) > len(desc.PKCols) {
+		return "", serr.New("too many primary key values in scan bound", "table", desc.Name)
+	}
+	coerced, err := coercePK(desc, pkVals)
+	if err != nil {
+		return "", err
+	}
+	buf, err := tuple.Append(prefix, coerced...)
+	if err != nil {
+		return "", serr.Wrap(err, "op", "encode scan bound")
+	}
+	return string(buf), nil
+}
+
+func coercePK(desc *TableDesc, pkVals []any) ([]any, error) {
+	out := make([]any, len(pkVals))
+	for i, v := range pkVals {
+		c := desc.Columns[desc.PKCols[i]]
+		cv, err := coerce(v, c.Type)
+		if err != nil {
+			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
+		}
+		if cv == nil {
+			return nil, serr.New("primary key value may not be NULL",
+				"table", desc.Name, "column", c.Name)
+		}
+		out[i] = cv
+	}
+	return out, nil
+}
+
+// encodeRowValue encodes the non-key columns, in declared order, as
+// the row's stored value. Key columns live in the key alone.
+func encodeRowValue(desc *TableDesc, row []any) ([]byte, error) {
+	var rest []any
+	for i, v := range row {
+		if !desc.isPK(i) {
+			rest = append(rest, v)
+		}
+	}
+	val, err := tuple.Encode(rest...)
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "encode row value")
+	}
+	return val, nil
+}
+
+// decodeRow reassembles a full row from its key and value: key columns
+// from the key tuple, the rest from the value tuple.
+func decodeRow(desc *TableDesc, key string, val []byte) (Row, error) {
+	keyVals, err := tuple.Decode([]byte(key))
+	if err != nil {
+		return Row{}, serr.Wrap(err, "op", "decode row key", "table", desc.Name)
+	}
+	if len(keyVals) != 2+len(desc.PKCols) {
+		return Row{}, serr.New("row key has wrong arity", "table", desc.Name)
+	}
+	restVals, err := tuple.Decode(val)
+	if err != nil {
+		return Row{}, serr.Wrap(err, "op", "decode row value", "table", desc.Name)
+	}
+	if len(restVals) != len(desc.Columns)-len(desc.PKCols) {
+		return Row{}, serr.New("row value has wrong arity", "table", desc.Name)
+	}
+	vals := make([]any, len(desc.Columns))
+	for i, ord := range desc.PKCols {
+		vals[ord] = keyVals[2+i]
+	}
+	next := 0
+	for i := range desc.Columns {
+		if !desc.isPK(i) {
+			vals[i] = restVals[next]
+			next++
+		}
+	}
+	return Row{Desc: desc, Vals: vals}, nil
+}
