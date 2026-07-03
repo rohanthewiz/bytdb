@@ -81,47 +81,8 @@ func stopped(stops []stop, row bytdb.Row) bool {
 // NULL never match anything but IS NULL, per SQL.
 func matches(preds []Pred, row bytdb.Row) bool {
 	for _, pr := range preds {
-		v := row.Col(pr.Col)
-		switch pr.Op {
-		case OpIsNull:
-			if v != nil {
-				return false
-			}
-		case OpIsNotNull:
-			if v == nil {
-				return false
-			}
-		default:
-			c, ok := compareVals(v, pr.Val)
-			if !ok {
-				return false
-			}
-			switch pr.Op {
-			case OpEQ:
-				if c != 0 {
-					return false
-				}
-			case OpNE:
-				if c == 0 {
-					return false
-				}
-			case OpLT:
-				if c >= 0 {
-					return false
-				}
-			case OpLE:
-				if c > 0 {
-					return false
-				}
-			case OpGT:
-				if c <= 0 {
-					return false
-				}
-			case OpGE:
-				if c < 0 {
-					return false
-				}
-			}
+		if !checkPred(row.Col(pr.Col), pr.Op, pr.Val) {
+			return false
 		}
 	}
 	return true
@@ -194,10 +155,10 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 				res.Types = append(res.Types, c.Type)
 			}
 		} else {
-			for _, name := range s.Cols {
-				ord := desc.ColIndex(name)
+			for _, it := range s.Items {
+				ord := desc.ColIndex(it.Col)
 				if ord < 0 {
-					return serr.New("no such column", "table", s.Table, "column", name)
+					return serr.New("no such column", "table", s.Table, "column", it.Col)
 				}
 				ords = append(ords, ord)
 				res.Cols = append(res.Cols, desc.Columns[ord].Name)

@@ -62,16 +62,19 @@ func TestParseSelect(t *testing.T) {
 		ORDER BY age DESC, name LIMIT 10 OFFSET 5`)
 	want := &Select{
 		Table: "users",
-		Cols:  []string{"name", "age"},
+		Items: []SelectItem{{Col: "name"}, {Col: "age"}},
 		Where: []Pred{
 			{Col: "age", Op: OpGE, Val: int64(21)},
 			{Col: "score", Op: OpLT, Val: int64(100)}, // flipped
 			{Col: "city", Op: OpEQ, Val: "Reno"},
 			{Col: "note", Op: OpIsNotNull},
 		},
-		OrderBy: []OrderItem{{Col: "age", Desc: true}, {Col: "name"}},
-		Limit:   10,
-		Offset:  5,
+		OrderBy: []OrderItem{
+			{SelectItem: SelectItem{Col: "age"}, Desc: true},
+			{SelectItem: SelectItem{Col: "name"}},
+		},
+		Limit:  10,
+		Offset: 5,
 	}
 	if !reflect.DeepEqual(st, want) {
 		t.Fatalf("got %#v", st)
@@ -162,7 +165,58 @@ func TestParseErrors(t *testing.T) {
 
 func TestParseQuotedIdents(t *testing.T) {
 	s := mustParse(t, `select "Weird Col" from "MyTable" where "true" = 1`).(*Select)
-	if s.Table != "MyTable" || s.Cols[0] != "Weird Col" || s.Where[0].Col != "true" {
+	if s.Table != "MyTable" || s.Items[0].Col != "Weird Col" || s.Where[0].Col != "true" {
 		t.Fatalf("got %#v", s)
+	}
+}
+
+func TestParseAggregates(t *testing.T) {
+	st := mustParse(t, `SELECT city, count(*), avg(age) FROM users
+		WHERE age > 18 GROUP BY city HAVING count(*) >= 2 AND min(age) IS NOT NULL
+		ORDER BY count(*) DESC, city LIMIT 3`)
+	want := &Select{
+		Table: "users",
+		Items: []SelectItem{
+			{Col: "city"},
+			{Agg: AggCount, Star: true},
+			{Agg: AggAvg, Col: "age"},
+		},
+		Where:   []Pred{{Col: "age", Op: OpGT, Val: int64(18)}},
+		GroupBy: []string{"city"},
+		Having: []AggPred{
+			{Item: SelectItem{Agg: AggCount, Star: true}, Op: OpGE, Val: int64(2)},
+			{Item: SelectItem{Agg: AggMin, Col: "age"}, Op: OpIsNotNull},
+		},
+		OrderBy: []OrderItem{
+			{SelectItem: SelectItem{Agg: AggCount, Star: true}, Desc: true},
+			{SelectItem: SelectItem{Col: "city"}},
+		},
+		Limit: 3,
+	}
+	if !reflect.DeepEqual(st, want) {
+		t.Fatalf("got %#v", st)
+	}
+	if !st.(*Select).isAggregate() {
+		t.Fatal("should be an aggregate query")
+	}
+
+	// A column that shares an aggregate's name stays a column without
+	// parentheses.
+	s := mustParse(t, `select count from t group by count`).(*Select)
+	if s.Items[0].Agg != AggNone || s.Items[0].Col != "count" {
+		t.Fatalf("got %#v", s.Items[0])
+	}
+}
+
+func TestParseAggregateErrors(t *testing.T) {
+	for _, src := range []string{
+		`select * from t where count(*) > 1`,       // aggregates belong in HAVING
+		`select count(*) from t having sum(v) = null`, // must use IS NULL
+		`select sum() from t`,                      // missing argument
+		`select sum(*) from t`,                     // * only for count
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Errorf("Parse(%q): expected error", src)
+		}
 	}
 }

@@ -11,7 +11,8 @@
 //	CREATE [UNIQUE] INDEX idx ON t (c, ...)
 //	DROP INDEX idx [ON t]
 //	INSERT INTO t [(c, ...)] VALUES (v, ...), ...
-//	SELECT * | c, ... FROM t [WHERE ...] [ORDER BY c [ASC|DESC], ...] [LIMIT n] [OFFSET n]
+//	SELECT * | items FROM t [WHERE ...] [GROUP BY c, ...] [HAVING ...]
+//	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
 //	UPDATE t SET c = v, ... [WHERE ...]
 //	DELETE FROM t [WHERE ...]
 //
@@ -21,6 +22,16 @@
 // primary key or of a secondary index into point gets or bounded
 // ordered scans; every predicate is still re-checked per row, so
 // pushdown only narrows what is visited.
+//
+// Select items are columns or aggregates: COUNT(*), COUNT(c), SUM(c),
+// AVG(c), MIN(c), MAX(c). Any aggregate, GROUP BY, or HAVING makes
+// the query aggregate rows, with SQL semantics: plain columns must
+// appear in GROUP BY, aggregates ignore NULL inputs (COUNT(*) counts
+// rows), NULL group values form one group, an ungrouped aggregate
+// query returns exactly one row, HAVING conjuncts (aggregate or
+// grouped column, op literal or IS [NOT] NULL) filter groups, and
+// ORDER BY may sort by grouped columns or aggregates. Without ORDER
+// BY, groups return in ascending group-column order.
 //
 // The dialect follows Postgres conventions: 'string' literals with ''
 // escapes, "quoted" identifiers, unquoted identifiers folded to
@@ -96,6 +107,9 @@ func (d *DB) Exec(query string) (*Result, error) {
 	case *Insert:
 		return d.execInsert(s)
 	case *Select:
+		if s.isAggregate() {
+			return d.execSelectAgg(s)
+		}
 		return d.execSelect(s)
 	case *Update:
 		return d.execUpdate(s)

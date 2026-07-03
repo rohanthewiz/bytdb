@@ -12,7 +12,7 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–5: a working relational store, queryable in SQL.
+Milestones 1–6: a working relational store, queryable in SQL.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -40,8 +40,9 @@ Milestones 1–5: a working relational store, queryable in SQL.
   name gets a fresh ID so stale data can never resurface.
 - **SQL frontend** — the `sql` package parses, plans, and executes a
   small Postgres-flavored dialect over the engine: full DDL, INSERT,
-  single-table SELECT/UPDATE/DELETE, with a planner that pushes WHERE
-  predicates down to point gets and bounded key scans.
+  single-table SELECT/UPDATE/DELETE with a planner that pushes WHERE
+  predicates down to point gets and bounded key scans, plus
+  aggregates with GROUP BY and HAVING.
 
 ## Example
 
@@ -118,9 +119,23 @@ ALTER TABLE t ADD COLUMN c type | DROP COLUMN c
 CREATE [UNIQUE] INDEX idx ON t (c, ...)
 DROP INDEX idx [ON t]
 INSERT INTO t [(cols)] VALUES (...), (...)
-SELECT * | cols FROM t [WHERE ...] [ORDER BY c [DESC], ...] [LIMIT n] [OFFSET n]
+SELECT * | items FROM t [WHERE ...] [GROUP BY ...] [HAVING ...]
+       [ORDER BY item [DESC], ...] [LIMIT n] [OFFSET n]
 UPDATE t SET c = v, ... [WHERE ...]
 DELETE FROM t [WHERE ...]
+```
+
+Select items are columns or aggregates — `COUNT(*)`, `COUNT(c)`,
+`SUM(c)`, `AVG(c)`, `MIN(c)`, `MAX(c)` — with SQL semantics
+throughout: aggregates ignore NULLs (`COUNT(*)` counts rows), NULL
+group values form one group, an ungrouped aggregate query returns
+exactly one row even over zero rows, `HAVING` filters groups, and
+`ORDER BY` can sort by grouped columns or aggregates:
+
+```sql
+SELECT city, count(*), avg(age) FROM users
+WHERE age > 18 GROUP BY city HAVING count(*) >= 2
+ORDER BY count(*) DESC LIMIT 3
 ```
 
 A WHERE clause is AND-ed predicates — `column op literal` (`=`, `!=`,
@@ -135,11 +150,11 @@ never depends on it.
 
 Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 runs in one engine transaction and rolls back entirely on error.
-Deferred, roughly in order: aggregates and GROUP BY, OR and richer
-expressions, joins, prepared statements (`$1` placeholders already
-lex), and a `bytdb-pgwire` module speaking the Postgres wire protocol
-— the embedded `Exec` result shape (columns + types + rows) is exactly
-what that layer needs.
+Deferred, roughly in order: OR and richer expressions, joins,
+prepared statements (`$1` placeholders already lex), and a
+`bytdb-pgwire` module speaking the Postgres wire protocol — the
+embedded `Exec` result shape (columns + types + rows) is exactly what
+that layer needs.
 
 ## How it maps onto the key space
 
@@ -187,7 +202,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 3**: `Update` by primary key (pk moves included) with check-before-write index maintenance; `WriteTxn`/`ReadTxn` engine transactions over btypedb's — serializable via single-writer, catalog snapshotted at begin (DDL stays outside transactions)
 - [x] **Milestone 4**: column-ID-tagged sparse row values; `AddColumn`/`DropColumn` as metadata-only changes (no row rewrites), with never-reused column IDs
 - [x] **Milestone 5**: SQL frontend — a hand-rolled Postgres-flavored dialect (zero new dependencies): lexer → recursive-descent parser → planner with filter pushdown to point gets and bounded key scans → executor over engine transactions
-- [ ] Later: aggregates/GROUP BY, OR and expression trees, joins, prepared statements, a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
+- [x] **Milestone 6**: aggregates — COUNT/SUM/AVG/MIN/MAX, GROUP BY (hash aggregation keyed by the order-preserving tuple encoding, so groups emit in order), HAVING, ORDER BY over grouped columns and aggregates
+- [ ] Later: OR and expression trees, joins, prepared statements, a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
 
 ## Design notes
 

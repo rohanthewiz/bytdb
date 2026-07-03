@@ -378,11 +378,11 @@ func (p *parser) selectStmt() (Statement, error) {
 		s.Star = true
 	} else {
 		for {
-			name, err := p.ident("a column name or *")
+			item, err := p.selectItem()
 			if err != nil {
 				return nil, err
 			}
-			s.Cols = append(s.Cols, name)
+			s.Items = append(s.Items, item)
 			if !p.acceptOp(",") {
 				break
 			}
@@ -400,7 +400,7 @@ func (p *parser) selectStmt() (Statement, error) {
 			return nil, err
 		}
 	}
-	if p.acceptKw("order") {
+	if p.acceptKw("group") {
 		if err := p.expectKw("by"); err != nil {
 			return nil, err
 		}
@@ -409,7 +409,34 @@ func (p *parser) selectStmt() (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
-			item := OrderItem{Col: name}
+			s.GroupBy = append(s.GroupBy, name)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	if p.acceptKw("having") {
+		for {
+			pr, err := p.aggPred()
+			if err != nil {
+				return nil, err
+			}
+			s.Having = append(s.Having, pr)
+			if !p.acceptKw("and") {
+				break
+			}
+		}
+	}
+	if p.acceptKw("order") {
+		if err := p.expectKw("by"); err != nil {
+			return nil, err
+		}
+		for {
+			si, err := p.selectItem()
+			if err != nil {
+				return nil, err
+			}
+			item := OrderItem{SelectItem: si}
 			if p.acceptKw("desc") {
 				item.Desc = true
 			} else {
@@ -504,6 +531,74 @@ func (p *parser) deleteStmt() (Statement, error) {
 	return d, nil
 }
 
+// selectItem parses one select-list or ORDER BY entry: a column, or
+// an aggregate call fn(col) / COUNT(*). An identifier that happens to
+// share an aggregate's name stays a column unless a '(' follows.
+func (p *parser) selectItem() (SelectItem, error) {
+	t := p.cur()
+	if t.kind == tIdent && aggNames[t.text] != AggNone && p.peekOp("(") {
+		fn := aggNames[t.text]
+		p.advance() // function name
+		p.advance() // (
+		item := SelectItem{Agg: fn}
+		if fn == AggCount && p.acceptOp("*") {
+			item.Star = true
+		} else {
+			col, err := p.ident("a column name")
+			if err != nil {
+				return SelectItem{}, err
+			}
+			item.Col = col
+		}
+		if err := p.expectOp(")"); err != nil {
+			return SelectItem{}, err
+		}
+		return item, nil
+	}
+	col, err := p.ident("a column name")
+	return SelectItem{Col: col}, err
+}
+
+// peekOp reports whether the token after the current one is op.
+func (p *parser) peekOp(op string) bool {
+	if p.cur().kind == tEOF {
+		return false
+	}
+	t := p.toks[p.i+1]
+	return t.kind == tOp && t.text == op
+}
+
+// aggPred parses one HAVING conjunct: item op literal, or item IS
+// [NOT] NULL.
+func (p *parser) aggPred() (AggPred, error) {
+	item, err := p.selectItem()
+	if err != nil {
+		return AggPred{}, err
+	}
+	if p.acceptKw("is") {
+		op := OpIsNull
+		if p.acceptKw("not") {
+			op = OpIsNotNull
+		}
+		if err := p.expectKw("null"); err != nil {
+			return AggPred{}, err
+		}
+		return AggPred{Item: item, Op: op}, nil
+	}
+	op, err := p.cmpOp()
+	if err != nil {
+		return AggPred{}, err
+	}
+	val, err := p.literal()
+	if err != nil {
+		return AggPred{}, err
+	}
+	if val == nil {
+		return AggPred{}, serr.New("cannot compare with NULL; use IS [NOT] NULL")
+	}
+	return AggPred{Item: item, Op: op, Val: val}, nil
+}
+
 // --- WHERE ---
 
 func (p *parser) wherePreds() ([]Pred, error) {
@@ -567,6 +662,9 @@ func (p *parser) operand() (col string, val any, isCol bool, err error) {
 	if t.kind == tIdent && (t.text == "true" || t.text == "false" || t.text == "null") {
 		val, err = p.literal()
 		return "", val, false, err
+	}
+	if t.kind == tIdent && aggNames[t.text] != AggNone && p.peekOp("(") {
+		return "", nil, false, serr.New("aggregates are not allowed in WHERE; use HAVING", "function", t.text)
 	}
 	if t.kind == tIdent || t.kind == tQIdent {
 		col, err = p.ident("a column name")

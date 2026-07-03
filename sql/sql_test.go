@@ -265,6 +265,109 @@ func TestSQLDDLRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSQLAggregates(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+
+	res := exec(t, d, `select count(*), min(age), max(age), sum(age), avg(age) from users`)
+	if !reflect.DeepEqual(res.Cols, []string{"count(*)", "min(age)", "max(age)", "sum(age)", "avg(age)"}) {
+		t.Fatalf("cols: %v", res.Cols)
+	}
+	if !reflect.DeepEqual(res.Types, []bytdb.ColType{bytdb.TInt, bytdb.TInt, bytdb.TInt, bytdb.TInt, bytdb.TFloat}) {
+		t.Fatalf("types: %v", res.Types)
+	}
+	want := [][]any{{int64(5), int64(28), int64(45), int64(189), 37.8}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// GROUP BY: groups come back in ascending group-column order.
+	res = exec(t, d, `select city, count(*), max(age) from users group by city`)
+	want = [][]any{
+		{"austin", int64(1), int64(39)},
+		{"london", int64(2), int64(41)},
+		{"nyc", int64(2), int64(45)},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// HAVING filters groups; ORDER BY an aggregate.
+	res = exec(t, d, `select city from users group by city having count(*) >= 2 order by count(*) desc, city`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"london"}, {"nyc"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// WHERE runs before grouping.
+	res = exec(t, d, `select city, count(*) from users where age > 36 group by city`)
+	want = [][]any{{"austin", int64(1)}, {"london", int64(1)}, {"nyc", int64(1)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+}
+
+func TestSQLAggregateNulls(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table m (id int primary key, grp text, v int)`)
+	exec(t, d, `insert into m values (1, 'a', 10), (2, 'a', null), (3, null, 30), (4, null, null)`)
+
+	// Aggregates ignore NULL inputs; COUNT(*) does not. NULL group
+	// values form one group, sorted first (key order).
+	res := exec(t, d, `select grp, count(*), count(v), sum(v) from m group by grp`)
+	want := [][]any{
+		{nil, int64(2), int64(1), int64(30)},
+		{"a", int64(2), int64(1), int64(10)},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Zero rows, no GROUP BY: one row; COUNT 0, the rest NULL.
+	res = exec(t, d, `select count(*), sum(v), avg(v), min(v) from m where id > 100`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(0), nil, nil, nil}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// Zero rows with GROUP BY: zero groups.
+	if res := exec(t, d, `select grp, count(*) from m where id > 100 group by grp`); len(res.Rows) != 0 {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// HAVING without GROUP BY filters the single group.
+	if res := exec(t, d, `select count(*) from m having count(*) > 100`); len(res.Rows) != 0 {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Float aggregation and AVG over ints.
+	exec(t, d, `create table f (id int primary key, x float)`)
+	exec(t, d, `insert into f values (1, 1.5), (2, 2.5)`)
+	res = exec(t, d, `select sum(x), avg(x), min(x) from f`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{4.0, 2.0, 1.5}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	// MIN/MAX work on strings too.
+	res = exec(t, d, `select min(grp), max(grp) from m`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"a", "a"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+}
+
+func TestSQLAggregateErrors(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+	for _, q := range []string{
+		`select name from users group by city`,          // name not grouped
+		`select * from users group by city`,             // star in aggregate query
+		`select sum(name) from users`,                   // non-numeric SUM
+		`select city from users group by city order by age`, // ungrouped sort column
+		`select count(*) from users having name = 'x'`,  // ungrouped HAVING column
+		`select count(nope) from users`,                 // unknown column
+		`select city, count(*) from users group by city, city`, // duplicate group col
+	} {
+		if _, err := d.Exec(q); err == nil {
+			t.Errorf("Exec(%q): expected error", q)
+		}
+	}
+}
+
 func TestSQLErrors(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)

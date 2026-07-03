@@ -29,6 +29,48 @@ type Pred struct {
 	Val any // literal value; nil for IS [NOT] NULL
 }
 
+// AggFunc is an aggregate function in a select list, HAVING, or
+// ORDER BY.
+type AggFunc int
+
+const (
+	AggNone AggFunc = iota
+	AggCount
+	AggSum
+	AggAvg
+	AggMin
+	AggMax
+)
+
+var aggNames = map[string]AggFunc{
+	"count": AggCount, "sum": AggSum, "avg": AggAvg, "min": AggMin, "max": AggMax,
+}
+
+func (f AggFunc) name() string {
+	for n, fn := range aggNames {
+		if fn == f {
+			return n
+		}
+	}
+	return ""
+}
+
+// SelectItem is one select-list entry: a plain column, or an
+// aggregate over a column (COUNT(*) sets Star).
+type SelectItem struct {
+	Col  string
+	Agg  AggFunc
+	Star bool // COUNT(*)
+}
+
+// AggPred is one HAVING conjunct: item op literal, or item IS [NOT]
+// NULL, where the item may be an aggregate or a grouped column.
+type AggPred struct {
+	Item SelectItem
+	Op   PredOp
+	Val  any
+}
+
 // ColDef is one column of a CREATE TABLE or ALTER TABLE ADD COLUMN.
 type ColDef struct {
 	Name string
@@ -75,18 +117,22 @@ type Insert struct {
 	Rows  [][]any
 }
 
-// OrderItem is one ORDER BY key.
+// OrderItem is one ORDER BY key: a column, or (in an aggregate
+// query) an aggregate call.
 type OrderItem struct {
-	Col  string
+	SelectItem
 	Desc bool
 }
 
-// Select is a single-table SELECT.
+// Select is a single-table SELECT. A query with any aggregate item,
+// a GROUP BY, or a HAVING is an aggregate query.
 type Select struct {
 	Table   string
 	Star    bool
-	Cols    []string
+	Items   []SelectItem
 	Where   []Pred
+	GroupBy []string
+	Having  []AggPred
 	OrderBy []OrderItem
 	Limit   int64 // -1: no limit
 	Offset  int64
