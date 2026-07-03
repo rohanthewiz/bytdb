@@ -165,9 +165,28 @@ func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, e
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
+		// A snapshot keeps the entry -> row lookup consistent and
+		// lock-free while we iterate.
+		tx, err := e.kv.Begin(false)
+		if err != nil {
+			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))
+			return
+		}
+		defer tx.Rollback()
+		scanIndexRows(tx, desc, idx, from, to)(yield)
+	}
+}
+
+// scanIndexRows iterates an index's rows from any kv view. The view
+// serves both the entry scan and the entry -> row lookups, so it must
+// be a snapshot or transaction (never the bare DB, whose iteration
+// holds a read lock that the inner lookups would re-enter).
+func scanIndexRows(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
 		prefix := indexPrefix(desc.ID, idx.ID)
 		start := string(prefix)
 		end := string(tuple.PrefixEnd(prefix))
+		var err error
 		if from != nil {
 			if start, err = indexBound(desc, idx, prefix, from); err != nil {
 				yield(Row{}, err)
@@ -180,19 +199,11 @@ func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, e
 				return
 			}
 		}
-		// A snapshot keeps the entry -> row lookup consistent and
-		// lock-free while we iterate.
-		tx, err := e.kv.Begin(false)
-		if err != nil {
-			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))
-			return
-		}
-		defer tx.Rollback()
-		for k, v := range tx.Ascend(start) {
+		for k, val := range v.Ascend(start) {
 			if k >= end {
 				return
 			}
-			row, err := rowFromIndexEntry(tx, desc, idx, k, v)
+			row, err := rowFromIndexEntry(v, desc, idx, k, val)
 			if !yield(row, err) || err != nil {
 				return
 			}
@@ -255,7 +266,7 @@ func indexBound(desc *TableDesc, idx *IndexDesc, prefix []byte, vals []any) (str
 // rowFromIndexEntry resolves an index entry to its full row. The entry
 // form is recognized by arity: pk-suffixed keys carry the primary key
 // themselves; unique-form keys carry it in the value.
-func rowFromIndexEntry(tx *btypedb.Tx[string, []byte], desc *TableDesc, idx *IndexDesc, key string, val []byte) (Row, error) {
+func rowFromIndexEntry(v kvView, desc *TableDesc, idx *IndexDesc, key string, val []byte) (Row, error) {
 	keyVals, err := tuple.Decode([]byte(key))
 	if err != nil {
 		return Row{}, serr.Wrap(err, "op", "decode index entry", "index", idx.Name)
@@ -278,7 +289,7 @@ func rowFromIndexEntry(tx *btypedb.Tx[string, []byte], desc *TableDesc, idx *Ind
 	if err != nil {
 		return Row{}, err
 	}
-	rv, ok := tx.Get(rk)
+	rv, ok := v.Get(rk)
 	if !ok {
 		return Row{}, serr.New("index entry points at a missing row", "table", desc.Name, "index", idx.Name)
 	}

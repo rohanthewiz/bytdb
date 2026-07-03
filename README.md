@@ -28,6 +28,11 @@ Milestone 1: the storage foundation.
   existing rows), `DropIndex`, unique indexes, and `ScanIndex` with
   range bounds; every insert and delete maintains all indexes in the
   same atomic commit as the row.
+- **row updates and transactions** — `Update` sets columns by name
+  (primary-key changes move the row), with every affected index entry
+  moved and uniqueness re-checked before anything is written;
+  `WriteTxn`/`ReadTxn` run multi-statement work on a serializable
+  snapshot of data and catalog, with own-write visibility.
 
 No SQL yet — the API is Go calls. See Roadmap.
 
@@ -58,6 +63,18 @@ _, err = e.CreateIndex("events", "by-note", false, "note")
 for row, err := range e.ScanIndex("events", "by-note", []any{"s"}, []any{"t"}) {
     // notes in ["s", "t"), note order
 }
+
+// Row update by primary key: named columns, indexes maintained.
+updated, err := e.Update("events", []any{"acme", 1}, map[string]any{"note": "signup+trial"})
+
+// Transactions: serializable, atomic, own writes visible inside.
+err = e.WriteTxn(func(tx *bytdb.Txn) error {
+    if err := tx.Insert("events", "acme", 11, "invite"); err != nil {
+        return err
+    }
+    _, err := tx.Update("events", []any{"acme", 10}, map[string]any{"note": "upgraded"})
+    return err // nil commits both; error rolls both back
+})
 ```
 
 ## How it maps onto the key space
@@ -99,7 +116,7 @@ fsync-before-ack durability with group commit.
 
 - [x] **Milestone 1**: order-preserving tuple encoding; catalog; create/drop table; insert/get/delete; ordered scans with range bounds
 - [x] **Milestone 2**: secondary indexes as key ranges, backfilled and maintained in the same atomic commit as the row; unique indexes (NULLs exempt); `ScanIndex` with partial-prefix bounds
-- [ ] **Milestone 3**: engine-level transactions mapped onto btypedb transactions (serializable via single-writer); UPDATE with index maintenance
+- [x] **Milestone 3**: `Update` by primary key (pk moves included) with check-before-write index maintenance; `WriteTxn`/`ReadTxn` engine transactions over btypedb's — serializable via single-writer, catalog snapshotted at begin (DDL stays outside transactions)
 - [ ] **Milestone 4**: column-ID-tagged row values so `ALTER TABLE ADD COLUMN` needs no rewrite
 - [ ] **Milestone 5**: SQL frontend — either a hand-rolled subset or the [go-mysql-server](https://github.com/dolthub/go-mysql-server) storage interface for a full dialect
 - [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN-able planner with filter pushdown to key ranges

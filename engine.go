@@ -14,6 +14,8 @@ package bytdb
 
 import (
 	"encoding/json"
+	"iter"
+	"maps"
 	"slices"
 	"sync"
 
@@ -167,6 +169,23 @@ func (e *Engine) desc(table string) (*TableDesc, error) {
 		return nil, serr.New("no such table", "table", table)
 	}
 	return d, nil
+}
+
+// catalogSnapshot returns a point-in-time view of the catalog.
+// Descriptors are never mutated in place (DDL clones and swaps), so a
+// shallow clone is a consistent snapshot.
+func (e *Engine) catalogSnapshot() map[string]*TableDesc {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return maps.Clone(e.tables)
+}
+
+// kvView is the read surface shared by the store and its transactions;
+// write paths always use a concrete transaction.
+type kvView interface {
+	Get(key string) ([]byte, bool)
+	Contains(key string) bool
+	Ascend(from string) iter.Seq2[string, []byte]
 }
 
 // --- key helpers ---
