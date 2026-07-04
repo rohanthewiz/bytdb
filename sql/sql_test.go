@@ -427,12 +427,12 @@ func TestSQLAggregateErrors(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)
 	for _, q := range []string{
-		`select name from users group by city`,          // name not grouped
-		`select * from users group by city`,             // star in aggregate query
-		`select sum(name) from users`,                   // non-numeric SUM
-		`select city from users group by city order by age`, // ungrouped sort column
-		`select count(*) from users having name = 'x'`,  // ungrouped HAVING column
-		`select count(nope) from users`,                 // unknown column
+		`select name from users group by city`,                 // name not grouped
+		`select * from users group by city`,                    // star in aggregate query
+		`select sum(name) from users`,                          // non-numeric SUM
+		`select city from users group by city order by age`,    // ungrouped sort column
+		`select count(*) from users having name = 'x'`,         // ungrouped HAVING column
+		`select count(nope) from users`,                        // unknown column
 		`select city, count(*) from users group by city, city`, // duplicate group col
 	} {
 		if _, err := d.Exec(q); err == nil {

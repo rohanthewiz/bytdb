@@ -17,8 +17,15 @@ func mustParse(t *testing.T, src string) Statement {
 }
 
 // tree-building helpers for expected values
-func cpred(col string, op PredOp, val any) *Pred {
-	return &Pred{Item: SelectItem{Col: col}, Op: op, Val: val}
+func col(name string) ColRef { return ColRef{Name: name} }
+
+func cpred(name string, op PredOp, val any) *Pred {
+	return &Pred{Item: SelectItem{Col: col(name)}, Op: op, Val: val}
+}
+
+// ccpred is a column-vs-column predicate: l op r.
+func ccpred(l ColRef, op PredOp, r ColRef) *Pred {
+	return &Pred{Item: SelectItem{Col: l}, Op: op, RItem: &SelectItem{Col: r}}
 }
 
 func apred(item SelectItem, op PredOp, val any) *Pred {
@@ -73,8 +80,8 @@ func TestParseSelect(t *testing.T) {
 		WHERE age >= 21 AND 100 > score AND city = 'Reno' AND note IS NOT NULL
 		ORDER BY age DESC, name LIMIT 10 OFFSET 5`)
 	want := &Select{
-		Table: "users",
-		Items: []SelectItem{{Col: "name"}, {Col: "age"}},
+		From:  []FromItem{{Table: "users"}},
+		Items: []SelectItem{{Col: col("name")}, {Col: col("age")}},
 		Where: and(
 			cpred("age", OpGE, int64(21)),
 			cpred("score", OpLT, int64(100)), // flipped
@@ -82,8 +89,8 @@ func TestParseSelect(t *testing.T) {
 			cpred("note", OpIsNotNull, nil),
 		),
 		OrderBy: []OrderItem{
-			{SelectItem: SelectItem{Col: "age"}, Desc: true},
-			{SelectItem: SelectItem{Col: "name"}},
+			{SelectItem: SelectItem{Col: col("age")}, Desc: true},
+			{SelectItem: SelectItem{Col: col("name")}},
 		},
 		Limit:  10,
 		Offset: 5,
@@ -171,6 +178,72 @@ func TestParseBoolExprs(t *testing.T) {
 	}
 }
 
+func TestParseJoins(t *testing.T) {
+	st := mustParse(t, `SELECT u.name, o.total FROM users AS u
+		JOIN orders o ON u.id = o.user_id
+		LEFT OUTER JOIN notes ON notes.order_id = o.id AND notes.kind = 'memo'
+		CROSS JOIN tags
+		WHERE u.age > 21 ORDER BY o.total DESC`)
+	uid, ouid := ColRef{Table: "u", Name: "id"}, ColRef{Table: "o", Name: "user_id"}
+	noid := ColRef{Table: "notes", Name: "order_id"}
+	oid := ColRef{Table: "o", Name: "id"}
+	want := &Select{
+		From: []FromItem{
+			{Table: "users", Alias: "u"},
+			{Table: "orders", Alias: "o", Join: JoinInner, On: ccpred(uid, OpEQ, ouid)},
+			{Table: "notes", Join: JoinLeft, On: and(
+				ccpred(noid, OpEQ, oid),
+				&Pred{Item: SelectItem{Col: ColRef{Table: "notes", Name: "kind"}}, Op: OpEQ, Val: "memo"},
+			)},
+			{Table: "tags", Join: JoinCross},
+		},
+		Items: []SelectItem{
+			{Col: ColRef{Table: "u", Name: "name"}},
+			{Col: ColRef{Table: "o", Name: "total"}},
+		},
+		Where: &Pred{Item: SelectItem{Col: ColRef{Table: "u", Name: "age"}}, Op: OpGT, Val: int64(21)},
+		OrderBy: []OrderItem{
+			{SelectItem: SelectItem{Col: ColRef{Table: "o", Name: "total"}}, Desc: true},
+		},
+		Limit: -1,
+	}
+	if !reflect.DeepEqual(st, want) {
+		t.Fatalf("got %#v", st)
+	}
+
+	// A comma is a cross join; t.* is a per-table star.
+	s := mustParse(t, `select a.*, b.v from a, b where a.id = b.a_id`).(*Select)
+	if len(s.From) != 2 || s.From[1].Join != JoinCross || s.From[1].On != nil {
+		t.Fatalf("from: %#v", s.From)
+	}
+	if !s.Items[0].Star || s.Items[0].Col.Table != "a" || s.Items[0].Agg != AggNone {
+		t.Fatalf("a.*: %#v", s.Items[0])
+	}
+	if pr := s.Where.(*Pred); pr.RItem == nil || pr.RItem.Col.Table != "b" {
+		t.Fatalf("where: %#v", s.Where)
+	}
+
+	// A keyword can't be a bare alias; quoting or AS makes it one.
+	s = mustParse(t, `select * from t where a = 1`).(*Select)
+	if s.From[0].Alias != "" {
+		t.Fatalf("alias: %q", s.From[0].Alias)
+	}
+	if mustParse(t, `select * from t as "where"`).(*Select).From[0].Alias != "where" {
+		t.Fatal("AS alias failed")
+	}
+
+	for _, src := range []string{
+		`select * from a right join b on a.id = b.id`, // unsupported join
+		`select * from a full join b on a.id = b.id`,
+		`select * from a join b`,                      // missing ON
+		`select * from a cross join b on a.id = b.id`, // stray ON
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Errorf("Parse(%q): expected error", src)
+		}
+	}
+}
+
 func TestParseDDLRest(t *testing.T) {
 	if st := mustParse(t, `create unique index by_email on users (email)`); !reflect.DeepEqual(st,
 		&CreateIndex{Name: "by_email", Table: "users", Unique: true, Cols: []string{"email"}}) {
@@ -195,16 +268,15 @@ func TestParseDDLRest(t *testing.T) {
 
 func TestParseErrors(t *testing.T) {
 	for _, src := range []string{
-		`select * from t where a = null`,       // must use IS NULL
-		`select * from t where a = b`,          // column-column compare
-		`select * from t where 1 = 2`,          // literal-literal compare
-		`select * from t where a = $1`,         // placeholders not yet supported
-		`select * from t limit -1`,             // negative limit
-		`select * from t; select * from t`,     // one statement per call
-		`insert into t (a, a) values (1, 2)`,   // duplicate column
-		`update t set a = 1, a = 2`,            // duplicate SET column
-		`alter table t add c int primary key`,  // can't add a pk column
-		`bogus`,                                // not a statement
+		`select * from t where a = null`,      // must use IS NULL
+		`select * from t where 1 = 2`,         // literal-literal compare
+		`select * from t where a = $1`,        // placeholders not yet supported
+		`select * from t limit -1`,            // negative limit
+		`select * from t; select * from t`,    // one statement per call
+		`insert into t (a, a) values (1, 2)`,  // duplicate column
+		`update t set a = 1, a = 2`,           // duplicate SET column
+		`alter table t add c int primary key`, // can't add a pk column
+		`bogus`,                               // not a statement
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%q): expected error", src)
@@ -214,7 +286,7 @@ func TestParseErrors(t *testing.T) {
 
 func TestParseQuotedIdents(t *testing.T) {
 	s := mustParse(t, `select "Weird Col" from "MyTable" where "true" = 1`).(*Select)
-	if s.Table != "MyTable" || s.Items[0].Col != "Weird Col" || s.Where.(*Pred).Item.Col != "true" {
+	if s.From[0].Table != "MyTable" || s.Items[0].Col.Name != "Weird Col" || s.Where.(*Pred).Item.Col.Name != "true" {
 		t.Fatalf("got %#v", s)
 	}
 }
@@ -224,21 +296,21 @@ func TestParseAggregates(t *testing.T) {
 		WHERE age > 18 GROUP BY city HAVING count(*) >= 2 AND min(age) IS NOT NULL
 		ORDER BY count(*) DESC, city LIMIT 3`)
 	want := &Select{
-		Table: "users",
+		From: []FromItem{{Table: "users"}},
 		Items: []SelectItem{
-			{Col: "city"},
+			{Col: col("city")},
 			{Agg: AggCount, Star: true},
-			{Agg: AggAvg, Col: "age"},
+			{Agg: AggAvg, Col: col("age")},
 		},
 		Where:   cpred("age", OpGT, int64(18)),
-		GroupBy: []string{"city"},
+		GroupBy: []ColRef{col("city")},
 		Having: and(
 			apred(SelectItem{Agg: AggCount, Star: true}, OpGE, int64(2)),
-			apred(SelectItem{Agg: AggMin, Col: "age"}, OpIsNotNull, nil),
+			apred(SelectItem{Agg: AggMin, Col: col("age")}, OpIsNotNull, nil),
 		),
 		OrderBy: []OrderItem{
 			{SelectItem: SelectItem{Agg: AggCount, Star: true}, Desc: true},
-			{SelectItem: SelectItem{Col: "city"}},
+			{SelectItem: SelectItem{Col: col("city")}},
 		},
 		Limit: 3,
 	}
@@ -252,17 +324,17 @@ func TestParseAggregates(t *testing.T) {
 	// A column that shares an aggregate's name stays a column without
 	// parentheses.
 	s := mustParse(t, `select count from t group by count`).(*Select)
-	if s.Items[0].Agg != AggNone || s.Items[0].Col != "count" {
+	if s.Items[0].Agg != AggNone || s.Items[0].Col.Name != "count" {
 		t.Fatalf("got %#v", s.Items[0])
 	}
 }
 
 func TestParseAggregateErrors(t *testing.T) {
 	for _, src := range []string{
-		`select * from t where count(*) > 1`,       // aggregates belong in HAVING
+		`select * from t where count(*) > 1`,          // aggregates belong in HAVING
 		`select count(*) from t having sum(v) = null`, // must use IS NULL
-		`select sum() from t`,                      // missing argument
-		`select sum(*) from t`,                     // * only for count
+		`select sum() from t`,                         // missing argument
+		`select sum(*) from t`,                        // * only for count
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%q): expected error", src)

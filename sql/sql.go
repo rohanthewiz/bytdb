@@ -11,33 +11,50 @@
 //	CREATE [UNIQUE] INDEX idx ON t (c, ...)
 //	DROP INDEX idx [ON t]
 //	INSERT INTO t [(c, ...)] VALUES (v, ...), ...
-//	SELECT * | items FROM t [WHERE ...] [GROUP BY c, ...] [HAVING ...]
+//	SELECT * | items FROM tables [WHERE ...] [GROUP BY c, ...] [HAVING ...]
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
 //	UPDATE t SET c = v, ... [WHERE ...]
 //	DELETE FROM t [WHERE ...]
 //
-// WHERE and HAVING are boolean expressions — predicates combined with
-// AND, OR, and NOT (standard precedence; parentheses group), evaluated
-// with SQL three-valued logic: a comparison against NULL is unknown,
-// and only definitely-true rows match. A predicate is column op
-// literal (=, !=, <>, <, <=, >, >=, either operand order) or column
-// IS [NOT] NULL. The planner turns equality and range predicates that
-// are top-level AND conjuncts on a prefix of the primary key or of a
-// secondary index into point gets or bounded ordered scans (anything
-// under OR or NOT stays filter-only); the whole condition is still
-// re-checked per row, so pushdown only narrows what is visited.
+// FROM names one table or a left-deep chain of joins:
+//
+//	FROM a [AS] x [INNER] JOIN b ON x.id = b.a_id
+//	       LEFT [OUTER] JOIN c ON ... CROSS JOIN d
+//
+// A comma-separated table is a cross join; RIGHT and FULL joins are
+// not supported. Columns may be qualified (t.c, using the alias when
+// one is given); unqualified names must be unambiguous across the
+// FROM tables. Select lists also accept t.* . Joins execute as nested
+// loops, but ON and WHERE equality conjuncts re-bind per outer row,
+// so an inner table joined on its primary key or an indexed column is
+// a point get or bounded scan per row, not a full scan. A LEFT JOIN
+// extends unmatched left rows with NULLs; WHERE predicates on its
+// right table apply after that extension (so o.id IS NULL is the
+// anti-join).
+//
+// WHERE, ON, and HAVING are boolean expressions — predicates combined
+// with AND, OR, and NOT (standard precedence; parentheses group),
+// evaluated with SQL three-valued logic: a comparison against NULL is
+// unknown, and only definitely-true rows match. A predicate is column
+// op literal, column op column (=, !=, <>, <, <=, >, >=, either
+// operand order), or column IS [NOT] NULL; in HAVING either operand
+// may be an aggregate call. The planner turns equality and range
+// predicates that are top-level AND conjuncts on a prefix of the
+// primary key or of a secondary index into point gets or bounded
+// ordered scans (anything under OR or NOT stays filter-only); the
+// whole condition is still re-checked per row, so pushdown only
+// narrows what is visited.
 //
 // Select items are columns or aggregates: COUNT(*), COUNT(c), SUM(c),
 // AVG(c), MIN(c), MAX(c). Any aggregate, GROUP BY, or HAVING makes
 // the query aggregate rows, with SQL semantics: plain columns must
 // appear in GROUP BY, aggregates ignore NULL inputs (COUNT(*) counts
 // rows), NULL group values form one group, an ungrouped aggregate
-// query returns exactly one row, HAVING conjuncts (aggregate or
-// grouped column, op literal or IS [NOT] NULL) filter groups, and
-// ORDER BY may sort by grouped columns or aggregates. Without ORDER
-// BY, groups return in ascending group-column order.
+// query returns exactly one row, HAVING filters groups, and ORDER BY
+// may sort by grouped columns or aggregates. Without ORDER BY, groups
+// return in ascending group-column order.
 //
-// The dialect follows Postgres conventions: 'string' literals with ''
+// The dialect follows Postgres conventions: 'string' literals with ”
 // escapes, "quoted" identifiers, unquoted identifiers folded to
 // lowercase, -- and /* */ comments, and type aliases (int, integer,
 // bigint, int8...; float, float8, real, double precision; text,

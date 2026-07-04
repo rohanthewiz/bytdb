@@ -378,7 +378,7 @@ func (p *parser) selectStmt() (Statement, error) {
 		s.Star = true
 	} else {
 		for {
-			item, err := p.selectItem()
+			item, err := p.selectListItem()
 			if err != nil {
 				return nil, err
 			}
@@ -392,7 +392,7 @@ func (p *parser) selectStmt() (Statement, error) {
 		return nil, err
 	}
 	var err error
-	if s.Table, err = p.ident("a table name"); err != nil {
+	if s.From, err = p.fromClause(); err != nil {
 		return nil, err
 	}
 	if p.acceptKw("where") {
@@ -405,11 +405,11 @@ func (p *parser) selectStmt() (Statement, error) {
 			return nil, err
 		}
 		for {
-			name, err := p.ident("a column name")
+			col, err := p.colRef()
 			if err != nil {
 				return nil, err
 			}
-			s.GroupBy = append(s.GroupBy, name)
+			s.GroupBy = append(s.GroupBy, col)
 			if !p.acceptOp(",") {
 				break
 			}
@@ -524,6 +524,134 @@ func (p *parser) deleteStmt() (Statement, error) {
 	return d, nil
 }
 
+// fromClause parses FROM t [alias] followed by any number of joins.
+// A comma-separated table reads as CROSS JOIN; RIGHT and FULL joins
+// are rejected.
+func (p *parser) fromClause() ([]FromItem, error) {
+	first, err := p.tableRef()
+	if err != nil {
+		return nil, err
+	}
+	items := []FromItem{first}
+	for {
+		var it FromItem
+		switch {
+		case p.acceptOp(","):
+			if it, err = p.tableRef(); err != nil {
+				return nil, err
+			}
+			it.Join = JoinCross
+		case p.acceptKw("cross"):
+			if err := p.expectKw("join"); err != nil {
+				return nil, err
+			}
+			if it, err = p.tableRef(); err != nil {
+				return nil, err
+			}
+			it.Join = JoinCross
+		case p.acceptKw("inner"):
+			if err := p.expectKw("join"); err != nil {
+				return nil, err
+			}
+			if it, err = p.joinOn(JoinInner); err != nil {
+				return nil, err
+			}
+		case p.acceptKw("left"):
+			p.acceptKw("outer")
+			if err := p.expectKw("join"); err != nil {
+				return nil, err
+			}
+			if it, err = p.joinOn(JoinLeft); err != nil {
+				return nil, err
+			}
+		case p.acceptKw("join"):
+			if it, err = p.joinOn(JoinInner); err != nil {
+				return nil, err
+			}
+		case p.cur().kind == tIdent && (p.cur().text == "right" || p.cur().text == "full"):
+			return nil, serr.New("only INNER, LEFT [OUTER], and CROSS joins are supported",
+				"join", strings.ToUpper(p.cur().text))
+		default:
+			return items, nil
+		}
+		items = append(items, it)
+	}
+}
+
+// joinOn parses "t [alias] ON expr" after a JOIN keyword.
+func (p *parser) joinOn(jt JoinType) (FromItem, error) {
+	it, err := p.tableRef()
+	if err != nil {
+		return FromItem{}, err
+	}
+	it.Join = jt
+	if err := p.expectKw("on"); err != nil {
+		return FromItem{}, err
+	}
+	if it.On, err = p.boolExpr(false); err != nil {
+		return FromItem{}, err
+	}
+	return it, nil
+}
+
+// noAlias is the keywords that cannot follow a table name as a bare
+// alias; an alias spelled like one needs AS or double quotes.
+var noAlias = map[string]bool{
+	"where": true, "group": true, "having": true, "order": true,
+	"limit": true, "offset": true, "on": true, "join": true,
+	"inner": true, "left": true, "right": true, "full": true,
+	"cross": true, "union": true, "as": true, "and": true, "or": true,
+	"not": true, "using": true, "natural": true, "set": true,
+	"values": true, "returning": true,
+}
+
+// tableRef parses "t", "t alias", or "t AS alias".
+func (p *parser) tableRef() (FromItem, error) {
+	name, err := p.ident("a table name")
+	if err != nil {
+		return FromItem{}, err
+	}
+	it := FromItem{Table: name}
+	if p.acceptKw("as") {
+		if it.Alias, err = p.ident("an alias"); err != nil {
+			return FromItem{}, err
+		}
+	} else if t := p.cur(); t.kind == tQIdent || (t.kind == tIdent && !noAlias[t.text]) {
+		it.Alias, _ = p.ident("an alias")
+	}
+	return it, nil
+}
+
+// colRef parses a column reference: col or table.col.
+func (p *parser) colRef() (ColRef, error) {
+	first, err := p.ident("a column name")
+	if err != nil {
+		return ColRef{}, err
+	}
+	if !p.acceptOp(".") {
+		return ColRef{Name: first}, nil
+	}
+	name, err := p.ident("a column name")
+	if err != nil {
+		return ColRef{}, err
+	}
+	return ColRef{Table: first, Name: name}, nil
+}
+
+// selectListItem parses one select-list entry: selectItem, plus t.*.
+func (p *parser) selectListItem() (SelectItem, error) {
+	if t := p.cur(); (t.kind == tIdent || t.kind == tQIdent) && p.peekOpAt(1, ".") && p.peekOpAt(2, "*") {
+		qual, err := p.ident("a table name")
+		if err != nil {
+			return SelectItem{}, err
+		}
+		p.advance() // .
+		p.advance() // *
+		return SelectItem{Col: ColRef{Table: qual}, Star: true}, nil
+	}
+	return p.selectItem()
+}
+
 // selectItem parses one select-list or ORDER BY entry: a column, or
 // an aggregate call fn(col) / COUNT(*). An identifier that happens to
 // share an aggregate's name stays a column unless a '(' follows.
@@ -537,7 +665,7 @@ func (p *parser) selectItem() (SelectItem, error) {
 		if fn == AggCount && p.acceptOp("*") {
 			item.Star = true
 		} else {
-			col, err := p.ident("a column name")
+			col, err := p.colRef()
 			if err != nil {
 				return SelectItem{}, err
 			}
@@ -548,16 +676,19 @@ func (p *parser) selectItem() (SelectItem, error) {
 		}
 		return item, nil
 	}
-	col, err := p.ident("a column name")
+	col, err := p.colRef()
 	return SelectItem{Col: col}, err
 }
 
 // peekOp reports whether the token after the current one is op.
-func (p *parser) peekOp(op string) bool {
-	if p.cur().kind == tEOF {
+func (p *parser) peekOp(op string) bool { return p.peekOpAt(1, op) }
+
+// peekOpAt reports whether the token n places ahead is op.
+func (p *parser) peekOpAt(n int, op string) bool {
+	if p.i+n >= len(p.toks) {
 		return false
 	}
-	t := p.toks[p.i+1]
+	t := p.toks[p.i+n]
 	return t.kind == tOp && t.text == op
 }
 
@@ -625,9 +756,9 @@ func (p *parser) boolNot(allowAgg bool) (BoolExpr, error) {
 	return p.predLeaf(allowAgg)
 }
 
-// predLeaf parses one predicate: item op literal (either operand
-// order; a literal-first comparison is flipped), or item IS [NOT]
-// NULL.
+// predLeaf parses one predicate: item op literal, item op item, or
+// item IS [NOT] NULL. A literal-first comparison is flipped so the
+// item is always on the left.
 func (p *parser) predLeaf(allowAgg bool) (BoolExpr, error) {
 	lItem, lVal, lIsItem, err := p.predOperand(allowAgg)
 	if err != nil {
@@ -652,18 +783,20 @@ func (p *parser) predLeaf(allowAgg bool) (BoolExpr, error) {
 		return nil, err
 	}
 	switch {
-	case lIsItem && !rIsItem:
+	case lIsItem && rIsItem:
+		return &Pred{Item: lItem, Op: op, RItem: &rItem}, nil
+	case lIsItem:
 		if rVal == nil {
 			return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
 		}
 		return &Pred{Item: lItem, Op: op, Val: rVal}, nil
-	case !lIsItem && rIsItem:
+	case rIsItem:
 		if lVal == nil {
 			return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
 		}
 		return &Pred{Item: rItem, Op: flip(op), Val: lVal}, nil
 	}
-	return nil, serr.New("a predicate must compare a column with a literal")
+	return nil, serr.New("a predicate cannot compare two literals")
 }
 
 // predOperand parses a column, an aggregate call (HAVING only), or a
@@ -682,7 +815,7 @@ func (p *parser) predOperand(allowAgg bool) (item SelectItem, val any, isItem bo
 		return item, nil, true, err
 	}
 	if t.kind == tIdent || t.kind == tQIdent {
-		col, err := p.ident("a column name")
+		col, err := p.colRef()
 		return SelectItem{Col: col}, nil, true, err
 	}
 	val, err = p.literal()

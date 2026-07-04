@@ -31,14 +31,15 @@ type And struct{ Exprs []BoolExpr }
 type Or struct{ Exprs []BoolExpr }
 type Not struct{ Expr BoolExpr }
 
-// Pred is a leaf predicate: item op literal, or item IS [NOT] NULL.
-// The item is a plain column in WHERE; in HAVING it may also be an
-// aggregate call. One side must be the item and the other a literal —
-// a reversed comparison is normalized at parse time.
+// Pred is a leaf predicate: item op literal, item op item, or item
+// IS [NOT] NULL. Items are plain columns in WHERE and ON; in HAVING
+// they may also be aggregate calls. A literal-first comparison is
+// normalized at parse time, so the left side is always an item.
 type Pred struct {
-	Item SelectItem
-	Op   PredOp
-	Val  any // literal value; nil for IS [NOT] NULL
+	Item  SelectItem
+	Op    PredOp
+	Val   any         // literal right side; nil for IS [NOT] NULL or when RItem is set
+	RItem *SelectItem // column (in HAVING: aggregate) right side; nil when comparing with Val
 }
 
 func (*And) boolExpr()  {}
@@ -97,12 +98,27 @@ func (f AggFunc) name() string {
 	return ""
 }
 
-// SelectItem is one select-list entry: a plain column, or an
-// aggregate over a column (COUNT(*) sets Star).
+// ColRef names a column, optionally qualified by a table name or
+// alias: c or t.c.
+type ColRef struct {
+	Table string // qualifier; "" when unqualified
+	Name  string
+}
+
+func (c ColRef) String() string {
+	if c.Table == "" {
+		return c.Name
+	}
+	return c.Table + "." + c.Name
+}
+
+// SelectItem is one select-list entry: a plain column, an aggregate
+// over a column, COUNT(*) (Agg with Star), or t.* (Star with
+// Col.Table, select lists only).
 type SelectItem struct {
-	Col  string
+	Col  ColRef
 	Agg  AggFunc
-	Star bool // COUNT(*)
+	Star bool
 }
 
 // ColDef is one column of a CREATE TABLE or ALTER TABLE ADD COLUMN.
@@ -158,14 +174,33 @@ type OrderItem struct {
 	Desc bool
 }
 
-// Select is a single-table SELECT. A query with any aggregate item,
-// a GROUP BY, or a HAVING is an aggregate query.
+// JoinType is how a FROM item combines with the tables before it.
+type JoinType int
+
+const (
+	JoinInner JoinType = iota
+	JoinLeft           // LEFT [OUTER] JOIN: unmatched left rows extend with NULLs
+	JoinCross          // CROSS JOIN, or a comma-separated table
+)
+
+// FromItem is one table of a FROM clause. Joins are left-deep: each
+// item after the first joins to the combination of all items before
+// it. The first item's Join and On are unset; CROSS JOIN has no On.
+type FromItem struct {
+	Table string
+	Alias string // "" : referenced by the table name
+	Join  JoinType
+	On    BoolExpr
+}
+
+// Select is SELECT over one table or a chain of joins. A query with
+// any aggregate item, a GROUP BY, or a HAVING is an aggregate query.
 type Select struct {
-	Table   string
+	From    []FromItem
 	Star    bool
 	Items   []SelectItem
 	Where   BoolExpr // nil: all rows
-	GroupBy []string
+	GroupBy []ColRef
 	Having  BoolExpr // nil: all groups; leaves may be aggregates
 	OrderBy []OrderItem
 	Limit   int64 // -1: no limit

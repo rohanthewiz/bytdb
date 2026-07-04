@@ -17,7 +17,8 @@ type plan struct {
 	index  string   // secondary index to scan; "" scans the primary index
 	from   []any    // inclusive lower bound pushed into the scan; nil is unbounded
 	stops  []stop   // early-termination checks, in key-column order
-	filter BoolExpr // residual filter: the full WHERE clause (nil: all rows)
+	filter BoolExpr // residual filter: the full condition (nil: all rows)
+	binds  binds    // the filter's operand ordinals within this table's rows
 }
 
 type stopKind int
@@ -39,33 +40,54 @@ type stop struct {
 	val  any
 }
 
-// planScan validates the WHERE columns and picks the access path:
-// a point Get when every primary-key column has an equality predicate,
-// else the primary index or the secondary index with the longest
-// equality prefix (plus at most one range column), else a full scan.
-// Only predicates that are top-level AND conjuncts push down; anything
-// under OR or NOT is residual-only.
-func planScan(desc *bytdb.TableDesc, where BoolExpr) (*plan, error) {
-	p := &plan{desc: desc, filter: where}
+// planScan validates the condition's columns against one table
+// (qualifiers must match alias — the table's name or its FROM alias)
+// and picks the access path: a point Get when every primary-key
+// column has an equality predicate, else the primary index or the
+// secondary index with the longest equality prefix (plus at most one
+// range column), else a full scan. Only predicates that are top-level
+// AND conjuncts push down; anything under OR or NOT is residual-only.
+func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error) {
+	p := &plan{desc: desc, filter: where, binds: binds{}}
 
-	// Every column referenced anywhere in the tree must exist.
-	if err := walkPreds(where, func(pr *Pred) error {
-		if desc.ColIndex(pr.Item.Col) < 0 {
-			return serr.New("no such column", "table", desc.Name, "column", pr.Item.Col)
+	// Every column referenced anywhere in the tree must exist in this
+	// table; record each leaf's operand ordinals for the row filter.
+	res := func(c ColRef) (int, error) {
+		if c.Table != "" && c.Table != alias {
+			return -1, serr.New("no such table in FROM", "table", c.Table)
 		}
+		ord := desc.ColIndex(c.Name)
+		if ord < 0 {
+			return -1, serr.New("no such column", "table", alias, "column", c.Name)
+		}
+		return ord, nil
+	}
+	if err := walkPreds(where, func(pr *Pred) error {
+		l, err := res(pr.Item.Col)
+		if err != nil {
+			return err
+		}
+		r := -1
+		if pr.RItem != nil {
+			if r, err = res(pr.RItem.Col); err != nil {
+				return err
+			}
+		}
+		p.binds[pr] = binding{l, r}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
 
 	// First usable conjunct per column, by kind. Only literals that
-	// fit the column type are pushed; the rest stay residual-only.
+	// fit the column type are pushed; column-to-column comparisons and
+	// the rest stay residual-only.
 	eq := map[int]any{}
 	lo := map[int]*Pred{}
 	hi := map[int]*Pred{}
 	for _, pr := range conjuncts(where) {
-		ord := desc.ColIndex(pr.Item.Col)
-		if pr.Val == nil || !litFits(pr.Val, desc.Columns[ord].Type) {
+		ord := p.binds[pr].l
+		if pr.RItem != nil || pr.Val == nil || !litFits(pr.Val, desc.Columns[ord].Type) {
 			continue
 		}
 		switch pr.Op {

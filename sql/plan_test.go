@@ -25,7 +25,7 @@ func planDesc() *bytdb.TableDesc {
 }
 
 func TestPlanPointGet(t *testing.T) {
-	p, err := planScan(planDesc(), and(
+	p, err := planScan(planDesc(), "users", and(
 		cpred("id", OpEQ, int64(7)),
 		cpred("city", OpEQ, "Reno"),
 	))
@@ -41,7 +41,7 @@ func TestPlanPointGet(t *testing.T) {
 }
 
 func TestPlanPKRange(t *testing.T) {
-	p, err := planScan(planDesc(), and(
+	p, err := planScan(planDesc(), "users", and(
 		cpred("id", OpGE, int64(10)),
 		cpred("id", OpLT, int64(20)),
 	))
@@ -60,7 +60,7 @@ func TestPlanPKRange(t *testing.T) {
 }
 
 func TestPlanIndexEqPrefixPlusRange(t *testing.T) {
-	p, err := planScan(planDesc(), and(
+	p, err := planScan(planDesc(), "users", and(
 		cpred("name", OpEQ, "ada"),
 		cpred("age", OpGT, int64(21)),
 		cpred("age", OpLE, int64(65)),
@@ -83,7 +83,7 @@ func TestPlanPrimaryWinsTies(t *testing.T) {
 	// eq on id (pk) and eq on city (indexed) score equally at one
 	// equality column... they don't: pk eq is a point get. Use a range
 	// on id vs a range on city instead: equal scores, primary wins.
-	p, err := planScan(planDesc(), and(
+	p, err := planScan(planDesc(), "users", and(
 		cpred("id", OpGE, int64(1)),
 		cpred("city", OpGE, "a"),
 	))
@@ -97,7 +97,7 @@ func TestPlanPrimaryWinsTies(t *testing.T) {
 
 func TestPlanFullScanFallback(t *testing.T) {
 	// A float literal does not fit an int key column: nothing pushes.
-	p, err := planScan(planDesc(), and(
+	p, err := planScan(planDesc(), "users", and(
 		cpred("id", OpEQ, 1.5),
 		cpred("age", OpNE, int64(3)),
 	))
@@ -113,12 +113,12 @@ func TestPlanFullScanFallback(t *testing.T) {
 }
 
 func TestPlanUnknownColumn(t *testing.T) {
-	if _, err := planScan(planDesc(), cpred("nope", OpEQ, int64(1))); err == nil {
+	if _, err := planScan(planDesc(), "users", cpred("nope", OpEQ, int64(1))); err == nil {
 		t.Fatal("expected error")
 	}
 	// Columns are validated even under OR and NOT.
 	bad := or(cpred("id", OpEQ, int64(1)), &Not{Expr: cpred("nope", OpEQ, int64(1))})
-	if _, err := planScan(planDesc(), bad); err == nil {
+	if _, err := planScan(planDesc(), "users", bad); err == nil {
 		t.Fatal("expected error inside OR/NOT")
 	}
 }
@@ -126,7 +126,7 @@ func TestPlanUnknownColumn(t *testing.T) {
 func TestPlanORIsResidualOnly(t *testing.T) {
 	// A top-level OR pushes nothing, even when every branch touches
 	// the primary key.
-	p, err := planScan(planDesc(), or(
+	p, err := planScan(planDesc(), "users", or(
 		cpred("id", OpEQ, int64(1)),
 		cpred("id", OpEQ, int64(2)),
 	))
@@ -138,7 +138,7 @@ func TestPlanORIsResidualOnly(t *testing.T) {
 	}
 
 	// NOT blocks pushdown of its subtree too.
-	p, err = planScan(planDesc(), &Not{Expr: cpred("id", OpLT, int64(5))})
+	p, err = planScan(planDesc(), "users", &Not{Expr: cpred("id", OpLT, int64(5))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,10 +147,32 @@ func TestPlanORIsResidualOnly(t *testing.T) {
 	}
 }
 
+func TestPlanColVsColIsResidualOnly(t *testing.T) {
+	// name = city compares two columns: valid, but nothing pushes.
+	p, err := planScan(planDesc(), "users", and(
+		ccpred(col("name"), OpEQ, col("city")),
+		cpred("id", OpGE, int64(10)),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.get != nil || p.index != "" || !reflect.DeepEqual(p.from, []any{int64(10)}) {
+		t.Fatalf("got %#v", p)
+	}
+	// A qualifier must match the table's FROM name.
+	if _, err := planScan(planDesc(), "u", cpred("id", OpEQ, int64(1))); err != nil {
+		t.Fatalf("unqualified ref should resolve under any alias: %v", err)
+	}
+	qualified := &Pred{Item: SelectItem{Col: ColRef{Table: "nope", Name: "id"}}, Op: OpEQ, Val: int64(1)}
+	if _, err := planScan(planDesc(), "users", qualified); err == nil {
+		t.Fatal("expected error for a foreign qualifier")
+	}
+}
+
 func TestPlanConjunctBesideOR(t *testing.T) {
 	// id >= 10 AND (city = 'a' OR age > 3): the conjunct still pushes;
 	// the OR stays residual.
-	p, err := planScan(planDesc(), and(
+	p, err := planScan(planDesc(), "users", and(
 		cpred("id", OpGE, int64(10)),
 		or(cpred("city", OpEQ, "a"), cpred("age", OpGT, int64(3))),
 	))

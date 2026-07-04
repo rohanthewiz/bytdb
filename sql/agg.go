@@ -40,12 +40,12 @@ type accum struct {
 	min, max any
 }
 
-func (a *accum) add(row bytdb.Row) {
+func (a *accum) add(vals []any) {
 	if a.ord < 0 {
 		a.count++ // COUNT(*)
 		return
 	}
-	v := row.Vals[a.ord]
+	v := vals[a.ord]
 	if v == nil {
 		return
 	}
@@ -97,16 +97,16 @@ func (a *accum) value() any {
 
 // aggQuery is a resolved aggregate SELECT: the accumulator templates
 // (one per distinct aggregate call anywhere in the query) and, for
-// each output position, HAVING conjunct, and sort key, a reference to
+// each output position, HAVING operand, and sort key, a reference to
 // either a group-by column or an accumulator.
 type aggQuery struct {
-	desc      *bytdb.TableDesc
-	groupOrds []int
+	sc        *scope
+	groupOrds []int   // combined-row ordinals of the GROUP BY columns
 	accums    []accum // templates, cloned per group
 
 	outputs    []aggRef
-	having     BoolExpr            // leaves resolved via havingRefs
-	havingRefs map[*Pred]aggRef
+	having     BoolExpr // leaves resolved via havingRefs
+	havingRefs map[*Pred]havingLeaf
 	sorts      []aggSortKey
 }
 
@@ -116,29 +116,36 @@ type aggRef struct {
 	acc   int // index into accums, or -1
 }
 
+// havingLeaf is one HAVING predicate's resolved operands; the right
+// side is r when hasR, else the leaf's literal.
+type havingLeaf struct {
+	l, r aggRef
+	hasR bool
+}
+
 type aggSortKey struct {
 	ref  aggRef
 	desc bool
 }
 
-// resolveAgg validates the aggregate query against the descriptor.
+// resolveAgg validates the aggregate query against the FROM scope.
 // Plain columns anywhere in the select list, HAVING, or ORDER BY must
 // appear in GROUP BY; SUM and AVG require a numeric argument.
-func resolveAgg(desc *bytdb.TableDesc, s *Select) (*aggQuery, error) {
+func resolveAgg(sc *scope, s *Select) (*aggQuery, error) {
 	if s.Star {
-		return nil, serr.New("SELECT * is not allowed in an aggregate query", "table", s.Table)
+		return nil, serr.New("SELECT * is not allowed in an aggregate query")
 	}
-	q := &aggQuery{desc: desc}
-	groupIdx := map[string]int{}
-	for _, name := range s.GroupBy {
-		ord := desc.ColIndex(name)
-		if ord < 0 {
-			return nil, serr.New("no such column", "table", s.Table, "column", name)
+	q := &aggQuery{sc: sc}
+	groupIdx := map[int]int{} // combined ordinal -> groupOrds index
+	for _, col := range s.GroupBy {
+		ord, err := sc.resolve(col)
+		if err != nil {
+			return nil, err
 		}
-		if _, dup := groupIdx[name]; dup {
-			return nil, serr.New("duplicate GROUP BY column", "column", name)
+		if _, dup := groupIdx[ord]; dup {
+			return nil, serr.New("duplicate GROUP BY column", "column", col.String())
 		}
-		groupIdx[name] = len(q.groupOrds)
+		groupIdx[ord] = len(q.groupOrds)
 		q.groupOrds = append(q.groupOrds, ord)
 	}
 
@@ -151,24 +158,31 @@ func resolveAgg(desc *bytdb.TableDesc, s *Select) (*aggQuery, error) {
 	accIdx := map[accKey]int{}
 	ref := func(it SelectItem) (aggRef, error) {
 		if it.Agg == AggNone {
-			gi, ok := groupIdx[it.Col]
+			if it.Star {
+				return aggRef{}, serr.New("t.* is not allowed in an aggregate query", "table", it.Col.Table)
+			}
+			ord, err := sc.resolve(it.Col)
+			if err != nil {
+				return aggRef{}, err
+			}
+			gi, ok := groupIdx[ord]
 			if !ok {
 				return aggRef{}, serr.New("column must appear in GROUP BY or inside an aggregate",
-					"table", s.Table, "column", it.Col)
+					"column", it.Col.String())
 			}
 			return aggRef{group: gi, acc: -1}, nil
 		}
 		ord := -1
 		intSum := false
 		if !it.Star {
-			ord = desc.ColIndex(it.Col)
-			if ord < 0 {
-				return aggRef{}, serr.New("no such column", "table", s.Table, "column", it.Col)
+			var err error
+			if ord, err = sc.resolve(it.Col); err != nil {
+				return aggRef{}, err
 			}
-			t := desc.Columns[ord].Type
+			t := sc.column(ord).Type
 			if (it.Agg == AggSum || it.Agg == AggAvg) && t != bytdb.TInt && t != bytdb.TFloat {
 				return aggRef{}, serr.New(it.Agg.name()+" requires a numeric column",
-					"column", it.Col, "type", string(t))
+					"column", it.Col.String(), "type", string(t))
 			}
 			intSum = t == bytdb.TInt
 		}
@@ -190,13 +204,20 @@ func resolveAgg(desc *bytdb.TableDesc, s *Select) (*aggQuery, error) {
 		q.outputs = append(q.outputs, r)
 	}
 	q.having = s.Having
-	q.havingRefs = map[*Pred]aggRef{}
+	q.havingRefs = map[*Pred]havingLeaf{}
 	if err := walkPreds(s.Having, func(pr *Pred) error {
-		r, err := ref(pr.Item)
-		if err != nil {
+		hl := havingLeaf{}
+		var err error
+		if hl.l, err = ref(pr.Item); err != nil {
 			return err
 		}
-		q.havingRefs[pr] = r
+		if pr.RItem != nil {
+			if hl.r, err = ref(*pr.RItem); err != nil {
+				return err
+			}
+			hl.hasR = true
+		}
+		q.havingRefs[pr] = hl
 		return nil
 	}); err != nil {
 		return nil, err
@@ -218,14 +239,14 @@ func (q *aggQuery) resultCols(s *Select, res *Result) {
 	for i, it := range s.Items {
 		r := q.outputs[i]
 		if r.acc < 0 {
-			ord := q.groupOrds[r.group]
-			res.Cols = append(res.Cols, q.desc.Columns[ord].Name)
-			res.Types = append(res.Types, q.desc.Columns[ord].Type)
+			c := q.sc.column(q.groupOrds[r.group])
+			res.Cols = append(res.Cols, c.Name)
+			res.Types = append(res.Types, c.Type)
 			continue
 		}
 		arg := "*"
 		if !it.Star {
-			arg = it.Col
+			arg = it.Col.String()
 		}
 		res.Cols = append(res.Cols, it.Agg.name()+"("+arg+")")
 		switch {
@@ -234,7 +255,7 @@ func (q *aggQuery) resultCols(s *Select, res *Result) {
 		case it.Agg == AggAvg:
 			res.Types = append(res.Types, bytdb.TFloat)
 		default:
-			res.Types = append(res.Types, q.desc.Columns[q.accums[r.acc].ord].Type)
+			res.Types = append(res.Types, q.sc.column(q.accums[r.acc].ord).Type)
 		}
 	}
 }
@@ -262,28 +283,23 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	var q *aggQuery
 	groups := map[string]*group{}
 	err := d.e.ReadTxn(func(tx *bytdb.Txn) error {
-		desc := tx.Table(s.Table)
-		if desc == nil {
-			return serr.New("no such table", "table", s.Table)
-		}
-		var err error
-		if q, err = resolveAgg(desc, s); err != nil {
-			return err
-		}
-		pl, err := planScan(desc, s.Where)
+		fp, err := prepareFrom(tx, s.From, s.Where)
 		if err != nil {
 			return err
 		}
-		// Without GROUP BY the whole table is one group, present even
+		if q, err = resolveAgg(fp.sc, s); err != nil {
+			return err
+		}
+		// Without GROUP BY the whole input is one group, present even
 		// over zero rows.
 		if len(q.groupOrds) == 0 {
 			groups[""] = q.newGroup(nil)
 		}
 		var scanErr error
-		err = scanPlan(tx, s.Table, pl, func(r bytdb.Row) bool {
+		err = runJoin(tx, fp, func(vals []any) bool {
 			keyVals := make([]any, len(q.groupOrds))
 			for i, ord := range q.groupOrds {
-				keyVals[i] = r.Vals[ord]
+				keyVals[i] = vals[ord]
 			}
 			// The order-preserving tuple encoding makes group values a
 			// map key (NULLs group together) whose byte order is the
@@ -299,7 +315,7 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 				groups[string(kb)] = g
 			}
 			for i := range g.accs {
-				g.accs[i].add(r)
+				g.accs[i].add(vals)
 			}
 			return true
 		})
@@ -324,7 +340,12 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	for _, k := range keys {
 		g := groups[k]
 		ok := evalBool(q.having, func(pr *Pred) tri {
-			return checkPred(q.valueOf(g, q.havingRefs[pr]), pr.Op, pr.Val)
+			hl := q.havingRefs[pr]
+			rhs := pr.Val
+			if hl.hasR {
+				rhs = q.valueOf(g, hl.r)
+			}
+			return checkPred(q.valueOf(g, hl.l), pr.Op, rhs)
 		})
 		if ok == triTrue {
 			kept = append(kept, g)

@@ -18,7 +18,7 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, yield func(bytdb.Row) bool) 
 		if err != nil {
 			return err
 		}
-		if ok && matches(p.filter, row) {
+		if ok && p.matches(row) {
 			yield(row)
 		}
 		return nil
@@ -36,7 +36,7 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, yield func(bytdb.Row) bool) 
 		if stopped(p.stops, row) {
 			return nil
 		}
-		if !matches(p.filter, row) {
+		if !p.matches(row) {
 			continue
 		}
 		if !yield(row) {
@@ -175,11 +175,10 @@ func checkPred(v any, op PredOp, lit any) tri {
 	return triFalse
 }
 
-// matches reports whether a row definitely satisfies the filter.
-func matches(filter BoolExpr, row bytdb.Row) bool {
-	return evalBool(filter, func(p *Pred) tri {
-		return checkPred(row.Col(p.Item.Col), p.Op, p.Val)
-	}) == triTrue
+// matches reports whether a row definitely satisfies the plan's
+// residual filter.
+func (p *plan) matches(row bytdb.Row) bool {
+	return evalPreds(p.filter, p.binds, row.Vals) == triTrue
 }
 
 // compareVals orders two non-NULL values. ok is false for NULLs and
@@ -230,46 +229,57 @@ func btoi(b bool) int {
 
 func (d *DB) execSelect(s *Select) (*Result, error) {
 	res := &Result{}
-	var rows [][]any // full rows; projected after sort/limit
+	var rows [][]any // full combined rows; projected after sort/limit
 	var ords []int   // projected column ordinals
 	var keys []sortKey
 	err := d.e.ReadTxn(func(tx *bytdb.Txn) error {
-		desc := tx.Table(s.Table)
-		if desc == nil {
-			return serr.New("no such table", "table", s.Table)
-		}
-		pl, err := planScan(desc, s.Where)
+		fp, err := prepareFrom(tx, s.From, s.Where)
 		if err != nil {
 			return err
 		}
-		if s.Star {
-			for i, c := range desc.Columns {
-				ords = append(ords, i)
+		sc := fp.sc
+		project := func(st scopeTable) {
+			for i, c := range st.desc.Columns {
+				ords = append(ords, st.off+i)
 				res.Cols = append(res.Cols, c.Name)
 				res.Types = append(res.Types, c.Type)
 			}
+		}
+		if s.Star {
+			for _, st := range sc.tables {
+				project(st)
+			}
 		} else {
 			for _, it := range s.Items {
-				ord := desc.ColIndex(it.Col)
-				if ord < 0 {
-					return serr.New("no such column", "table", s.Table, "column", it.Col)
+				if it.Star { // t.*
+					st, err := sc.table(it.Col.Table)
+					if err != nil {
+						return err
+					}
+					project(st)
+					continue
+				}
+				ord, err := sc.resolve(it.Col)
+				if err != nil {
+					return err
 				}
 				ords = append(ords, ord)
-				res.Cols = append(res.Cols, desc.Columns[ord].Name)
-				res.Types = append(res.Types, desc.Columns[ord].Type)
+				c := sc.column(ord)
+				res.Cols = append(res.Cols, c.Name)
+				res.Types = append(res.Types, c.Type)
 			}
 		}
 		for _, o := range s.OrderBy {
-			ord := desc.ColIndex(o.Col)
-			if ord < 0 {
-				return serr.New("no such column", "table", s.Table, "column", o.Col)
+			ord, err := sc.resolve(o.Col)
+			if err != nil {
+				return err
 			}
 			keys = append(keys, sortKey{ord, o.Desc})
 		}
-		// With no ORDER BY the scan order is the result order, so
+		// With no ORDER BY the join order is the result order, so
 		// collection can end at OFFSET+LIMIT rows.
-		return scanPlan(tx, s.Table, pl, func(r bytdb.Row) bool {
-			rows = append(rows, r.Vals)
+		return runJoin(tx, fp, func(vals []any) bool {
+			rows = append(rows, vals)
 			return len(keys) > 0 || s.Limit < 0 || int64(len(rows)) < s.Offset+s.Limit
 		})
 	})
@@ -378,7 +388,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
-		pl, err := planScan(desc, s.Where)
+		pl, err := planScan(desc, s.Table, s.Where)
 		if err != nil {
 			return err
 		}
@@ -412,7 +422,7 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
-		pl, err := planScan(desc, s.Where)
+		pl, err := planScan(desc, s.Table, s.Where)
 		if err != nil {
 			return err
 		}
