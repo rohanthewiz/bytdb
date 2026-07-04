@@ -238,36 +238,8 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 			return err
 		}
 		sc := fp.sc
-		project := func(st scopeTable) {
-			for i, c := range st.desc.Columns {
-				ords = append(ords, st.off+i)
-				res.Cols = append(res.Cols, c.Name)
-				res.Types = append(res.Types, c.Type)
-			}
-		}
-		if s.Star {
-			for _, st := range sc.tables {
-				project(st)
-			}
-		} else {
-			for _, it := range s.Items {
-				if it.Star { // t.*
-					st, err := sc.table(it.Col.Table)
-					if err != nil {
-						return err
-					}
-					project(st)
-					continue
-				}
-				ord, err := sc.resolve(it.Col)
-				if err != nil {
-					return err
-				}
-				ords = append(ords, ord)
-				c := sc.column(ord)
-				res.Cols = append(res.Cols, c.Name)
-				res.Types = append(res.Types, c.Type)
-			}
+		if ords, err = projectSelect(sc, s, res); err != nil {
+			return err
 		}
 		for _, o := range s.OrderBy {
 			ord, err := sc.resolve(o.Col)
@@ -324,6 +296,44 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 type sortKey struct {
 	ord  int
 	desc bool
+}
+
+// projectSelect resolves a non-aggregate select list against the FROM
+// scope: the combined-row ordinals to output, with the column names
+// and types appended to res.
+func projectSelect(sc *scope, s *Select, res *Result) (ords []int, err error) {
+	project := func(st scopeTable) {
+		for i, c := range st.desc.Columns {
+			ords = append(ords, st.off+i)
+			res.Cols = append(res.Cols, c.Name)
+			res.Types = append(res.Types, c.Type)
+		}
+	}
+	if s.Star {
+		for _, st := range sc.tables {
+			project(st)
+		}
+		return ords, nil
+	}
+	for _, it := range s.Items {
+		if it.Star { // t.*
+			st, err := sc.table(it.Col.Table)
+			if err != nil {
+				return nil, err
+			}
+			project(st)
+			continue
+		}
+		ord, err := sc.resolve(it.Col)
+		if err != nil {
+			return nil, err
+		}
+		ords = append(ords, ord)
+		c := sc.column(ord)
+		res.Cols = append(res.Cols, c.Name)
+		res.Types = append(res.Types, c.Type)
+	}
+	return ords, nil
 }
 
 // orderCmp is compareVals for sorting: NULLs order last ascending

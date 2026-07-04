@@ -19,11 +19,11 @@ type scopeTable struct {
 	off  int // this table's first ordinal in the combined row
 }
 
-func buildScope(tx *bytdb.Txn, items []FromItem) (*scope, error) {
+func buildScope(lookup func(string) *bytdb.TableDesc, items []FromItem) (*scope, error) {
 	sc := &scope{}
 	seen := map[string]bool{}
 	for _, it := range items {
-		desc := tx.Table(it.Table)
+		desc := lookup(it.Table)
 		if desc == nil {
 			return nil, serr.New("no such table", "table", it.Table)
 		}
@@ -177,7 +177,7 @@ type predTmpl struct {
 // table is not NULL-extended (the right side of a LEFT JOIN), where
 // they must wait for the post-join filter.
 func prepareFrom(tx *bytdb.Txn, items []FromItem, where BoolExpr) (*fromPlan, error) {
-	sc, err := buildScope(tx, items)
+	sc, err := buildScope(tx.Table, items)
 	if err != nil {
 		return nil, err
 	}

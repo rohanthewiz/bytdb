@@ -58,7 +58,11 @@
 // escapes, "quoted" identifiers, unquoted identifiers folded to
 // lowercase, -- and /* */ comments, and type aliases (int, integer,
 // bigint, int8...; float, float8, real, double precision; text,
-// varchar[(n)], string; bool, boolean; bytea, bytes).
+// varchar[(n)], string; bool, boolean; bytea, bytes). As in Postgres,
+// a quoted literal is untyped until context types it: '2' compares,
+// inserts, and assigns as an integer against an int column (and
+// likewise for float, bool, and bytea columns), erroring when the
+// text does not parse as the column's type.
 //
 // Statements may use $1-style placeholders wherever a literal may
 // appear: comparison values in WHERE, ON, and HAVING, INSERT values,
@@ -135,10 +139,14 @@ func (s *Stmt) NumParams() int { return s.n }
 // placeholders.
 func (s *Stmt) Exec(args ...any) (*Result, error) { return s.db.run(s.st, args) }
 
-// run binds args into st and dispatches it.
+// run binds args into st, adapts quoted literals to their column
+// types, and dispatches it.
 func (d *DB) run(st Statement, args []any) (*Result, error) {
 	st, err := bindParams(st, args)
 	if err != nil {
+		return nil, err
+	}
+	if st, err = d.coerceLiterals(st); err != nil {
 		return nil, err
 	}
 	switch s := st.(type) {

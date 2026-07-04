@@ -12,7 +12,8 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–9: a working relational store, queryable in SQL.
+Milestones 1–10: a working relational store, queryable in SQL — in
+process or over the Postgres wire protocol.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -44,6 +45,11 @@ Milestones 1–9: a working relational store, queryable in SQL.
   down to point gets and bounded key scans, aggregates with GROUP BY
   and HAVING, INNER/LEFT/CROSS joins executed as index nested loops,
   and prepared statements with `$1`-style parameters.
+- **Postgres wire protocol** — the `pgwire` module (its own go.mod)
+  serves a database to psql, pgx, and `database/sql`: simple and
+  extended query protocols, text and binary formats, inferred
+  parameter types, and structured errors with SQLSTATE codes and
+  error positions.
 
 ## Example
 
@@ -109,7 +115,11 @@ The dialect is deliberately small and Postgres-flavored — `'string'`
 literals, `"quoted"` identifiers (unquoted ones fold to lowercase),
 `--` and `/* */` comments, and Postgres type names as aliases
 (`bigint`/`int8` → int, `double precision`/`real` → float, `text`/
-`varchar(n)` → string, `boolean` → bool, `bytea` → bytes).
+`varchar(n)` → string, `boolean` → bool, `bytea` → bytes). As in
+Postgres, a quoted literal is untyped until context types it:
+`WHERE id = '2'` against an int column compares as the integer 2 (and
+errors if the text doesn't parse as one), which is what quote-happy
+clients like pgx's simple protocol produce.
 
 Supported statements:
 
@@ -181,10 +191,47 @@ with the structured attributes for user-facing surfaces — `wrong
 number of parameters (want: 1, got: 0)` — and a serr-aware logger
 gets the full context including code locations.
 
-Deferred: a `bytdb-pgwire` module speaking the Postgres wire
-protocol — the embedded `Exec` result shape (columns + types + rows)
-is exactly what that layer needs, and prepared statements map onto
-its Parse/Bind/Execute messages.
+## Postgres wire protocol
+
+The `pgwire` module (a nested module, so the core library keeps zero
+serving dependencies) exposes a database over PostgreSQL protocol
+3.0 — psql, pgx, `database/sql` via pgx's stdlib adapter, and
+anything else that speaks Postgres connects to it:
+
+```go
+import (
+    "github.com/rohanthewiz/bytdb/pgwire"
+    bsql "github.com/rohanthewiz/bytdb/sql"
+)
+
+err := pgwire.NewServer(bsql.New(e)).ListenAndServe("127.0.0.1:5433")
+```
+
+or as a standalone server:
+
+```
+go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd -db app.db -addr 127.0.0.1:5433
+psql "postgres://any@127.0.0.1:5433/any?sslmode=disable"
+```
+
+The embedded API maps directly onto the protocol: `Prepare` is Parse,
+`Stmt.Describe` answers Describe — parameter types are inferred from
+the column each `$n` compares against or inserts into, and the result
+shape (`Result`'s columns + types) is computed from the catalog
+without executing — and `Stmt.Exec` is Bind/Execute. Both the simple
+(`Q`, multi-statement) and extended protocols work, in text and
+binary formats for all five column types. Errors cross the wire
+structurally from serr fields: the parser's byte offset becomes the
+error Position (psql's `LINE 1: ... ^` caret), structured attributes
+become DETAIL, and stable message texts map to SQLSTATE codes
+(syntax_error, undefined_table, unique_violation, ...).
+
+Trust auth (user/database accepted and ignored), TLS declined
+politely, autocommit only; cancellation, portal suspension, COPY, and
+`pg_catalog` are not implemented. The end-to-end tests drive a real
+pgx v5 client — including pgx's statement cache and its simple
+protocol mode, which renders every argument as a quoted literal and
+so exercises the dialect's untyped-literal coercion.
 
 ## How it maps onto the key space
 
@@ -236,7 +283,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 7**: boolean expressions — AND/OR/NOT with parentheses in WHERE and HAVING, SQL three-valued logic, pushdown restricted to top-level AND conjuncts
 - [x] **Milestone 8**: joins — INNER/LEFT/CROSS as left-deep nested loops with per-outer-row re-binding of equality conjuncts (index nested loop), qualified column references, `t.*`
 - [x] **Milestone 9**: prepared statements — `$1` parameters in WHERE/ON/HAVING, INSERT, and UPDATE SET; variadic `Exec` and `Prepare`/`Stmt` that re-bind into a copy per execution
-- [ ] Later: a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
+- [x] **Milestone 10**: Postgres wire protocol — the `pgwire` nested module: startup/auth handshake, simple + extended query protocols mapped onto `Prepare`/`Describe`/`Exec` (with parameter-type inference and catalog-computed result shapes), text + binary formats, structured errors with SQLSTATE and positions; plus Postgres-style untyped-literal coercion in the dialect
+- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, transaction blocks over the wire, `pg_catalog` for ORMs
 
 ## Design notes
 
