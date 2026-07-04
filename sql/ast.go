@@ -19,6 +19,10 @@ const (
 	OpIsNotNull
 )
 
+// Param is a $n placeholder (1-based), parsed wherever a literal may
+// appear and replaced by the n-th bound argument at execution.
+type Param int
+
 // BoolExpr is a WHERE or HAVING condition: a tree of AND/OR/NOT over
 // Pred leaves, evaluated with SQL three-valued logic (a comparison
 // against NULL is unknown; a row or group matches only when the tree

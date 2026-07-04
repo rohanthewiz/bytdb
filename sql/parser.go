@@ -459,6 +459,9 @@ func (p *parser) selectStmt() (Statement, error) {
 
 func (p *parser) nonNegInt(clause string) (int64, error) {
 	t := p.cur()
+	if t.kind == tParam {
+		return 0, serr.New("placeholders are not supported in "+clause, "param", t.text)
+	}
 	if t.kind != tNumber {
 		return 0, p.unexpected("a count after " + clause)
 	}
@@ -863,8 +866,9 @@ func flip(op PredOp) PredOp {
 	return op // EQ, NE are symmetric
 }
 
-// literal parses one literal value: [+|-] number, 'string', TRUE,
-// FALSE, or NULL. Numbers become int64 when they fit, else float64.
+// literal parses one literal value — [+|-] number, 'string', TRUE,
+// FALSE, or NULL — or a $n placeholder, which becomes a Param marker.
+// Numbers become int64 when they fit, else float64.
 func (p *parser) literal() (any, error) {
 	neg := false
 	if p.acceptOp("-") {
@@ -911,7 +915,15 @@ func (p *parser) literal() (any, error) {
 			}
 		}
 	case tParam:
-		return nil, serr.New("placeholders are not supported yet", "param", t.text)
+		if neg {
+			return nil, p.unexpected("a number after '-'")
+		}
+		n, err := strconv.Atoi(t.text[1:])
+		if err != nil || n < 1 {
+			return nil, serr.New("parameter numbers start at $1", "param", t.text, "pos", fmt.Sprint(t.pos))
+		}
+		p.advance()
+		return Param(n), nil
 	}
 	return nil, p.unexpected("a literal value")
 }

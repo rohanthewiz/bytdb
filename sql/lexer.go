@@ -17,7 +17,7 @@ const (
 	tString         // 'string' literal, escapes resolved
 	tNumber         // integer or float literal
 	tOp             // operator or punctuation
-	tParam          // $1-style placeholder (lexed for later; not yet executable)
+	tParam          // $1-style placeholder
 )
 
 type token struct {

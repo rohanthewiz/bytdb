@@ -169,6 +169,36 @@ func TestPlanColVsColIsResidualOnly(t *testing.T) {
 	}
 }
 
+func TestPlanBoundParamPushdown(t *testing.T) {
+	// An unbound Param is not a literal the planner can use; after
+	// binding, the value pushes down like any literal, and binding
+	// leaves the parsed statement untouched.
+	st := mustParse(t, `select * from users where id = $1`)
+	where := st.(*Select).Where
+	p, err := planScan(planDesc(), "users", where)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.get != nil || p.from != nil || p.stops != nil {
+		t.Fatalf("unbound param must not push, got %#v", p)
+	}
+
+	bound, err := bindParams(st, []any{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err = planScan(planDesc(), "users", bound.(*Select).Where)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(p.get, []any{int64(7)}) {
+		t.Fatalf("want point get, got %#v", p)
+	}
+	if where.(*Pred).Val != Param(1) {
+		t.Fatalf("binding mutated the parsed statement: %#v", where)
+	}
+}
+
 func TestPlanConjunctBesideOR(t *testing.T) {
 	// id >= 10 AND (city = 'a' OR age > 3): the conjunct still pushes;
 	// the OR stays residual.

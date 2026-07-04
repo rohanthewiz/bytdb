@@ -60,6 +60,16 @@
 // bigint, int8...; float, float8, real, double precision; text,
 // varchar[(n)], string; bool, boolean; bytea, bytes).
 //
+// Statements may use $1-style placeholders wherever a literal may
+// appear: comparison values in WHERE, ON, and HAVING, INSERT values,
+// and UPDATE SET values (LIMIT and OFFSET take literal counts only).
+// Exec binds its trailing arguments to them, and Prepare parses a
+// statement once for repeated execution. Parameters are numbered: a
+// statement takes exactly as many values as its highest $n, and the
+// same $n may be used more than once. Arguments are Go values —
+// int64, float64, string, bool, []byte, or nil for NULL, with other
+// integer and float types converted.
+//
 // Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 // runs in one engine transaction and rolls back entirely on error.
 package sql
@@ -87,9 +97,47 @@ type Result struct {
 	RowsAffected int
 }
 
-// Exec parses and executes one SQL statement.
-func (d *DB) Exec(query string) (*Result, error) {
+// Exec parses and executes one SQL statement, binding args to its
+// $1-style placeholders (the statement's highest $n and len(args)
+// must agree).
+func (d *DB) Exec(query string, args ...any) (*Result, error) {
 	st, err := Parse(query)
+	if err != nil {
+		return nil, err
+	}
+	return d.run(st, args)
+}
+
+// Prepare parses a statement once for repeated execution with
+// per-call parameter values.
+func (d *DB) Prepare(query string) (*Stmt, error) {
+	st, err := Parse(query)
+	if err != nil {
+		return nil, err
+	}
+	return &Stmt{db: d, st: st, n: numParams(st)}, nil
+}
+
+// Stmt is a prepared statement. Execution binds parameters into a
+// copy of the parsed form, so a Stmt may be executed any number of
+// times and is safe for concurrent use.
+type Stmt struct {
+	db *DB
+	st Statement
+	n  int
+}
+
+// NumParams is the number of values Exec expects: the statement's
+// highest $n.
+func (s *Stmt) NumParams() int { return s.n }
+
+// Exec executes the prepared statement with args bound to its
+// placeholders.
+func (s *Stmt) Exec(args ...any) (*Result, error) { return s.db.run(s.st, args) }
+
+// run binds args into st and dispatches it.
+func (d *DB) run(st Statement, args []any) (*Result, error) {
+	st, err := bindParams(st, args)
 	if err != nil {
 		return nil, err
 	}

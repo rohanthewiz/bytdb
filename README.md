@@ -12,7 +12,7 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–7: a working relational store, queryable in SQL.
+Milestones 1–9: a working relational store, queryable in SQL.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -40,9 +40,10 @@ Milestones 1–7: a working relational store, queryable in SQL.
   name gets a fresh ID so stale data can never resurface.
 - **SQL frontend** — the `sql` package parses, plans, and executes a
   small Postgres-flavored dialect over the engine: full DDL, INSERT,
-  single-table SELECT/UPDATE/DELETE with a planner that pushes WHERE
-  predicates down to point gets and bounded key scans, plus
-  aggregates with GROUP BY and HAVING.
+  SELECT/UPDATE/DELETE with a planner that pushes WHERE predicates
+  down to point gets and bounded key scans, aggregates with GROUP BY
+  and HAVING, INNER/LEFT/CROSS joins executed as index nested loops,
+  and prepared statements with `$1`-style parameters.
 
 ## Example
 
@@ -119,11 +120,18 @@ ALTER TABLE t ADD COLUMN c type | DROP COLUMN c
 CREATE [UNIQUE] INDEX idx ON t (c, ...)
 DROP INDEX idx [ON t]
 INSERT INTO t [(cols)] VALUES (...), (...)
-SELECT * | items FROM t [WHERE ...] [GROUP BY ...] [HAVING ...]
+SELECT * | items FROM tables [WHERE ...] [GROUP BY ...] [HAVING ...]
        [ORDER BY item [DESC], ...] [LIMIT n] [OFFSET n]
 UPDATE t SET c = v, ... [WHERE ...]
 DELETE FROM t [WHERE ...]
 ```
+
+`FROM` names one table or a left-deep chain of joins — `a [AS] x
+[INNER] JOIN b ON x.id = b.a_id`, `LEFT [OUTER] JOIN`, `CROSS JOIN`
+(a comma is a cross join) — with qualified column references and
+`t.*`. Joins run as nested loops, but equality conjuncts re-bind per
+outer row, so an inner table joined on its primary key or an indexed
+column is a point get or bounded scan per row, not a full scan.
 
 Select items are columns or aggregates — `COUNT(*)`, `COUNT(c)`,
 `SUM(c)`, `AVG(c)`, `MIN(c)`, `MAX(c)` — with SQL semantics
@@ -153,12 +161,23 @@ filtered full scan. The whole condition is also re-checked row by
 row, so pushdown only narrows what is visited — correctness never
 depends on it.
 
+Statements take `$1`-style parameters wherever a literal may appear —
+`Exec` binds its trailing arguments, and `Prepare` parses once for
+repeated execution:
+
+```go
+res, err = db.Exec(`SELECT name FROM users WHERE city = $1 AND age > $2`, "london", 30)
+
+st, err := db.Prepare(`INSERT INTO users VALUES ($1, $2, $3, $4)`)
+_, err = st.Exec(3, "alan", 41, "london") // re-executable; safe for concurrent use
+```
+
 Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 runs in one engine transaction and rolls back entirely on error.
-Deferred, roughly in order: joins, prepared statements (`$1`
-placeholders already lex), and a `bytdb-pgwire` module speaking the
-Postgres wire protocol — the embedded `Exec` result shape (columns +
-types + rows) is exactly what that layer needs.
+Deferred: a `bytdb-pgwire` module speaking the Postgres wire
+protocol — the embedded `Exec` result shape (columns + types + rows)
+is exactly what that layer needs, and prepared statements map onto
+its Parse/Bind/Execute messages.
 
 ## How it maps onto the key space
 
@@ -208,7 +227,9 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 5**: SQL frontend — a hand-rolled Postgres-flavored dialect (zero new dependencies): lexer → recursive-descent parser → planner with filter pushdown to point gets and bounded key scans → executor over engine transactions
 - [x] **Milestone 6**: aggregates — COUNT/SUM/AVG/MIN/MAX, GROUP BY (hash aggregation keyed by the order-preserving tuple encoding, so groups emit in order), HAVING, ORDER BY over grouped columns and aggregates
 - [x] **Milestone 7**: boolean expressions — AND/OR/NOT with parentheses in WHERE and HAVING, SQL three-valued logic, pushdown restricted to top-level AND conjuncts
-- [ ] Later: joins, prepared statements, a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
+- [x] **Milestone 8**: joins — INNER/LEFT/CROSS as left-deep nested loops with per-outer-row re-binding of equality conjuncts (index nested loop), qualified column references, `t.*`
+- [x] **Milestone 9**: prepared statements — `$1` parameters in WHERE/ON/HAVING, INSERT, and UPDATE SET; variadic `Exec` and `Prepare`/`Stmt` that re-bind into a copy per execution
+- [ ] Later: a Postgres wire-protocol module; DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN
 
 ## Design notes
 

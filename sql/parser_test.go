@@ -270,13 +270,48 @@ func TestParseErrors(t *testing.T) {
 	for _, src := range []string{
 		`select * from t where a = null`,      // must use IS NULL
 		`select * from t where 1 = 2`,         // literal-literal compare
-		`select * from t where a = $1`,        // placeholders not yet supported
 		`select * from t limit -1`,            // negative limit
 		`select * from t; select * from t`,    // one statement per call
 		`insert into t (a, a) values (1, 2)`,  // duplicate column
 		`update t set a = 1, a = 2`,           // duplicate SET column
 		`alter table t add c int primary key`, // can't add a pk column
 		`bogus`,                               // not a statement
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Errorf("Parse(%q): expected error", src)
+		}
+	}
+}
+
+func TestParseParams(t *testing.T) {
+	// Placeholders parse wherever a literal may appear; a literal-first
+	// comparison still flips.
+	s := mustParse(t, `select * from t where a = $1 and $2 < b`).(*Select)
+	want := and(cpred("a", OpEQ, Param(1)), cpred("b", OpGT, Param(2)))
+	if !reflect.DeepEqual(s.Where, BoolExpr(want)) {
+		t.Fatalf("got %#v", s.Where)
+	}
+
+	ins := mustParse(t, `insert into t values ($1, $2), ($3, 'x')`).(*Insert)
+	if !reflect.DeepEqual(ins.Rows, [][]any{{Param(1), Param(2)}, {Param(3), "x"}}) {
+		t.Fatalf("got %#v", ins.Rows)
+	}
+
+	u := mustParse(t, `update t set a = $2 where b = $1`).(*Update)
+	if u.Set["a"] != Param(2) || !reflect.DeepEqual(u.Where, BoolExpr(cpred("b", OpEQ, Param(1)))) {
+		t.Fatalf("got %#v", u)
+	}
+
+	h := mustParse(t, `select count(*) from t having count(*) > $1`).(*Select)
+	if !reflect.DeepEqual(h.Having, BoolExpr(apred(SelectItem{Agg: AggCount, Star: true}, OpGT, Param(1)))) {
+		t.Fatalf("got %#v", h.Having)
+	}
+
+	for _, src := range []string{
+		`select * from t where a = $0`,  // params are 1-based
+		`select * from t where a = -$1`, // no unary minus on a param
+		`select * from t limit $1`,      // LIMIT takes a literal count
+		`select * from t offset $1`,
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%q): expected error", src)

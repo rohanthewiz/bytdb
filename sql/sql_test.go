@@ -441,6 +441,125 @@ func TestSQLAggregateErrors(t *testing.T) {
 	}
 }
 
+func TestSQLParams(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+
+	// Go integers normalize to int64 before comparison and storage.
+	res, err := d.Exec(`select name from users where city = $1 and age > $2 order by name`, "london", 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.Rows, [][]any{{"ada"}, {"alan"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// The same parameter may be used more than once.
+	res, err = d.Exec(`select id from users where age = $1 or id = $1`, 41)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(3)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// INSERT, UPDATE, and DELETE take parameters; nil is SQL NULL.
+	if res, err = d.Exec(`insert into users values ($1, $2, $3, $4)`, 6, "linus", 55, nil); err != nil || res.RowsAffected != 1 {
+		t.Fatalf("insert: %v %v", res, err)
+	}
+	res, err = d.Exec(`select name from users where id = $1 and city is null`, 6)
+	if err != nil || len(res.Rows) != 1 || res.Rows[0][0] != "linus" {
+		t.Fatalf("got %v, %v", res, err)
+	}
+	if res, err = d.Exec(`update users set city = $1 where id = $2`, "helsinki", 6); err != nil || res.RowsAffected != 1 {
+		t.Fatalf("update: %v %v", res, err)
+	}
+	if res, err = d.Exec(`delete from users where id = $1`, 6); err != nil || res.RowsAffected != 1 {
+		t.Fatalf("delete: %v %v", res, err)
+	}
+
+	// A nil parameter in a comparison is NULL: unknown, never a match.
+	res, err = d.Exec(`select id from users where city = $1`, nil)
+	if err != nil || len(res.Rows) != 0 {
+		t.Fatalf("got %v, %v", res, err)
+	}
+
+	// Parameters bind in join ON conditions and in HAVING.
+	exec(t, d, `create table orders (id int primary key, user_id int, total int)`)
+	exec(t, d, `insert into orders values (1, 1, 40), (2, 1, 60), (3, 2, 90)`)
+	res, err = d.Exec(`select u.name, o.total from users u join orders o
+		on u.id = o.user_id and o.total > $1 order by o.total`, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.Rows, [][]any{{"ada", int64(60)}, {"grace", int64(90)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	res, err = d.Exec(`select city, count(*) from users group by city having count(*) >= $1 order by city`, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.Rows, [][]any{{"london", int64(2)}, {"nyc", int64(2)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Arity and argument types are checked.
+	for _, bad := range []func() (*Result, error){
+		func() (*Result, error) { return d.Exec(`select * from users where id = $1`) },
+		func() (*Result, error) { return d.Exec(`select * from users where id = $1`, 1, 2) },
+		func() (*Result, error) { return d.Exec(`select * from users`, 1) },
+		func() (*Result, error) { return d.Exec(`select * from users where id = $1`, struct{}{}) },
+	} {
+		if _, err := bad(); err == nil {
+			t.Error("expected error")
+		}
+	}
+}
+
+func TestSQLPrepare(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+
+	st, err := d.Prepare(`select name from users where city = $1 order by name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.NumParams() != 1 {
+		t.Fatalf("NumParams: got %d", st.NumParams())
+	}
+	london := [][]any{{"ada"}, {"alan"}}
+	res, err := st.Exec("london")
+	if err != nil || !reflect.DeepEqual(res.Rows, london) {
+		t.Fatalf("got %v, %v", res, err)
+	}
+	res, err = st.Exec("nyc")
+	if err != nil || !reflect.DeepEqual(res.Rows, [][]any{{"barbara"}, {"grace"}}) {
+		t.Fatalf("got %v, %v", res, err)
+	}
+	// Re-binding starts from the parsed form: earlier values don't stick.
+	res, err = st.Exec("london")
+	if err != nil || !reflect.DeepEqual(res.Rows, london) {
+		t.Fatalf("rerun got %v, %v", res, err)
+	}
+	if _, err := st.Exec(); err == nil {
+		t.Error("expected arity error")
+	}
+
+	ins, err := d.Prepare(`insert into users values ($1, $2, $3, $4)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, name := range []string{"ken", "dennis"} {
+		if res, err := ins.Exec(10+i, name, 70, "murray hill"); err != nil || res.RowsAffected != 1 {
+			t.Fatalf("insert %s: %v %v", name, res, err)
+		}
+	}
+	res = exec(t, d, `select count(*) from users where city = 'murray hill'`)
+	if res.Rows[0][0] != int64(2) {
+		t.Fatalf("got %v", res.Rows)
+	}
+}
+
 func TestSQLErrors(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)
