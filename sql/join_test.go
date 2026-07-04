@@ -209,7 +209,7 @@ func TestJoinPushdown(t *testing.T) {
 		var fp *fromPlan
 		if err := d.e.ReadTxn(func(tx *bytdb.Txn) error {
 			var err error
-			fp, err = prepareFrom(tx, s.From, s.Where)
+			fp, err = prepareFrom(d.lookup(tx.Table), s.From, s.Where)
 			return err
 		}); err != nil {
 			t.Fatal(err)

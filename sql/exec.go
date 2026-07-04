@@ -3,6 +3,7 @@ package sql
 import (
 	"bytes"
 	"cmp"
+	"fmt"
 	"iter"
 	"slices"
 
@@ -229,19 +230,29 @@ func btoi(b bool) int {
 
 func (d *DB) execSelect(s *Select) (*Result, error) {
 	res := &Result{}
-	var rows [][]any // full combined rows; projected after sort/limit
-	var ords []int   // projected column ordinals
+	var rows [][]any     // full combined rows; projected after sort/limit
+	var proj []projEntry // projected column ordinals and literals
 	var keys []sortKey
 	err := d.e.ReadTxn(func(tx *bytdb.Txn) error {
-		fp, err := prepareFrom(tx, s.From, s.Where)
+		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
 		if err != nil {
 			return err
 		}
 		sc := fp.sc
-		if ords, err = projectSelect(sc, s, res); err != nil {
+		if proj, err = projectSelect(sc, s, res); err != nil {
 			return err
 		}
 		for _, o := range s.OrderBy {
+			if o.IsLit { // ORDER BY n: a select-list position
+				pe, err := ordinalEntry(o.Lit, proj)
+				if err != nil {
+					return err
+				}
+				if pe.ord >= 0 {
+					keys = append(keys, sortKey{pe.ord, o.Desc})
+				}
+				continue // a literal output is a constant key: no effect
+			}
 			ord, err := sc.resolve(o.Col)
 			if err != nil {
 				return err
@@ -284,9 +295,13 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 	}
 	res.Rows = make([][]any, len(rows))
 	for i, r := range rows {
-		out := make([]any, len(ords))
-		for j, ord := range ords {
-			out[j] = r[ord]
+		out := make([]any, len(proj))
+		for j, pe := range proj {
+			if pe.ord < 0 {
+				out[j] = pe.lit
+			} else {
+				out[j] = r[pe.ord]
+			}
 		}
 		res.Rows[i] = out
 	}
@@ -298,25 +313,41 @@ type sortKey struct {
 	desc bool
 }
 
+// projEntry is one projected output: a combined-row ordinal, or a
+// literal (ord < 0).
+type projEntry struct {
+	ord int
+	lit any
+}
+
 // projectSelect resolves a non-aggregate select list against the FROM
-// scope: the combined-row ordinals to output, with the column names
-// and types appended to res.
-func projectSelect(sc *scope, s *Select, res *Result) (ords []int, err error) {
+// scope: the projection entries, with the column names and types
+// appended to res.
+func projectSelect(sc *scope, s *Select, res *Result) (proj []projEntry, err error) {
 	project := func(st scopeTable) {
 		for i, c := range st.desc.Columns {
-			ords = append(ords, st.off+i)
+			proj = append(proj, projEntry{ord: st.off + i})
 			res.Cols = append(res.Cols, c.Name)
 			res.Types = append(res.Types, c.Type)
 		}
 	}
 	if s.Star {
+		if len(sc.tables) == 0 {
+			return nil, serr.New("SELECT * requires a FROM clause")
+		}
 		for _, st := range sc.tables {
 			project(st)
 		}
-		return ords, nil
+		return proj, nil
 	}
 	for _, it := range s.Items {
-		if it.Star { // t.*
+		switch {
+		case it.IsLit:
+			proj = append(proj, projEntry{ord: -1, lit: it.Lit})
+			res.Cols = append(res.Cols, it.LitName)
+			res.Types = append(res.Types, litType(it.Lit))
+			continue
+		case it.Star: // t.*
 			st, err := sc.table(it.Col.Table)
 			if err != nil {
 				return nil, err
@@ -328,12 +359,40 @@ func projectSelect(sc *scope, s *Select, res *Result) (ords []int, err error) {
 		if err != nil {
 			return nil, err
 		}
-		ords = append(ords, ord)
+		proj = append(proj, projEntry{ord: ord})
 		c := sc.column(ord)
 		res.Cols = append(res.Cols, c.Name)
 		res.Types = append(res.Types, c.Type)
 	}
-	return ords, nil
+	return proj, nil
+}
+
+// litType is the column type a literal select item reports.
+func litType(v any) bytdb.ColType {
+	switch v.(type) {
+	case int64:
+		return bytdb.TInt
+	case float64:
+		return bytdb.TFloat
+	case bool:
+		return bytdb.TBool
+	case []byte:
+		return bytdb.TBytes
+	}
+	return bytdb.TString // strings and NULL
+}
+
+// ordinalEntry resolves ORDER BY n to the n-th projection entry.
+func ordinalEntry(lit any, proj []projEntry) (projEntry, error) {
+	n, ok := lit.(int64)
+	if !ok {
+		return projEntry{}, serr.New("non-integer constant in ORDER BY")
+	}
+	if n < 1 || int(n) > len(proj) {
+		return projEntry{}, serr.New("ORDER BY position is not in the select list",
+			"position", fmt.Sprint(n))
+	}
+	return proj[n-1], nil
 }
 
 // orderCmp is compareVals for sorting: NULLs order last ascending

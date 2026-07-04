@@ -111,7 +111,7 @@ func (p *parser) statement() (Statement, error) {
 	case p.acceptKw("drop"):
 		switch {
 		case p.acceptKw("table"):
-			name, err := p.ident("a table name")
+			name, err := p.tableName()
 			if err != nil {
 				return nil, err
 			}
@@ -137,7 +137,7 @@ func (p *parser) statement() (Statement, error) {
 // --- DDL ---
 
 func (p *parser) createTable() (Statement, error) {
-	name, err := p.ident("a table name")
+	name, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +265,7 @@ func (p *parser) createIndex(unique bool) (Statement, error) {
 	if err := p.expectKw("on"); err != nil {
 		return nil, err
 	}
-	table, err := p.ident("a table name")
+	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +283,7 @@ func (p *parser) dropIndex() (Statement, error) {
 	}
 	di := &DropIndex{Name: name}
 	if p.acceptKw("on") {
-		if di.Table, err = p.ident("a table name"); err != nil {
+		if di.Table, err = p.tableName(); err != nil {
 			return nil, err
 		}
 	}
@@ -294,7 +294,7 @@ func (p *parser) alterTable() (Statement, error) {
 	if err := p.expectKw("table"); err != nil {
 		return nil, err
 	}
-	table, err := p.ident("a table name")
+	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +326,7 @@ func (p *parser) insert() (Statement, error) {
 	if err := p.expectKw("into"); err != nil {
 		return nil, err
 	}
-	table, err := p.ident("a table name")
+	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
@@ -388,12 +388,11 @@ func (p *parser) selectStmt() (Statement, error) {
 			}
 		}
 	}
-	if err := p.expectKw("from"); err != nil {
-		return nil, err
-	}
 	var err error
-	if s.From, err = p.fromClause(); err != nil {
-		return nil, err
+	if p.acceptKw("from") { // FROM is optional: SELECT 1, SELECT version()
+		if s.From, err = p.fromClause(); err != nil {
+			return nil, err
+		}
 	}
 	if p.acceptKw("where") {
 		if s.Where, err = p.boolExpr(false); err != nil {
@@ -474,7 +473,7 @@ func (p *parser) nonNegInt(clause string) (int64, error) {
 }
 
 func (p *parser) update() (Statement, error) {
-	table, err := p.ident("a table name")
+	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
@@ -514,7 +513,7 @@ func (p *parser) deleteStmt() (Statement, error) {
 	if err := p.expectKw("from"); err != nil {
 		return nil, err
 	}
-	table, err := p.ident("a table name")
+	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
@@ -608,9 +607,66 @@ var noAlias = map[string]bool{
 	"values": true, "returning": true,
 }
 
+// tableName parses a table name with an optional schema qualifier:
+// public.t normalizes to t; pg_catalog.t and information_schema.t
+// stay qualified (they name the virtual system catalog); any other
+// schema is an error.
+func (p *parser) tableName() (string, error) {
+	first, err := p.ident("a table name")
+	if err != nil {
+		return "", err
+	}
+	if !p.acceptOp(".") {
+		return first, nil
+	}
+	name, err := p.ident("a table name")
+	if err != nil {
+		return "", err
+	}
+	switch first {
+	case "public":
+		return name, nil
+	case "pg_catalog", "information_schema":
+		return first + "." + name, nil
+	}
+	return "", serr.New("no such schema", "schema", first)
+}
+
+// tokAt is the token n places ahead (saturating at EOF).
+func (p *parser) tokAt(n int) token {
+	if p.i+n >= len(p.toks) {
+		return p.toks[len(p.toks)-1]
+	}
+	return p.toks[p.i+n]
+}
+
+// sysFuncCall folds a whitelisted zero-argument function call —
+// version(), current_schema(), ..., optionally pg_catalog-qualified —
+// to its constant. ok reports whether a call was consumed (or began
+// and failed).
+func (p *parser) sysFuncCall() (val, name string, ok bool, err error) {
+	t := p.cur()
+	if t.kind != tIdent {
+		return "", "", false, nil
+	}
+	name, at := t.text, 0
+	if name == "pg_catalog" && p.peekOpAt(1, ".") && p.tokAt(2).kind == tIdent {
+		name, at = p.tokAt(2).text, 2
+	}
+	v, isFn := sysFuncs[name]
+	if !isFn || !p.peekOpAt(at+1, "(") {
+		return "", "", false, nil
+	}
+	p.i += at + 2 // the name (with any qualifier) and '('
+	if err := p.expectOp(")"); err != nil {
+		return "", "", true, serr.Wrap(err, "msg", name+" takes no arguments")
+	}
+	return v, name, true, nil
+}
+
 // tableRef parses "t", "t alias", or "t AS alias".
 func (p *parser) tableRef() (FromItem, error) {
-	name, err := p.ident("a table name")
+	name, err := p.tableName()
 	if err != nil {
 		return FromItem{}, err
 	}
@@ -655,11 +711,28 @@ func (p *parser) selectListItem() (SelectItem, error) {
 	return p.selectItem()
 }
 
-// selectItem parses one select-list or ORDER BY entry: a column, or
-// an aggregate call fn(col) / COUNT(*). An identifier that happens to
-// share an aggregate's name stays a column unless a '(' follows.
+// selectItem parses one select-list or ORDER BY entry: a column, an
+// aggregate call fn(col) / COUNT(*), a literal (in ORDER BY an
+// integer literal is a select-list position), or a folded system
+// function call. An identifier that happens to share an aggregate's
+// name stays a column unless a '(' follows.
 func (p *parser) selectItem() (SelectItem, error) {
+	if v, name, ok, err := p.sysFuncCall(); err != nil {
+		return SelectItem{}, err
+	} else if ok {
+		return SelectItem{IsLit: true, Lit: v, LitName: name}, nil
+	}
 	t := p.cur()
+	if t.kind == tNumber || t.kind == tString ||
+		(t.kind == tOp && (t.text == "-" || t.text == "+")) ||
+		(t.kind == tIdent && (t.text == "true" || t.text == "false" || t.text == "null")) {
+		v, err := p.literal()
+		return SelectItem{IsLit: true, Lit: v, LitName: "?column?"}, err
+	}
+	if t.kind == tParam {
+		return SelectItem{}, serr.New("placeholders are not supported in the select list",
+			"param", t.text, "pos", fmt.Sprint(t.pos))
+	}
 	if t.kind == tIdent && aggNames[t.text] != AggNone && p.peekOp("(") {
 		fn := aggNames[t.text]
 		p.advance() // function name
@@ -816,6 +889,11 @@ func (p *parser) predOperand(allowAgg bool) (item SelectItem, val any, isItem bo
 		}
 		item, err = p.selectItem()
 		return item, nil, true, err
+	}
+	if v, _, ok, err := p.sysFuncCall(); err != nil {
+		return SelectItem{}, nil, false, err
+	} else if ok {
+		return SelectItem{}, v, false, nil
 	}
 	if t.kind == tIdent || t.kind == tQIdent {
 		col, err := p.colRef()

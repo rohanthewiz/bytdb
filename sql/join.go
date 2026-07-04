@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"strings"
+
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
@@ -16,26 +18,33 @@ type scope struct {
 type scopeTable struct {
 	name string // what qualifiers match: the alias, or the table name
 	desc *bytdb.TableDesc
-	off  int // this table's first ordinal in the combined row
+	off  int     // this table's first ordinal in the combined row
+	rows [][]any // materialized rows of a virtual system table; nil for real tables
 }
 
-func buildScope(lookup func(string) *bytdb.TableDesc, items []FromItem) (*scope, error) {
+func buildScope(lookup tableLookup, items []FromItem) (*scope, error) {
 	sc := &scope{}
 	seen := map[string]bool{}
 	for _, it := range items {
-		desc := lookup(it.Table)
+		desc, rows := lookup(it.Table)
 		if desc == nil {
 			return nil, serr.New("no such table", "table", it.Table)
 		}
 		name := it.Alias
 		if name == "" {
+			// A schema-qualified system table is referenced by its bare
+			// name (pg_catalog.pg_class c aside, ON n.oid = ... uses
+			// pg_class.oid), as in Postgres.
 			name = it.Table
+			if _, bare, ok := strings.Cut(name, "."); ok {
+				name = bare
+			}
 		}
 		if seen[name] {
 			return nil, serr.New("table name appears twice in FROM; alias one of them", "name", name)
 		}
 		seen[name] = true
-		sc.tables = append(sc.tables, scopeTable{name: name, desc: desc, off: sc.width})
+		sc.tables = append(sc.tables, scopeTable{name: name, desc: desc, off: sc.width, rows: rows})
 		sc.width += len(desc.Columns)
 	}
 	return sc, nil
@@ -176,8 +185,8 @@ type predTmpl struct {
 // table's scan; WHERE conjuncts narrow a table's scan only when the
 // table is not NULL-extended (the right side of a LEFT JOIN), where
 // they must wait for the post-join filter.
-func prepareFrom(tx *bytdb.Txn, items []FromItem, where BoolExpr) (*fromPlan, error) {
-	sc, err := buildScope(tx.Table, items)
+func prepareFrom(lk tableLookup, items []FromItem, where BoolExpr) (*fromPlan, error) {
+	sc, err := buildScope(lk, items)
 	if err != nil {
 		return nil, err
 	}
@@ -263,31 +272,44 @@ func (j *joinRun) rec(k int, partial []any) {
 
 	matched := false
 	if !skip {
-		var expr BoolExpr
-		switch {
-		case len(exprs) == 1:
-			expr = exprs[0]
-		case len(exprs) > 1:
-			expr = &And{Exprs: exprs}
-		}
-		pl, err := planScan(step.st.desc, step.st.name, expr)
-		if err != nil {
-			j.err = err
-			return
-		}
-		err = scanPlan(j.tx, step.it.Table, pl, func(r bytdb.Row) bool {
-			vals := make([]any, len(partial)+len(r.Vals))
+		next := func(rowVals []any) bool {
+			vals := make([]any, len(partial)+len(rowVals))
 			copy(vals, partial)
-			copy(vals[len(partial):], r.Vals)
+			copy(vals[len(partial):], rowVals)
 			if step.it.On != nil && evalPreds(step.it.On, j.fp.b, vals) != triTrue {
 				return true
 			}
 			matched = true
 			j.rec(k+1, vals)
 			return !j.stop && j.err == nil
-		})
-		if err != nil && j.err == nil {
-			j.err = err
+		}
+		if step.st.rows != nil {
+			// A virtual system table: no pushdown, just its
+			// materialized rows — ON and WHERE still filter fully.
+			for _, rv := range step.st.rows {
+				if !next(rv) {
+					break
+				}
+			}
+		} else {
+			var expr BoolExpr
+			switch {
+			case len(exprs) == 1:
+				expr = exprs[0]
+			case len(exprs) > 1:
+				expr = &And{Exprs: exprs}
+			}
+			pl, err := planScan(step.st.desc, step.st.name, expr)
+			if err != nil {
+				j.err = err
+				return
+			}
+			err = scanPlan(j.tx, step.it.Table, pl, func(r bytdb.Row) bool {
+				return next(r.Vals)
+			})
+			if err != nil && j.err == nil {
+				j.err = err
+			}
 		}
 		if j.stop || j.err != nil {
 			return

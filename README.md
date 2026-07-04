@@ -12,8 +12,9 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–10: a working relational store, queryable in SQL — in
-process or over the Postgres wire protocol.
+Milestones 1–11: a working relational store, queryable in SQL — in
+process or over the Postgres wire protocol, with enough system
+catalog for clients to introspect it.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -50,6 +51,11 @@ process or over the Postgres wire protocol.
   extended query protocols, text and binary formats, inferred
   parameter types, and structured errors with SQLSTATE codes and
   error positions.
+- **system catalog** — virtual `pg_catalog` and `information_schema`
+  tables synthesized from the engine catalog, so clients and ORMs
+  introspect with the queries they already send (GORM's `HasTable`,
+  the pg_attribute/pg_type join, `SELECT version()`), all read-only
+  and flowing through the ordinary join and aggregate machinery.
 
 ## Example
 
@@ -182,6 +188,33 @@ st, err := db.Prepare(`INSERT INTO users VALUES ($1, $2, $3, $4)`)
 _, err = st.Exec(3, "alan", 41, "london") // re-executable; safe for concurrent use
 ```
 
+For introspection there is a virtual system catalog:
+`pg_catalog.pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, and
+`pg_index`, plus `information_schema.tables` and `columns`, all
+synthesized from the engine catalog on the fly and queryable like any
+tables — WHERE, joins, and aggregates included — but read-only. Table
+names may be schema-qualified (`public.t` is `t`; bare `pg_class`
+resolves because pg_catalog is on the search path). `SELECT` works
+without FROM (`SELECT 1`), a small whitelist of zero-argument
+functions folds to constants (`version()`, `current_schema()`,
+`current_database()`, ...), and `ORDER BY 1, 2` addresses select-list
+positions. That covers real client probes verbatim:
+
+```sql
+SELECT count(*) FROM information_schema.tables
+WHERE table_schema = CURRENT_SCHEMA() AND table_name = $1
+  AND table_type = 'BASE TABLE'            -- GORM HasTable
+
+SELECT a.attname, t.typname, a.attnotnull
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+WHERE c.relname = $1 ORDER BY a.attnum     -- column introspection
+```
+
+(psql's `\dt` still wants `CASE`, `IN`, and `!~` — expression-language
+work on the roadmap.)
+
 Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 runs in one engine transaction and rolls back entirely on error.
 
@@ -284,7 +317,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 8**: joins — INNER/LEFT/CROSS as left-deep nested loops with per-outer-row re-binding of equality conjuncts (index nested loop), qualified column references, `t.*`
 - [x] **Milestone 9**: prepared statements — `$1` parameters in WHERE/ON/HAVING, INSERT, and UPDATE SET; variadic `Exec` and `Prepare`/`Stmt` that re-bind into a copy per execution
 - [x] **Milestone 10**: Postgres wire protocol — the `pgwire` nested module: startup/auth handshake, simple + extended query protocols mapped onto `Prepare`/`Describe`/`Exec` (with parameter-type inference and catalog-computed result shapes), text + binary formats, structured errors with SQLSTATE and positions; plus Postgres-style untyped-literal coercion in the dialect
-- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, transaction blocks over the wire, `pg_catalog` for ORMs
+- [x] **Milestone 11**: system catalog — virtual `pg_catalog` + `information_schema` tables from the engine catalog through the ordinary executor; schema-qualified names, SELECT without FROM, literal select items, folded zero-arg functions (`version()`, `current_schema()`, ...), ORDER BY ordinals; catalog writes rejected
+- [ ] Later: expression language (CASE, IN, `~`/`!~`, casts — what psql's `\d` still needs), DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, transaction blocks over the wire
 
 ## Design notes
 

@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/rohanthewiz/bytdb"
@@ -157,6 +158,9 @@ func resolveAgg(sc *scope, s *Select) (*aggQuery, error) {
 	}
 	accIdx := map[accKey]int{}
 	ref := func(it SelectItem) (aggRef, error) {
+		if it.IsLit {
+			return aggRef{}, serr.New("literals are not supported in aggregate queries")
+		}
 		if it.Agg == AggNone {
 			if it.Star {
 				return aggRef{}, serr.New("t.* is not allowed in an aggregate query", "table", it.Col.Table)
@@ -223,6 +227,18 @@ func resolveAgg(sc *scope, s *Select) (*aggQuery, error) {
 		return nil, err
 	}
 	for _, o := range s.OrderBy {
+		if o.IsLit { // ORDER BY n: a select-list position
+			n, ok := o.Lit.(int64)
+			if !ok {
+				return nil, serr.New("non-integer constant in ORDER BY")
+			}
+			if n < 1 || int(n) > len(q.outputs) {
+				return nil, serr.New("ORDER BY position is not in the select list",
+					"position", fmt.Sprint(n))
+			}
+			q.sorts = append(q.sorts, aggSortKey{ref: q.outputs[n-1], desc: o.Desc})
+			continue
+		}
 		r, err := ref(o.SelectItem)
 		if err != nil {
 			return nil, err
@@ -283,7 +299,7 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	var q *aggQuery
 	groups := map[string]*group{}
 	err := d.e.ReadTxn(func(tx *bytdb.Txn) error {
-		fp, err := prepareFrom(tx, s.From, s.Where)
+		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
 		if err != nil {
 			return err
 		}

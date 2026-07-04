@@ -37,10 +37,10 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 			info.Params[p-1] = t
 		}
 	}
-	lookup := s.db.e.Table
+	lk := s.db.lookup(s.db.e.Table)
 	switch st := s.st.(type) {
 	case *Insert:
-		desc := lookup(st.Table)
+		desc, _ := lk(st.Table)
 		if desc == nil {
 			return nil, serr.New("no such table", "table", st.Table)
 		}
@@ -66,7 +66,7 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 			}
 		}
 	case *Update:
-		sc, err := buildScope(lookup, []FromItem{{Table: st.Table}})
+		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
 		if err != nil {
 			return nil, err
 		}
@@ -82,7 +82,7 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 			return nil, err
 		}
 	case *Delete:
-		sc, err := buildScope(lookup, []FromItem{{Table: st.Table}})
+		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
 		if err != nil {
 			return nil, err
 		}
@@ -90,7 +90,7 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 			return nil, err
 		}
 	case *Select:
-		sc, err := buildScope(lookup, st.From)
+		sc, err := buildScope(lk, st.From)
 		if err != nil {
 			return nil, err
 		}

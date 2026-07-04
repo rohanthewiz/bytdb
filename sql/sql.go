@@ -64,6 +64,19 @@
 // likewise for float, bool, and bytea columns), erroring when the
 // text does not parse as the column's type.
 //
+// For introspection, the virtual system catalog serves
+// pg_catalog.pg_namespace, pg_class, pg_attribute, pg_type, and
+// pg_index, plus information_schema.tables and columns, synthesized
+// from the engine catalog and queryable like any tables (read-only;
+// their names are reserved). Table names may be schema-qualified —
+// public.t is t; pg_catalog members also resolve bare, as on
+// Postgres's search path. SELECT works without FROM over literal
+// select items (SELECT 1), a whitelist of zero-argument functions
+// folds to constants wherever a literal fits (version(),
+// current_database(), current_schema(), current_user(),
+// session_user(), optionally pg_catalog-qualified), and ORDER BY
+// takes select-list positions (ORDER BY 1, 2).
+//
 // Statements may use $1-style placeholders wherever a literal may
 // appear: comparison values in WHERE, ON, and HAVING, INSERT values,
 // and UPDATE SET values (LIMIT and OFFSET take literal counts only).
@@ -147,6 +160,9 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		return nil, err
 	}
 	if st, err = d.coerceLiterals(st); err != nil {
+		return nil, err
+	}
+	if err := sysWriteGuard(writeTarget(st)); err != nil {
 		return nil, err
 	}
 	switch s := st.(type) {

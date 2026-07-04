@@ -27,10 +27,10 @@ import (
 // converted to their column's value kind, copying whatever it
 // changes; statements with nothing to coerce pass through as is.
 func (d *DB) coerceLiterals(st Statement) (Statement, error) {
-	lookup := d.e.Table
+	lk := d.lookup(d.e.Table)
 	switch s := st.(type) {
 	case *Insert:
-		desc := lookup(s.Table)
+		desc, _ := lk(s.Table)
 		if desc == nil {
 			return st, nil
 		}
@@ -66,7 +66,7 @@ func (d *DB) coerceLiterals(st Statement) (Statement, error) {
 		}
 		return &c, nil
 	case *Update:
-		desc := lookup(s.Table)
+		desc, _ := lk(s.Table)
 		if desc == nil {
 			return st, nil
 		}
@@ -82,7 +82,7 @@ func (d *DB) coerceLiterals(st Statement) (Statement, error) {
 				c.Set[name] = cv
 			}
 		}
-		sc, err := buildScope(lookup, []FromItem{{Table: s.Table}})
+		sc, err := buildScope(lk, []FromItem{{Table: s.Table}})
 		if err != nil {
 			return &c, nil
 		}
@@ -91,7 +91,7 @@ func (d *DB) coerceLiterals(st Statement) (Statement, error) {
 		}
 		return &c, nil
 	case *Delete:
-		sc, err := buildScope(lookup, []FromItem{{Table: s.Table}})
+		sc, err := buildScope(lk, []FromItem{{Table: s.Table}})
 		if err != nil {
 			return st, nil
 		}
@@ -103,7 +103,7 @@ func (d *DB) coerceLiterals(st Statement) (Statement, error) {
 		c.Where = where
 		return &c, nil
 	case *Select:
-		sc, err := buildScope(lookup, s.From)
+		sc, err := buildScope(lk, s.From)
 		if err != nil {
 			return st, nil
 		}

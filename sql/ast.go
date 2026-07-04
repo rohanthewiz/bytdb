@@ -117,12 +117,16 @@ func (c ColRef) String() string {
 }
 
 // SelectItem is one select-list entry: a plain column, an aggregate
-// over a column, COUNT(*) (Agg with Star), or t.* (Star with
-// Col.Table, select lists only).
+// over a column, COUNT(*) (Agg with Star), t.* (Star with Col.Table,
+// select lists only), or a literal (IsLit; select lists only —
+// parsed literals and folded zero-argument functions like version()).
 type SelectItem struct {
-	Col  ColRef
-	Agg  AggFunc
-	Star bool
+	Col     ColRef
+	Agg     AggFunc
+	Star    bool
+	IsLit   bool
+	Lit     any
+	LitName string // output column name; "?column?" for plain literals
 }
 
 // ColDef is one column of a CREATE TABLE or ALTER TABLE ADD COLUMN.
