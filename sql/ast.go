@@ -17,6 +17,10 @@ const (
 	OpGE
 	OpIsNull
 	OpIsNotNull
+	OpRegex     // ~   POSIX regex match
+	OpNotRegex  // !~
+	OpRegexI    // ~*  case-insensitive
+	OpNotRegexI // !~*
 )
 
 // Param is a $n placeholder (1-based), parsed wherever a literal may
@@ -46,10 +50,184 @@ type Pred struct {
 	RItem *SelectItem // column (in HAVING: aggregate) right side; nil when comparing with Val
 }
 
+// Cond is a leaf evaluated by the general expression evaluator: any
+// condition the legacy Pred shape cannot express (function calls,
+// CASE, IN, casts, subqueries, bare boolean operands, ...). Cond
+// leaves never push into scans; they filter rows after retrieval.
+type Cond struct{ Ex Expr }
+
 func (*And) boolExpr()  {}
 func (*Or) boolExpr()   {}
 func (*Not) boolExpr()  {}
 func (*Pred) boolExpr() {}
+func (*Cond) boolExpr() {}
+
+// Expr is a general scalar expression, evaluated per row with
+// eval-time name resolution (an unresolved column falls back to the
+// enclosing query's scope, which is what makes correlated subqueries
+// work). Boolean operators are expressions too, so one grammar parses
+// every context; simple shapes are lowered back to Pred/SelectItem
+// after parsing to keep index pushdown and literal coercion.
+type Expr interface{ expr() }
+
+// ExLit is a literal value or a $n Param; Name is the output column
+// name a folded system function carries ("" reads as "?column?").
+type ExLit struct {
+	Val  any
+	Name string
+}
+
+// ExCol is a column reference.
+type ExCol struct{ Col ColRef }
+
+// ExAgg is an aggregate call inside an expression; only supported
+// where the legacy paths accept aggregates (it errors elsewhere).
+type ExAgg struct {
+	Fn   AggFunc
+	Col  ColRef
+	Star bool
+}
+
+// ExAnd / ExOr / ExNot are boolean operators within an expression.
+type ExAnd struct{ Exprs []Expr }
+type ExOr struct{ Exprs []Expr }
+type ExNot struct{ E Expr }
+
+// ExCmp compares two subexpressions (including the regex operators).
+type ExCmp struct {
+	Op   PredOp
+	L, R Expr
+}
+
+// ExAny is L op ANY(R); parsed for compatibility, unsupported at
+// evaluation (bytdb has no arrays).
+type ExAny struct {
+	Op   PredOp
+	L, R Expr
+}
+
+// ExIsNull is E IS [NOT] NULL.
+type ExIsNull struct {
+	E   Expr
+	Not bool
+}
+
+// ExIn is E [NOT] IN (list...).
+type ExIn struct {
+	E    Expr
+	List []Expr
+	Not  bool
+}
+
+// ExCase is both CASE forms: with Operand, each When compares = to
+// it; without, each When is a boolean condition. A missing ELSE is
+// NULL.
+type ExCase struct {
+	Operand Expr
+	Whens   []ExWhen
+	Else    Expr
+}
+
+type ExWhen struct{ When, Then Expr }
+
+// ExFunc is a function call by (lowercased, unqualified) name.
+// Unknown functions parse fine and error only if evaluated.
+type ExFunc struct {
+	Name string
+	Args []Expr
+}
+
+// ExCast is E::type; Type is the lowercased base name, keeping a
+// trailing "[]" for array types (which parse but do not evaluate).
+type ExCast struct {
+	E    Expr
+	Type string
+}
+
+// ExIndex is E[Idx]; parses, does not evaluate (no arrays).
+type ExIndex struct{ E, Idx Expr }
+
+// ExArith is arithmetic or string concatenation: + - * / % ||.
+// A unary minus parses as 0 - E.
+type ExArith struct {
+	Op   string
+	L, R Expr
+}
+
+// ExSub is a scalar subquery, executed lazily per row with the
+// enclosing scopes visible for correlation.
+type ExSub struct{ Sel *Select }
+
+// walkExpr visits e and its subexpressions pre-order; visit returning
+// false skips a node's children. A subquery's own expressions are not
+// entered — an *ExSub is visited as a leaf (callers that care recurse
+// into its Select themselves).
+func walkExpr(e Expr, visit func(Expr) bool) {
+	if e == nil || !visit(e) {
+		return
+	}
+	switch n := e.(type) {
+	case *ExAnd:
+		for _, sub := range n.Exprs {
+			walkExpr(sub, visit)
+		}
+	case *ExOr:
+		for _, sub := range n.Exprs {
+			walkExpr(sub, visit)
+		}
+	case *ExNot:
+		walkExpr(n.E, visit)
+	case *ExCmp:
+		walkExpr(n.L, visit)
+		walkExpr(n.R, visit)
+	case *ExAny:
+		walkExpr(n.L, visit)
+		walkExpr(n.R, visit)
+	case *ExIsNull:
+		walkExpr(n.E, visit)
+	case *ExIn:
+		walkExpr(n.E, visit)
+		for _, sub := range n.List {
+			walkExpr(sub, visit)
+		}
+	case *ExCase:
+		walkExpr(n.Operand, visit)
+		for _, w := range n.Whens {
+			walkExpr(w.When, visit)
+			walkExpr(w.Then, visit)
+		}
+		walkExpr(n.Else, visit)
+	case *ExFunc:
+		for _, a := range n.Args {
+			walkExpr(a, visit)
+		}
+	case *ExCast:
+		walkExpr(n.E, visit)
+	case *ExIndex:
+		walkExpr(n.E, visit)
+		walkExpr(n.Idx, visit)
+	case *ExArith:
+		walkExpr(n.L, visit)
+		walkExpr(n.R, visit)
+	}
+}
+
+func (*ExLit) expr()    {}
+func (*ExCol) expr()    {}
+func (*ExAgg) expr()    {}
+func (*ExAnd) expr()    {}
+func (*ExOr) expr()     {}
+func (*ExNot) expr()    {}
+func (*ExCmp) expr()    {}
+func (*ExAny) expr()    {}
+func (*ExIsNull) expr() {}
+func (*ExIn) expr()     {}
+func (*ExCase) expr()   {}
+func (*ExFunc) expr()   {}
+func (*ExCast) expr()   {}
+func (*ExIndex) expr()  {}
+func (*ExArith) expr()  {}
+func (*ExSub) expr()    {}
 
 // walkPreds visits every leaf predicate in the tree.
 func walkPreds(e BoolExpr, visit func(*Pred) error) error {
@@ -118,8 +296,9 @@ func (c ColRef) String() string {
 
 // SelectItem is one select-list entry: a plain column, an aggregate
 // over a column, COUNT(*) (Agg with Star), t.* (Star with Col.Table,
-// select lists only), or a literal (IsLit; select lists only —
-// parsed literals and folded zero-argument functions like version()).
+// select lists only), a literal (IsLit — parsed literals and folded
+// zero-argument functions like version()), or, when none of those
+// shapes fit, a general expression (Ex non-nil), evaluated per row.
 type SelectItem struct {
 	Col     ColRef
 	Agg     AggFunc
@@ -127,6 +306,8 @@ type SelectItem struct {
 	IsLit   bool
 	Lit     any
 	LitName string // output column name; "?column?" for plain literals
+	Ex      Expr   // general expression; nil for the legacy shapes
+	As      string // output alias from AS (or a bare alias); "" for none
 }
 
 // ColDef is one column of a CREATE TABLE or ALTER TABLE ADD COLUMN.
@@ -195,14 +376,20 @@ const (
 // item after the first joins to the combination of all items before
 // it. The first item's Join and On are unset; CROSS JOIN has no On.
 type FromItem struct {
-	Table string
-	Alias string // "" : referenced by the table name
-	Join  JoinType
-	On    BoolExpr
+	Table    string
+	Alias    string // "" : referenced by the table name
+	Join     JoinType
+	On       BoolExpr
+	FuncArgs []Expr // non-nil: a set-returning function call in FROM —
+	// parses (psql writes them inside never-evaluated subqueries) but
+	// errors if the scan is ever built
 }
 
 // Select is SELECT over one table or a chain of joins. A query with
 // any aggregate item, a GROUP BY, or a HAVING is an aggregate query.
+// A non-empty Union makes this the first arm of a UNION chain;
+// OrderBy, Limit, and Offset then apply to the combined result, and
+// the arms' own OrderBy/Limit/Offset are unset.
 type Select struct {
 	From    []FromItem
 	Star    bool
@@ -213,6 +400,14 @@ type Select struct {
 	OrderBy []OrderItem
 	Limit   int64 // -1: no limit
 	Offset  int64
+	Union   []UnionArm
+}
+
+// UnionArm is one UNION [ALL] continuation, combined left to right:
+// a distinct arm dedups everything accumulated so far, per SQL.
+type UnionArm struct {
+	All bool
+	Sel *Select
 }
 
 // Update is UPDATE t SET col = lit, ... [WHERE ...].

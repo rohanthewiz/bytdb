@@ -373,6 +373,64 @@ func (p *parser) insert() (Statement, error) {
 }
 
 func (p *parser) selectStmt() (Statement, error) {
+	s, err := p.selectCore()
+	if err != nil {
+		return nil, err
+	}
+	// UNION [ALL] chains; ORDER BY / LIMIT / OFFSET then apply to the
+	// combined result.
+	for p.acceptKw("union") {
+		all := p.acceptKw("all")
+		if err := p.expectKw("select"); err != nil {
+			return nil, err
+		}
+		arm, err := p.selectCore()
+		if err != nil {
+			return nil, err
+		}
+		s.Union = append(s.Union, UnionArm{All: all, Sel: arm})
+	}
+	if p.acceptKw("order") {
+		if err := p.expectKw("by"); err != nil {
+			return nil, err
+		}
+		for {
+			si, err := p.selectItem()
+			if err != nil {
+				return nil, err
+			}
+			item := OrderItem{SelectItem: si}
+			if p.acceptKw("desc") {
+				item.Desc = true
+			} else {
+				p.acceptKw("asc")
+			}
+			s.OrderBy = append(s.OrderBy, item)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	for {
+		switch {
+		case p.acceptKw("limit"):
+			if s.Limit, err = p.nonNegInt("LIMIT"); err != nil {
+				return nil, err
+			}
+		case p.acceptKw("offset"):
+			if s.Offset, err = p.nonNegInt("OFFSET"); err != nil {
+				return nil, err
+			}
+		default:
+			return s, nil
+		}
+	}
+}
+
+// selectCore parses one SELECT's items, FROM, WHERE, GROUP BY, and
+// HAVING — the part a UNION arm owns; ORDER BY, LIMIT, and OFFSET
+// belong to the whole statement.
+func (p *parser) selectCore() (*Select, error) {
 	s := &Select{Limit: -1}
 	if p.acceptOp("*") {
 		s.Star = true
@@ -419,41 +477,7 @@ func (p *parser) selectStmt() (Statement, error) {
 			return nil, err
 		}
 	}
-	if p.acceptKw("order") {
-		if err := p.expectKw("by"); err != nil {
-			return nil, err
-		}
-		for {
-			si, err := p.selectItem()
-			if err != nil {
-				return nil, err
-			}
-			item := OrderItem{SelectItem: si}
-			if p.acceptKw("desc") {
-				item.Desc = true
-			} else {
-				p.acceptKw("asc")
-			}
-			s.OrderBy = append(s.OrderBy, item)
-			if !p.acceptOp(",") {
-				break
-			}
-		}
-	}
-	for {
-		switch {
-		case p.acceptKw("limit"):
-			if s.Limit, err = p.nonNegInt("LIMIT"); err != nil {
-				return nil, err
-			}
-		case p.acceptKw("offset"):
-			if s.Offset, err = p.nonNegInt("OFFSET"); err != nil {
-				return nil, err
-			}
-		default:
-			return s, nil
-		}
-	}
+	return s, nil
 }
 
 func (p *parser) nonNegInt(clause string) (int64, error) {
@@ -664,13 +688,34 @@ func (p *parser) sysFuncCall() (val, name string, ok bool, err error) {
 	return v, name, true, nil
 }
 
-// tableRef parses "t", "t alias", or "t AS alias".
+// tableRef parses "t", "t alias", or "t AS alias". A function call in
+// FROM (generate_series(...) s) parses too — psql writes them inside
+// subqueries that never run — but errors if its scan is ever built.
 func (p *parser) tableRef() (FromItem, error) {
 	name, err := p.tableName()
 	if err != nil {
 		return FromItem{}, err
 	}
 	it := FromItem{Table: name}
+	if p.cur().kind == tOp && p.cur().text == "(" {
+		p.advance()
+		it.FuncArgs = []Expr{}
+		if !p.acceptOp(")") {
+			for {
+				a, err := p.expression()
+				if err != nil {
+					return FromItem{}, err
+				}
+				it.FuncArgs = append(it.FuncArgs, a)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return FromItem{}, err
+			}
+		}
+	}
 	if p.acceptKw("as") {
 		if it.Alias, err = p.ident("an alias"); err != nil {
 			return FromItem{}, err
@@ -697,7 +742,16 @@ func (p *parser) colRef() (ColRef, error) {
 	return ColRef{Table: first, Name: name}, nil
 }
 
-// selectListItem parses one select-list entry: selectItem, plus t.*.
+// itemEnd is the keywords that cannot follow a select item as a bare
+// output alias; an alias spelled like one needs AS or double quotes.
+var itemEnd = map[string]bool{
+	"from": true, "where": true, "group": true, "having": true,
+	"order": true, "limit": true, "offset": true, "union": true,
+	"as": true,
+}
+
+// selectListItem parses one select-list entry: t.*, or an expression
+// with an optional [AS] output alias.
 func (p *parser) selectListItem() (SelectItem, error) {
 	if t := p.cur(); (t.kind == tIdent || t.kind == tQIdent) && p.peekOpAt(1, ".") && p.peekOpAt(2, "*") {
 		qual, err := p.ident("a table name")
@@ -708,52 +762,47 @@ func (p *parser) selectListItem() (SelectItem, error) {
 		p.advance() // *
 		return SelectItem{Col: ColRef{Table: qual}, Star: true}, nil
 	}
-	return p.selectItem()
+	item, err := p.selectItem()
+	if err != nil {
+		return item, err
+	}
+	if p.acceptKw("as") {
+		item.As, err = p.ident("an output name")
+	} else if t := p.cur(); t.kind == tQIdent || (t.kind == tIdent && !itemEnd[t.text]) {
+		item.As, err = p.ident("an output name")
+	}
+	return item, err
 }
 
-// selectItem parses one select-list or ORDER BY entry: a column, an
-// aggregate call fn(col) / COUNT(*), a literal (in ORDER BY an
-// integer literal is a select-list position), or a folded system
-// function call. An identifier that happens to share an aggregate's
-// name stays a column unless a '(' follows.
+// selectItem parses one select-list or ORDER BY entry through the
+// expression grammar, lowering the simple shapes — a column, an
+// aggregate call, a literal (in ORDER BY an integer literal is a
+// select-list position) — to their legacy item kinds; anything richer
+// stays a general expression.
 func (p *parser) selectItem() (SelectItem, error) {
-	if v, name, ok, err := p.sysFuncCall(); err != nil {
+	e, err := p.expression()
+	if err != nil {
 		return SelectItem{}, err
-	} else if ok {
-		return SelectItem{IsLit: true, Lit: v, LitName: name}, nil
 	}
-	t := p.cur()
-	if t.kind == tNumber || t.kind == tString ||
-		(t.kind == tOp && (t.text == "-" || t.text == "+")) ||
-		(t.kind == tIdent && (t.text == "true" || t.text == "false" || t.text == "null")) {
-		v, err := p.literal()
-		return SelectItem{IsLit: true, Lit: v, LitName: "?column?"}, err
-	}
-	if t.kind == tParam {
-		return SelectItem{}, serr.New("placeholders are not supported in the select list",
-			"param", t.text, "pos", fmt.Sprint(t.pos))
-	}
-	if t.kind == tIdent && aggNames[t.text] != AggNone && p.peekOp("(") {
-		fn := aggNames[t.text]
-		p.advance() // function name
-		p.advance() // (
-		item := SelectItem{Agg: fn}
-		if fn == AggCount && p.acceptOp("*") {
-			item.Star = true
-		} else {
-			col, err := p.colRef()
-			if err != nil {
-				return SelectItem{}, err
-			}
-			item.Col = col
+	return lowerItem(e), nil
+}
+
+// lowerItem maps an expression to a select item, keeping the legacy
+// shapes where they fit.
+func lowerItem(e Expr) SelectItem {
+	switch n := e.(type) {
+	case *ExCol:
+		return SelectItem{Col: n.Col}
+	case *ExAgg:
+		return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}
+	case *ExLit:
+		name := n.Name
+		if name == "" {
+			name = "?column?"
 		}
-		if err := p.expectOp(")"); err != nil {
-			return SelectItem{}, err
-		}
-		return item, nil
+		return SelectItem{IsLit: true, Lit: n.Val, LitName: name}
 	}
-	col, err := p.colRef()
-	return SelectItem{Col: col}, err
+	return SelectItem{Ex: e}
 }
 
 // peekOp reports whether the token after the current one is op.
@@ -768,165 +817,584 @@ func (p *parser) peekOpAt(n int, op string) bool {
 	return t.kind == tOp && t.text == op
 }
 
-// --- boolean expressions (WHERE / HAVING) ---
+// --- expressions ---
 
-// boolExpr parses a boolean expression with SQL precedence — OR
-// binds loosest, then AND, then NOT, then predicates; parentheses
-// group. allowAgg permits aggregate calls in predicates (HAVING).
+// boolExpr parses a condition (WHERE, ON, HAVING) through the
+// expression grammar, then lowers it: AND/OR/NOT map to the legacy
+// tree, simple comparisons become Pred leaves (keeping index pushdown
+// and literal coercion), and everything else becomes a Cond leaf for
+// the expression evaluator. allowAgg permits aggregate calls (HAVING).
 func (p *parser) boolExpr(allowAgg bool) (BoolExpr, error) {
-	e, err := p.boolAnd(allowAgg)
+	e, err := p.expression()
+	if err != nil {
+		return nil, err
+	}
+	if !allowAgg {
+		if fn := findAgg(e); fn != AggNone {
+			return nil, serr.New("aggregates are not allowed in WHERE; use HAVING", "function", fn.name())
+		}
+	}
+	return lowerBool(e)
+}
+
+func lowerBool(e Expr) (BoolExpr, error) {
+	switch n := e.(type) {
+	case *ExAnd:
+		out := &And{Exprs: make([]BoolExpr, len(n.Exprs))}
+		for i, sub := range n.Exprs {
+			var err error
+			if out.Exprs[i], err = lowerBool(sub); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	case *ExOr:
+		out := &Or{Exprs: make([]BoolExpr, len(n.Exprs))}
+		for i, sub := range n.Exprs {
+			var err error
+			if out.Exprs[i], err = lowerBool(sub); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	case *ExNot:
+		sub, err := lowerBool(n.E)
+		if err != nil {
+			return nil, err
+		}
+		return &Not{Expr: sub}, nil
+	case *ExIsNull:
+		if it, ok := simpleItem(n.E); ok {
+			op := OpIsNull
+			if n.Not {
+				op = OpIsNotNull
+			}
+			return &Pred{Item: it, Op: op}, nil
+		}
+		return &Cond{Ex: n}, nil
+	case *ExCmp:
+		lIt, lOK := simpleItem(n.L)
+		rIt, rOK := simpleItem(n.R)
+		lLit, lIsLit := n.L.(*ExLit)
+		rLit, rIsLit := n.R.(*ExLit)
+		switch {
+		case lOK && rOK:
+			r := rIt
+			return &Pred{Item: lIt, Op: n.Op, RItem: &r}, nil
+		case lOK && rIsLit:
+			if rLit.Val == nil {
+				return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
+			}
+			return &Pred{Item: lIt, Op: n.Op, Val: rLit.Val}, nil
+		case rOK && lIsLit && flippable(n.Op):
+			if lLit.Val == nil {
+				return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
+			}
+			return &Pred{Item: rIt, Op: flip(n.Op), Val: lLit.Val}, nil
+		}
+		// Anything else — including WHERE 1 = 1 — evaluates per row.
+		return &Cond{Ex: n}, nil
+	}
+	return &Cond{Ex: e}, nil
+}
+
+// simpleItem recognizes the operands the legacy Pred shape carries: a
+// plain column or an aggregate call.
+func simpleItem(e Expr) (SelectItem, bool) {
+	switch n := e.(type) {
+	case *ExCol:
+		return SelectItem{Col: n.Col}, true
+	case *ExAgg:
+		return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}, true
+	}
+	return SelectItem{}, false
+}
+
+// findAgg reports an aggregate call anywhere in an expression, not
+// descending into subqueries (their aggregates are their own).
+func findAgg(e Expr) AggFunc {
+	found := AggNone
+	walkExpr(e, func(sub Expr) bool {
+		if _, isSub := sub.(*ExSub); isSub {
+			return false
+		}
+		if a, ok := sub.(*ExAgg); ok && found == AggNone {
+			found = a.Fn
+		}
+		return true
+	})
+	return found
+}
+
+// flippable reports whether a comparison can mirror across its
+// operands (the regex operators cannot).
+func flippable(op PredOp) bool {
+	switch op {
+	case OpEQ, OpNE, OpLT, OpLE, OpGT, OpGE:
+		return true
+	}
+	return false
+}
+
+// expression parses a full scalar/boolean expression: OR binds
+// loosest, then AND, NOT, comparisons (with IS NULL, IN, ANY, and
+// COLLATE postfixes), additive (+ - ||), multiplicative (* / %),
+// unary sign, and the :: cast and [] subscript postfixes.
+func (p *parser) expression() (Expr, error) { return p.exprOr() }
+
+func (p *parser) exprOr() (Expr, error) {
+	e, err := p.exprAnd()
 	if err != nil {
 		return nil, err
 	}
 	for p.acceptKw("or") {
-		r, err := p.boolAnd(allowAgg)
+		r, err := p.exprAnd()
 		if err != nil {
 			return nil, err
 		}
-		if or, ok := e.(*Or); ok {
+		if or, ok := e.(*ExOr); ok {
 			or.Exprs = append(or.Exprs, r)
 		} else {
-			e = &Or{Exprs: []BoolExpr{e, r}}
+			e = &ExOr{Exprs: []Expr{e, r}}
 		}
 	}
 	return e, nil
 }
 
-func (p *parser) boolAnd(allowAgg bool) (BoolExpr, error) {
-	e, err := p.boolNot(allowAgg)
+func (p *parser) exprAnd() (Expr, error) {
+	e, err := p.exprNot()
 	if err != nil {
 		return nil, err
 	}
 	for p.acceptKw("and") {
-		r, err := p.boolNot(allowAgg)
+		r, err := p.exprNot()
 		if err != nil {
 			return nil, err
 		}
-		if and, ok := e.(*And); ok {
+		if and, ok := e.(*ExAnd); ok {
 			and.Exprs = append(and.Exprs, r)
 		} else {
-			e = &And{Exprs: []BoolExpr{e, r}}
+			e = &ExAnd{Exprs: []Expr{e, r}}
 		}
 	}
 	return e, nil
 }
 
-func (p *parser) boolNot(allowAgg bool) (BoolExpr, error) {
+func (p *parser) exprNot() (Expr, error) {
 	if p.acceptKw("not") {
-		e, err := p.boolNot(allowAgg)
+		e, err := p.exprNot()
 		if err != nil {
 			return nil, err
 		}
-		return &Not{Expr: e}, nil
+		return &ExNot{E: e}, nil
 	}
-	if p.acceptOp("(") {
-		e, err := p.boolExpr(allowAgg)
+	return p.exprCmp()
+}
+
+// exprCmp parses an additive expression followed by comparison-level
+// postfixes: COLLATE (parsed and ignored), IS [NOT] NULL, [NOT] IN
+// (...), and one comparison operator — plain or OPERATOR-qualified —
+// whose right side may be ANY(...).
+func (p *parser) exprCmp() (Expr, error) {
+	e, err := p.exprAdd()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		switch {
+		case p.acceptKw("collate"):
+			if _, err := p.ident("a collation name"); err != nil {
+				return nil, err
+			}
+			if p.acceptOp(".") {
+				if _, err := p.ident("a collation name"); err != nil {
+					return nil, err
+				}
+			}
+		case p.acceptKw("is"):
+			not := p.acceptKw("not")
+			if err := p.expectKw("null"); err != nil {
+				return nil, err
+			}
+			e = &ExIsNull{E: e, Not: not}
+		case p.cur().kind == tIdent && p.cur().text == "in":
+			p.advance()
+			list, err := p.exprList()
+			if err != nil {
+				return nil, err
+			}
+			e = &ExIn{E: e, List: list}
+		case p.cur().kind == tIdent && p.cur().text == "not" &&
+			p.tokAt(1).kind == tIdent && p.tokAt(1).text == "in":
+			p.advance()
+			p.advance()
+			list, err := p.exprList()
+			if err != nil {
+				return nil, err
+			}
+			e = &ExIn{E: e, List: list, Not: true}
+		default:
+			op, ok, err := p.cmpOp()
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return e, nil
+			}
+			if t := p.cur(); t.kind == tIdent && t.text == "any" && p.peekOp("(") {
+				p.advance()
+				p.advance()
+				r, err := p.expression()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				e = &ExAny{Op: op, L: e, R: r}
+				continue
+			}
+			r, err := p.exprAdd()
+			if err != nil {
+				return nil, err
+			}
+			e = &ExCmp{Op: op, L: e, R: r}
+		}
+	}
+}
+
+// exprList parses "( expr [, expr]* )".
+func (p *parser) exprList() ([]Expr, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	var out []Expr
+	for {
+		e, err := p.expression()
 		if err != nil {
 			return nil, err
 		}
-		if err := p.expectOp(")"); err != nil {
+		out = append(out, e)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return out, p.expectOp(")")
+}
+
+func (p *parser) exprAdd() (Expr, error) {
+	e, err := p.exprMul()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		t := p.cur()
+		if t.kind != tOp || (t.text != "+" && t.text != "-" && t.text != "||") {
+			return e, nil
+		}
+		p.advance()
+		r, err := p.exprMul()
+		if err != nil {
 			return nil, err
+		}
+		e = &ExArith{Op: t.text, L: e, R: r}
+	}
+}
+
+func (p *parser) exprMul() (Expr, error) {
+	e, err := p.exprUnary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		t := p.cur()
+		if t.kind != tOp || (t.text != "*" && t.text != "/" && t.text != "%") {
+			return e, nil
+		}
+		p.advance()
+		r, err := p.exprUnary()
+		if err != nil {
+			return nil, err
+		}
+		e = &ExArith{Op: t.text, L: e, R: r}
+	}
+}
+
+func (p *parser) exprUnary() (Expr, error) {
+	t := p.cur()
+	if t.kind == tOp && (t.text == "-" || t.text == "+") {
+		// A signed number folds to a literal; any other operand
+		// becomes 0 - E (or passes through for unary +).
+		if p.tokAt(1).kind == tNumber {
+			v, err := p.literal()
+			return &ExLit{Val: v}, err
+		}
+		p.advance()
+		e, err := p.exprPostfix()
+		if err != nil {
+			return nil, err
+		}
+		if t.text == "-" {
+			return &ExArith{Op: "-", L: &ExLit{Val: int64(0)}, R: e}, nil
 		}
 		return e, nil
 	}
-	return p.predLeaf(allowAgg)
+	return p.exprPostfix()
 }
 
-// predLeaf parses one predicate: item op literal, item op item, or
-// item IS [NOT] NULL. A literal-first comparison is flipped so the
-// item is always on the left.
-func (p *parser) predLeaf(allowAgg bool) (BoolExpr, error) {
-	lItem, lVal, lIsItem, err := p.predOperand(allowAgg)
+func (p *parser) exprPostfix() (Expr, error) {
+	e, err := p.exprPrimary()
 	if err != nil {
 		return nil, err
 	}
-	if lIsItem && p.acceptKw("is") {
-		op := OpIsNull
-		if p.acceptKw("not") {
-			op = OpIsNotNull
+	for {
+		switch {
+		case p.acceptOp("::"):
+			typ, err := p.castType()
+			if err != nil {
+				return nil, err
+			}
+			e = &ExCast{E: e, Type: typ}
+		case p.acceptOp("["):
+			idx, err := p.expression()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("]"); err != nil {
+				return nil, err
+			}
+			e = &ExIndex{E: e, Idx: idx}
+		default:
+			return e, nil
 		}
-		if err := p.expectKw("null"); err != nil {
+	}
+}
+
+// castType parses [schema.]name[[]]; the schema qualifier drops, a
+// trailing [] is kept on the name.
+func (p *parser) castType() (string, error) {
+	name, err := p.ident("a type name")
+	if err != nil {
+		return "", err
+	}
+	if p.acceptOp(".") {
+		if name, err = p.ident("a type name"); err != nil {
+			return "", err
+		}
+	}
+	if name == "double" {
+		p.acceptKw("precision")
+		name = "float8"
+	}
+	if p.acceptOp("[") {
+		if err := p.expectOp("]"); err != nil {
+			return "", err
+		}
+		name += "[]"
+	}
+	return name, nil
+}
+
+func (p *parser) exprPrimary() (Expr, error) {
+	// Folded zero-argument system functions: version(), ...
+	if v, name, ok, err := p.sysFuncCall(); err != nil {
+		return nil, err
+	} else if ok {
+		return &ExLit{Val: v, Name: name}, nil
+	}
+	t := p.cur()
+	if t.kind == tNumber || t.kind == tString || t.kind == tParam ||
+		(t.kind == tIdent && (t.text == "true" || t.text == "false" || t.text == "null")) {
+		v, err := p.literal()
+		return &ExLit{Val: v}, err
+	}
+	if t.kind == tOp && t.text == "(" {
+		p.advance()
+		if c := p.cur(); c.kind == tIdent && c.text == "select" {
+			p.advance()
+			st, err := p.selectStmt()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			return &ExSub{Sel: st.(*Select)}, nil
+		}
+		e, err := p.expression()
+		if err != nil {
 			return nil, err
 		}
-		return &Pred{Item: lItem, Op: op}, nil
+		return e, p.expectOp(")")
 	}
-	op, err := p.cmpOp()
-	if err != nil {
-		return nil, err
-	}
-	rItem, rVal, rIsItem, err := p.predOperand(allowAgg)
-	if err != nil {
-		return nil, err
-	}
-	switch {
-	case lIsItem && rIsItem:
-		return &Pred{Item: lItem, Op: op, RItem: &rItem}, nil
-	case lIsItem:
-		if rVal == nil {
-			return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
-		}
-		return &Pred{Item: lItem, Op: op, Val: rVal}, nil
-	case rIsItem:
-		if lVal == nil {
-			return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
-		}
-		return &Pred{Item: rItem, Op: flip(op), Val: lVal}, nil
-	}
-	return nil, serr.New("a predicate cannot compare two literals")
-}
-
-// predOperand parses a column, an aggregate call (HAVING only), or a
-// literal.
-func (p *parser) predOperand(allowAgg bool) (item SelectItem, val any, isItem bool, err error) {
-	t := p.cur()
-	if t.kind == tIdent && (t.text == "true" || t.text == "false" || t.text == "null") {
-		val, err = p.literal()
-		return SelectItem{}, val, false, err
+	if t.kind == tIdent && t.text == "case" {
+		p.advance()
+		return p.caseExpr()
 	}
 	if t.kind == tIdent && aggNames[t.text] != AggNone && p.peekOp("(") {
-		if !allowAgg {
-			return SelectItem{}, nil, false, serr.New("aggregates are not allowed in WHERE; use HAVING", "function", t.text)
+		fn := aggNames[t.text]
+		p.advance() // function name
+		p.advance() // (
+		agg := &ExAgg{Fn: fn}
+		if fn == AggCount && p.acceptOp("*") {
+			agg.Star = true
+		} else {
+			col, err := p.colRef()
+			if err != nil {
+				return nil, err
+			}
+			agg.Col = col
 		}
-		item, err = p.selectItem()
-		return item, nil, true, err
+		return agg, p.expectOp(")")
 	}
-	if v, _, ok, err := p.sysFuncCall(); err != nil {
-		return SelectItem{}, nil, false, err
-	} else if ok {
-		return SelectItem{}, v, false, nil
+	if t.kind == tIdent && p.peekOp("(") {
+		name := t.text
+		p.advance()
+		return p.funcCall(name)
+	}
+	if t.kind == tIdent && p.peekOpAt(1, ".") && p.tokAt(2).kind == tIdent && p.peekOpAt(3, "(") {
+		// A schema-qualified function call; the schema drops.
+		name := p.tokAt(2).text
+		p.i += 3
+		return p.funcCall(name)
 	}
 	if t.kind == tIdent || t.kind == tQIdent {
 		col, err := p.colRef()
-		return SelectItem{Col: col}, nil, true, err
+		return &ExCol{Col: col}, err
 	}
-	val, err = p.literal()
-	return SelectItem{}, val, false, err
+	return nil, p.unexpected("an expression")
 }
 
-func (p *parser) cmpOp() (PredOp, error) {
+// funcCall parses the argument list of name(...); the caller has
+// consumed the name, cur is '('. An argument may itself be a bare
+// subquery — the ARRAY(SELECT ...) constructor psql writes (which,
+// like any unknown function, errors only if evaluated).
+func (p *parser) funcCall(name string) (Expr, error) {
+	p.advance() // (
+	f := &ExFunc{Name: name}
+	if p.acceptOp(")") {
+		return f, nil
+	}
+	for {
+		var a Expr
+		if t := p.cur(); t.kind == tIdent && t.text == "select" {
+			p.advance()
+			st, err := p.selectStmt()
+			if err != nil {
+				return nil, err
+			}
+			a = &ExSub{Sel: st.(*Select)}
+		} else {
+			var err error
+			if a, err = p.expression(); err != nil {
+				return nil, err
+			}
+		}
+		f.Args = append(f.Args, a)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return f, p.expectOp(")")
+}
+
+// caseExpr parses both CASE forms; "case" is consumed.
+func (p *parser) caseExpr() (Expr, error) {
+	c := &ExCase{}
+	if t := p.cur(); !(t.kind == tIdent && t.text == "when") {
+		op, err := p.expression()
+		if err != nil {
+			return nil, err
+		}
+		c.Operand = op
+	}
+	for {
+		if err := p.expectKw("when"); err != nil {
+			return nil, err
+		}
+		w, err := p.expression()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("then"); err != nil {
+			return nil, err
+		}
+		th, err := p.expression()
+		if err != nil {
+			return nil, err
+		}
+		c.Whens = append(c.Whens, ExWhen{When: w, Then: th})
+		if t := p.cur(); !(t.kind == tIdent && t.text == "when") {
+			break
+		}
+	}
+	if p.acceptKw("else") {
+		var err error
+		if c.Else, err = p.expression(); err != nil {
+			return nil, err
+		}
+	}
+	return c, p.expectKw("end")
+}
+
+// cmpOp consumes a comparison operator if one is next; ok is false
+// when the next token is not one. The OPERATOR(pg_catalog.op) form
+// reads as the operator it names.
+func (p *parser) cmpOp() (op PredOp, ok bool, err error) {
 	t := p.cur()
-	if t.kind == tOp {
-		var op PredOp
-		switch t.text {
-		case "=":
-			op = OpEQ
-		case "!=", "<>":
-			op = OpNE
-		case "<":
-			op = OpLT
-		case "<=":
-			op = OpLE
-		case ">":
-			op = OpGT
-		case ">=":
-			op = OpGE
-		default:
-			return 0, p.unexpected("a comparison operator")
+	if t.kind == tIdent && t.text == "operator" && p.peekOp("(") {
+		p.advance()
+		p.advance()
+		if p.cur().kind == tIdent {
+			if _, err := p.ident("an operator schema"); err != nil {
+				return 0, false, err
+			}
+			if err := p.expectOp("."); err != nil {
+				return 0, false, err
+			}
+		}
+		op, ok := predOpFor(p.cur())
+		if !ok {
+			return 0, false, p.unexpected("an operator")
 		}
 		p.advance()
-		return op, nil
+		return op, true, p.expectOp(")")
 	}
-	return 0, p.unexpected("a comparison operator")
+	op, ok = predOpFor(t)
+	if !ok {
+		return 0, false, nil
+	}
+	p.advance()
+	return op, true, nil
+}
+
+func predOpFor(t token) (PredOp, bool) {
+	if t.kind != tOp {
+		return 0, false
+	}
+	switch t.text {
+	case "=":
+		return OpEQ, true
+	case "!=", "<>":
+		return OpNE, true
+	case "<":
+		return OpLT, true
+	case "<=":
+		return OpLE, true
+	case ">":
+		return OpGT, true
+	case ">=":
+		return OpGE, true
+	case "~":
+		return OpRegex, true
+	case "!~":
+		return OpNotRegex, true
+	case "~*":
+		return OpRegexI, true
+	case "!~*":
+		return OpNotRegexI, true
+	}
+	return 0, false
 }
 
 // flip mirrors a comparison across its operands (5 < id  ==>  id > 5).

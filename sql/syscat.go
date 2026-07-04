@@ -39,9 +39,12 @@ func (d *DB) lookup(base func(string) *bytdb.TableDesc) tableLookup {
 			}
 		}
 		if st := sysLookup(name); st != nil {
-			rows := st.rows(d)
+			var rows [][]any
+			if st.rows != nil {
+				rows = st.rows(d)
+			}
 			if rows == nil {
-				rows = [][]any{}
+				rows = [][]any{} // non-nil marks the table virtual
 			}
 			return st.desc, rows
 		}
@@ -106,7 +109,7 @@ func writeTarget(st Statement) string {
 
 type sysTableDef struct {
 	desc *bytdb.TableDesc
-	rows func(d *DB) [][]any
+	rows func(d *DB) [][]any // nil: the table is always empty
 }
 
 func sysDesc(name string, cols ...bytdb.Column) *bytdb.TableDesc {
@@ -120,6 +123,13 @@ const (
 	oidPGCatalog  = int64(11)
 	oidPublic     = int64(2200)
 	oidInfoSchema = int64(13000)
+)
+
+// Access-method oids (Postgres's well-known values): every table
+// reads as heap, every index as btree.
+const (
+	amHeap  = int64(2)
+	amBtree = int64(403)
 )
 
 // typeOID is the pg_type oid a column type presents as.
@@ -197,12 +207,13 @@ func indexOID(tableID uint64, indexID uint64) int64 { return int64(tableID*1000 
 
 var sysTables = map[string]*sysTableDef{
 	"pg_catalog.pg_namespace": {
-		desc: sysDesc("pg_namespace", sysCol("oid", bytdb.TInt), sysCol("nspname", bytdb.TString)),
+		desc: sysDesc("pg_namespace", sysCol("oid", bytdb.TInt),
+			sysCol("nspname", bytdb.TString), sysCol("nspowner", bytdb.TInt)),
 		rows: func(*DB) [][]any {
 			return [][]any{
-				{oidPGCatalog, "pg_catalog"},
-				{oidPublic, "public"},
-				{oidInfoSchema, "information_schema"},
+				{oidPGCatalog, "pg_catalog", int64(10)},
+				{oidPublic, "public", int64(10)},
+				{oidInfoSchema, "information_schema", int64(10)},
 			}
 		},
 	},
@@ -212,11 +223,26 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("relnamespace", bytdb.TInt), sysCol("relkind", bytdb.TString),
 			sysCol("relowner", bytdb.TInt), sysCol("relpersistence", bytdb.TString),
 			sysCol("relhasindex", bytdb.TBool), sysCol("reltuples", bytdb.TFloat),
-			sysCol("relpages", bytdb.TInt)),
+			sysCol("relpages", bytdb.TInt),
+			// The columns \d reads and bytdb has no story for; constants.
+			sysCol("relam", bytdb.TInt), sysCol("relchecks", bytdb.TInt),
+			sysCol("relhasrules", bytdb.TBool), sysCol("relhastriggers", bytdb.TBool),
+			sysCol("relrowsecurity", bytdb.TBool), sysCol("relforcerowsecurity", bytdb.TBool),
+			sysCol("relispartition", bytdb.TBool), sysCol("reloftype", bytdb.TInt),
+			sysCol("reltablespace", bytdb.TInt), sysCol("relreplident", bytdb.TString),
+			sysCol("reltoastrelid", bytdb.TInt), sysCol("reloptions", bytdb.TString)),
 		rows: func(d *DB) [][]any {
 			var rows [][]any
 			rel := func(oid int64, name, kind string, hasIdx bool) {
-				rows = append(rows, []any{oid, name, oidPublic, kind, int64(10), "p", hasIdx, -1.0, int64(0)})
+				am := amHeap
+				if kind == "i" {
+					am = amBtree
+				}
+				rows = append(rows, []any{
+					oid, name, oidPublic, kind, int64(10), "p", hasIdx, -1.0, int64(0),
+					am, int64(0), false, false, false, false, false, int64(0),
+					int64(0), "d", int64(0), nil,
+				})
 			}
 			for _, desc := range d.userDescs() {
 				rel(int64(desc.ID), desc.Name, "r", len(desc.Indexes) > 0)
@@ -233,19 +259,37 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("attrelid", bytdb.TInt), sysCol("attname", bytdb.TString),
 			sysCol("atttypid", bytdb.TInt), sysCol("attlen", bytdb.TInt),
 			sysCol("attnum", bytdb.TInt), sysCol("attnotnull", bytdb.TBool),
-			sysCol("atthasdef", bytdb.TBool), sysCol("attisdropped", bytdb.TBool)),
+			sysCol("atthasdef", bytdb.TBool), sysCol("attisdropped", bytdb.TBool),
+			sysCol("atttypmod", bytdb.TInt), sysCol("attcollation", bytdb.TInt),
+			sysCol("attidentity", bytdb.TString), sysCol("attgenerated", bytdb.TString),
+			sysCol("attstorage", bytdb.TString), sysCol("attcompression", bytdb.TString),
+			sysCol("attstattarget", bytdb.TInt)),
 		rows: func(d *DB) [][]any {
 			var rows [][]any
+			attr := func(relid int64, num int, c bytdb.Column, notNull bool) {
+				rows = append(rows, []any{
+					relid, c.Name, typeOID(c.Type), typeLen(c.Type),
+					int64(num), notNull, false, false,
+					int64(-1), int64(0), "", "",
+					"p", "", int64(-1),
+				})
+			}
 			for _, desc := range d.userDescs() {
 				pk := map[int]bool{}
 				for _, o := range desc.PKCols {
 					pk[o] = true
 				}
 				for i, c := range desc.Columns {
-					rows = append(rows, []any{
-						int64(desc.ID), c.Name, typeOID(c.Type), typeLen(c.Type),
-						int64(i + 1), pk[i], false, false,
-					})
+					attr(int64(desc.ID), i+1, c, pk[i])
+				}
+				// Index relations list their key columns too (\d idx).
+				for i, o := range desc.PKCols {
+					attr(indexOID(desc.ID, 0), i+1, desc.Columns[o], false)
+				}
+				for _, ix := range desc.Indexes {
+					for i, o := range ix.Cols {
+						attr(indexOID(desc.ID, ix.ID), i+1, desc.Columns[o], false)
+					}
 				}
 			}
 			return rows
@@ -255,7 +299,8 @@ var sysTables = map[string]*sysTableDef{
 		desc: sysDesc("pg_type",
 			sysCol("oid", bytdb.TInt), sysCol("typname", bytdb.TString),
 			sysCol("typnamespace", bytdb.TInt), sysCol("typlen", bytdb.TInt),
-			sysCol("typtype", bytdb.TString), sysCol("typcategory", bytdb.TString)),
+			sysCol("typtype", bytdb.TString), sysCol("typcategory", bytdb.TString),
+			sysCol("typcollation", bytdb.TInt)),
 		rows: func(*DB) [][]any {
 			var rows [][]any
 			for _, t := range []struct {
@@ -269,7 +314,7 @@ var sysTables = map[string]*sysTableDef{
 				{25, "text", -1, "S"}, {26, "oid", 4, "N"}, {700, "float4", 4, "N"},
 				{701, "float8", 8, "N"}, {1043, "varchar", -1, "S"},
 			} {
-				rows = append(rows, []any{t.oid, t.name, oidPGCatalog, t.len, "b", t.cat})
+				rows = append(rows, []any{t.oid, t.name, oidPGCatalog, t.len, "b", t.cat, int64(0)})
 			}
 			return rows
 		},
@@ -278,7 +323,11 @@ var sysTables = map[string]*sysTableDef{
 		desc: sysDesc("pg_index",
 			sysCol("indexrelid", bytdb.TInt), sysCol("indrelid", bytdb.TInt),
 			sysCol("indisunique", bytdb.TBool), sysCol("indisprimary", bytdb.TBool),
-			sysCol("indnatts", bytdb.TInt), sysCol("indkey", bytdb.TString)),
+			sysCol("indnatts", bytdb.TInt), sysCol("indkey", bytdb.TString),
+			sysCol("indisclustered", bytdb.TBool), sysCol("indisvalid", bytdb.TBool),
+			sysCol("indisreplident", bytdb.TBool), sysCol("indnullsnotdistinct", bytdb.TBool),
+			sysCol("indimmediate", bytdb.TBool), sysCol("indcheckxmin", bytdb.TBool),
+			sysCol("indnkeyatts", bytdb.TInt), sysCol("indpred", bytdb.TString)),
 		rows: func(d *DB) [][]any {
 			var rows [][]any
 			attnums := func(ords []int) string {
@@ -292,16 +341,120 @@ var sysTables = map[string]*sysTableDef{
 				rows = append(rows, []any{
 					indexOID(desc.ID, 0), int64(desc.ID), true, true,
 					int64(len(desc.PKCols)), attnums(desc.PKCols),
+					false, true, false, false, true, false,
+					int64(len(desc.PKCols)), nil,
 				})
 				for _, ix := range desc.Indexes {
 					rows = append(rows, []any{
 						indexOID(desc.ID, ix.ID), int64(desc.ID), ix.Unique, false,
 						int64(len(ix.Cols)), attnums(ix.Cols),
+						false, true, false, false, true, false,
+						int64(len(ix.Cols)), nil,
 					})
 				}
 			}
 			return rows
 		},
+	},
+	// The tables below exist so psql's probes parse, bind, and return
+	// zero rows: bytdb has no access methods, defaults, collations,
+	// declared constraints (keys surface through pg_index), inheritance,
+	// policies, extended statistics, or publications.
+	"pg_catalog.pg_am": {
+		desc: sysDesc("pg_am",
+			sysCol("oid", bytdb.TInt), sysCol("amname", bytdb.TString),
+			sysCol("amtype", bytdb.TString)),
+		rows: func(*DB) [][]any {
+			return [][]any{{amHeap, "heap", "t"}, {amBtree, "btree", "i"}}
+		},
+	},
+	"pg_catalog.pg_attrdef": {
+		desc: sysDesc("pg_attrdef",
+			sysCol("oid", bytdb.TInt), sysCol("adrelid", bytdb.TInt),
+			sysCol("adnum", bytdb.TInt), sysCol("adbin", bytdb.TString)),
+	},
+	"pg_catalog.pg_collation": {
+		desc: sysDesc("pg_collation",
+			sysCol("oid", bytdb.TInt), sysCol("collname", bytdb.TString),
+			sysCol("collnamespace", bytdb.TInt)),
+	},
+	"pg_catalog.pg_constraint": {
+		desc: sysDesc("pg_constraint",
+			sysCol("oid", bytdb.TInt), sysCol("conname", bytdb.TString),
+			sysCol("connamespace", bytdb.TInt), sysCol("contype", bytdb.TString),
+			sysCol("condeferrable", bytdb.TBool), sysCol("condeferred", bytdb.TBool),
+			sysCol("convalidated", bytdb.TBool), sysCol("conrelid", bytdb.TInt),
+			sysCol("contypid", bytdb.TInt), sysCol("conindid", bytdb.TInt),
+			sysCol("conparentid", bytdb.TInt), sysCol("confrelid", bytdb.TInt),
+			sysCol("conkey", bytdb.TString), sysCol("confkey", bytdb.TString)),
+	},
+	"pg_catalog.pg_inherits": {
+		desc: sysDesc("pg_inherits",
+			sysCol("inhrelid", bytdb.TInt), sysCol("inhparent", bytdb.TInt),
+			sysCol("inhseqno", bytdb.TInt), sysCol("inhdetachpending", bytdb.TBool)),
+	},
+	"pg_catalog.pg_policy": {
+		desc: sysDesc("pg_policy",
+			sysCol("oid", bytdb.TInt), sysCol("polname", bytdb.TString),
+			sysCol("polrelid", bytdb.TInt), sysCol("polcmd", bytdb.TString),
+			sysCol("polpermissive", bytdb.TBool), sysCol("polroles", bytdb.TString),
+			sysCol("polqual", bytdb.TString), sysCol("polwithcheck", bytdb.TString)),
+	},
+	"pg_catalog.pg_statistic_ext": {
+		desc: sysDesc("pg_statistic_ext",
+			sysCol("oid", bytdb.TInt), sysCol("stxrelid", bytdb.TInt),
+			sysCol("stxname", bytdb.TString), sysCol("stxnamespace", bytdb.TInt),
+			sysCol("stxstattarget", bytdb.TInt), sysCol("stxkind", bytdb.TString)),
+	},
+	"pg_catalog.pg_publication": {
+		desc: sysDesc("pg_publication",
+			sysCol("oid", bytdb.TInt), sysCol("pubname", bytdb.TString),
+			sysCol("puballtables", bytdb.TBool), sysCol("pubinsert", bytdb.TBool),
+			sysCol("pubupdate", bytdb.TBool), sysCol("pubdelete", bytdb.TBool),
+			sysCol("pubtruncate", bytdb.TBool), sysCol("pubviaroot", bytdb.TBool)),
+	},
+	"pg_catalog.pg_publication_rel": {
+		desc: sysDesc("pg_publication_rel",
+			sysCol("oid", bytdb.TInt), sysCol("prpubid", bytdb.TInt),
+			sysCol("prrelid", bytdb.TInt), sysCol("prqual", bytdb.TString),
+			sysCol("prattrs", bytdb.TString)),
+	},
+	"pg_catalog.pg_database": {
+		desc: sysDesc("pg_database",
+			sysCol("oid", bytdb.TInt), sysCol("datname", bytdb.TString),
+			sysCol("datdba", bytdb.TInt), sysCol("encoding", bytdb.TInt),
+			sysCol("datlocprovider", bytdb.TString), sysCol("datcollate", bytdb.TString),
+			sysCol("datctype", bytdb.TString), sysCol("daticulocale", bytdb.TString),
+			sysCol("daticurules", bytdb.TString), sysCol("datacl", bytdb.TString),
+			sysCol("datistemplate", bytdb.TBool), sysCol("datallowconn", bytdb.TBool)),
+		rows: func(*DB) [][]any {
+			return [][]any{{int64(1), sysDatabase, int64(10), int64(6), "c",
+				"C", "C", nil, nil, nil, false, true}}
+		},
+	},
+	"pg_catalog.pg_roles": {
+		desc: sysDesc("pg_roles",
+			sysCol("oid", bytdb.TInt), sysCol("rolname", bytdb.TString),
+			sysCol("rolsuper", bytdb.TBool), sysCol("rolinherit", bytdb.TBool),
+			sysCol("rolcreaterole", bytdb.TBool), sysCol("rolcreatedb", bytdb.TBool),
+			sysCol("rolcanlogin", bytdb.TBool), sysCol("rolconnlimit", bytdb.TInt),
+			sysCol("rolvaliduntil", bytdb.TString), sysCol("rolreplication", bytdb.TBool),
+			sysCol("rolbypassrls", bytdb.TBool)),
+		rows: func(*DB) [][]any {
+			return [][]any{{int64(10), sysDatabase, true, true, true, true, true,
+				int64(-1), nil, false, false}}
+		},
+	},
+	"pg_catalog.pg_auth_members": {
+		desc: sysDesc("pg_auth_members",
+			sysCol("oid", bytdb.TInt), sysCol("roleid", bytdb.TInt),
+			sysCol("member", bytdb.TInt), sysCol("grantor", bytdb.TInt),
+			sysCol("admin_option", bytdb.TBool)),
+	},
+	"pg_catalog.pg_publication_namespace": {
+		desc: sysDesc("pg_publication_namespace",
+			sysCol("oid", bytdb.TInt), sysCol("pnpubid", bytdb.TInt),
+			sysCol("pnnspid", bytdb.TInt)),
 	},
 	"information_schema.tables": {
 		desc: sysDesc("tables",

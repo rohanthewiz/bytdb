@@ -121,6 +121,19 @@ func (d *DB) coerceLiterals(st Statement) (Statement, error) {
 		if c.Having, err = coerceBool(s.Having, itemType(sc)); err != nil {
 			return nil, err
 		}
+		// Union arms coerce independently against their own scopes.
+		// (Cond leaves and subqueries adapt dynamically at evaluation.)
+		if len(s.Union) > 0 {
+			c.Union = make([]UnionArm, len(s.Union))
+			copy(c.Union, s.Union)
+			for i := range c.Union {
+				armSt, err := d.coerceLiterals(c.Union[i].Sel)
+				if err != nil {
+					return nil, err
+				}
+				c.Union[i].Sel = armSt.(*Select)
+			}
+		}
 		return &c, nil
 	}
 	return st, nil

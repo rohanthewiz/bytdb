@@ -8,19 +8,29 @@ import (
 	"slices"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
 // scanPlan yields the rows a plan matches, in the chosen path's key
-// order, within tx's snapshot. yield returning false stops the scan.
-func scanPlan(tx *bytdb.Txn, table string, p *plan, yield func(bytdb.Row) bool) error {
+// order, within tx's snapshot. env supplies the evaluation
+// environment for any Cond leaves in the residual filter (nil when
+// the filter is known to hold none). yield returning false stops the
+// scan.
+func scanPlan(tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb.Row) bool) error {
 	if p.get != nil {
 		row, ok, err := tx.Get(table, p.get...)
 		if err != nil {
 			return err
 		}
-		if ok && p.matches(row) {
-			yield(row)
+		if ok {
+			hit, err := p.matches(env, row)
+			if err != nil {
+				return err
+			}
+			if hit {
+				yield(row)
+			}
 		}
 		return nil
 	}
@@ -37,7 +47,11 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, yield func(bytdb.Row) bool) 
 		if stopped(p.stops, row) {
 			return nil
 		}
-		if !p.matches(row) {
+		hit, err := p.matches(env, row)
+		if err != nil {
+			return err
+		}
+		if !hit {
 			continue
 		}
 		if !yield(row) {
@@ -99,61 +113,107 @@ func (t tri) not() tri {
 	return triUnknown
 }
 
-// evalBool evaluates a boolean expression; leaf values each Pred.
-// A nil expression is true (no WHERE / no HAVING).
-func evalBool(e BoolExpr, leaf func(*Pred) tri) tri {
+// evalBool evaluates a boolean expression; leaf values each Pred or
+// Cond leaf. A nil expression is true (no WHERE / no HAVING).
+func evalBool(e BoolExpr, leaf func(BoolExpr) (tri, error)) (tri, error) {
 	switch n := e.(type) {
 	case nil:
-		return triTrue
-	case *Pred:
-		return leaf(n)
+		return triTrue, nil
+	case *Pred, *Cond:
+		return leaf(e)
 	case *Not:
-		return evalBool(n.Expr, leaf).not()
+		t, err := evalBool(n.Expr, leaf)
+		return t.not(), err
 	case *And:
 		out := triTrue
 		for _, sub := range n.Exprs {
-			switch evalBool(sub, leaf) {
+			t, err := evalBool(sub, leaf)
+			if err != nil {
+				return triUnknown, err
+			}
+			switch t {
 			case triFalse:
-				return triFalse
+				return triFalse, nil
 			case triUnknown:
 				out = triUnknown
 			}
 		}
-		return out
+		return out, nil
 	case *Or:
 		out := triFalse
 		for _, sub := range n.Exprs {
-			switch evalBool(sub, leaf) {
+			t, err := evalBool(sub, leaf)
+			if err != nil {
+				return triUnknown, err
+			}
+			switch t {
 			case triTrue:
-				return triTrue
+				return triTrue, nil
 			case triUnknown:
 				out = triUnknown
 			}
 		}
-		return out
+		return out, nil
 	}
-	return triUnknown
+	return triUnknown, serr.New("unhandled condition kind")
 }
 
 // checkPred applies one predicate to the item's value. IS [NOT] NULL
 // is always definite; a comparison involving NULL or incomparable
-// kinds is unknown.
-func checkPred(v any, op PredOp, lit any) tri {
+// kinds is unknown — except that a string operand facing a number or
+// boolean re-reads as that type first, Postgres-style ('16384' = oid
+// 16384), which covers positions the static coercion pass cannot see
+// (subqueries, expression internals).
+func checkPred(v any, op PredOp, lit any) (tri, error) {
 	switch op {
 	case OpIsNull:
 		if v == nil {
-			return triTrue
+			return triTrue, nil
 		}
-		return triFalse
+		return triFalse, nil
 	case OpIsNotNull:
 		if v != nil {
-			return triTrue
+			return triTrue, nil
 		}
-		return triFalse
+		return triFalse, nil
+	case OpRegex, OpNotRegex, OpRegexI, OpNotRegexI:
+		if v == nil || lit == nil {
+			return triUnknown, nil
+		}
+		s, okS := v.(string)
+		pat, okP := lit.(string)
+		if !okS || !okP {
+			return triUnknown, serr.New("regex match requires text operands")
+		}
+		re, err := compileRegex(pat, op == OpRegexI || op == OpNotRegexI)
+		if err != nil {
+			return triUnknown, err
+		}
+		hit := re.MatchString(s)
+		if op == OpNotRegex || op == OpNotRegexI {
+			hit = !hit
+		}
+		if hit {
+			return triTrue, nil
+		}
+		return triFalse, nil
+	}
+	if v != nil && lit != nil {
+		if _, ok := compareVals(v, lit); !ok {
+			if s, isS := v.(string); isS {
+				if cv, err := coerceLit(s, kindOf(lit)); err == nil {
+					v = cv
+				}
+			} else if s, isS := lit.(string); isS {
+				if cl, err := coerceLit(s, kindOf(v)); err == nil {
+					lit = cl
+				}
+			}
+		}
 	}
 	c, ok := compareVals(v, lit)
 	if !ok {
-		return triUnknown
+		return triUnknown, nil
 	}
 	hit := false
 	switch op {
@@ -171,15 +231,31 @@ func checkPred(v any, op PredOp, lit any) tri {
 		hit = c >= 0
 	}
 	if hit {
-		return triTrue
+		return triTrue, nil
 	}
-	return triFalse
+	return triFalse, nil
+}
+
+// kindOf is the column type a runtime value reads as.
+func kindOf(v any) bytdb.ColType {
+	switch v.(type) {
+	case int64:
+		return bytdb.TInt
+	case float64:
+		return bytdb.TFloat
+	case bool:
+		return bytdb.TBool
+	case []byte:
+		return bytdb.TBytes
+	}
+	return bytdb.TString
 }
 
 // matches reports whether a row definitely satisfies the plan's
 // residual filter.
-func (p *plan) matches(row bytdb.Row) bool {
-	return evalPreds(p.filter, p.binds, row.Vals) == triTrue
+func (p *plan) matches(env *exEnv, row bytdb.Row) (bool, error) {
+	t, err := evalPreds(p.filter, p.binds, env, row.Vals)
+	return t == triTrue, err
 }
 
 // compareVals orders two non-NULL values. ok is false for NULLs and
@@ -239,7 +315,8 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 			return err
 		}
 		sc := fp.sc
-		if proj, err = projectSelect(sc, s, res); err != nil {
+		var exprs []Expr // evaluated per row, appended after the combined columns
+		if proj, exprs, err = projectSelect(sc, s, res); err != nil {
 			return err
 		}
 		for _, o := range s.OrderBy {
@@ -253,18 +330,48 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 				}
 				continue // a literal output is a constant key: no effect
 			}
+			if o.Ex != nil { // a hidden sort expression, appended like an item
+				keys = append(keys, sortKey{sc.width + len(exprs), o.Desc})
+				exprs = append(exprs, o.Ex)
+				continue
+			}
+			// A bare name matching an output alias sorts by that output.
+			if o.Col.Table == "" {
+				if pe, ok := aliasEntry(sc, s, proj, o.Col.Name); ok {
+					if pe.ord >= 0 {
+						keys = append(keys, sortKey{pe.ord, o.Desc})
+					}
+					continue
+				}
+			}
 			ord, err := sc.resolve(o.Col)
 			if err != nil {
 				return err
 			}
 			keys = append(keys, sortKey{ord, o.Desc})
 		}
+		env := &exEnv{d: d, tx: tx, sc: sc}
+		var evalErr error
 		// With no ORDER BY the join order is the result order, so
 		// collection can end at OFFSET+LIMIT rows.
-		return runJoin(tx, fp, func(vals []any) bool {
+		err = runJoin(tx, fp, env, func(vals []any) bool {
+			for _, ex := range exprs {
+				rowEnv := *env
+				rowEnv.row = vals[:sc.width]
+				v, e := evalEx(&rowEnv, ex)
+				if e != nil {
+					evalErr = e
+					return false
+				}
+				vals = append(vals, v)
+			}
 			rows = append(rows, vals)
 			return len(keys) > 0 || s.Limit < 0 || int64(len(rows)) < s.Offset+s.Limit
 		})
+		if err != nil {
+			return err
+		}
+		return evalErr
 	})
 	if err != nil {
 		return nil, err
@@ -322,8 +429,10 @@ type projEntry struct {
 
 // projectSelect resolves a non-aggregate select list against the FROM
 // scope: the projection entries, with the column names and types
-// appended to res.
-func projectSelect(sc *scope, s *Select, res *Result) (proj []projEntry, err error) {
+// appended to res. Expression items come back in exprs; they are
+// evaluated per row and appended to the combined row, and their
+// projection ordinals point past sc.width accordingly.
+func projectSelect(sc *scope, s *Select, res *Result) (proj []projEntry, exprs []Expr, err error) {
 	project := func(st scopeTable) {
 		for i, c := range st.desc.Columns {
 			proj = append(proj, projEntry{ord: st.off + i})
@@ -331,40 +440,76 @@ func projectSelect(sc *scope, s *Select, res *Result) (proj []projEntry, err err
 			res.Types = append(res.Types, c.Type)
 		}
 	}
+	name := func(it SelectItem, def string) string {
+		if it.As != "" {
+			return it.As
+		}
+		return def
+	}
 	if s.Star {
 		if len(sc.tables) == 0 {
-			return nil, serr.New("SELECT * requires a FROM clause")
+			return nil, nil, serr.New("SELECT * requires a FROM clause")
 		}
 		for _, st := range sc.tables {
 			project(st)
 		}
-		return proj, nil
+		return proj, nil, nil
 	}
 	for _, it := range s.Items {
 		switch {
+		case it.Ex != nil:
+			proj = append(proj, projEntry{ord: sc.width + len(exprs)})
+			res.Cols = append(res.Cols, name(it, exprName(it.Ex)))
+			res.Types = append(res.Types, exprType(sc, it.Ex))
+			exprs = append(exprs, it.Ex)
+			continue
 		case it.IsLit:
 			proj = append(proj, projEntry{ord: -1, lit: it.Lit})
-			res.Cols = append(res.Cols, it.LitName)
+			res.Cols = append(res.Cols, name(it, it.LitName))
 			res.Types = append(res.Types, litType(it.Lit))
 			continue
 		case it.Star: // t.*
 			st, err := sc.table(it.Col.Table)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			project(st)
 			continue
 		}
 		ord, err := sc.resolve(it.Col)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		proj = append(proj, projEntry{ord: ord})
 		c := sc.column(ord)
-		res.Cols = append(res.Cols, c.Name)
+		res.Cols = append(res.Cols, name(it, c.Name))
 		res.Types = append(res.Types, c.Type)
 	}
-	return proj, nil
+	return proj, exprs, nil
+}
+
+// aliasEntry finds the projection entry behind an output alias, for
+// ORDER BY name resolution (an alias wins over a FROM column).
+func aliasEntry(sc *scope, s *Select, proj []projEntry, name string) (projEntry, bool) {
+	if s.Star {
+		return projEntry{}, false
+	}
+	pi := 0
+	for _, it := range s.Items {
+		if it.Star { // t.* expands to the table's width
+			st, err := sc.table(it.Col.Table)
+			if err != nil {
+				return projEntry{}, false
+			}
+			pi += len(st.desc.Columns)
+			continue
+		}
+		if it.As == name && pi < len(proj) {
+			return proj[pi], true
+		}
+		pi++
+	}
+	return projEntry{}, false
 }
 
 // litType is the column type a literal select item reports.
@@ -463,7 +608,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		}
 		// Materialize matching keys before writing: updates move rows
 		// and index entries under a live scan.
-		pks, err := collectPKs(tx, s.Table, desc, pl)
+		pks, err := collectPKs(tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc))
 		if err != nil {
 			return err
 		}
@@ -495,7 +640,7 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		if err != nil {
 			return err
 		}
-		pks, err := collectPKs(tx, s.Table, desc, pl)
+		pks, err := collectPKs(tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc))
 		if err != nil {
 			return err
 		}
@@ -516,9 +661,19 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 	return &Result{RowsAffected: affected}, nil
 }
 
-func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan) ([][]any, error) {
+// tableEnv is the evaluation environment for a single-table scan
+// (UPDATE/DELETE), whose plan binds are table-local ordinals.
+func (d *DB) tableEnv(tx *bytdb.Txn, table string, desc *bytdb.TableDesc) *exEnv {
+	sc := &scope{
+		tables: []scopeTable{{name: table, desc: desc}},
+		width:  len(desc.Columns),
+	}
+	return &exEnv{d: d, tx: tx, sc: sc}
+}
+
+func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, env *exEnv) ([][]any, error) {
 	var pks [][]any
-	err := scanPlan(tx, table, pl, func(r bytdb.Row) bool {
+	err := scanPlan(tx, table, pl, env, func(r bytdb.Row) bool {
 		pk := make([]any, len(desc.PKCols))
 		for i, ord := range desc.PKCols {
 			pk[i] = r.Vals[ord]
@@ -527,6 +682,121 @@ func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan) ([
 		return true
 	})
 	return pks, err
+}
+
+// runSelectCore executes one UNION arm (or a whole plain SELECT).
+func (d *DB) runSelectCore(s *Select) (*Result, error) {
+	if s.isAggregate() {
+		return d.execSelectAgg(s)
+	}
+	return d.execSelect(s)
+}
+
+// execUnion executes a UNION chain left to right: arms concatenate,
+// and each distinct arm dedups everything accumulated so far. ORDER
+// BY applies to the combined output and takes select-list positions
+// or output column names.
+func (d *DB) execUnion(s *Select) (*Result, error) {
+	head := *s
+	head.Union, head.OrderBy = nil, nil
+	head.Limit, head.Offset = -1, 0
+	res, err := d.runSelectCore(&head)
+	if err != nil {
+		return nil, err
+	}
+	rows := res.Rows
+	for _, arm := range s.Union {
+		armRes, err := d.runSelectCore(arm.Sel)
+		if err != nil {
+			return nil, err
+		}
+		if len(armRes.Cols) != len(res.Cols) {
+			return nil, serr.New("each UNION query must have the same number of columns")
+		}
+		rows = append(rows, armRes.Rows...)
+		if !arm.All {
+			if rows, err = dedupRows(rows); err != nil {
+				return nil, err
+			}
+		}
+	}
+	var keys []sortKey
+	for _, o := range s.OrderBy {
+		switch {
+		case o.IsLit:
+			n, ok := o.Lit.(int64)
+			if !ok {
+				return nil, serr.New("non-integer constant in ORDER BY")
+			}
+			if n < 1 || int(n) > len(res.Cols) {
+				return nil, serr.New("ORDER BY position is not in the select list",
+					"position", fmt.Sprint(n))
+			}
+			keys = append(keys, sortKey{int(n - 1), o.Desc})
+		case o.Ex == nil && o.Agg == AggNone && o.Col.Table == "":
+			found := -1
+			for i, c := range res.Cols {
+				if c == o.Col.Name {
+					found = i
+					break
+				}
+			}
+			if found < 0 {
+				return nil, serr.New("ORDER BY on a UNION must name an output column",
+					"column", o.Col.Name)
+			}
+			keys = append(keys, sortKey{found, o.Desc})
+		default:
+			return nil, serr.New("ORDER BY on a UNION takes output columns or positions")
+		}
+	}
+	if len(keys) > 0 {
+		slices.SortStableFunc(rows, func(a, b []any) int {
+			for _, k := range keys {
+				c := orderCmp(a[k.ord], b[k.ord])
+				if k.desc {
+					c = -c
+				}
+				if c != 0 {
+					return c
+				}
+			}
+			return 0
+		})
+	}
+	if s.Offset > 0 {
+		if s.Offset >= int64(len(rows)) {
+			rows = nil
+		} else {
+			rows = rows[s.Offset:]
+		}
+	}
+	if s.Limit >= 0 && int64(len(rows)) > s.Limit {
+		rows = rows[:s.Limit]
+	}
+	res.Rows = rows
+	res.RowsAffected = 0
+	return res, nil
+}
+
+// dedupRows keeps each distinct row's first occurrence, compared by
+// the order-preserving tuple encoding (NULLs equal NULLs, as UNION
+// requires).
+func dedupRows(rows [][]any) ([][]any, error) {
+	seen := make(map[string]bool, len(rows))
+	out := rows[:0]
+	for _, r := range rows {
+		kb, err := tuple.Encode(r...)
+		if err != nil {
+			return nil, serr.Wrap(err, "op", "encode UNION row")
+		}
+		if seen[string(kb)] {
+			continue
+		}
+		seen[string(kb)] = true
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {

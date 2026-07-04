@@ -161,6 +161,9 @@ func resolveAgg(sc *scope, s *Select) (*aggQuery, error) {
 		if it.IsLit {
 			return aggRef{}, serr.New("literals are not supported in aggregate queries")
 		}
+		if it.Ex != nil {
+			return aggRef{}, serr.New("expressions are not supported in aggregate queries")
+		}
 		if it.Agg == AggNone {
 			if it.Star {
 				return aggRef{}, serr.New("t.* is not allowed in an aggregate query", "table", it.Col.Table)
@@ -312,7 +315,8 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 			groups[""] = q.newGroup(nil)
 		}
 		var scanErr error
-		err = runJoin(tx, fp, func(vals []any) bool {
+		env := &exEnv{d: d, tx: tx, sc: fp.sc}
+		err = runJoin(tx, fp, env, func(vals []any) bool {
 			keyVals := make([]any, len(q.groupOrds))
 			for i, ord := range q.groupOrds {
 				keyVals[i] = vals[ord]
@@ -355,7 +359,11 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	kept := make([]*group, 0, len(groups))
 	for _, k := range keys {
 		g := groups[k]
-		ok := evalBool(q.having, func(pr *Pred) tri {
+		ok, err := evalBool(q.having, func(leaf BoolExpr) (tri, error) {
+			pr, isPred := leaf.(*Pred)
+			if !isPred {
+				return triUnknown, serr.New("expressions are not supported in HAVING")
+			}
 			hl := q.havingRefs[pr]
 			rhs := pr.Val
 			if hl.hasR {
@@ -363,6 +371,9 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 			}
 			return checkPred(q.valueOf(g, hl.l), pr.Op, rhs)
 		})
+		if err != nil {
+			return nil, err
+		}
 		if ok == triTrue {
 			kept = append(kept, g)
 		}

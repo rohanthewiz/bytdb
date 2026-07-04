@@ -48,6 +48,14 @@ func lex(src string) ([]token, error) {
 				return nil, serr.New("unterminated block comment", "pos", fmt.Sprint(i))
 			}
 			i += 2 + end + 2
+		case (c == 'e' || c == 'E') && i+1 < len(src) && src[i+1] == '\'':
+			// E'...' escape-string literal (\n, \t, \\, '', \', ...)
+			text, n, err := scanEString(src[i+1:])
+			if err != nil {
+				return nil, serr.Wrap(err, "pos", fmt.Sprint(i))
+			}
+			toks = append(toks, token{tString, text, i})
+			i += 1 + n
 		case isIdentStart(c):
 			start := i
 			for i < len(src) && isIdentPart(src[i]) {
@@ -116,6 +124,45 @@ func scanQuoted(s string, q byte) (string, int, error) {
 	return "", 0, serr.New("unterminated " + what)
 }
 
+// scanEString scans an E-prefixed string body starting at s[0] == ',
+// resolving backslash escapes and doubled quotes. It returns the
+// content and the bytes consumed from s.
+func scanEString(s string) (string, int, error) {
+	var b strings.Builder
+	i := 1
+	for i < len(s) {
+		switch {
+		case s[i] == '\'':
+			if i+1 < len(s) && s[i+1] == '\'' {
+				b.WriteByte('\'')
+				i += 2
+				continue
+			}
+			return b.String(), i + 1, nil
+		case s[i] == '\\' && i+1 < len(s):
+			switch s[i+1] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case 'b':
+				b.WriteByte('\b')
+			case 'f':
+				b.WriteByte('\f')
+			default: // \\ \' and any other char stand for themselves
+				b.WriteByte(s[i+1])
+			}
+			i += 2
+		default:
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	return "", 0, serr.New("unterminated string literal")
+}
+
 // scanNumber consumes digits [. digits] [e[+-]digits] starting at i.
 func scanNumber(src string, i int) int {
 	for i < len(src) && isDigit(src[i]) {
@@ -145,14 +192,18 @@ func scanNumber(src string, i int) int {
 // scanOp recognizes the operator starting at src[i], longest first, or
 // returns "".
 func scanOp(src string, i int) string {
+	if i+2 < len(src) && src[i:i+3] == "!~*" {
+		return "!~*"
+	}
 	if i+1 < len(src) {
 		switch two := src[i : i+2]; two {
-		case "!=", "<>", "<=", ">=":
+		case "!=", "<>", "<=", ">=", "!~", "~*", "::", "||":
 			return two
 		}
 	}
 	switch src[i] {
-	case '=', '<', '>', '(', ')', ',', ';', '*', '.', '+', '-':
+	case '=', '<', '>', '(', ')', ',', ';', '*', '.', '+', '-',
+		'~', '[', ']', '/', '%':
 		return string(src[i])
 	}
 	return ""

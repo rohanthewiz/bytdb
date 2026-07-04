@@ -26,6 +26,10 @@ func buildScope(lookup tableLookup, items []FromItem) (*scope, error) {
 	sc := &scope{}
 	seen := map[string]bool{}
 	for _, it := range items {
+		if it.FuncArgs != nil {
+			return nil, serr.New("set-returning functions in FROM are not supported",
+				"function", it.Table)
+		}
 		desc, rows := lookup(it.Table)
 		if desc == nil {
 			return nil, serr.New("no such table", "table", it.Table)
@@ -137,15 +141,28 @@ func (b binds) bind(e BoolExpr, sc *scope) error {
 	})
 }
 
-// evalPreds evaluates a bound condition over one combined row.
-func evalPreds(e BoolExpr, b binds, vals []any) tri {
-	return evalBool(e, func(pr *Pred) tri {
-		bd := b[pr]
-		rhs := pr.Val
-		if bd.r >= 0 {
-			rhs = vals[bd.r]
+// evalPreds evaluates a bound condition over one combined row. base
+// supplies the evaluation environment for Cond leaves (nil when the
+// tree is known to hold none).
+func evalPreds(e BoolExpr, b binds, base *exEnv, vals []any) (tri, error) {
+	return evalBool(e, func(leaf BoolExpr) (tri, error) {
+		switch n := leaf.(type) {
+		case *Pred:
+			bd := b[n]
+			rhs := n.Val
+			if bd.r >= 0 {
+				rhs = vals[bd.r]
+			}
+			return checkPred(vals[bd.l], n.Op, rhs)
+		case *Cond:
+			if base == nil {
+				return triUnknown, serr.New("internal: expression condition without an environment")
+			}
+			env := *base
+			env.row = vals
+			return evalTruth(&env, n.Ex)
 		}
-		return checkPred(vals[bd.l], pr.Op, rhs)
+		return triUnknown, serr.New("internal: unknown condition leaf")
 	})
 }
 
@@ -231,9 +248,11 @@ func prepareFrom(lk tableLookup, items []FromItem, where BoolExpr) (*fromPlan, e
 
 // runJoin nested-loops the FROM clause within tx's snapshot, yielding
 // each combined row on which every ON and the WHERE are definitely
-// true. yield returning false stops the whole join.
-func runJoin(tx *bytdb.Txn, fp *fromPlan, yield func([]any) bool) error {
-	j := &joinRun{tx: tx, fp: fp, yield: yield}
+// true. env is the evaluation environment for expression conditions
+// (its row is set per combined row). yield returning false stops the
+// whole join.
+func runJoin(tx *bytdb.Txn, fp *fromPlan, env *exEnv, yield func([]any) bool) error {
+	j := &joinRun{tx: tx, fp: fp, env: env, yield: yield}
 	j.rec(0, nil)
 	return j.err
 }
@@ -241,6 +260,7 @@ func runJoin(tx *bytdb.Txn, fp *fromPlan, yield func([]any) bool) error {
 type joinRun struct {
 	tx    *bytdb.Txn
 	fp    *fromPlan
+	env   *exEnv
 	yield func([]any) bool
 	stop  bool
 	err   error
@@ -248,7 +268,12 @@ type joinRun struct {
 
 func (j *joinRun) rec(k int, partial []any) {
 	if k == len(j.fp.steps) {
-		if evalPreds(j.fp.where, j.fp.b, partial) == triTrue && !j.yield(partial) {
+		t, err := evalPreds(j.fp.where, j.fp.b, j.env, partial)
+		if err != nil {
+			j.err = err
+			return
+		}
+		if t == triTrue && !j.yield(partial) {
 			j.stop = true
 		}
 		return
@@ -276,8 +301,15 @@ func (j *joinRun) rec(k int, partial []any) {
 			vals := make([]any, len(partial)+len(rowVals))
 			copy(vals, partial)
 			copy(vals[len(partial):], rowVals)
-			if step.it.On != nil && evalPreds(step.it.On, j.fp.b, vals) != triTrue {
-				return true
+			if step.it.On != nil {
+				t, err := evalPreds(step.it.On, j.fp.b, j.env, vals)
+				if err != nil {
+					j.err = err
+					return false
+				}
+				if t != triTrue {
+					return true
+				}
 			}
 			matched = true
 			j.rec(k+1, vals)
@@ -304,7 +336,9 @@ func (j *joinRun) rec(k int, partial []any) {
 				j.err = err
 				return
 			}
-			err = scanPlan(j.tx, step.it.Table, pl, func(r bytdb.Row) bool {
+			// The pushed conjuncts are all plain Preds, so no
+			// environment is needed for this scan's residual filter.
+			err = scanPlan(j.tx, step.it.Table, pl, nil, func(r bytdb.Row) bool {
 				return next(r.Vals)
 			})
 			if err != nil && j.err == nil {

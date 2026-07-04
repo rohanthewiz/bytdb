@@ -267,9 +267,14 @@ func TestParseDDLRest(t *testing.T) {
 }
 
 func TestParseErrors(t *testing.T) {
+	// A literal-literal comparison (WHERE 1 = 2) evaluates per row now.
+	ll := mustParse(t, `select * from t where 1 = 2`).(*Select)
+	if _, ok := ll.Where.(*Cond); !ok {
+		t.Fatalf("got %#v", ll.Where)
+	}
+
 	for _, src := range []string{
 		`select * from t where a = null`,      // must use IS NULL
-		`select * from t where 1 = 2`,         // literal-literal compare
 		`select * from t limit -1`,            // negative limit
 		`select * from t; select * from t`,    // one statement per call
 		`insert into t (a, a) values (1, 2)`,  // duplicate column
@@ -307,10 +312,15 @@ func TestParseParams(t *testing.T) {
 		t.Fatalf("got %#v", h.Having)
 	}
 
+	// A negated param is a general expression now: 0 - $1.
+	neg := mustParse(t, `select * from t where a = -$1`).(*Select)
+	if _, ok := neg.Where.(*Cond); !ok {
+		t.Fatalf("got %#v", neg.Where)
+	}
+
 	for _, src := range []string{
-		`select * from t where a = $0`,  // params are 1-based
-		`select * from t where a = -$1`, // no unary minus on a param
-		`select * from t limit $1`,      // LIMIT takes a literal count
+		`select * from t where a = $0`, // params are 1-based
+		`select * from t limit $1`,     // LIMIT takes a literal count
 		`select * from t offset $1`,
 	} {
 		if _, err := Parse(src); err == nil {

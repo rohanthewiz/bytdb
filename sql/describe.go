@@ -90,36 +90,52 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 			return nil, err
 		}
 	case *Select:
-		sc, err := buildScope(lk, st.From)
-		if err != nil {
-			return nil, err
-		}
-		for k, it := range st.From {
-			if it.On != nil {
-				if err := inferPredParams(it.On, columnType(sc.prefix(k+1)), note); err != nil {
-					return nil, err
-				}
-			}
-		}
-		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
-			return nil, err
-		}
-		if err := inferPredParams(st.Having, itemType(sc), note); err != nil {
-			return nil, err
-		}
 		res := &Result{}
-		if st.isAggregate() {
-			q, err := resolveAgg(sc, st)
-			if err != nil {
+		if err := describeSelect(lk, st, note, res); err != nil {
+			return nil, err
+		}
+		// A UNION's shape is its first arm's; later arms only
+		// contribute parameter positions.
+		for _, arm := range st.Union {
+			if err := describeSelect(lk, arm.Sel, note, &Result{}); err != nil {
 				return nil, err
 			}
-			q.resultCols(st, res)
-		} else if _, err := projectSelect(sc, st, res); err != nil {
-			return nil, err
 		}
 		info.Cols, info.Types = res.Cols, res.Types
 	}
 	return info, nil
+}
+
+// describeSelect infers one SELECT core's parameter types and output
+// shape without executing it.
+func describeSelect(lk tableLookup, st *Select, note func(any, bytdb.ColType), res *Result) error {
+	sc, err := buildScope(lk, st.From)
+	if err != nil {
+		return err
+	}
+	for k, it := range st.From {
+		if it.On != nil {
+			if err := inferPredParams(it.On, columnType(sc.prefix(k+1)), note); err != nil {
+				return err
+			}
+		}
+	}
+	if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
+		return err
+	}
+	if err := inferPredParams(st.Having, itemType(sc), note); err != nil {
+		return err
+	}
+	if st.isAggregate() {
+		q, err := resolveAgg(sc, st)
+		if err != nil {
+			return err
+		}
+		q.resultCols(st, res)
+		return nil
+	}
+	_, _, err = projectSelect(sc, st, res)
+	return err
 }
 
 // Command is the statement's command tag word(s) — SELECT, INSERT,

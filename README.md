@@ -12,9 +12,10 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–11: a working relational store, queryable in SQL — in
+Milestones 1–12: a working relational store, queryable in SQL — in
 process or over the Postgres wire protocol, with enough system
-catalog for clients to introspect it.
+catalog and expression language that psql's `\dt`, `\d`, `\d <table>`,
+`\di`, `\du`, and `\l` render for real.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -45,7 +46,10 @@ catalog for clients to introspect it.
   SELECT/UPDATE/DELETE with a planner that pushes WHERE predicates
   down to point gets and bounded key scans, aggregates with GROUP BY
   and HAVING, INNER/LEFT/CROSS joins executed as index nested loops,
-  and prepared statements with `$1`-style parameters.
+  prepared statements with `$1`-style parameters, and an expression
+  language: CASE, IN, regex matches (`~`, `!~`, ...), `::` casts,
+  arithmetic and `||`, output aliases, correlated scalar subqueries,
+  EXISTS, and UNION [ALL].
 - **Postgres wire protocol** — the `pgwire` module (its own go.mod)
   serves a database to psql, pgx, and `database/sql`: simple and
   extended query protocols, text and binary formats, inferred
@@ -54,8 +58,9 @@ catalog for clients to introspect it.
 - **system catalog** — virtual `pg_catalog` and `information_schema`
   tables synthesized from the engine catalog, so clients and ORMs
   introspect with the queries they already send (GORM's `HasTable`,
-  the pg_attribute/pg_type join, `SELECT version()`), all read-only
-  and flowing through the ordinary join and aggregate machinery.
+  the pg_attribute/pg_type join, `SELECT version()`, and psql's
+  backslash commands verbatim), all read-only and flowing through the
+  ordinary join and aggregate machinery.
 
 ## Example
 
@@ -189,16 +194,21 @@ _, err = st.Exec(3, "alan", 41, "london") // re-executable; safe for concurrent 
 ```
 
 For introspection there is a virtual system catalog:
-`pg_catalog.pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, and
-`pg_index`, plus `information_schema.tables` and `columns`, all
-synthesized from the engine catalog on the fly and queryable like any
-tables — WHERE, joins, and aggregates included — but read-only. Table
-names may be schema-qualified (`public.t` is `t`; bare `pg_class`
-resolves because pg_catalog is on the search path). `SELECT` works
-without FROM (`SELECT 1`), a small whitelist of zero-argument
-functions folds to constants (`version()`, `current_schema()`,
-`current_database()`, ...), and `ORDER BY 1, 2` addresses select-list
-positions. That covers real client probes verbatim:
+`pg_catalog.pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
+`pg_index`, `pg_am`, `pg_database`, and `pg_roles` with real rows, a
+set of always-empty tables psql probes (`pg_constraint`, `pg_policy`,
+the `pg_publication` family, ...), plus `information_schema.tables`
+and `columns`, all synthesized from the engine catalog on the fly and
+queryable like any tables — WHERE, joins, and aggregates included —
+but read-only. Table names may be schema-qualified (`public.t` is
+`t`; bare `pg_class` resolves because pg_catalog is on the search
+path). `SELECT` works without FROM (`SELECT 1`), a small whitelist of
+zero-argument functions folds to constants (`version()`,
+`current_schema()`, `current_database()`, ...), the introspection
+functions psql calls evaluate for real (`format_type`,
+`pg_get_indexdef`, `pg_get_userbyid`, `pg_table_is_visible`, ...),
+and `ORDER BY 1, 2` addresses select-list positions. That covers real
+client probes verbatim:
 
 ```sql
 SELECT count(*) FROM information_schema.tables
@@ -212,8 +222,12 @@ JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
 WHERE c.relname = $1 ORDER BY a.attnum     -- column introspection
 ```
 
-(psql's `\dt` still wants `CASE`, `IN`, and `!~` — expression-language
-work on the roadmap.)
+psql's `\dt`, `\d`, `\d <table>`, `\d <index>`, `\di`, `\dn`, `\du`,
+and `\l` render against it — including the queries whose exotic
+corners (`generate_series` in FROM, array subscripts, `string_agg`)
+sit in branches that only run over rows the empty catalog tables
+never produce: unknown names error at evaluation, not at parse, so
+zero-row queries succeed.
 
 Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 runs in one engine transaction and rolls back entirely on error.
@@ -260,8 +274,8 @@ become DETAIL, and stable message texts map to SQLSTATE codes
 (syntax_error, undefined_table, unique_violation, ...).
 
 Trust auth (user/database accepted and ignored), TLS declined
-politely, autocommit only; cancellation, portal suspension, COPY, and
-`pg_catalog` are not implemented. The end-to-end tests drive a real
+politely, autocommit only; cancellation, portal suspension, and COPY
+are not implemented. The end-to-end tests drive a real
 pgx v5 client — including pgx's statement cache and its simple
 protocol mode, which renders every argument as a quoted literal and
 so exercises the dialect's untyped-literal coercion.
@@ -318,7 +332,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 9**: prepared statements — `$1` parameters in WHERE/ON/HAVING, INSERT, and UPDATE SET; variadic `Exec` and `Prepare`/`Stmt` that re-bind into a copy per execution
 - [x] **Milestone 10**: Postgres wire protocol — the `pgwire` nested module: startup/auth handshake, simple + extended query protocols mapped onto `Prepare`/`Describe`/`Exec` (with parameter-type inference and catalog-computed result shapes), text + binary formats, structured errors with SQLSTATE and positions; plus Postgres-style untyped-literal coercion in the dialect
 - [x] **Milestone 11**: system catalog — virtual `pg_catalog` + `information_schema` tables from the engine catalog through the ordinary executor; schema-qualified names, SELECT without FROM, literal select items, folded zero-arg functions (`version()`, `current_schema()`, ...), ORDER BY ordinals; catalog writes rejected
-- [ ] Later: expression language (CASE, IN, `~`/`!~`, casts — what psql's `\d` still needs), DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, transaction blocks over the wire
+- [x] **Milestone 12**: expression language — one grammar for select items and conditions (CASE, IN, `~`/`!~`/`~*`/`!~*`, `OPERATOR()`/`COLLATE`, `::` casts, arithmetic/`||`, functions with arguments, output aliases), lowered to the legacy predicate shapes where simple so pushdown survives; eval-time name resolution through an environment chain (correlated scalar subqueries, EXISTS, ARRAY(SELECT ...) — and unknown functions error only if a row reaches them); UNION [ALL]; catalog grown until psql's `\dt`, `\d`, `\d <table>`, `\d <index>`, `\di`, `\dn`, `\du`, `\l` all render
+- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, transaction blocks over the wire, GROUP BY ordinals/expressions
 
 ## Design notes
 

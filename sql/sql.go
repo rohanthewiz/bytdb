@@ -32,18 +32,37 @@
 // right table apply after that extension (so o.id IS NULL is the
 // anti-join).
 //
-// WHERE, ON, and HAVING are boolean expressions — predicates combined
+// WHERE, ON, and HAVING are boolean expressions — conditions combined
 // with AND, OR, and NOT (standard precedence; parentheses group),
 // evaluated with SQL three-valued logic: a comparison against NULL is
-// unknown, and only definitely-true rows match. A predicate is column
-// op literal, column op column (=, !=, <>, <, <=, >, >=, either
-// operand order), or column IS [NOT] NULL; in HAVING either operand
-// may be an aggregate call. The planner turns equality and range
-// predicates that are top-level AND conjuncts on a prefix of the
-// primary key or of a secondary index into point gets or bounded
-// ordered scans (anything under OR or NOT stays filter-only); the
-// whole condition is still re-checked per row, so pushdown only
-// narrows what is visited.
+// unknown, and only definitely-true rows match. Comparisons are =,
+// !=, <>, <, <=, >, >= and the regex operators ~, !~, ~*, !~* (Go
+// regexp syntax), in either operand order, plus IS [NOT] NULL, [NOT]
+// IN (list), and EXISTS (SELECT ...); in HAVING an operand may be an
+// aggregate call. The planner turns equality and range predicates
+// that are top-level AND conjuncts on a prefix of the primary key or
+// of a secondary index into point gets or bounded ordered scans
+// (anything under OR or NOT, and every non-simple expression, stays
+// filter-only); the whole condition is still re-checked per row, so
+// pushdown only narrows what is visited.
+//
+// Beyond plain columns, select items and conditions take a general
+// expression language: CASE (both forms), casts with :: (integer and
+// oid families, text, bool, float, and the reg* types — 'users'::
+// regclass resolves through the catalog), arithmetic and || concat,
+// a whitelist of functions (coalesce, nullif, upper, lower, length,
+// and the pg_catalog introspection set: format_type, pg_get_indexdef,
+// pg_get_userbyid, pg_table_is_visible, ...), scalar subqueries —
+// correlated ones resolve outer columns through the enclosing scopes
+// — including single-aggregate forms like (SELECT count(*) ... WHERE
+// x = outer.y), EXISTS, and ARRAY(SELECT ...) rendered as Postgres
+// array text. Select items take [AS] output aliases, and ORDER BY
+// resolves bare names against them. Unknown functions parse and only
+// error if a row actually evaluates them, which is what lets psql's
+// catalog queries (with their generate_series/string_agg/array-
+// subscript corners) run against empty catalog tables. SELECT cores
+// combine with UNION [ALL]; ORDER BY, LIMIT, and OFFSET then apply to
+// the combined rows by select-list position or output name.
 //
 // Select items are columns or aggregates: COUNT(*), COUNT(c), SUM(c),
 // AVG(c), MIN(c), MAX(c). Any aggregate, GROUP BY, or HAVING makes
@@ -65,14 +84,19 @@
 // text does not parse as the column's type.
 //
 // For introspection, the virtual system catalog serves
-// pg_catalog.pg_namespace, pg_class, pg_attribute, pg_type, and
-// pg_index, plus information_schema.tables and columns, synthesized
-// from the engine catalog and queryable like any tables (read-only;
-// their names are reserved). Table names may be schema-qualified —
-// public.t is t; pg_catalog members also resolve bare, as on
-// Postgres's search path. SELECT works without FROM over literal
-// select items (SELECT 1), a whitelist of zero-argument functions
-// folds to constants wherever a literal fits (version(),
+// pg_catalog.pg_namespace, pg_class, pg_attribute, pg_type, pg_index,
+// pg_am, pg_database, and pg_roles with real rows, a set of
+// always-empty tables psql probes (pg_attrdef, pg_collation,
+// pg_constraint, pg_inherits, pg_policy, pg_statistic_ext, the
+// pg_publication family, pg_auth_members), plus
+// information_schema.tables and columns — all synthesized from the
+// engine catalog and queryable like any tables (read-only; their
+// names are reserved). psql's \dt, \d, \d <table>, \d <index>, \di,
+// \dn, \du, and \l render against it. Table names may be
+// schema-qualified — public.t is t; pg_catalog members also resolve
+// bare, as on Postgres's search path. SELECT works without FROM over
+// literal select items (SELECT 1), a whitelist of zero-argument
+// functions folds to constants wherever a literal fits (version(),
 // current_database(), current_schema(), current_user(),
 // session_user(), optionally pg_catalog-qualified), and ORDER BY
 // takes select-list positions (ORDER BY 1, 2).
@@ -200,10 +224,10 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 	case *Insert:
 		return d.execInsert(s)
 	case *Select:
-		if s.isAggregate() {
-			return d.execSelectAgg(s)
+		if len(s.Union) > 0 {
+			return d.execUnion(s)
 		}
-		return d.execSelect(s)
+		return d.runSelectCore(s)
 	case *Update:
 		return d.execUpdate(s)
 	case *Delete:

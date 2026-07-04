@@ -165,8 +165,10 @@ func TestErrors(t *testing.T) {
 	mustExec(t, c, `create table t (id int primary key)`)
 	mustExec(t, c, `insert into t values ($1)`, int64(1))
 
+	// (`select frim t` reads as SELECT frim AS t now, as in Postgres,
+	// so a stray token after * makes the syntax error.)
 	var pgErr *pgconn.PgError
-	_, err := c.Exec(ctx, `select frim t`)
+	_, err := c.Exec(ctx, `select * frim t`)
 	if !errors.As(err, &pgErr) || pgErr.Code != "42601" || pgErr.Position <= 0 {
 		t.Fatalf("syntax: %+v", err)
 	}
