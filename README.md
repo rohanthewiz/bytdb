@@ -174,6 +174,13 @@ _, err = st.Exec(3, "alan", 41, "london") // re-executable; safe for concurrent 
 
 Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 runs in one engine transaction and rolls back entirely on error.
+
+Errors are [serr](https://github.com/rohanthewiz/serr) structured
+errors: `%v` prints just the message, `bytdb.ErrText(err)` renders it
+with the structured attributes for user-facing surfaces — `wrong
+number of parameters (want: 1, got: 0)` — and a serr-aware logger
+gets the full context including code locations.
+
 Deferred: a `bytdb-pgwire` module speaking the Postgres wire
 protocol — the embedded `Exec` result shape (columns + types + rows)
 is exactly what that layer needs, and prepared statements map onto

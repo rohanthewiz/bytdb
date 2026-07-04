@@ -503,6 +503,13 @@ func TestSQLParams(t *testing.T) {
 		t.Fatalf("got %v", res.Rows)
 	}
 
+	// An arity error carries its fields for client-facing rendering.
+	if _, err := d.Exec(`select * from users where id = $1`); err == nil {
+		t.Error("expected arity error")
+	} else if got := bytdb.ErrText(err); got != "wrong number of parameters (want: 1, got: 0)" {
+		t.Errorf("ErrText: got %q", got)
+	}
+
 	// Arity and argument types are checked.
 	for _, bad := range []func() (*Result, error){
 		func() (*Result, error) { return d.Exec(`select * from users where id = $1`) },
