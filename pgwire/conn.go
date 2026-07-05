@@ -17,9 +17,10 @@ import (
 )
 
 type conn struct {
-	srv *Server
-	r   *bufio.Reader
-	w   *bufio.Writer
+	srv  *Server
+	r    *bufio.Reader
+	w    *bufio.Writer
+	sess *sql.Session
 
 	stmts   map[string]*prepared
 	portals map[string]*portal
@@ -168,10 +169,13 @@ func (c *conn) simpleQuery(q string) {
 			c.sendError(err, q, p.off)
 			break
 		}
-		res, err := st.Exec()
+		res, err := c.sess.ExecStmt(st)
 		if err != nil {
 			c.sendError(err, q, p.off)
 			break
+		}
+		if res.Notice != "" {
+			c.sendNotice(res.Notice)
 		}
 		if len(res.Cols) > 0 {
 			c.sendRowDescription(res.Cols, res.Types, nil)
@@ -328,10 +332,13 @@ func (c *conn) execute(r *rbuf) {
 		c.send(msgEmptyQuery, nil)
 		return
 	}
-	res, err := pt.prep.stmt.Exec(pt.args...)
+	res, err := c.sess.ExecStmt(pt.prep.stmt, pt.args...)
 	if err != nil {
 		c.sendError(err, pt.prep.query, 0)
 		return
+	}
+	if res.Notice != "" {
+		c.sendNotice(res.Notice)
 	}
 	if len(res.Cols) > 0 && !c.sendDataRows(res.Rows, pt.formats) {
 		return
@@ -367,10 +374,11 @@ func (c *conn) send(typ byte, body wbuf) {
 	c.w.Write(body)
 }
 
-// ready sends ReadyForQuery (always idle: autocommit only) and
+// ready sends ReadyForQuery with the session's transaction status —
+// 'I' idle, 'T' in a transaction block, 'E' in a failed one — and
 // flushes.
 func (c *conn) ready() {
-	c.send(msgReadyForQuery, wbuf{'I'})
+	c.send(msgReadyForQuery, wbuf{byte(c.sess.Status())})
 	c.w.Flush()
 }
 
@@ -379,6 +387,12 @@ func (c *conn) ready() {
 func (c *conn) sendError(err error, query string, base int) {
 	c.send(msgErrorResponse, errorBody(err, query, base))
 	c.inErr = true
+}
+
+// sendNotice sends a statement's warning (a redundant BEGIN, a stray
+// COMMIT) as a NoticeResponse.
+func (c *conn) sendNotice(msg string) {
+	c.send(msgNoticeResponse, noticeBody(msg))
 }
 
 func (c *conn) protoError(msg string) {
@@ -426,8 +440,12 @@ func (c *conn) sendDataRows(rows [][]any, formats []int) bool {
 
 // sendCommandComplete renders the command tag: rows returned for
 // SELECT, rows affected for INSERT/UPDATE/DELETE, the bare command
-// for DDL.
+// for DDL and transaction control. A result may override its
+// statement's tag (COMMIT of a failed transaction reports ROLLBACK).
 func (c *conn) sendCommandComplete(cmd string, res *sql.Result) {
+	if res.Tag != "" {
+		cmd = res.Tag
+	}
 	var b wbuf
 	switch cmd {
 	case "SELECT":

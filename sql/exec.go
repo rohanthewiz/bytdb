@@ -309,7 +309,7 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 	var rows [][]any     // full combined rows; projected after sort/limit
 	var proj []projEntry // projected column ordinals and literals
 	var keys []sortKey
-	err := d.e.ReadTxn(func(tx *bytdb.Txn) error {
+	err := d.read(func(tx *bytdb.Txn) error {
 		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
 		if err != nil {
 			return err
@@ -556,7 +556,7 @@ func orderCmp(a, b any) int {
 }
 
 func (d *DB) execInsert(s *Insert) (*Result, error) {
-	err := d.e.WriteTxn(func(tx *bytdb.Txn) error {
+	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
@@ -597,7 +597,7 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 
 func (d *DB) execUpdate(s *Update) (*Result, error) {
 	affected := 0
-	err := d.e.WriteTxn(func(tx *bytdb.Txn) error {
+	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
@@ -631,7 +631,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 
 func (d *DB) execDelete(s *Delete) (*Result, error) {
 	affected := 0
-	err := d.e.WriteTxn(func(tx *bytdb.Txn) error {
+	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)

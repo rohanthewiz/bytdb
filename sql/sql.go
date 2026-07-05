@@ -15,6 +15,7 @@
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
 //	UPDATE t SET c = v, ... [WHERE ...]
 //	DELETE FROM t [WHERE ...]
+//	BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
 //
 // FROM names one table or a left-deep chain of joins:
 //
@@ -113,6 +114,18 @@
 //
 // Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 // runs in one engine transaction and rolls back entirely on error.
+// For multi-statement transactions, a Session executes BEGIN ...
+// COMMIT | ROLLBACK blocks with Postgres semantics: the block is one
+// engine transaction; an error inside it fails the block, refusing
+// everything but ROLLBACK (COMMIT then rolls back, reporting so in
+// its tag); redundant control statements warn and do nothing. BEGIN
+// accepts the standard transaction modes — isolation levels parse and
+// are ignored (the engine's single-writer transactions are
+// serializable, which satisfies them all) and READ ONLY is honored. A
+// writable block holds the engine's single-writer lock from BEGIN to
+// its end, so writes in other sessions wait behind it; reads never
+// do. DDL cannot run inside a block, because the engine gives every
+// schema change its own transaction.
 package sql
 
 import (
@@ -120,13 +133,39 @@ import (
 	"github.com/rohanthewiz/serr"
 )
 
-// DB executes SQL statements against a bytdb Engine.
+// DB executes SQL statements against a bytdb Engine. Each statement
+// is its own transaction; for BEGIN/COMMIT transaction blocks, wrap
+// it in a Session.
 type DB struct {
 	e *bytdb.Engine
+
+	// tx, when set, is a Session's open transaction: every statement
+	// runs inside it instead of opening its own.
+	tx *bytdb.Txn
 }
 
 // New wraps an Engine for SQL execution.
 func New(e *bytdb.Engine) *DB { return &DB{e: e} }
+
+// read runs fn over the open session transaction, or a fresh
+// read-only snapshot in autocommit.
+func (d *DB) read(fn func(*bytdb.Txn) error) error {
+	if d.tx != nil {
+		return fn(d.tx)
+	}
+	return d.e.ReadTxn(fn)
+}
+
+// write runs fn in the open session transaction — staged writes
+// commit or roll back with the block, so fn's error must abort the
+// session (the Session does) — or in its own transaction in
+// autocommit.
+func (d *DB) write(fn func(*bytdb.Txn) error) error {
+	if d.tx != nil {
+		return fn(d.tx)
+	}
+	return d.e.WriteTxn(fn)
+}
 
 // Result is the outcome of one statement. SELECT fills Cols, Types,
 // and Rows; INSERT, UPDATE, and DELETE fill RowsAffected; DDL fills
@@ -136,6 +175,14 @@ type Result struct {
 	Types        []bytdb.ColType
 	Rows         [][]any
 	RowsAffected int
+
+	// Tag, when set, overrides the statement's command tag: COMMIT of
+	// a failed transaction reports ROLLBACK, as in Postgres.
+	Tag string
+	// Notice is a warning the statement raised without failing:
+	// BEGIN inside a transaction block, COMMIT or ROLLBACK outside
+	// one. Wire servers forward it as a NoticeResponse.
+	Notice string
 }
 
 // Exec parses and executes one SQL statement, binding args to its
@@ -232,6 +279,11 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		return d.execUpdate(s)
 	case *Delete:
 		return d.execDelete(s)
+	case *TxnControl:
+		// Sessions intercept these before run; a bare DB has no
+		// transaction state to control.
+		return nil, serr.New("transaction control statements require a Session",
+			"statement", s.Tag)
 	}
 	return nil, serr.New("unhandled statement type")
 }

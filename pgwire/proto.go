@@ -54,6 +54,7 @@ const (
 	msgCloseComplete   = '3'
 	msgParamDesc       = 't'
 	msgNoData          = 'n'
+	msgNoticeResponse  = 'N'
 )
 
 // readMessage reads one typed frontend frame: type byte, int32 length

@@ -14,10 +14,14 @@
 //     and ignored. TLS and GSS encryption are declined; clients must
 //     connect with sslmode=disable or tolerate the refusal (the
 //     default sslmode=prefer does).
-//   - Autocommit only — each statement is its own transaction, and
-//     ReadyForQuery always reports idle. BEGIN is not a statement the
-//     SQL layer knows, so transaction blocks fail loudly rather than
-//     silently autocommitting.
+//   - Transaction blocks: each connection is a sql.Session, so BEGIN
+//     ... COMMIT/ROLLBACK behave as in Postgres — ReadyForQuery
+//     reports the real status (idle / in transaction / failed), an
+//     error fails the block until ROLLBACK, COMMIT of a failed block
+//     reports ROLLBACK, redundant control statements raise
+//     NoticeResponse warnings, and a dropped connection rolls back.
+//     A writable block holds the engine's single-writer lock, so
+//     other connections' writes (not reads) wait behind it.
 //   - Errors travel structurally: the SQL layer's serr fields become
 //     ErrorResponse fields — a parse position becomes Position
 //     (1-based character offset), the rest become Detail — with a
@@ -101,9 +105,11 @@ func (s *Server) Serve(ln net.Listener) error {
 				srv:     s,
 				r:       bufio.NewReader(nc),
 				w:       bufio.NewWriter(nc),
+				sess:    s.db.NewSession(),
 				stmts:   map[string]*prepared{},
 				portals: map[string]*portal{},
 			}
+			defer c.sess.Close() // a dropped connection rolls back
 			c.run()
 		}()
 	}

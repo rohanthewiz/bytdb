@@ -230,7 +230,17 @@ never produce: unknown names error at evaluation, not at parse, so
 zero-row queries succeed.
 
 Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
-runs in one engine transaction and rolls back entirely on error.
+runs in one engine transaction and rolls back entirely on error. For
+multi-statement transactions, `DB.NewSession()` executes `BEGIN ...
+COMMIT | ROLLBACK` blocks with Postgres semantics: the block is one
+engine transaction, an error fails the block until `ROLLBACK`
+(`COMMIT` then rolls back and says so in its command tag), and
+redundant control statements warn without failing. Isolation levels
+parse and are ignored — single-writer transactions are serializable,
+which satisfies every level — and `READ ONLY` is honored. A writable
+block holds the engine's writer lock from `BEGIN` to its end (other
+sessions' writes wait; reads never do), and DDL cannot run inside a
+block since every schema change is its own transaction.
 
 Errors are [serr](https://github.com/rohanthewiz/serr) structured
 errors: `%v` prints just the message, `bytdb.ErrText(err)` renders it
@@ -274,8 +284,12 @@ become DETAIL, and stable message texts map to SQLSTATE codes
 (syntax_error, undefined_table, unique_violation, ...).
 
 Trust auth (user/database accepted and ignored), TLS declined
-politely, autocommit only; cancellation, portal suspension, and COPY
-are not implemented. The end-to-end tests drive a real
+politely. Transaction blocks work as in Postgres: each connection is
+a `sql.Session`, `ReadyForQuery` reports the real status (idle / in
+transaction / failed), redundant `BEGIN`/`COMMIT` raise
+`NoticeResponse` warnings, and a dropped connection rolls back its
+open block. Cancellation, portal suspension, and COPY are not
+implemented. The end-to-end tests drive a real
 pgx v5 client — including pgx's statement cache and its simple
 protocol mode, which renders every argument as a quoted literal and
 so exercises the dialect's untyped-literal coercion.
@@ -333,7 +347,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 10**: Postgres wire protocol — the `pgwire` nested module: startup/auth handshake, simple + extended query protocols mapped onto `Prepare`/`Describe`/`Exec` (with parameter-type inference and catalog-computed result shapes), text + binary formats, structured errors with SQLSTATE and positions; plus Postgres-style untyped-literal coercion in the dialect
 - [x] **Milestone 11**: system catalog — virtual `pg_catalog` + `information_schema` tables from the engine catalog through the ordinary executor; schema-qualified names, SELECT without FROM, literal select items, folded zero-arg functions (`version()`, `current_schema()`, ...), ORDER BY ordinals; catalog writes rejected
 - [x] **Milestone 12**: expression language — one grammar for select items and conditions (CASE, IN, `~`/`!~`/`~*`/`!~*`, `OPERATOR()`/`COLLATE`, `::` casts, arithmetic/`||`, functions with arguments, output aliases), lowered to the legacy predicate shapes where simple so pushdown survives; eval-time name resolution through an environment chain (correlated scalar subqueries, EXISTS, ARRAY(SELECT ...) — and unknown functions error only if a row reaches them); UNION [ALL]; catalog grown until psql's `\dt`, `\d`, `\d <table>`, `\d <index>`, `\di`, `\dn`, `\du`, `\l` all render
-- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, transaction blocks over the wire, GROUP BY ordinals/expressions
+- [x] **Milestone 13**: transaction blocks — `Engine.Begin`/`Txn.Commit`/`Txn.Rollback` over btypedb's manual transactions; `sql.Session` with Postgres block semantics (failed-block state and 25P02, `COMMIT`-of-failed reports `ROLLBACK`, warnings for redundant control, `READ ONLY`, isolation levels accepted as serializable, DDL refused in-block); pgwire sessions with real `ReadyForQuery` status, `NoticeResponse`, and rollback on disconnect
+- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, GROUP BY ordinals/expressions
 
 ## Design notes
 

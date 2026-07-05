@@ -12,7 +12,8 @@ import (
 type StmtInfo struct {
 	// Command is the statement's command tag word(s): SELECT, INSERT,
 	// UPDATE, DELETE, CREATE TABLE, DROP TABLE, ALTER TABLE,
-	// CREATE INDEX, or DROP INDEX.
+	// CREATE INDEX, DROP INDEX, BEGIN, START TRANSACTION, COMMIT, or
+	// ROLLBACK.
 	Command string
 	// Params holds one inferred type per placeholder, $1 first: the
 	// type of the column each placeholder is compared against,
@@ -144,6 +145,9 @@ func (s *Stmt) Command() string { return command(s.st) }
 
 // command is the statement's command tag word(s).
 func command(st Statement) string {
+	if tc, ok := st.(*TxnControl); ok {
+		return tc.Tag
+	}
 	switch st.(type) {
 	case *CreateTable:
 		return "CREATE TABLE"

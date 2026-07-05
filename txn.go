@@ -38,6 +38,30 @@ func (e *Engine) ReadTxn(fn func(tx *Txn) error) error {
 	})
 }
 
+// Begin starts a transaction the caller must end with Commit or
+// Rollback. A writable transaction takes the engine's single-writer
+// lock at Begin and holds it until it ends: other writable
+// transactions, one-shot writes, and DDL block behind it (reads and
+// read-only transactions do not). Prefer WriteTxn and ReadTxn, which
+// cannot leak the lock; Begin exists for callers whose transaction
+// boundaries arrive from outside, like a SQL session's BEGIN/COMMIT.
+func (e *Engine) Begin(writable bool) (*Txn, error) {
+	tx, err := e.kv.Begin(writable)
+	if err != nil {
+		return nil, err
+	}
+	return &Txn{tx: tx, tables: e.catalogSnapshot()}, nil
+}
+
+// Commit publishes the transaction's writes atomically and releases
+// it. Only for transactions from Begin; WriteTxn and ReadTxn finish
+// theirs themselves.
+func (t *Txn) Commit() error { return t.tx.Commit() }
+
+// Rollback discards the transaction's writes and releases it. Rolling
+// back a finished transaction is a no-op.
+func (t *Txn) Rollback() error { return t.tx.Rollback() }
+
 // Table returns the descriptor for a table name in the transaction's
 // catalog snapshot, or nil if absent.
 func (t *Txn) Table(name string) *TableDesc {

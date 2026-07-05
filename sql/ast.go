@@ -423,6 +423,27 @@ type Delete struct {
 	Where BoolExpr
 }
 
+// TxnKind distinguishes the transaction-control statements.
+type TxnKind int
+
+const (
+	TxnBegin TxnKind = iota
+	TxnCommit
+	TxnRollback
+)
+
+// TxnControl is BEGIN / START TRANSACTION, COMMIT / END, or ROLLBACK
+// / ABORT, executed by a Session (a bare DB rejects it). Isolation
+// levels parse and are ignored — the engine's single-writer
+// transactions are serializable, which satisfies every level — and
+// READ ONLY is honored. Tag is the Postgres command tag of the form
+// used (END reports COMMIT, ABORT reports ROLLBACK).
+type TxnControl struct {
+	Kind     TxnKind
+	ReadOnly bool
+	Tag      string
+}
+
 func (*CreateTable) stmt() {}
 func (*DropTable) stmt()   {}
 func (*AddColumn) stmt()   {}
@@ -433,3 +454,4 @@ func (*Insert) stmt()      {}
 func (*Select) stmt()      {}
 func (*Update) stmt()      {}
 func (*Delete) stmt()      {}
+func (*TxnControl) stmt()  {}

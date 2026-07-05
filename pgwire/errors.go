@@ -33,8 +33,38 @@ func sqlstate(msg string, hasPos bool) string {
 		return "23505" // unique_violation
 	case strings.Contains(msg, "wrong number of parameters"):
 		return "08P01" // protocol_violation
+	case strings.Contains(msg, "current transaction is aborted"):
+		return "25P02" // in_failed_sql_transaction
+	case strings.Contains(msg, "read-only transaction"):
+		return "25006" // read_only_sql_transaction
+	case strings.Contains(msg, "cannot run inside a transaction block"):
+		return "25001" // active_sql_transaction
 	}
 	return "XX000"
+}
+
+// noticeBody builds a NoticeResponse body for a statement warning —
+// the same field format as ErrorResponse, at WARNING severity, with
+// the code Postgres uses for the same notice.
+func noticeBody(msg string) wbuf {
+	code := "01000" // warning
+	switch {
+	case strings.Contains(msg, "already a transaction"):
+		code = "25001" // active_sql_transaction
+	case strings.Contains(msg, "no transaction"):
+		code = "25P01" // no_active_sql_transaction
+	}
+	var b wbuf
+	b.byte('S')
+	b.cstr("WARNING")
+	b.byte('V')
+	b.cstr("WARNING")
+	b.byte('C')
+	b.cstr(code)
+	b.byte('M')
+	b.cstr(msg)
+	b.byte(0)
+	return b
 }
 
 // errorBody builds an ErrorResponse body. query is the full text the

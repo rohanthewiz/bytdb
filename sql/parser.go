@@ -130,8 +130,87 @@ func (p *parser) statement() (Statement, error) {
 		return p.update()
 	case p.acceptKw("delete"):
 		return p.deleteStmt()
+	case p.acceptKw("begin"):
+		if !p.acceptKw("work") {
+			p.acceptKw("transaction")
+		}
+		return p.txnModes(&TxnControl{Kind: TxnBegin, Tag: "BEGIN"})
+	case p.acceptKw("start"):
+		if err := p.expectKw("transaction"); err != nil {
+			return nil, err
+		}
+		return p.txnModes(&TxnControl{Kind: TxnBegin, Tag: "START TRANSACTION"})
+	case p.acceptKw("commit"), p.acceptKw("end"):
+		return p.txnEnd(&TxnControl{Kind: TxnCommit, Tag: "COMMIT"})
+	case p.acceptKw("rollback"), p.acceptKw("abort"):
+		return p.txnEnd(&TxnControl{Kind: TxnRollback, Tag: "ROLLBACK"})
 	}
 	return nil, p.unexpected("a SQL statement")
+}
+
+// txnModes parses BEGIN's transaction modes, in any order with
+// optional commas: ISOLATION LEVEL ... (accepted and ignored — every
+// engine transaction is serializable), READ ONLY / READ WRITE, and
+// [NOT] DEFERRABLE (ignored; it only matters for concurrent
+// serializable reads, which the engine gives for free).
+func (p *parser) txnModes(tc *TxnControl) (Statement, error) {
+	for {
+		switch {
+		case p.acceptKw("isolation"):
+			if err := p.expectKw("level"); err != nil {
+				return nil, err
+			}
+			switch {
+			case p.acceptKw("serializable"):
+			case p.acceptKw("repeatable"):
+				if err := p.expectKw("read"); err != nil {
+					return nil, err
+				}
+			case p.acceptKw("read"):
+				if !p.acceptKw("committed") && !p.acceptKw("uncommitted") {
+					return nil, p.unexpected("COMMITTED or UNCOMMITTED")
+				}
+			default:
+				return nil, p.unexpected("an isolation level")
+			}
+		case p.acceptKw("read"):
+			switch {
+			case p.acceptKw("only"):
+				tc.ReadOnly = true
+			case p.acceptKw("write"):
+				tc.ReadOnly = false
+			default:
+				return nil, p.unexpected("ONLY or WRITE")
+			}
+		case p.acceptKw("not"):
+			if err := p.expectKw("deferrable"); err != nil {
+				return nil, err
+			}
+		case p.acceptKw("deferrable"):
+		default:
+			return tc, nil
+		}
+		p.acceptOp(",")
+	}
+}
+
+// txnEnd parses COMMIT/ROLLBACK's tail: [WORK | TRANSACTION]
+// [AND [NO] CHAIN]. AND CHAIN (immediately restarting a transaction
+// with the same modes) is not supported.
+func (p *parser) txnEnd(tc *TxnControl) (Statement, error) {
+	if !p.acceptKw("work") {
+		p.acceptKw("transaction")
+	}
+	if p.acceptKw("and") {
+		no := p.acceptKw("no")
+		if err := p.expectKw("chain"); err != nil {
+			return nil, err
+		}
+		if !no {
+			return nil, serr.New("AND CHAIN is not supported")
+		}
+	}
+	return tc, nil
 }
 
 // --- DDL ---

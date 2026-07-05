@@ -288,3 +288,60 @@ func TestTxnRangeScans(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestManualTxn(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+
+	// Commit publishes atomically.
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Insert("people", 1, "ada", 36, "a@x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Insert("people", 2, "grace", 45, "g@x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := e.Get("people", 2); !ok {
+		t.Fatal("committed row missing")
+	}
+
+	// Rollback discards; the writer lock is released either way.
+	tx, err = e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Insert("people", 3, "alan", 41, "al@x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := e.Get("people", 3); ok {
+		t.Fatal("rolled-back row visible")
+	}
+
+	// A read-only transaction is a stable snapshot and refuses writes.
+	ro, err := e.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("people", 4, "edsger", 39, "e@x"); err != nil {
+		t.Fatal(err) // read txn holds no writer lock, so this proceeds
+	}
+	if _, ok, _ := ro.Get("people", 4); ok {
+		t.Fatal("read snapshot sees later commit")
+	}
+	if err := ro.Insert("people", 5, "x", 1, "x@x"); !errors.Is(err, btypedb.ErrTxNotWritable) {
+		t.Fatalf("write through read txn = %v; want ErrTxNotWritable", err)
+	}
+	if err := ro.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}

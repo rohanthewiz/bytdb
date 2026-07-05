@@ -301,7 +301,7 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	res := &Result{}
 	var q *aggQuery
 	groups := map[string]*group{}
-	err := d.e.ReadTxn(func(tx *bytdb.Txn) error {
+	err := d.read(func(tx *bytdb.Txn) error {
 		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
 		if err != nil {
 			return err
