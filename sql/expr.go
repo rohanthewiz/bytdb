@@ -30,8 +30,25 @@ type exEnv struct {
 	tx    *bytdb.Txn
 	sc    *scope
 	row   []any
+	grp   *group // current group in an aggregate query's group phase
 	outer *exEnv
 }
+
+// exGroupRef and exAccRef are the shapes resolveAgg rewrites an
+// aggregate query's expressions into: references to a GROUP BY key's
+// value and to an accumulator's result, read from the environment's
+// current group. They never come from the parser.
+type exGroupRef struct {
+	idx int
+	typ bytdb.ColType
+}
+type exAccRef struct {
+	idx int
+	typ bytdb.ColType
+}
+
+func (*exGroupRef) expr() {}
+func (*exAccRef) expr()   {}
 
 // lookupVal resolves a column reference against the environment
 // chain, innermost scope first. An ON condition evaluates against a
@@ -172,6 +189,16 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 	case *ExAgg:
 		return nil, serr.New("aggregate calls are not supported inside expressions",
 			"function", n.Fn.name())
+	case *exGroupRef:
+		if env.grp == nil {
+			return nil, serr.New("group reference outside an aggregate query")
+		}
+		return env.grp.keyVals[n.idx], nil
+	case *exAccRef:
+		if env.grp == nil {
+			return nil, serr.New("aggregate reference outside an aggregate query")
+		}
+		return env.grp.accs[n.idx].value(), nil
 	case *ExSub:
 		return evalSubquery(env, n.Sel)
 	}
@@ -676,12 +703,17 @@ func evalSubquery(env *exEnv, sel *Select) (any, error) {
 			return nil, serr.New("only COUNT takes *", "function", it.Agg.name())
 		}
 		sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
+		var addErr error
 		err = runJoin(env.tx, fp, sub, func(vals []any) bool {
-			acc.add(vals)
-			return true
+			sub.row = vals
+			addErr = acc.add(sub, vals)
+			return addErr == nil
 		})
 		if err != nil {
 			return nil, err
+		}
+		if addErr != nil {
+			return nil, addErr
 		}
 		return acc.value(), nil
 	}
@@ -914,6 +946,10 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 		}
 	case *ExCast:
 		return castColType(n.Type)
+	case *exGroupRef:
+		return n.typ
+	case *exAccRef:
+		return n.typ
 	case *ExArith:
 		if n.Op == "||" {
 			return bytdb.TString
@@ -960,6 +996,8 @@ func exprName(e Expr) string {
 	switch n := e.(type) {
 	case *ExFunc:
 		return n.Name
+	case *ExAgg:
+		return n.Fn.name() // sum(a*b) names its column "sum", as Postgres does
 	case *ExCase:
 		return "case"
 	case *ExCast:

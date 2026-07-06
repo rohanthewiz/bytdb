@@ -582,28 +582,32 @@ func (p *parser) selectCore() (*Select, error) {
 	return s, nil
 }
 
-// groupItem parses one GROUP BY key: an integer ordinal naming a
-// select-list position (GROUP BY 1), or a column reference. Other
-// constants draw the same complaint Postgres makes.
+// groupItem parses one GROUP BY key through the expression grammar.
+// A bare integer constant is an ordinal naming a select-list position
+// (GROUP BY 1); any other bare constant draws the same complaint
+// Postgres makes; a column stays a column, anything richer is a
+// general expression key.
 func (p *parser) groupItem() (GroupItem, error) {
-	t := p.cur()
-	if t.kind == tNumber || t.kind == tString {
-		n, err := strconv.ParseInt(t.text, 10, 64)
-		if t.kind != tNumber || err != nil {
-			return GroupItem{}, serr.New("non-integer constant in GROUP BY", "got", t.text)
-		}
-		if n < 1 {
-			return GroupItem{}, serr.New("GROUP BY position is not in the select list",
-				"position", t.text)
-		}
-		p.advance()
-		return GroupItem{Pos: n}, nil
-	}
-	col, err := p.colRef()
+	e, err := p.expression()
 	if err != nil {
 		return GroupItem{}, err
 	}
-	return GroupItem{Col: col}, nil
+	switch n := e.(type) {
+	case *ExLit:
+		v, ok := n.Val.(int64)
+		if !ok {
+			return GroupItem{}, serr.New("non-integer constant in GROUP BY",
+				"got", fmt.Sprint(n.Val))
+		}
+		if v < 1 {
+			return GroupItem{}, serr.New("GROUP BY position is not in the select list",
+				"position", fmt.Sprint(v))
+		}
+		return GroupItem{Pos: v}, nil
+	case *ExCol:
+		return GroupItem{Col: n.Col}, nil
+	}
+	return GroupItem{Ex: e}, nil
 }
 
 func (p *parser) nonNegInt(clause string) (int64, error) {
@@ -920,6 +924,9 @@ func lowerItem(e Expr) SelectItem {
 	case *ExCol:
 		return SelectItem{Col: n.Col}
 	case *ExAgg:
+		if n.Arg != nil { // an expression argument stays an expression
+			return SelectItem{Ex: e}
+		}
 		return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}
 	case *ExLit:
 		name := n.Name
@@ -1031,7 +1038,9 @@ func simpleItem(e Expr) (SelectItem, bool) {
 	case *ExCol:
 		return SelectItem{Col: n.Col}, true
 	case *ExAgg:
-		return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}, true
+		if n.Arg == nil { // an expression argument stays an expression
+			return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}, true
+		}
 	}
 	return SelectItem{}, false
 }
@@ -1365,11 +1374,18 @@ func (p *parser) exprPrimary() (Expr, error) {
 		if fn == AggCount && p.acceptOp("*") {
 			agg.Star = true
 		} else {
-			col, err := p.colRef()
+			e, err := p.expression()
 			if err != nil {
 				return nil, err
 			}
-			agg.Col = col
+			if c, ok := e.(*ExCol); ok {
+				agg.Col = c.Col
+			} else {
+				if findAgg(e) != AggNone {
+					return nil, serr.New("aggregate function calls cannot be nested")
+				}
+				agg.Arg = e
+			}
 		}
 		return agg, p.expectOp(")")
 	}

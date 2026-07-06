@@ -379,6 +379,17 @@ func TestParseAggregates(t *testing.T) {
 	if !reflect.DeepEqual(s.GroupBy, []GroupItem{{Pos: 1}, {Col: col("age")}}) {
 		t.Fatalf("got %#v", s.GroupBy)
 	}
+
+	// GROUP BY expressions stay expressions; an aggregate over an
+	// expression stays an expression item carrying the ExAgg.
+	s = mustParse(t, `select sum(age * 2) from t group by age / 10, upper(city)`).(*Select)
+	if len(s.GroupBy) != 2 || s.GroupBy[0].Ex == nil || s.GroupBy[1].Ex == nil {
+		t.Fatalf("got %#v", s.GroupBy)
+	}
+	agg, ok := s.Items[0].Ex.(*ExAgg)
+	if !ok || agg.Fn != AggSum || agg.Arg == nil {
+		t.Fatalf("got %#v", s.Items[0])
+	}
 }
 
 func TestParseAggregateErrors(t *testing.T) {
@@ -390,6 +401,7 @@ func TestParseAggregateErrors(t *testing.T) {
 		`select city from t group by 1.5`,             // non-integer constant
 		`select city from t group by 'city'`,          // non-integer constant
 		`select city from t group by 0`,               // position out of range
+		`select sum(count(*)) from t`,                 // nested aggregates
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%q): expected error", src)

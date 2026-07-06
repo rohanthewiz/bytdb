@@ -81,11 +81,14 @@ type ExLit struct {
 type ExCol struct{ Col ColRef }
 
 // ExAgg is an aggregate call inside an expression; only supported
-// where the legacy paths accept aggregates (it errors elsewhere).
+// where aggregates may appear (it errors elsewhere). The argument is
+// Col (a plain column), Star (COUNT(*)), or Arg (a general
+// expression, evaluated per input row).
 type ExAgg struct {
 	Fn   AggFunc
 	Col  ColRef
 	Star bool
+	Arg  Expr
 }
 
 // ExAnd / ExOr / ExNot are boolean operators within an expression.
@@ -167,6 +170,8 @@ func walkExpr(e Expr, visit func(Expr) bool) {
 		return
 	}
 	switch n := e.(type) {
+	case *ExAgg:
+		walkExpr(n.Arg, visit)
 	case *ExAnd:
 		for _, sub := range n.Exprs {
 			walkExpr(sub, visit)
@@ -356,11 +361,13 @@ type Insert struct {
 	Rows  [][]any
 }
 
-// GroupItem is one GROUP BY key: a column reference, or (Pos > 0) an
-// integer ordinal naming a select-list position, as in GROUP BY 1.
+// GroupItem is one GROUP BY key: a column reference, an integer
+// ordinal naming a select-list position (Pos > 0, as in GROUP BY 1),
+// or a general expression (Ex non-nil).
 type GroupItem struct {
 	Col ColRef
-	Pos int64 // 1-based select-list position; 0: Col names the key
+	Pos int64 // 1-based select-list position; 0: Col or Ex is the key
+	Ex  Expr
 }
 
 // OrderItem is one ORDER BY key: a column, or (in an aggregate

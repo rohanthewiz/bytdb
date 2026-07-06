@@ -51,6 +51,9 @@ func noteSelectVals(s *Select, note func(any)) {
 		}
 		noteExprVals(it.Ex, note)
 	}
+	for _, g := range s.GroupBy {
+		noteExprVals(g.Ex, note)
+	}
 	for _, o := range s.OrderBy {
 		noteExprVals(o.Ex, note)
 	}
@@ -172,6 +175,13 @@ func bindSelect(s *Select, sub func(any) any) *Select {
 		}
 		c.Items[i].Ex = bindExpr(c.Items[i].Ex, sub)
 	}
+	if len(s.GroupBy) > 0 { // preserve nil: it means "not an aggregate"
+		c.GroupBy = make([]GroupItem, len(s.GroupBy))
+		copy(c.GroupBy, s.GroupBy)
+		for i := range c.GroupBy {
+			c.GroupBy[i].Ex = bindExpr(c.GroupBy[i].Ex, sub)
+		}
+	}
 	c.OrderBy = make([]OrderItem, len(s.OrderBy))
 	copy(c.OrderBy, s.OrderBy)
 	for i := range c.OrderBy {
@@ -223,8 +233,15 @@ func bindExpr(e Expr, sub func(any) any) Expr {
 		c := *n
 		c.Val = sub(c.Val)
 		return &c
-	case *ExCol, *ExAgg:
+	case *ExCol:
 		return e
+	case *ExAgg:
+		if n.Arg == nil {
+			return e
+		}
+		c := *n
+		c.Arg = bindExpr(n.Arg, sub)
+		return &c
 	case *ExAnd:
 		c := &ExAnd{Exprs: make([]Expr, len(n.Exprs))}
 		for i, s := range n.Exprs {

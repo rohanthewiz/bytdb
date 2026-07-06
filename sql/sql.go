@@ -66,16 +66,20 @@
 // combine with UNION [ALL]; ORDER BY, LIMIT, and OFFSET then apply to
 // the combined rows by select-list position or output name.
 //
-// Select items are columns or aggregates: COUNT(*), COUNT(c), SUM(c),
-// AVG(c), MIN(c), MAX(c). Any aggregate, GROUP BY, or HAVING makes
-// the query aggregate rows, with SQL semantics: plain columns must
-// appear in GROUP BY, aggregates ignore NULL inputs (COUNT(*) counts
-// rows), NULL group values form one group, an ungrouped aggregate
-// query returns exactly one row, HAVING filters groups, and ORDER BY
-// may sort by grouped columns or aggregates. A GROUP BY key may be an
-// integer ordinal naming a select-list position (GROUP BY 1), which
-// must resolve to a plain column. Without ORDER BY, groups return in
-// ascending group-column order.
+// Aggregates are COUNT(*), COUNT(x), SUM(x), AVG(x), MIN(x), MAX(x),
+// where x is a column or any expression evaluated per input row
+// (SUM(a * b)); aggregate calls cannot nest. Any aggregate, GROUP BY,
+// or HAVING makes the query aggregate rows, with SQL semantics:
+// aggregates ignore NULL inputs (COUNT(*) counts rows), NULL group
+// values form one group, an ungrouped aggregate query returns exactly
+// one row, and HAVING filters groups. A GROUP BY key is a column, an
+// expression (GROUP BY age / 10), or an integer ordinal naming a
+// select-list position (GROUP BY 1). Select items, HAVING, and ORDER
+// BY take expressions over grouped data — a subtree matching a GROUP
+// BY key reads the group's key value, aggregates read their
+// accumulated results, and any other column reference is the classic
+// "must appear in the GROUP BY clause" error. Without ORDER BY,
+// groups return in ascending group-key order.
 //
 // The dialect follows Postgres conventions: 'string' literals with ”
 // escapes, "quoted" identifiers, unquoted identifiers folded to

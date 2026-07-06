@@ -443,7 +443,10 @@ func TestSQLAggregateErrors(t *testing.T) {
 		`select city, count(*) from users group by 3`,          // position out of range
 		`select city, count(*) from users group by 2`,          // ordinal names an aggregate
 		`select city, count(*) from users group by city, 1`,    // duplicate via ordinal
-		`select 'x', count(*) from users group by 1`,           // ordinal names a literal
+		`select upper(name) from users group by city`,          // ungrouped column in expression
+		`select count(count(*)) from users`,                    // nested aggregates
+		`select sum(name || 'x') from users`,                   // non-numeric SUM argument
+		`select city from users group by count(*)`,             // aggregate in GROUP BY
 	} {
 		if _, err := d.Exec(q); err == nil {
 			t.Errorf("Exec(%q): expected error", q)
@@ -592,5 +595,95 @@ func TestSQLErrors(t *testing.T) {
 		if _, err := d.Exec(q); err == nil {
 			t.Errorf("Exec(%q): expected error", q)
 		}
+	}
+}
+
+func TestSQLAggregateExpressions(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+
+	// GROUP BY an expression; the matching select item reads the key.
+	res := exec(t, d, `select age / 10 as decade, count(*) from users group by age / 10 order by 1`)
+	if !reflect.DeepEqual(res.Cols, []string{"decade", "count(*)"}) {
+		t.Fatalf("cols: %v", res.Cols)
+	}
+	want := [][]any{{int64(2), int64(1)}, {int64(3), int64(2)}, {int64(4), int64(2)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// GROUP BY 1 naming an expression item.
+	res = exec(t, d, `select upper(city), count(*) from users group by 1 order by 1`)
+	want = [][]any{{"AUSTIN", int64(1)}, {"LONDON", int64(2)}, {"NYC", int64(2)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// CASE as a group key, via the ordinal.
+	res = exec(t, d, `select case when age >= 40 then 'old' else 'young' end, count(*)
+		from users group by 1 order by 1`)
+	want = [][]any{{"old", int64(2)}, {"young", int64(3)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// An expression over a grouped column need not itself be a key.
+	res = exec(t, d, `select city || '!', count(*) from users group by city order by city || '!'`)
+	want = [][]any{{"austin!", int64(1)}, {"london!", int64(2)}, {"nyc!", int64(2)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Expressions over aggregates; literals ride along.
+	res = exec(t, d, `select 'x', count(*) + 1, sum(age * 2), avg(age + 0.0) from users`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"x", int64(6), int64(378), 37.8}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	if !reflect.DeepEqual(res.Cols, []string{"?column?", "?column?", "sum", "avg"}) {
+		t.Fatalf("cols: %v", res.Cols)
+	}
+	if !reflect.DeepEqual(res.Types, []bytdb.ColType{bytdb.TString, bytdb.TInt, bytdb.TInt, bytdb.TFloat}) {
+		t.Fatalf("types: %v", res.Types)
+	}
+
+	// ...and over zero rows the single group still evaluates.
+	res = exec(t, d, `select count(*) + 1 from users where id > 100`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(1)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// HAVING takes expressions over aggregates and group keys.
+	res = exec(t, d, `select city from users group by city having count(*) + 1 >= 3 order by city`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"london"}, {"nyc"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	res = exec(t, d, `select city from users group by city having upper(city) = 'NYC'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"nyc"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// ORDER BY resolves output aliases and full expressions.
+	res = exec(t, d, `select city, count(*) as n from users group by city order by n desc, city`)
+	want = [][]any{{"london", int64(2)}, {"nyc", int64(2)}, {"austin", int64(1)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	res = exec(t, d, `select city from users group by city order by count(*) * -1, city`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"london"}, {"nyc"}, {"austin"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Parameters bind inside group keys and aggregate arguments.
+	res, err := d.Exec(`select age / $1, count(*), sum(age * $1) from users group by age / $1 order by 1`, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = [][]any{
+		{int64(2), int64(1), int64(280)},
+		{int64(3), int64(2), int64(750)},
+		{int64(4), int64(2), int64(860)},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
 	}
 }

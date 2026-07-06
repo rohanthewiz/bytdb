@@ -156,19 +156,22 @@ SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 outer row, so an inner table joined on its primary key or an indexed
 column is a point get or bounded scan per row, not a full scan.
 
-Select items are columns or aggregates — `COUNT(*)`, `COUNT(c)`,
-`SUM(c)`, `AVG(c)`, `MIN(c)`, `MAX(c)` — with SQL semantics
-throughout: aggregates ignore NULLs (`COUNT(*)` counts rows), NULL
-group values form one group, an ungrouped aggregate query returns
-exactly one row even over zero rows, `HAVING` filters groups, and
-`ORDER BY` can sort by grouped columns or aggregates. A `GROUP BY`
-key is a column or an integer ordinal naming a select-list position
-(`GROUP BY 1`):
+Aggregates are `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `AVG(x)`, `MIN(x)`,
+`MAX(x)` — over a column or any per-row expression (`SUM(a * b)`) —
+with SQL semantics throughout: aggregates ignore NULLs (`COUNT(*)`
+counts rows), NULL group values form one group, an ungrouped
+aggregate query returns exactly one row even over zero rows, and
+`HAVING` filters groups. A `GROUP BY` key is a column, an expression,
+or an integer ordinal naming a select-list position (`GROUP BY 1`),
+and select items, `HAVING`, and `ORDER BY` take expressions over the
+grouped data — group keys, aggregate results, and anything built from
+them:
 
 ```sql
-SELECT city, count(*), avg(age) FROM users
-WHERE age > 18 GROUP BY city HAVING count(*) >= 2
-ORDER BY count(*) DESC LIMIT 3
+SELECT age / 10 AS decade, count(*) AS n, max(age)
+FROM users WHERE age > 18
+GROUP BY age / 10 HAVING count(*) >= 2
+ORDER BY n DESC, decade LIMIT 3
 ```
 
 WHERE and HAVING are boolean expressions: predicates — `column op
@@ -359,7 +362,8 @@ durability with group commit.
 - [x] **Milestone 12**: expression language — one grammar for select items and conditions (CASE, IN, `~`/`!~`/`~*`/`!~*`, `OPERATOR()`/`COLLATE`, `::` casts, arithmetic/`||`, functions with arguments, output aliases), lowered to the legacy predicate shapes where simple so pushdown survives; eval-time name resolution through an environment chain (correlated scalar subqueries, EXISTS, ARRAY(SELECT ...) — and unknown functions error only if a row reaches them); UNION [ALL]; catalog grown until psql's `\dt`, `\d`, `\d <table>`, `\d <index>`, `\di`, `\dn`, `\du`, `\l` all render
 - [x] **Milestone 13**: transaction blocks — `Engine.Begin`/`Txn.Commit`/`Txn.Rollback` over btypedb's manual transactions; `sql.Session` with Postgres block semantics (failed-block state and 25P02, `COMMIT`-of-failed reports `ROLLBACK`, warnings for redundant control, `READ ONLY`, isolation levels accepted as serializable, DDL refused in-block); pgwire sessions with real `ReadyForQuery` status, `NoticeResponse`, and rollback on disconnect
 - [x] **Milestone 14**: GROUP BY ordinals (`GROUP BY 1`); savepoints — btypedb v0.4 `Savepoint`/`RollbackTo`/`Release` as O(1) COW marks with WAL-batch truncation, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` in sessions with Postgres semantics (name shadowing, failed-block recovery, 3B001/25P01), pgx nested transactions over the wire
-- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, EXPLAIN, GROUP BY expressions
+- [x] **Milestone 15**: aggregate expressions — GROUP BY keys as arbitrary expressions (columns, ordinals, `age / 10`, CASE); select items, HAVING, and ORDER BY rewritten against the keys (matching subtrees read the group's key value, aggregate calls read accumulators, leftover columns get the classic must-appear-in-GROUP-BY error) and evaluated per group by the ordinary expression evaluator; aggregate calls over expressions (`SUM(a * b)`)
+- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, EXPLAIN
 
 ## Design notes
 
