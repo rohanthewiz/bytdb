@@ -44,11 +44,15 @@ func (s *Select) isAggregate() bool {
 // The argument is a column ordinal, an expression evaluated per input
 // row, or neither for COUNT(*). Aggregates ignore NULL inputs
 // (COUNT(*) counts rows); over zero inputs COUNT is 0 and the rest
-// are NULL, per SQL.
+// are NULL, per SQL. A distinct accumulator consumes each distinct
+// value once, deduplicated by the order-preserving tuple encoding
+// (the same equivalence GROUP BY uses).
 type accum struct {
 	fn       AggFunc
 	ord      int  // argument column ordinal; -1 when argEx or COUNT(*)
 	argEx    Expr // expression argument; nil for a column or COUNT(*)
+	distinct bool
+	seen     map[string]bool // per group; allocated by newGroup
 	intSum   bool
 	count    int64
 	sumI     int64
@@ -72,6 +76,16 @@ func (a *accum) add(env *exEnv, vals []any) error {
 	}
 	if v == nil {
 		return nil
+	}
+	if a.distinct {
+		kb, err := tuple.Encode(v)
+		if err != nil {
+			return serr.Wrap(err, "op", "encode DISTINCT value")
+		}
+		if a.seen[string(kb)] {
+			return nil
+		}
+		a.seen[string(kb)] = true
 	}
 	a.count++
 	switch a.fn {
@@ -452,7 +466,7 @@ func (q *aggQuery) rewrite(e Expr) (Expr, error) {
 // identical calls share one. SUM and AVG over a column require a
 // numeric column; expression arguments are checked at evaluation.
 func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
-	a := accum{fn: n.Fn, ord: -1}
+	a := accum{fn: n.Fn, ord: -1, distinct: n.Distinct}
 	key := "*"
 	switch {
 	case n.Arg != nil:
@@ -478,9 +492,9 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 		a.ord, a.intSum = ord, t == bytdb.TInt
 		key = fmt.Sprintf("c%d", ord)
 	}
-	key = fmt.Sprintf("%d|%s", n.Fn, key)
+	key = fmt.Sprintf("%d|%v|%s", n.Fn, n.Distinct, key)
 	for i, ex := range q.accums {
-		got := fmt.Sprintf("%d|", ex.fn)
+		got := fmt.Sprintf("%d|%v|", ex.fn, ex.distinct)
 		switch {
 		case ex.argEx != nil:
 			txt, _ := exprKey(q.sc, ex.argEx)
@@ -615,7 +629,13 @@ type group struct {
 }
 
 func (q *aggQuery) newGroup(keyVals []any) *group {
-	return &group{keyVals: keyVals, accs: slices.Clone(q.accums)}
+	g := &group{keyVals: keyVals, accs: slices.Clone(q.accums)}
+	for i := range g.accs {
+		if g.accs[i].distinct { // dedup state is per group, not shared
+			g.accs[i].seen = map[string]bool{}
+		}
+	}
+	return g
 }
 
 func (d *DB) execSelectAgg(s *Select) (*Result, error) {

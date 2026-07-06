@@ -170,7 +170,7 @@ func command(st Statement) string {
 		return "CREATE TABLE"
 	case *DropTable:
 		return "DROP TABLE"
-	case *AddColumn, *DropColumn:
+	case *AddColumn, *DropColumn, *AddConstraint, *DropConstraint:
 		return "ALTER TABLE"
 	case *CreateIndex:
 		return "CREATE INDEX"

@@ -239,7 +239,8 @@ func (s *Session) savepointControl(tc *TxnControl) (*Result, error) {
 // isDDL reports whether st changes the schema.
 func isDDL(st Statement) bool {
 	switch st.(type) {
-	case *CreateTable, *DropTable, *AddColumn, *DropColumn, *CreateIndex, *DropIndex:
+	case *CreateTable, *DropTable, *AddColumn, *DropColumn,
+		*AddConstraint, *DropConstraint, *CreateIndex, *DropIndex:
 		return true
 	}
 	return false

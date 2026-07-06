@@ -94,6 +94,11 @@ func TestExplainJoinAggSort(t *testing.T) {
 	wantPlan(t, d, `explain select count(*) from users`,
 		`Aggregate`,
 		`  ->  Seq Scan on users`)
+	wantPlan(t, d, `explain select city from users group by city having count(distinct age) > 1`,
+		`HashAggregate`,
+		`  Group Key: city`,
+		`  Filter: (count(DISTINCT age) > 1)`,
+		`  ->  Seq Scan on users`)
 
 	wantPlan(t, d, `explain select name from users union all select name from users`,
 		`Append`,

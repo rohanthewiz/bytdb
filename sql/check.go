@@ -129,6 +129,82 @@ func checkRow(env *exEnv, table string, checks []namedCheck, vals []any) error {
 	return nil
 }
 
+// execAddConstraint handles ALTER TABLE ... ADD CHECK: the expression
+// is validated against the table's columns, named by convention when
+// unnamed, and every existing row must satisfy it — evaluated in the
+// transaction that publishes the descriptor, so no write slips in
+// between.
+func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
+	desc := d.e.Table(s.Table)
+	if desc == nil {
+		return nil, serr.New("no such table", "table", s.Table)
+	}
+	sc := &scope{tables: []scopeTable{{name: s.Table, desc: desc}}, width: len(desc.Columns)}
+	if err := validateCheckExpr(sc, s.Check.Ex); err != nil {
+		return nil, err
+	}
+	name := s.Check.Name
+	if name == "" {
+		taken := map[string]bool{}
+		for _, ck := range desc.Checks {
+			taken[ck.Name] = true
+		}
+		base := s.Table + "_check" // ALTER adds table-level checks only
+		name = base
+		for n := 1; taken[name]; n++ {
+			name = fmt.Sprintf("%s%d", base, n)
+		}
+	}
+	// Checks cannot hold subqueries, so evaluation never needs a
+	// transaction in the environment.
+	env := &exEnv{d: d, sc: sc}
+	err := d.e.AddCheck(s.Table, bytdb.CheckDesc{Name: name, Expr: s.Check.Text},
+		func(row bytdb.Row) error {
+			rowEnv := *env
+			rowEnv.row = row.Vals
+			t, err := evalTruth(&rowEnv, s.Check.Ex)
+			if err != nil {
+				return serr.Wrap(err, "constraint", name)
+			}
+			if t == triFalse {
+				return serr.New(`check constraint "` + name + `" of relation "` +
+					s.Table + `" is violated by some row`)
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return &Result{}, nil
+}
+
+// execDropConstraint handles ALTER TABLE ... DROP CONSTRAINT. Only
+// CHECK constraints can be dropped: the primary key is structural in
+// bytdb, and unique constraints are indexes (DROP INDEX).
+func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
+	desc := d.e.Table(s.Table)
+	if desc == nil {
+		return nil, serr.New("no such table", "table", s.Table)
+	}
+	existed, err := d.e.DropCheck(s.Table, s.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !existed {
+		if s.Name == s.Table+"_pkey" {
+			return nil, serr.New(`cannot drop constraint "`+s.Name+`" of relation "`+s.Table+`"`,
+				"hint", "a bytdb table keeps its primary key for life")
+		}
+		if s.IfExists {
+			return &Result{Notice: `constraint "` + s.Name + `" of relation "` +
+				s.Table + `" does not exist, skipping`}, nil
+		}
+		return nil, serr.New(`constraint "` + s.Name + `" of relation "` +
+			s.Table + `" does not exist`)
+	}
+	return &Result{}, nil
+}
+
 // checkDropColumn rejects dropping a column a check constraint
 // mentions, as Postgres does without CASCADE.
 func (d *DB) checkDropColumn(table, col string) error {

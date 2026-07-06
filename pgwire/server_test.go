@@ -211,6 +211,19 @@ func TestConstraintsAndExplain(t *testing.T) {
 	}
 	mustExec(t, c, `insert into items values (1, 'x', 3)`)
 
+	// ALTER TABLE ADD/DROP CONSTRAINT over the wire, with its tag and
+	// SQLSTATEs.
+	if tag := mustExec(t, c, `alter table items add constraint cheap check (price < 100)`); tag.String() != "ALTER TABLE" {
+		t.Fatalf("add constraint tag: %q", tag)
+	}
+	if _, err := c.Exec(ctx, `alter table items add check (price > 50)`); !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("violated add constraint: %+v", err)
+	}
+	if _, err := c.Exec(ctx, `alter table items drop constraint nope`); !errors.As(err, &pgErr) || pgErr.Code != "42704" {
+		t.Fatalf("drop missing constraint: %+v", err)
+	}
+	mustExec(t, c, `alter table items drop constraint cheap`)
+
 	// EXPLAIN over the wire: one text column, EXPLAIN command tag.
 	rows, err := c.Query(ctx, `explain select * from items where id = $1`, int64(1))
 	if err != nil {

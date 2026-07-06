@@ -229,6 +229,70 @@ func (e *Engine) DropColumn(table, name string) error {
 	return nil
 }
 
+// AddCheck appends a CHECK constraint to a table. The engine treats
+// the expression as opaque text (see CheckDesc); validate, when
+// non-nil, is called for every existing row inside the transaction
+// that publishes the descriptor — its error aborts the add — so the
+// caller can verify the constraint holds with no write slipping in
+// between. The name must be non-empty and unused.
+func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) error {
+	e.ddlMu.Lock()
+	defer e.ddlMu.Unlock()
+	old := e.Table(table)
+	if old == nil {
+		return serr.New("no such table", "table", table)
+	}
+	if ck.Name == "" {
+		return serr.New("check constraint name is required", "table", table)
+	}
+	for _, c := range old.Checks {
+		if c.Name == ck.Name {
+			return serr.New(`constraint "` + ck.Name + `" for relation "` + table +
+				`" already exists`)
+		}
+	}
+	desc := old.clone()
+	desc.Checks = append(desc.Checks, ck)
+	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+		if validate != nil {
+			for row, err := range scanRows(tx, old, nil, nil) {
+				if err != nil {
+					return err
+				}
+				if err := validate(row); err != nil {
+					return err
+				}
+			}
+		}
+		return e.writeDescIn(tx, table, desc)
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "add check", "table", table, "constraint", ck.Name)
+	}
+	return nil
+}
+
+// DropCheck removes the named CHECK constraint, reporting whether it
+// existed.
+func (e *Engine) DropCheck(table, name string) (bool, error) {
+	e.ddlMu.Lock()
+	defer e.ddlMu.Unlock()
+	old := e.Table(table)
+	if old == nil {
+		return false, serr.New("no such table", "table", table)
+	}
+	i := slices.IndexFunc(old.Checks, func(c CheckDesc) bool { return c.Name == name })
+	if i < 0 {
+		return false, nil
+	}
+	desc := old.clone()
+	desc.Checks = slices.Delete(desc.Checks, i, i+1)
+	if err := e.writeDesc(table, desc); err != nil {
+		return false, serr.Wrap(err, "op", "drop check", "table", table, "constraint", name)
+	}
+	return true, nil
+}
+
 // writeDesc persists an updated descriptor and publishes it as the
 // last step inside the transaction (callers hold ddlMu).
 func (e *Engine) writeDesc(table string, desc *TableDesc) error {

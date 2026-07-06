@@ -1,6 +1,7 @@
 package bytdb
 
 import (
+	"errors"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -267,6 +268,57 @@ func TestCheckDescStorage(t *testing.T) {
 	defer e2.Close()
 	if got := e2.Table("t").Checks; !reflect.DeepEqual(got, checks) {
 		t.Fatalf("checks not persisted: %+v", got)
+	}
+}
+
+func TestAddDropCheck(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	e := openEngine(t, path)
+	defer e.Close()
+	peopleTable(t, e)
+	insertPeople(t, e, []any{1, "ada", 36, "a@x"}, []any{2, "grace", 45, "g@x"})
+
+	// validate sees every existing row; its error aborts the add.
+	var seen []any
+	err := e.AddCheck("people", CheckDesc{Name: "adults", Expr: "age >= 18"}, func(r Row) error {
+		seen = append(seen, r.Col("id"))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(seen, []any{int64(1), int64(2)}) {
+		t.Fatalf("validate saw %v", seen)
+	}
+	if err := e.AddCheck("people", CheckDesc{Name: "x", Expr: "e"}, func(Row) error {
+		return errors.New("row rejected")
+	}); err == nil || !strings.Contains(err.Error(), "row rejected") {
+		t.Fatalf("validate error not surfaced: %v", err)
+	}
+	if e.Table("people").Checks[0].Name != "adults" || len(e.Table("people").Checks) != 1 {
+		t.Fatalf("checks after failed add: %+v", e.Table("people").Checks)
+	}
+
+	// Names must be present and unused.
+	if err := e.AddCheck("people", CheckDesc{Name: "adults", Expr: "age >= 21"}, nil); err == nil ||
+		!strings.Contains(err.Error(), `constraint "adults" for relation "people" already exists`) {
+		t.Fatalf("duplicate name: %v", err)
+	}
+	if err := e.AddCheck("people", CheckDesc{Expr: "age >= 21"}, nil); err == nil {
+		t.Fatal("empty name accepted")
+	}
+	if err := e.AddCheck("nope", CheckDesc{Name: "c", Expr: "1"}, nil); err == nil {
+		t.Fatal("missing table accepted")
+	}
+
+	if existed, err := e.DropCheck("people", "nope"); err != nil || existed {
+		t.Fatalf("DropCheck missing = %v, %v", existed, err)
+	}
+	if existed, err := e.DropCheck("people", "adults"); err != nil || !existed {
+		t.Fatalf("DropCheck = %v, %v", existed, err)
+	}
+	if len(e.Table("people").Checks) != 0 {
+		t.Fatalf("checks after drop: %+v", e.Table("people").Checks)
 	}
 }
 

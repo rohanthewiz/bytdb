@@ -83,12 +83,15 @@ type ExCol struct{ Col ColRef }
 // ExAgg is an aggregate call inside an expression; only supported
 // where aggregates may appear (it errors elsewhere). The argument is
 // Col (a plain column), Star (COUNT(*)), or Arg (a general
-// expression, evaluated per input row).
+// expression, evaluated per input row). Distinct makes the aggregate
+// consume each distinct non-NULL argument value once (COUNT(DISTINCT
+// x), SUM(DISTINCT x), ...).
 type ExAgg struct {
-	Fn   AggFunc
-	Col  ColRef
-	Star bool
-	Arg  Expr
+	Fn       AggFunc
+	Col      ColRef
+	Star     bool
+	Arg      Expr
+	Distinct bool
 }
 
 // ExAnd / ExOr / ExNot are boolean operators within an expression.
@@ -355,6 +358,19 @@ type AddColumn struct {
 // DropColumn is ALTER TABLE t DROP [COLUMN] col.
 type DropColumn struct{ Table, Col string }
 
+// AddConstraint is ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr).
+type AddConstraint struct {
+	Table string
+	Check CheckDef
+}
+
+// DropConstraint is ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name.
+type DropConstraint struct {
+	Table    string
+	Name     string
+	IfExists bool
+}
+
 // CreateIndex is CREATE [UNIQUE] INDEX name ON t (col [ASC|DESC], ...).
 // Desc is parallel to Cols (nil: all ascending).
 type CreateIndex struct {
@@ -484,15 +500,17 @@ type TxnControl struct {
 // are ignored.
 type Explain struct{ Stmt Statement }
 
-func (*CreateTable) stmt() {}
-func (*Explain) stmt()     {}
-func (*DropTable) stmt()   {}
-func (*AddColumn) stmt()   {}
-func (*DropColumn) stmt()  {}
-func (*CreateIndex) stmt() {}
-func (*DropIndex) stmt()   {}
-func (*Insert) stmt()      {}
-func (*Select) stmt()      {}
-func (*Update) stmt()      {}
-func (*Delete) stmt()      {}
-func (*TxnControl) stmt()  {}
+func (*CreateTable) stmt()    {}
+func (*Explain) stmt()        {}
+func (*DropTable) stmt()      {}
+func (*AddColumn) stmt()      {}
+func (*DropColumn) stmt()     {}
+func (*AddConstraint) stmt()  {}
+func (*DropConstraint) stmt() {}
+func (*CreateIndex) stmt()    {}
+func (*DropIndex) stmt()      {}
+func (*Insert) stmt()         {}
+func (*Select) stmt()         {}
+func (*Update) stmt()         {}
+func (*Delete) stmt()         {}
+func (*TxnControl) stmt()     {}

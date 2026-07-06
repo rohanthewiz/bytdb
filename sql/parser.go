@@ -619,6 +619,34 @@ func (p *parser) alterTable() (Statement, error) {
 	}
 	switch {
 	case p.acceptKw("add"):
+		// A table constraint: [CONSTRAINT name] CHECK (expr). Other
+		// constraint kinds are recognized and rejected with a pointer
+		// to what bytdb offers instead.
+		cname := ""
+		named := false
+		if p.acceptKw("constraint") {
+			if cname, err = p.ident("a constraint name"); err != nil {
+				return nil, err
+			}
+			named = true
+		}
+		switch {
+		case p.acceptKw("check"):
+			ex, text, err := p.checkExpr()
+			if err != nil {
+				return nil, err
+			}
+			return &AddConstraint{Table: table, Check: CheckDef{Name: cname, Ex: ex, Text: text}}, nil
+		case p.acceptKw("primary"):
+			return nil, serr.New("ADD PRIMARY KEY is not supported", "table", table)
+		case p.acceptKw("unique"):
+			return nil, serr.New("ADD UNIQUE is not supported; use CREATE UNIQUE INDEX",
+				"table", table)
+		case p.acceptKw("foreign"):
+			return nil, serr.New("foreign keys are not supported", "table", table)
+		case named:
+			return nil, p.unexpected("CHECK after CONSTRAINT name")
+		}
 		p.acceptKw("column")
 		col, pk, checks, err := p.colDef()
 		if err != nil {
@@ -633,6 +661,19 @@ func (p *parser) alterTable() (Statement, error) {
 		}
 		return &AddColumn{Table: table, Col: col}, nil
 	case p.acceptKw("drop"):
+		if p.acceptKw("constraint") {
+			dc := &DropConstraint{Table: table}
+			if p.acceptKw("if") {
+				if err := p.expectKw("exists"); err != nil {
+					return nil, err
+				}
+				dc.IfExists = true
+			}
+			if dc.Name, err = p.ident("a constraint name"); err != nil {
+				return nil, err
+			}
+			return dc, nil
+		}
 		p.acceptKw("column")
 		name, err := p.ident("a column name")
 		if err != nil {
@@ -640,7 +681,7 @@ func (p *parser) alterTable() (Statement, error) {
 		}
 		return &DropColumn{Table: table, Col: name}, nil
 	}
-	return nil, p.unexpected("ADD or DROP COLUMN")
+	return nil, p.unexpected("ADD or DROP COLUMN or CONSTRAINT")
 }
 
 // --- DML ---
@@ -1145,7 +1186,7 @@ func lowerItem(e Expr) SelectItem {
 	case *ExCol:
 		return SelectItem{Col: n.Col}
 	case *ExAgg:
-		if n.Arg != nil { // an expression argument stays an expression
+		if n.Arg != nil || n.Distinct { // beyond the legacy shape: stays an expression
 			return SelectItem{Ex: e}
 		}
 		return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}
@@ -1259,7 +1300,7 @@ func simpleItem(e Expr) (SelectItem, bool) {
 	case *ExCol:
 		return SelectItem{Col: n.Col}, true
 	case *ExAgg:
-		if n.Arg == nil { // an expression argument stays an expression
+		if n.Arg == nil && !n.Distinct { // beyond the legacy shape: stays an expression
 			return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}, true
 		}
 	}
@@ -1592,7 +1633,12 @@ func (p *parser) exprPrimary() (Expr, error) {
 		p.advance() // function name
 		p.advance() // (
 		agg := &ExAgg{Fn: fn}
-		if fn == AggCount && p.acceptOp("*") {
+		if p.acceptKw("distinct") {
+			agg.Distinct = true
+		} else {
+			p.acceptKw("all") // the default
+		}
+		if fn == AggCount && !agg.Distinct && p.acceptOp("*") {
 			agg.Star = true
 		} else {
 			e, err := p.expression()

@@ -472,6 +472,9 @@ func exprText(e Expr) string {
 		case !n.Star:
 			arg = n.Col.String()
 		}
+		if n.Distinct {
+			arg = "DISTINCT " + arg
+		}
 		return n.Fn.name() + "(" + arg + ")"
 	case *ExAnd:
 		return joinExprs(n.Exprs, " AND ")

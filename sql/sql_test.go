@@ -245,6 +245,90 @@ func TestSQLCheckValidation(t *testing.T) {
 	}
 }
 
+func TestSQLAddDropConstraint(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table items (id int primary key, price int, qty int)`)
+	exec(t, d, `insert into items values (1, 10, 5), (2, 20, null)`)
+
+	// Existing rows must satisfy a new check; NULL evaluations pass.
+	if _, err := d.Exec(`alter table items add check (price > 15)`); err == nil ||
+		!strings.Contains(err.Error(), `check constraint "items_check" of relation "items" is violated by some row`) {
+		t.Fatalf("violated add: %v", err)
+	}
+	exec(t, d, `alter table items add check (price > 0)`)
+	exec(t, d, `alter table items add constraint qty_sane check (qty >= 0)`)
+
+	// The new checks enforce on writes and show in the catalog.
+	if _, err := d.Exec(`insert into items values (3, -1, 1)`); err == nil ||
+		!strings.Contains(err.Error(), `violates check constraint "items_check"`) {
+		t.Fatalf("insert after add: %v", err)
+	}
+	if _, err := d.Exec(`update items set qty = -2 where id = 1`); err == nil ||
+		!strings.Contains(err.Error(), `violates check constraint "qty_sane"`) {
+		t.Fatalf("update after add: %v", err)
+	}
+	res := exec(t, d, `select conname from pg_constraint where conrelid = 'items'::regclass order by 1`)
+	if want := [][]any{{"items_check"}, {"qty_sane"}}; !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("pg_constraint: got %v", res.Rows)
+	}
+
+	// Default names dedup against existing constraints.
+	exec(t, d, `alter table items add check (qty < 1000)`)
+	res = exec(t, d, `select conname from pg_constraint where conrelid = 'items'::regclass order by 1`)
+	if want := [][]any{{"items_check"}, {"items_check1"}, {"qty_sane"}}; !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("after dedup add: got %v", res.Rows)
+	}
+
+	// DROP CONSTRAINT lifts enforcement and unblocks DROP COLUMN.
+	exec(t, d, `alter table items drop constraint items_check1`)
+	if _, err := d.Exec(`alter table items drop column qty`); err == nil {
+		t.Fatal("drop of checked column allowed")
+	}
+	exec(t, d, `alter table items drop constraint qty_sane`)
+	exec(t, d, `alter table items drop column qty`)
+	exec(t, d, `alter table items drop constraint items_check`)
+	exec(t, d, `insert into items values (3, -1)`) // no checks left
+
+	// Error and IF EXISTS shapes.
+	if _, err := d.Exec(`alter table items drop constraint nope`); err == nil ||
+		!strings.Contains(err.Error(), `constraint "nope" of relation "items" does not exist`) {
+		t.Fatalf("drop missing: %v", err)
+	}
+	res = exec(t, d, `alter table items drop constraint if exists nope`)
+	if !strings.Contains(res.Notice, "does not exist, skipping") {
+		t.Fatalf("IF EXISTS notice: %q", res.Notice)
+	}
+	if _, err := d.Exec(`alter table items drop constraint items_pkey`); err == nil ||
+		!strings.Contains(err.Error(), `cannot drop constraint "items_pkey"`) {
+		t.Fatalf("drop pkey: %v", err)
+	}
+	if _, err := d.Exec(`alter table items add constraint c check (nope > 0)`); err == nil ||
+		!strings.Contains(err.Error(), "no such column") {
+		t.Fatalf("bad column: %v", err)
+	}
+	if _, err := d.Exec(`alter table items add check (count(price) > 0)`); err == nil ||
+		!strings.Contains(err.Error(), "aggregate functions are not allowed in check constraints") {
+		t.Fatalf("aggregate check: %v", err)
+	}
+	exec(t, d, `alter table items add constraint dup check (price != 0)`)
+	if _, err := d.Exec(`alter table items add constraint dup check (price != 1)`); err == nil ||
+		!strings.Contains(err.Error(), `constraint "dup" for relation "items" already exists`) {
+		t.Fatalf("duplicate name: %v", err)
+	}
+	for q, want := range map[string]string{
+		`alter table items add primary key (id)`:                    "ADD PRIMARY KEY is not supported",
+		`alter table items add constraint u unique (price)`:         "ADD UNIQUE is not supported",
+		`alter table items add foreign key (id) references o (id)`:  "foreign keys are not supported",
+		`alter table nosuch add check (a > 0)`:                      "no such table",
+		`alter table nosuch drop constraint c`:                      "no such table",
+		`alter table items add constraint x check ((select 1) = 1)`: "cannot use subquery in check constraint",
+	} {
+		if _, err := d.Exec(q); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s\n  got: %v\n  want: %s", q, err, want)
+		}
+	}
+}
+
 func TestSQLPointGetAndMisses(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)
@@ -597,6 +681,59 @@ func TestSQLAggregateNulls(t *testing.T) {
 	res = exec(t, d, `select min(grp), max(grp) from m`)
 	if !reflect.DeepEqual(res.Rows, [][]any{{"a", "a"}}) {
 		t.Fatalf("got %v", res.Rows)
+	}
+}
+
+func TestSQLDistinctAggregates(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table m (id int primary key, grp text, v int)`)
+	exec(t, d, `insert into m values
+		(1, 'a', 10), (2, 'a', 10), (3, 'a', 20), (4, 'a', null),
+		(5, 'b', 10), (6, 'b', null), (7, 'b', null)`)
+
+	// DISTINCT consumes each distinct non-NULL value once; NULLs are
+	// ignored as in any aggregate. Postgres names the column after the
+	// bare function.
+	res := exec(t, d, `select count(distinct v), count(v), count(*) from m`)
+	if !reflect.DeepEqual(res.Cols, []string{"count", "count(v)", "count(*)"}) {
+		t.Fatalf("cols: %v", res.Cols)
+	}
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(2), int64(4), int64(7)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Dedup state is per group, per accumulator.
+	res = exec(t, d, `select grp, count(distinct v), sum(distinct v), avg(distinct v) from m group by grp`)
+	want := [][]any{
+		{"a", int64(2), int64(30), 15.0},
+		{"b", int64(1), int64(10), 10.0},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Expression arguments, HAVING, and ORDER BY; ALL is the default.
+	res = exec(t, d, `select grp from m group by grp having count(distinct v) > 1`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"a"}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	res = exec(t, d, `select grp, count(distinct v % 10) from m group by grp order by count(distinct v) desc`)
+	if want := [][]any{{"a", int64(1)}, {"b", int64(1)}}; !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+	res = exec(t, d, `select count(all v) from m`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(4)}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	// Zero rows: COUNT(DISTINCT) is 0, SUM(DISTINCT) NULL.
+	res = exec(t, d, `select count(distinct v), sum(distinct v) from m where id > 100`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(0), nil}}) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
+	if _, err := d.Exec(`select count(distinct *) from m`); err == nil {
+		t.Fatal("count(distinct *) accepted")
 	}
 }
 

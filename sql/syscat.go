@@ -93,6 +93,10 @@ func writeTarget(st Statement) string {
 		return s.Table
 	case *DropColumn:
 		return s.Table
+	case *AddConstraint:
+		return s.Table
+	case *DropConstraint:
+		return s.Table
 	case *CreateIndex:
 		return s.Table
 	case *DropIndex:

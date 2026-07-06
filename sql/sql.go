@@ -10,6 +10,8 @@
 //	DROP TABLE t
 //	ALTER TABLE t ADD [COLUMN] c type [NOT NULL]
 //	ALTER TABLE t DROP [COLUMN] c
+//	ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
+//	ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 //	CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 //	DROP INDEX idx [ON t]
 //	EXPLAIN statement
@@ -71,7 +73,10 @@
 //
 // Aggregates are COUNT(*), COUNT(x), SUM(x), AVG(x), MIN(x), MAX(x),
 // where x is a column or any expression evaluated per input row
-// (SUM(a * b)); aggregate calls cannot nest. Any aggregate, GROUP BY,
+// (SUM(a * b)); aggregate calls cannot nest. The argument may be
+// DISTINCT x (COUNT(DISTINCT city)): the aggregate then consumes each
+// distinct non-NULL value once per group, deduplicated by the same
+// equivalence GROUP BY uses. Any aggregate, GROUP BY,
 // or HAVING makes the query aggregate rows, with SQL semantics:
 // aggregates ignore NULL inputs (COUNT(*) counts rows), NULL group
 // values form one group, an ungrouped aggregate query returns exactly
@@ -123,8 +128,14 @@
 // wording ("violates not-null constraint", "violates check
 // constraint") and SQLSTATEs (23502, 23514) over the wire, checks
 // appear in pg_constraint and pg_get_constraintdef (psql's \d shows
-// them), and a column a check mentions cannot be dropped. DEFAULT,
-// UNIQUE column constraints, and REFERENCES are rejected at parse.
+// them), and a column a check mentions cannot be dropped (drop the
+// constraint first). ALTER TABLE ADD [CONSTRAINT name] CHECK installs
+// a check on an existing table after verifying every existing row
+// satisfies it — in the transaction that publishes it, so no write
+// slips in between — and ALTER TABLE DROP CONSTRAINT removes one by
+// name (checks only: the primary key is structural, and unique
+// constraints are indexes here). DEFAULT, UNIQUE column constraints,
+// and REFERENCES are rejected at parse.
 //
 // A CREATE INDEX key column may be DESC: the index stores that
 // column's keys byte-inverted, so scans (and the rows a bounded scan
@@ -312,6 +323,10 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 			return nil, err
 		}
 		return &Result{}, nil
+	case *AddConstraint:
+		return d.execAddConstraint(s)
+	case *DropConstraint:
+		return d.execDropConstraint(s)
 	case *CreateIndex:
 		keys := make([]bytdb.IndexCol, len(s.Cols))
 		for i, c := range s.Cols {
