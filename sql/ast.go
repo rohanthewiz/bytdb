@@ -105,12 +105,21 @@ type ExCmp struct {
 	L, R Expr
 }
 
-// ExAny is L op ANY(R); parsed for compatibility, unsupported at
-// evaluation (bytdb has no arrays).
+// ExAny is L op ANY(R) or, when All is set, L op ALL(R). R is an
+// ARRAY[...] constructor, a subquery, or a value that reads as an
+// array (a []any or a Postgres '{...}' array-literal string). ANY is
+// true when the comparison holds for some element; ALL when it holds
+// for every element.
 type ExAny struct {
 	Op   PredOp
 	L, R Expr
+	All  bool
 }
+
+// ExArray is the ARRAY[e1, e2, ...] constructor. bytdb has no
+// first-class array type; the node exists so the right-hand side of
+// op ANY(...) / op ALL(...) can be written as a list of elements.
+type ExArray struct{ Elems []Expr }
 
 // ExIsNull is E IS [NOT] NULL.
 type ExIsNull struct {
@@ -214,6 +223,10 @@ func walkExpr(e Expr, visit func(Expr) bool) {
 	case *ExIndex:
 		walkExpr(n.E, visit)
 		walkExpr(n.Idx, visit)
+	case *ExArray:
+		for _, sub := range n.Elems {
+			walkExpr(sub, visit)
+		}
 	case *ExArith:
 		walkExpr(n.L, visit)
 		walkExpr(n.R, visit)
@@ -234,6 +247,7 @@ func (*ExCase) expr()   {}
 func (*ExFunc) expr()   {}
 func (*ExCast) expr()   {}
 func (*ExIndex) expr()  {}
+func (*ExArray) expr()  {}
 func (*ExArith) expr()  {}
 func (*ExSub) expr()    {}
 

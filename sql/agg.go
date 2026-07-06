@@ -209,7 +209,7 @@ func writeExprKey(b *strings.Builder, sc *scope, e Expr) error {
 	case *ExCmp:
 		return list(fmt.Sprintf("cmp%d", n.Op), n.L, n.R)
 	case *ExAny:
-		return list(fmt.Sprintf("any%d", n.Op), n.L, n.R)
+		return list(fmt.Sprintf("any%d/%v", n.Op, n.All), n.L, n.R)
 	case *ExIsNull:
 		return list(fmt.Sprintf("isnull%v", n.Not), n.E)
 	case *ExIn:
@@ -226,6 +226,8 @@ func writeExprKey(b *strings.Builder, sc *scope, e Expr) error {
 		return list("cast:"+n.Type, n.E)
 	case *ExIndex:
 		return list("idx", n.E, n.Idx)
+	case *ExArray:
+		return list("array", n.Elems...)
 	case *ExArith:
 		return list("op"+n.Op, n.L, n.R)
 	default:
@@ -455,6 +457,15 @@ func (q *aggQuery) rewrite(e Expr) (Expr, error) {
 	case *ExIndex:
 		c := *n
 		return &c, sub(&c.E, &c.Idx)
+	case *ExArray:
+		c := *n
+		c.Elems = slices.Clone(n.Elems)
+		for i := range c.Elems {
+			if err := sub(&c.Elems[i]); err != nil {
+				return nil, err
+			}
+		}
+		return &c, nil
 	case *ExArith:
 		c := *n
 		return &c, sub(&c.L, &c.R)

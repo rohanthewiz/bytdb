@@ -129,7 +129,7 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		}
 		return triVal(t), nil
 	case *ExAny:
-		return nil, serr.New("ANY is not supported (bytdb has no array values)")
+		return evalAnyAll(env, n)
 	case *ExIsNull:
 		v, err := evalEx(env, n.E)
 		if err != nil {
@@ -170,6 +170,16 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		return castVal(env, v, n.Type)
 	case *ExIndex:
 		return nil, serr.New("array subscripts are not supported")
+	case *ExArray:
+		vals, err := arrayElems(env, n)
+		if err != nil {
+			return nil, err
+		}
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = valText(v)
+		}
+		return "{" + strings.Join(parts, ",") + "}", nil
 	case *ExArith:
 		// Every arithmetic/concat operator is NULL-strict, so a NULL
 		// left operand decides the result without evaluating the right
@@ -265,6 +275,185 @@ func evalIn(env *exEnv, n *ExIn) (any, error) {
 		out = out.not()
 	}
 	return triVal(out), nil
+}
+
+// evalAnyAll evaluates L op ANY(R) / L op ALL(R). ANY yields TRUE on
+// the first element the comparison holds for; ALL yields FALSE on the
+// first it fails. Otherwise a NULL operand (or element) leaves the
+// result unknown, matching Postgres three-valued logic. An empty array
+// is FALSE for ANY and TRUE for ALL, regardless of a NULL left side.
+func evalAnyAll(env *exEnv, n *ExAny) (any, error) {
+	l, err := evalEx(env, n.L)
+	if err != nil {
+		return nil, err
+	}
+	elems, err := anyElements(env, n.R)
+	if err != nil {
+		return nil, err
+	}
+	if len(elems) == 0 {
+		return n.All, nil // ANY→false, ALL→true, even for a NULL left side
+	}
+	// ANY starts false and climbs to true; ALL starts true and falls to
+	// false. An unknown comparison holds the result at unknown unless a
+	// decisive element overrides it.
+	out := triFalse
+	if n.All {
+		out = triTrue
+	}
+	for _, ev := range elems {
+		t, err := checkPred(l, n.Op, ev)
+		if err != nil {
+			return nil, err
+		}
+		if !n.All && t == triTrue {
+			return true, nil
+		}
+		if n.All && t == triFalse {
+			return false, nil
+		}
+		if t == triUnknown {
+			out = triUnknown
+		}
+	}
+	return triVal(out), nil
+}
+
+// anyElements resolves the right-hand side of ANY/ALL to its element
+// values: an ARRAY[...] constructor, a subquery's single column, an
+// already-materialized []any, or a Postgres '{...}' array-literal
+// string (whose elements stay text for checkPred to coerce).
+func anyElements(env *exEnv, r Expr) ([]any, error) {
+	switch n := r.(type) {
+	case *ExArray:
+		return arrayElems(env, n)
+	case *ExSub:
+		return collectSubColumn(env, n.Sel)
+	case *ExCast:
+		// An array-typed cast (ARRAY[...]::int[], '{1,2}'::int[]) is only
+		// a type annotation here — the elements coerce during comparison,
+		// so evaluate the operand directly and skip the unsupported cast.
+		if strings.HasSuffix(n.Type, "[]") {
+			return anyElements(env, n.E)
+		}
+	}
+	v, err := evalEx(env, r)
+	if err != nil {
+		return nil, err
+	}
+	switch v := v.(type) {
+	case nil:
+		return nil, nil
+	case []any:
+		return v, nil
+	case string:
+		return parseArrayLiteral(v)
+	}
+	return nil, serr.New("ANY/ALL requires an array on the right-hand side")
+}
+
+func arrayElems(env *exEnv, n *ExArray) ([]any, error) {
+	vals := make([]any, len(n.Elems))
+	for i, el := range n.Elems {
+		v, err := evalEx(env, el)
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = v
+	}
+	return vals, nil
+}
+
+// parseArrayLiteral splits a Postgres array literal ("{1,2,3}",
+// "{a,b}", "{}") into its element strings; quoted elements are
+// unquoted, the unquoted token NULL becomes a nil element.
+func parseArrayLiteral(s string) ([]any, error) {
+	t := strings.TrimSpace(s)
+	if len(t) < 2 || t[0] != '{' || t[len(t)-1] != '}' {
+		return nil, serr.New("malformed array literal", "value", s)
+	}
+	body := strings.TrimSpace(t[1 : len(t)-1])
+	if body == "" {
+		return nil, nil
+	}
+	var out []any
+	var cur strings.Builder
+	inQuote, sawQuote := false, false
+	flush := func() {
+		tok := cur.String()
+		cur.Reset()
+		if !sawQuote && strings.EqualFold(strings.TrimSpace(tok), "null") {
+			out = append(out, nil)
+		} else {
+			out = append(out, strings.TrimSpace(tok))
+		}
+		sawQuote = false
+	}
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		switch {
+		case inQuote && c == '\\' && i+1 < len(body):
+			i++
+			cur.WriteByte(body[i])
+		case c == '"':
+			inQuote = !inQuote
+			sawQuote = true
+		case c == ',' && !inQuote:
+			flush()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
+	return out, nil
+}
+
+// collectSubColumn runs a (possibly correlated) subquery and returns
+// its single output column's values — the row-set form of ANY/ALL's
+// right-hand side, sharing evalArraySub's non-aggregate constraints.
+func collectSubColumn(env *exEnv, sel *Select) ([]any, error) {
+	if sel.Star || len(sel.Items) != 1 {
+		return nil, serr.New("a subquery on the right of ANY/ALL must select exactly one column")
+	}
+	it := sel.Items[0]
+	if it.Agg != AggNone || sel.GroupBy != nil || sel.Having != nil || len(sel.Union) > 0 {
+		return nil, serr.New("this subquery shape is not supported on the right of ANY/ALL")
+	}
+	lk := env.d.lookup(env.tx.Table)
+	sc, err := buildScope(lk, sel.From)
+	if err != nil {
+		return nil, err
+	}
+	from := make([]FromItem, len(sel.From))
+	copy(from, sel.From)
+	for k := range from {
+		from[k].On = decorrelate(from[k].On, sc.prefix(k+1))
+	}
+	fp, err := prepareFrom(lk, from, decorrelate(sel.Where, sc))
+	if err != nil {
+		return nil, err
+	}
+	itemEx := itemToExpr(it)
+	sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
+	var vals []any
+	var evalErr error
+	err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
+		rowEnv := *sub
+		rowEnv.row = rowVals
+		var v any
+		if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
+			return false
+		}
+		vals = append(vals, v)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if evalErr != nil {
+		return nil, evalErr
+	}
+	return vals, nil
 }
 
 func evalCase(env *exEnv, n *ExCase) (any, error) {

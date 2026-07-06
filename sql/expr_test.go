@@ -81,6 +81,57 @@ func TestExprInAndRegex(t *testing.T) {
 	}
 }
 
+func TestExprAnyAll(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+
+	// = ANY over an ARRAY[...] constructor — the IN equivalent.
+	res := exec(t, d, `select name from users where id = any(array[1, 3, 99]) order by 1`)
+	if !reflect.DeepEqual(rows1(res), []any{"ada", "alan"}) {
+		t.Fatalf("= any array: %v", res.Rows)
+	}
+	// A non-equality operator: ANY is true if it holds for some element.
+	res = exec(t, d, `select name from users where age > any(array[40, 45]) order by 1`)
+	if !reflect.DeepEqual(rows1(res), []any{"alan", "grace"}) {
+		t.Fatalf("> any: %v", res.Rows)
+	}
+	// <> ALL is NOT IN.
+	res = exec(t, d, `select name from users where city <> all(array['nyc']) order by 1`)
+	if !reflect.DeepEqual(rows1(res), []any{"ada", "alan", "edsger"}) {
+		t.Fatalf("<> all: %v", res.Rows)
+	}
+	// >= ALL selects the maxima.
+	res = exec(t, d, `select name from users where age >= all(array[28, 45]) order by 1`)
+	if !reflect.DeepEqual(rows1(res), []any{"grace"}) {
+		t.Fatalf(">= all: %v", res.Rows)
+	}
+	// A Postgres array-literal string coerces its text elements.
+	res = exec(t, d, `select name from users where id = any('{2}') order by 1`)
+	if !reflect.DeepEqual(rows1(res), []any{"grace"}) {
+		t.Fatalf("= any literal: %v", res.Rows)
+	}
+	// The subquery (row-set) form.
+	res = exec(t, d, `select name from users
+		where id = any(select id from users where city = 'london') order by 1`)
+	if !reflect.DeepEqual(rows1(res), []any{"ada", "alan"}) {
+		t.Fatalf("= any subquery: %v", res.Rows)
+	}
+	// Empty array: ANY→false (no rows), ALL→true (all rows).
+	res = exec(t, d, `select name from users where id = any(array[]::int[])`)
+	if len(res.Rows) != 0 {
+		t.Fatalf("= any empty: %v", res.Rows)
+	}
+	res = exec(t, d, `select count(*) from users where id <> all(array[]::int[])`)
+	if res.Rows[0][0] != int64(5) {
+		t.Fatalf("<> all empty: %v", res.Rows)
+	}
+	// The constructor is also a value: SELECT ARRAY[...] renders {..}.
+	res = exec(t, d, `select array[1, 2, 3]`)
+	if res.Rows[0][0] != "{1,2,3}" {
+		t.Fatalf("array literal render: %v", res.Rows)
+	}
+}
+
 func TestExprArithCastsFuncs(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)

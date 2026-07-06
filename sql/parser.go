@@ -1438,17 +1438,28 @@ func (p *parser) exprCmp() (Expr, error) {
 			if !ok {
 				return e, nil
 			}
-			if t := p.cur(); t.kind == tIdent && t.text == "any" && p.peekOp("(") {
-				p.advance()
-				p.advance()
-				r, err := p.expression()
-				if err != nil {
-					return nil, err
+			if t := p.cur(); t.kind == tIdent && (t.text == "any" || t.text == "all") && p.peekOp("(") {
+				all := t.text == "all"
+				p.advance() // any / all
+				p.advance() // (
+				var r Expr
+				if c := p.cur(); c.kind == tIdent && c.text == "select" {
+					p.advance()
+					st, err := p.selectStmt()
+					if err != nil {
+						return nil, err
+					}
+					r = &ExSub{Sel: st.(*Select)}
+				} else {
+					var err error
+					if r, err = p.expression(); err != nil {
+						return nil, err
+					}
 				}
 				if err := p.expectOp(")"); err != nil {
 					return nil, err
 				}
-				e = &ExAny{Op: op, L: e, R: r}
+				e = &ExAny{Op: op, L: e, R: r, All: all}
 				continue
 			}
 			r, err := p.exprAdd()
@@ -1627,6 +1638,27 @@ func (p *parser) exprPrimary() (Expr, error) {
 	if t.kind == tIdent && t.text == "case" {
 		p.advance()
 		return p.caseExpr()
+	}
+	if t.kind == tIdent && t.text == "array" && p.peekOp("[") {
+		p.advance() // array
+		p.advance() // [
+		arr := &ExArray{}
+		if !p.acceptOp("]") {
+			for {
+				el, err := p.expression()
+				if err != nil {
+					return nil, err
+				}
+				arr.Elems = append(arr.Elems, el)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp("]"); err != nil {
+				return nil, err
+			}
+		}
+		return arr, nil
 	}
 	if t.kind == tIdent && aggNames[t.text] != AggNone && p.peekOp("(") {
 		fn := aggNames[t.text]

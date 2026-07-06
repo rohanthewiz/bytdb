@@ -485,7 +485,11 @@ func exprText(e Expr) string {
 	case *ExCmp:
 		return "(" + exprText(n.L) + " " + opText(n.Op) + " " + exprText(n.R) + ")"
 	case *ExAny:
-		return "(" + exprText(n.L) + " " + opText(n.Op) + " ANY(" + exprText(n.R) + "))"
+		kw := "ANY"
+		if n.All {
+			kw = "ALL"
+		}
+		return "(" + exprText(n.L) + " " + opText(n.Op) + " " + kw + "(" + exprText(n.R) + "))"
 	case *ExIsNull:
 		if n.Not {
 			return "(" + exprText(n.E) + " IS NOT NULL)"
@@ -525,6 +529,12 @@ func exprText(e Expr) string {
 		return exprText(n.E) + "::" + n.Type
 	case *ExIndex:
 		return exprText(n.E) + "[" + exprText(n.Idx) + "]"
+	case *ExArray:
+		txts := make([]string, len(n.Elems))
+		for i, el := range n.Elems {
+			txts[i] = exprText(el)
+		}
+		return "ARRAY[" + strings.Join(txts, ", ") + "]"
 	case *ExArith:
 		return "(" + exprText(n.L) + " " + n.Op + " " + exprText(n.R) + ")"
 	case *ExSub:

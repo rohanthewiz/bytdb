@@ -267,7 +267,7 @@ func bindExpr(e Expr, sub func(any) any) Expr {
 	case *ExCmp:
 		return &ExCmp{Op: n.Op, L: bindExpr(n.L, sub), R: bindExpr(n.R, sub)}
 	case *ExAny:
-		return &ExAny{Op: n.Op, L: bindExpr(n.L, sub), R: bindExpr(n.R, sub)}
+		return &ExAny{Op: n.Op, L: bindExpr(n.L, sub), R: bindExpr(n.R, sub), All: n.All}
 	case *ExIsNull:
 		return &ExIsNull{E: bindExpr(n.E, sub), Not: n.Not}
 	case *ExIn:
@@ -293,6 +293,12 @@ func bindExpr(e Expr, sub func(any) any) Expr {
 		return &ExCast{E: bindExpr(n.E, sub), Type: n.Type}
 	case *ExIndex:
 		return &ExIndex{E: bindExpr(n.E, sub), Idx: bindExpr(n.Idx, sub)}
+	case *ExArray:
+		c := &ExArray{Elems: make([]Expr, len(n.Elems))}
+		for i, el := range n.Elems {
+			c.Elems[i] = bindExpr(el, sub)
+		}
+		return c
 	case *ExArith:
 		return &ExArith{Op: n.Op, L: bindExpr(n.L, sub), R: bindExpr(n.R, sub)}
 	case *ExSub:
