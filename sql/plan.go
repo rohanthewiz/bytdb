@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"slices"
+
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
@@ -13,13 +15,14 @@ import (
 type plan struct {
 	desc *bytdb.TableDesc
 
-	get    []any    // full-PK point lookup (values in key order); nil when scanning
-	index  string   // secondary index to scan; "" scans the primary index
-	from   []any    // inclusive lower bound pushed into the scan; nil is unbounded
-	stops  []stop   // early-termination checks, in key-column order
-	filter BoolExpr // residual filter: the full condition (nil: all rows)
-	binds  binds    // the filter's operand ordinals within this table's rows
-	pushed []*Pred  // the conjuncts behind get/from/stops (EXPLAIN's Index Cond)
+	get     []any    // full-PK point lookup (values in key order); nil when scanning
+	index   string   // secondary index to scan; "" scans the primary index
+	from    []any    // inclusive lower bound pushed into the scan; nil is unbounded
+	stops   []stop   // early-termination checks, in key-column order
+	reverse bool     // read the path backward (descending key order); set only for an unbounded scan
+	filter  BoolExpr // residual filter: the full condition (nil: all rows)
+	binds   binds    // the filter's operand ordinals within this table's rows
+	pushed  []*Pred  // the conjuncts behind get/from/stops (EXPLAIN's Index Cond)
 }
 
 type stopKind int
@@ -249,4 +252,113 @@ func litFits(v any, t bytdb.ColType) bool {
 		return ok
 	}
 	return false // TBytes: no bytes literals exist in the dialect
+}
+
+// chooseOrderedPlan picks the scan path for a single-table SELECT,
+// preferring one that reads rows already in ORDER BY order so the sort
+// can be skipped. It starts from the ordinary WHERE-driven plan: if
+// that path already serves the order (forward, or — when unbounded —
+// reversed) it uses it. Otherwise, only when the WHERE pushed nothing
+// and a LIMIT bounds the result, it looks for a secondary index whose
+// order serves the sort, trading a full scan plus sort for a bounded
+// ordered index walk. The second result reports whether the sort can
+// be skipped.
+func chooseOrderedPlan(desc *bytdb.TableDesc, alias string, where BoolExpr, keys []sortKey, limited bool) (*plan, bool, error) {
+	p, err := planScan(desc, alias, where)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(keys) == 0 {
+		return p, false, nil
+	}
+	if ok, rev := p.orderSatisfied(desc, keys); ok {
+		p.reverse = rev
+		return p, true, nil
+	}
+	// Override only a plain full scan (WHERE chose no path) and only
+	// when a LIMIT makes the ordered index walk clearly worthwhile.
+	if !limited || p.get != nil || p.index != "" || p.from != nil || len(p.stops) > 0 {
+		return p, false, nil
+	}
+	for i := range desc.Indexes {
+		cand := &plan{desc: desc, index: desc.Indexes[i].Name, filter: p.filter, binds: p.binds}
+		if ok, rev := cand.orderSatisfied(desc, keys); ok {
+			cand.reverse = rev
+			return cand, true, nil
+		}
+	}
+	return p, false, nil
+}
+
+// orderSatisfied reports whether scanning this plan's access path
+// yields rows already in the order the sort keys request, and if so
+// whether the scan must run in reverse (descending key order). keys
+// carry combined-row ordinals which, for a single table, are the
+// table's column ordinals.
+//
+// Each key column of the path advances a fixed way as the forward scan
+// proceeds — ascending for a primary-key or plain index column,
+// descending for a DESC index column. A leading run pinned to a
+// constant by an equality predicate carries no order and is skipped in
+// both the keys and the path; the remaining sort keys must then match
+// the remaining path columns one for one, all demanding the same scan
+// direction. NULLs are the catch: the key encoding orders them opposite
+// to ORDER BY's NULLS LAST/FIRST, so any column that can hold NULL
+// cannot have its order served from the scan — every ordering column
+// must be NOT NULL (a primary-key column always is). Reverse applies
+// only to an unbounded scan; a pushed lower bound or early-stop marks a
+// forward-only region.
+func (p *plan) orderSatisfied(desc *bytdb.TableDesc, keys []sortKey) (ok, reverse bool) {
+	if p.get != nil {
+		return false, false
+	}
+	cols := desc.PKCols
+	asc := func(int) bool { return true } // primary-key columns sort ascending
+	if p.index != "" {
+		idx := desc.Index(p.index)
+		if idx == nil {
+			return false, false
+		}
+		cols = idx.Cols
+		asc = func(i int) bool { return !idx.DescAt(i) }
+	}
+	eq := map[int]bool{}
+	for _, st := range p.stops {
+		if st.kind == stopNE {
+			eq[st.ord] = true
+		}
+	}
+	nonNull := func(ord int) bool {
+		return slices.Contains(desc.PKCols, ord) || desc.Columns[ord].NotNull
+	}
+	try := func(rev bool) bool {
+		ki := 0
+		for _, k := range keys {
+			if eq[k.ord] {
+				continue // pinned to a constant: contributes no order
+			}
+			for ki < len(cols) && eq[cols[ki]] {
+				ki++
+			}
+			if ki >= len(cols) || cols[ki] != k.ord || !nonNull(k.ord) {
+				return false
+			}
+			colAsc := asc(ki)
+			if rev {
+				colAsc = !colAsc
+			}
+			if k.desc == colAsc { // want descending where the column ascends, or vice versa
+				return false
+			}
+			ki++
+		}
+		return true
+	}
+	if try(false) {
+		return true, false
+	}
+	if p.from == nil && len(p.stops) == 0 && try(true) {
+		return true, true
+	}
+	return false, false
 }

@@ -35,9 +35,14 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb
 		return nil
 	}
 	var seq iter.Seq2[bytdb.Row, error]
-	if p.index == "" {
+	switch {
+	case p.reverse && p.index == "": // reverse is set only for an unbounded scan
+		seq = tx.ScanRangeRev(table, nil, nil)
+	case p.reverse:
+		seq = tx.ScanIndexRev(table, p.index, nil, nil)
+	case p.index == "":
 		seq = tx.ScanRange(table, p.from, nil)
-	} else {
+	default:
 		seq = tx.ScanIndex(table, p.index, p.from, nil)
 	}
 	for row, err := range seq {
@@ -333,6 +338,15 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 		if keys, exprs, err = buildSortKeys(sc, s, proj, exprs); err != nil {
 			return err
 		}
+		// When the sole table's scan can yield rows already in ORDER BY
+		// order, plan it that way and drop the sort keys: collection then
+		// stops at OFFSET+LIMIT and sortOffsetProject skips the sort.
+		if p, elim, err := orderedScan(fp, s, keys); err != nil {
+			return err
+		} else if elim {
+			fp.steps[0].plan = p
+			keys = nil
+		}
 		env := &exEnv{d: d, tx: tx, sc: sc}
 		var evalErr error
 		// With no ORDER BY the join order is the result order, so
@@ -449,6 +463,43 @@ func buildSortKeys(sc *scope, s *Select, proj []projEntry, exprs []Expr) ([]sort
 		keys = append(keys, sortKey{ord, o.Desc})
 	}
 	return keys, exprs, nil
+}
+
+// orderedScan decides, for a single-table non-aggregate, non-window
+// SELECT, whether the table's scan can yield rows already in ORDER BY
+// order. It returns the order-aware plan for the sole table and whether
+// the sort (and, under a LIMIT, the tail rows) can be skipped. Not
+// eligible -> (nil, false): the caller keeps the ordinary plan and
+// sorts. Every sort key must be a base column of the table; an ORDER BY
+// expression (ord past the table's width) forces the sort.
+func orderedScan(fp *fromPlan, s *Select, keys []sortKey) (*plan, bool, error) {
+	if len(keys) == 0 || len(fp.steps) != 1 {
+		return nil, false, nil
+	}
+	step := &fp.steps[0]
+	if step.st.rows != nil || len(step.tmpls) != 0 {
+		return nil, false, nil
+	}
+	width := len(step.st.desc.Columns)
+	for _, k := range keys {
+		if k.ord < 0 || k.ord >= width {
+			return nil, false, nil
+		}
+	}
+	return chooseOrderedPlan(step.st.desc, step.st.name, combineStatic(step.static), keys, s.Limit >= 0)
+}
+
+// combineStatic folds a step's static conjuncts into one condition, as
+// rec does before planning a scan.
+func combineStatic(static []BoolExpr) BoolExpr {
+	switch len(static) {
+	case 0:
+		return nil
+	case 1:
+		return static[0]
+	default:
+		return &And{Exprs: static}
+	}
 }
 
 // projEntry is one projected output: a combined-row ordinal, or a

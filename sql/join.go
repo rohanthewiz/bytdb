@@ -186,6 +186,7 @@ type joinStep struct {
 	st     scopeTable
 	static []BoolExpr
 	tmpls  []predTmpl
+	plan   *plan // precomputed access path (order-aware single-table scan); nil: plan per outer row
 }
 
 // predTmpl is "this table's column op the value at srcOrd of the
@@ -326,21 +327,24 @@ func (j *joinRun) rec(k int, partial []any) {
 				}
 			}
 		} else {
-			var expr BoolExpr
-			switch {
-			case len(exprs) == 1:
-				expr = exprs[0]
-			case len(exprs) > 1:
-				expr = &And{Exprs: exprs}
-			}
-			pl, err := planScan(step.st.desc, step.st.name, expr)
-			if err != nil {
-				j.err = err
-				return
+			pl := step.plan
+			if pl == nil {
+				var expr BoolExpr
+				switch {
+				case len(exprs) == 1:
+					expr = exprs[0]
+				case len(exprs) > 1:
+					expr = &And{Exprs: exprs}
+				}
+				var err error
+				if pl, err = planScan(step.st.desc, step.st.name, expr); err != nil {
+					j.err = err
+					return
+				}
 			}
 			// The pushed conjuncts are all plain Preds, so no
 			// environment is needed for this scan's residual filter.
-			err = scanPlan(j.tx, step.it.Table, pl, nil, func(r bytdb.Row) bool {
+			err := scanPlan(j.tx, step.it.Table, pl, nil, func(r bytdb.Row) bool {
 				return next(r.Vals)
 			})
 			if err != nil && j.err == nil {

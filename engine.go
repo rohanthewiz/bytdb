@@ -226,6 +226,7 @@ type kvView interface {
 	Get(key string) ([]byte, bool)
 	Contains(key string) bool
 	Ascend(from string) iter.Seq2[string, []byte]
+	Descend(from string) iter.Seq2[string, []byte]
 }
 
 // --- key helpers ---

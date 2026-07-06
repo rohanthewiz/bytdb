@@ -83,6 +83,11 @@ type explainer struct {
 	d    *DB
 	tx   *bytdb.Txn
 	tmpl map[*Pred]string
+	// Set for a single-table SELECT whose scan yields ORDER BY order:
+	// scanNode renders step0Plan instead of re-planning, and selectNode
+	// drops the Sort node. Reset per SELECT core.
+	step0Plan *plan
+	orderElim bool
 }
 
 // --- statement nodes ---
@@ -141,7 +146,7 @@ func (x *explainer) selectNode(s *Select) (*planNode, error) {
 	} else if n, err = x.coreNode(s); err != nil {
 		return nil, err
 	}
-	if len(s.OrderBy) > 0 {
+	if len(s.OrderBy) > 0 && !x.orderElim {
 		keys := make([]string, len(s.OrderBy))
 		for i, o := range s.OrderBy {
 			keys[i] = itemText(o.SelectItem)
@@ -168,11 +173,12 @@ func (x *explainer) coreNode(s *Select) (*planNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	n, err := x.fromNode(fp)
-	if err != nil {
-		return nil, err
-	}
+	x.step0Plan, x.orderElim = nil, false // reset per core (UNION reuses the explainer)
 	if s.isAggregate() {
+		n, err := x.fromNode(fp)
+		if err != nil {
+			return nil, err
+		}
 		q, err := resolveAgg(fp.sc, s) // validate as execution would
 		if err != nil {
 			return nil, err
@@ -191,8 +197,26 @@ func (x *explainer) coreNode(s *Select) (*planNode, error) {
 		}
 		return agg, nil
 	}
-	if _, _, err := projectSelect(fp.sc, s, &Result{}); err != nil {
-		return nil, err // validate the select list as execution would
+	proj, exprs, err := projectSelect(fp.sc, s, &Result{}) // validate the select list as execution would
+	if err != nil {
+		return nil, err
+	}
+	// Decide the order-eliminating scan before building the FROM node,
+	// so scanNode can render it (and selectNode can drop the sort).
+	if !hasWindow(s) {
+		keys, _, err := buildSortKeys(fp.sc, s, proj, exprs)
+		if err != nil {
+			return nil, err
+		}
+		if p, elim, err := orderedScan(fp, s, keys); err != nil {
+			return nil, err
+		} else if elim {
+			x.step0Plan, x.orderElim = p, true
+		}
+	}
+	n, err := x.fromNode(fp)
+	if err != nil {
+		return nil, err
 	}
 	if hasWindow(s) {
 		win := &planNode{title: "WindowAgg", children: []*planNode{n}}
@@ -290,9 +314,12 @@ func (x *explainer) stepScan(fp *fromPlan, step *joinStep, claimed map[BoolExpr]
 // as execution will; its pushed conjuncts render as the Index Cond
 // (or point-get Key) and the rest as the scan's Filter.
 func (x *explainer) scanNode(desc *bytdb.TableDesc, alias, display string, where BoolExpr) (*planNode, error) {
-	pl, err := planScan(desc, alias, where)
-	if err != nil {
-		return nil, err
+	pl := x.step0Plan // the order-aware plan, when this is the sorted single-table scan
+	if pl == nil {
+		var err error
+		if pl, err = planScan(desc, alias, where); err != nil {
+			return nil, err
+		}
 	}
 	pushed := map[BoolExpr]bool{}
 	for _, pr := range pl.pushed {
@@ -300,14 +327,19 @@ func (x *explainer) scanNode(desc *bytdb.TableDesc, alias, display string, where
 	}
 	n := &planNode{}
 	cond := "Index Cond: "
+	backward := ""
+	if pl.reverse {
+		backward = " Backward"
+	}
+	ordered := pl == x.step0Plan // this scan is read in ORDER BY order
 	switch {
 	case pl.get != nil:
 		n.title = "Point Get on " + display
 		cond = "Key: "
 	case pl.index != "":
-		n.title = "Index Scan using " + pl.index + " on " + display
-	case len(pl.from) > 0 || len(pl.stops) > 0:
-		n.title = "Index Scan using " + desc.Name + "_pkey on " + display
+		n.title = "Index Scan" + backward + " using " + pl.index + " on " + display
+	case len(pl.from) > 0 || len(pl.stops) > 0 || ordered:
+		n.title = "Index Scan" + backward + " using " + desc.Name + "_pkey on " + display
 	default:
 		n.title = "Seq Scan on " + display
 	}

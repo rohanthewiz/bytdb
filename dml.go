@@ -317,6 +317,57 @@ func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, erro
 	}
 }
 
+// ScanRangeRev iterates rows with fromPK <= pk < toPK in descending
+// primary-key order — ScanRange read backward.
+func (e *Engine) ScanRangeRev(table string, fromPK, toPK []any) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		desc, err := e.desc(table)
+		if err != nil {
+			yield(Row{}, err)
+			return
+		}
+		scanRowsRev(e.kv, desc, fromPK, toPK)(yield)
+	}
+}
+
+// scanRowsRev iterates a table's rows in descending primary-key order,
+// mirroring scanRows. Descend starts at the last key <= the exclusive
+// upper bound: the first yield lands at or past it, so keys >= end are
+// skipped, and the walk stops once it drops below the inclusive lower
+// bound.
+func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		prefix := tablePrefix(desc.ID)
+		start := string(prefix)
+		end := string(tuple.PrefixEnd(prefix))
+		var err error
+		if fromPK != nil {
+			if start, err = boundKey(desc, prefix, fromPK); err != nil {
+				yield(Row{}, err)
+				return
+			}
+		}
+		if toPK != nil {
+			if end, err = boundKey(desc, prefix, toPK); err != nil {
+				yield(Row{}, err)
+				return
+			}
+		}
+		for k, val := range v.Descend(end) {
+			if k >= end {
+				continue
+			}
+			if k < start {
+				return
+			}
+			row, err := decodeRow(desc, k, val)
+			if !yield(row, err) || err != nil {
+				return
+			}
+		}
+	}
+}
+
 // --- row/key plumbing ---
 
 // coerceRow validates arity and coerces every value to its column

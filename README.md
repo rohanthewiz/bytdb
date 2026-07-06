@@ -12,7 +12,7 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–19: a working relational store, queryable in SQL — in
+Milestones 1–20: a working relational store, queryable in SQL — in
 process or over the Postgres wire protocol, with transaction blocks
 and savepoints, NOT NULL and CHECK constraints, descending index
 columns, EXPLAIN, and enough system catalog and expression language
@@ -374,7 +374,8 @@ durability with group commit.
 - [x] **Milestone 17**: DISTINCT aggregates — `COUNT(DISTINCT x)` and friends, deduplicated per group by the order-preserving tuple encoding (the same equivalence GROUP BY uses); ALTER TABLE ADD/DROP CONSTRAINT — `AddCheck` verifies every existing row satisfies a new check inside the transaction that publishes the descriptor (`is violated by some row`, SQLSTATE 23514), `DROP CONSTRAINT [IF EXISTS]` removes checks by name (42704 when absent), which also unblocks dropping a previously check-referenced column
 - [x] **Milestone 18**: `op ANY(...)` / `op ALL(...)` — a right-hand side that is an `ARRAY[...]` constructor, a single-column subquery, or a Postgres `'{...}'` array-literal string (elements coerce to the left operand's type); Postgres three-valued logic (empty array is ANY→false, ALL→true even against a NULL left side), so `= ANY` generalizes `IN` and `<> ALL` generalizes `NOT IN`; `ARRAY[...]` is also a value that renders as `{...}`
 - [x] **Milestone 19**: window functions — `ROW_NUMBER`/`RANK`/`DENSE_RANK` and aggregate windows (`SUM/COUNT/AVG/MIN/MAX(...) OVER (PARTITION BY ... ORDER BY ...)`) as a third execution shape that emits every input row: materialize post-filter rows, partition by the order-preserving tuple encoding (the GROUP BY equivalence), sort each partition, assign per-row values (ranking by ordinal / prior-key compare; aggregates whole-partition when unordered, else running with the Postgres RANGE peer-sharing default); window calls rewrite to environment refs so the ordinary evaluator handles nesting (`rn + 1`); `EXPLAIN` gains a WindowAgg node; explicit ROWS/RANGE frames, `DISTINCT`, and window+GROUP BY are rejected
-- [ ] Later: window frames (`ROWS/RANGE BETWEEN`), `LAG`/`LEAD`/`FIRST_VALUE`, ORDER BY exploiting index order
+- [x] **Milestone 20**: ORDER BY exploiting index order — a single-table SELECT whose sort matches a scan's key order skips the sort (and, under a LIMIT, stops early). The chosen path's key columns each advance a fixed way (ascending, or descending for a DESC index column); an equality-pinned prefix carries no order and is skipped, so `WHERE a = 1 ORDER BY b` reads a `(a, b)` index directly. A fully-reversed match runs the scan backward (new engine `ScanRangeRev`/`ScanIndexRev` over btypedb's `Descend`), giving bounded `ORDER BY … DESC LIMIT n`; when no WHERE pushes a path and a LIMIT bounds the result, a NOT NULL indexed column's ordered walk replaces the full scan + sort. Ordering columns must be NOT NULL (the key encoding places NULLs opposite to `NULLS LAST`/`FIRST`), so nullable columns keep the sort; `EXPLAIN` shows `Index Scan [Backward] …` and drops the `Sort`
+- [ ] Later: bounded reverse scans (equality-prefix + `ORDER BY … DESC`), order-aware path selection among redundant indexes, window frames (`ROWS/RANGE BETWEEN`), `LAG`/`LEAD`/`FIRST_VALUE`
 
 ## Design notes
 

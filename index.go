@@ -201,6 +201,65 @@ func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, e
 	}
 }
 
+// ScanIndexRev iterates rows in descending order of the named index —
+// ScanIndex read backward. See ScanIndex on the snapshot caveat.
+func (e *Engine) ScanIndexRev(table, index string, from, to []any) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		desc, err := e.desc(table)
+		if err != nil {
+			yield(Row{}, err)
+			return
+		}
+		idx := desc.Index(index)
+		if idx == nil {
+			yield(Row{}, serr.New("no such index", "table", table, "index", index))
+			return
+		}
+		tx, err := e.kv.Begin(false)
+		if err != nil {
+			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))
+			return
+		}
+		defer tx.Rollback()
+		scanIndexRowsRev(tx, desc, idx, from, to)(yield)
+	}
+}
+
+// scanIndexRowsRev iterates an index's rows in descending order,
+// mirroring scanIndexRows (and scanRowsRev's bound handling).
+func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		prefix := indexPrefix(desc.ID, idx.ID)
+		start := string(prefix)
+		end := string(tuple.PrefixEnd(prefix))
+		var err error
+		if from != nil {
+			if start, err = indexBound(desc, idx, prefix, from); err != nil {
+				yield(Row{}, err)
+				return
+			}
+		}
+		if to != nil {
+			if end, err = indexBound(desc, idx, prefix, to); err != nil {
+				yield(Row{}, err)
+				return
+			}
+		}
+		for k, val := range v.Descend(end) {
+			if k >= end {
+				continue
+			}
+			if k < start {
+				return
+			}
+			row, err := rowFromIndexEntry(v, desc, idx, k, val)
+			if !yield(row, err) || err != nil {
+				return
+			}
+		}
+	}
+}
+
 // scanIndexRows iterates an index's rows from any kv view. The view
 // serves both the entry scan and the entry -> row lookups, so it must
 // be a snapshot or transaction (never the bare DB, whose iteration
