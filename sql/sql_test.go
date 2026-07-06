@@ -354,6 +354,12 @@ func TestSQLAggregates(t *testing.T) {
 		t.Fatalf("got %v", res.Rows)
 	}
 
+	// GROUP BY 1 names the first select-list item — same query.
+	res = exec(t, d, `select city, count(*), max(age) from users group by 1`)
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+
 	// HAVING filters groups; ORDER BY an aggregate.
 	res = exec(t, d, `select city from users group by city having count(*) >= 2 order by count(*) desc, city`)
 	if !reflect.DeepEqual(res.Rows, [][]any{{"london"}, {"nyc"}}) {
@@ -434,6 +440,10 @@ func TestSQLAggregateErrors(t *testing.T) {
 		`select count(*) from users having name = 'x'`,         // ungrouped HAVING column
 		`select count(nope) from users`,                        // unknown column
 		`select city, count(*) from users group by city, city`, // duplicate group col
+		`select city, count(*) from users group by 3`,          // position out of range
+		`select city, count(*) from users group by 2`,          // ordinal names an aggregate
+		`select city, count(*) from users group by city, 1`,    // duplicate via ordinal
+		`select 'x', count(*) from users group by 1`,           // ordinal names a literal
 	} {
 		if _, err := d.Exec(q); err == nil {
 			t.Errorf("Exec(%q): expected error", q)

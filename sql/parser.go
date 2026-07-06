@@ -144,6 +144,19 @@ func (p *parser) statement() (Statement, error) {
 		return p.txnEnd(&TxnControl{Kind: TxnCommit, Tag: "COMMIT"})
 	case p.acceptKw("rollback"), p.acceptKw("abort"):
 		return p.txnEnd(&TxnControl{Kind: TxnRollback, Tag: "ROLLBACK"})
+	case p.acceptKw("savepoint"):
+		name, err := p.ident("a savepoint name")
+		if err != nil {
+			return nil, err
+		}
+		return &TxnControl{Kind: TxnSavepoint, Tag: "SAVEPOINT", Name: name}, nil
+	case p.acceptKw("release"):
+		p.acceptKw("savepoint")
+		name, err := p.ident("a savepoint name")
+		if err != nil {
+			return nil, err
+		}
+		return &TxnControl{Kind: TxnRelease, Tag: "RELEASE", Name: name}, nil
 	}
 	return nil, p.unexpected("a SQL statement")
 }
@@ -195,11 +208,21 @@ func (p *parser) txnModes(tc *TxnControl) (Statement, error) {
 }
 
 // txnEnd parses COMMIT/ROLLBACK's tail: [WORK | TRANSACTION]
-// [AND [NO] CHAIN]. AND CHAIN (immediately restarting a transaction
-// with the same modes) is not supported.
+// [AND [NO] CHAIN], or for ROLLBACK a TO [SAVEPOINT] name. AND CHAIN
+// (immediately restarting a transaction with the same modes) is not
+// supported.
 func (p *parser) txnEnd(tc *TxnControl) (Statement, error) {
 	if !p.acceptKw("work") {
 		p.acceptKw("transaction")
+	}
+	if tc.Kind == TxnRollback && p.acceptKw("to") {
+		p.acceptKw("savepoint")
+		name, err := p.ident("a savepoint name")
+		if err != nil {
+			return nil, err
+		}
+		tc.Kind, tc.Name = TxnRollbackTo, name
+		return tc, nil
 	}
 	if p.acceptKw("and") {
 		no := p.acceptKw("no")
@@ -541,11 +564,11 @@ func (p *parser) selectCore() (*Select, error) {
 			return nil, err
 		}
 		for {
-			col, err := p.colRef()
+			g, err := p.groupItem()
 			if err != nil {
 				return nil, err
 			}
-			s.GroupBy = append(s.GroupBy, col)
+			s.GroupBy = append(s.GroupBy, g)
 			if !p.acceptOp(",") {
 				break
 			}
@@ -557,6 +580,30 @@ func (p *parser) selectCore() (*Select, error) {
 		}
 	}
 	return s, nil
+}
+
+// groupItem parses one GROUP BY key: an integer ordinal naming a
+// select-list position (GROUP BY 1), or a column reference. Other
+// constants draw the same complaint Postgres makes.
+func (p *parser) groupItem() (GroupItem, error) {
+	t := p.cur()
+	if t.kind == tNumber || t.kind == tString {
+		n, err := strconv.ParseInt(t.text, 10, 64)
+		if t.kind != tNumber || err != nil {
+			return GroupItem{}, serr.New("non-integer constant in GROUP BY", "got", t.text)
+		}
+		if n < 1 {
+			return GroupItem{}, serr.New("GROUP BY position is not in the select list",
+				"position", t.text)
+		}
+		p.advance()
+		return GroupItem{Pos: n}, nil
+	}
+	col, err := p.colRef()
+	if err != nil {
+		return GroupItem{}, err
+	}
+	return GroupItem{Col: col}, nil
 }
 
 func (p *parser) nonNegInt(clause string) (int64, error) {

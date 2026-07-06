@@ -8,6 +8,13 @@ package sql
 // refused. That failure rule is also what keeps failed statements
 // atomic — a multi-row INSERT that dies halfway has staged rows in
 // the open transaction, but they can only ever be rolled back.
+//
+// SAVEPOINT refines that: ROLLBACK TO a savepoint rewinds the
+// transaction to the mark and clears the failed state, so a block can
+// recover from an error instead of losing everything. Every savepoint
+// predates the block's first error (a failed block refuses SAVEPOINT),
+// so rewinding always discards the failed statement's partial writes
+// along with everything after the mark.
 
 import (
 	"github.com/rohanthewiz/bytdb"
@@ -42,6 +49,14 @@ type Session struct {
 
 	readOnly bool
 	aborted  bool
+	saves    []sesSave // savepoint stack, oldest first
+}
+
+// sesSave is one named savepoint in the open block. Names may repeat;
+// references resolve to the most recent, as in Postgres.
+type sesSave struct {
+	name string
+	sp   *bytdb.Savepoint
 }
 
 // NewSession wraps the DB with per-connection transaction state.
@@ -62,7 +77,7 @@ func (s *Session) Status() TxStatus {
 // usable afterward.
 func (s *Session) Close() error {
 	tx := s.tx
-	s.tx, s.sdb, s.aborted = nil, nil, false
+	s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
 	if tx != nil {
 		return tx.Rollback()
 	}
@@ -118,9 +133,11 @@ func (s *Session) run(st Statement, args []any) (*Result, error) {
 	return res, err
 }
 
-// txnControl handles BEGIN, COMMIT, and ROLLBACK. Redundant forms
-// warn and do nothing, as in Postgres; COMMIT of a failed block rolls
-// back and says so in its tag.
+// txnControl handles BEGIN, COMMIT, ROLLBACK, and the savepoint
+// statements. Redundant BEGIN/COMMIT/ROLLBACK forms warn and do
+// nothing, as in Postgres; COMMIT of a failed block rolls back and
+// says so in its tag. Savepoint statements outside a block are
+// errors, not warnings, again as in Postgres.
 func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 	switch tc.Kind {
 	case TxnBegin:
@@ -131,7 +148,7 @@ func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		s.tx, s.readOnly, s.aborted = tx, tc.ReadOnly, false
+		s.tx, s.readOnly, s.aborted, s.saves = tx, tc.ReadOnly, false, nil
 		s.sdb = &DB{e: s.db.e, tx: tx}
 		return &Result{}, nil
 	case TxnCommit:
@@ -139,7 +156,7 @@ func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 			return &Result{Notice: "there is no transaction in progress"}, nil
 		}
 		tx, aborted := s.tx, s.aborted
-		s.tx, s.sdb, s.aborted = nil, nil, false
+		s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
 		if aborted {
 			if err := tx.Rollback(); err != nil {
 				return nil, err
@@ -150,17 +167,73 @@ func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 			return nil, err
 		}
 		return &Result{}, nil
-	default: // TxnRollback
+	case TxnRollback:
 		if s.tx == nil {
 			return &Result{Notice: "there is no transaction in progress"}, nil
 		}
 		tx := s.tx
-		s.tx, s.sdb, s.aborted = nil, nil, false
+		s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
 		if err := tx.Rollback(); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
+	default:
+		return s.savepointControl(tc)
 	}
+}
+
+// savepointControl handles SAVEPOINT, RELEASE, and ROLLBACK TO within
+// the open block. ROLLBACK TO is the one statement besides COMMIT and
+// ROLLBACK that a failed block accepts: it rewinds the transaction —
+// staged writes, indexes, and the WAL batch — to the mark (an O(1)
+// copy-on-write snapshot) and clears the failed state. A savepoint
+// name may repeat; references resolve to the most recent, and RELEASE
+// or ROLLBACK TO destroys every savepoint after the one named.
+func (s *Session) savepointControl(tc *TxnControl) (*Result, error) {
+	verb := "SAVEPOINT"
+	switch tc.Kind {
+	case TxnRelease:
+		verb = "RELEASE SAVEPOINT"
+	case TxnRollbackTo:
+		verb = "ROLLBACK TO SAVEPOINT"
+	}
+	if s.tx == nil {
+		return nil, serr.New(verb + " can only be used in transaction blocks")
+	}
+	if s.aborted && tc.Kind != TxnRollbackTo {
+		return nil, serr.New("current transaction is aborted, " +
+			"commands ignored until end of transaction block")
+	}
+	if tc.Kind == TxnSavepoint {
+		sp, err := s.tx.Savepoint()
+		if err != nil {
+			s.aborted = true
+			return nil, err
+		}
+		s.saves = append(s.saves, sesSave{tc.Name, sp})
+		return &Result{}, nil
+	}
+	i := len(s.saves) - 1
+	for ; i >= 0 && s.saves[i].name != tc.Name; i-- {
+	}
+	if i < 0 { // an error like any other: it fails the block
+		s.aborted = true
+		return nil, serr.New(`savepoint "` + tc.Name + `" does not exist`)
+	}
+	if tc.Kind == TxnRelease {
+		if err := s.tx.Release(s.saves[i].sp); err != nil {
+			s.aborted = true
+			return nil, err
+		}
+		s.saves = s.saves[:i]
+		return &Result{}, nil
+	}
+	if err := s.tx.RollbackTo(s.saves[i].sp); err != nil {
+		s.aborted = true
+		return nil, err
+	}
+	s.saves, s.aborted = s.saves[:i+1], false
+	return &Result{}, nil
 }
 
 // isDDL reports whether st changes the schema.

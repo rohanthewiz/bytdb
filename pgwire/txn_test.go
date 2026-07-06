@@ -200,3 +200,119 @@ func TestTransactionDisconnectReleases(t *testing.T) {
 		t.Fatalf("rows = %d err = %v; want only the post-disconnect row", n, err)
 	}
 }
+
+func TestTransactionSavepoints(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table t (id int primary key)`)
+	mustExec(t, c, `insert into t values (1)`)
+
+	// Plain savepoint flow with the Postgres command tags.
+	mustExec(t, c, `begin`)
+	if tag, err := c.Exec(ctx, `savepoint sp`); err != nil || tag.String() != "SAVEPOINT" {
+		t.Fatalf("savepoint: tag=%q err=%v", tag, err)
+	}
+	mustExec(t, c, `insert into t values (2)`)
+	if tag, err := c.Exec(ctx, `rollback to savepoint sp`); err != nil || tag.String() != "ROLLBACK" {
+		t.Fatalf("rollback to: tag=%q err=%v", tag, err)
+	}
+	if st := c.PgConn().TxStatus(); st != 'T' {
+		t.Fatalf("TxStatus after rollback to = %c; want T", st)
+	}
+	if tag, err := c.Exec(ctx, `release savepoint sp`); err != nil || tag.String() != "RELEASE" {
+		t.Fatalf("release: tag=%q err=%v", tag, err)
+	}
+	mustExec(t, c, `commit`)
+	var n int64
+	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("count = %d err = %v; want 1", n, err)
+	}
+
+	// ROLLBACK TO recovers a failed block: 'E' back to 'T', and the
+	// block commits what preceded the mark.
+	mustExec(t, c, `begin`)
+	mustExec(t, c, `insert into t values (3)`)
+	mustExec(t, c, `savepoint sp`)
+	if _, err := c.Exec(ctx, `insert into t values (1)`); err == nil {
+		t.Fatal("duplicate insert succeeded")
+	}
+	if st := c.PgConn().TxStatus(); st != 'E' {
+		t.Fatalf("TxStatus after error = %c; want E", st)
+	}
+	mustExec(t, c, `rollback to savepoint sp`)
+	if st := c.PgConn().TxStatus(); st != 'T' {
+		t.Fatalf("TxStatus after recovery = %c; want T", st)
+	}
+	mustExec(t, c, `commit`)
+	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("count after recovered block = %d err = %v; want 2", n, err)
+	}
+
+	// Savepoint statements outside a block are errors (25P01), and an
+	// unknown name is 3B001.
+	var pgErr *pgconn.PgError
+	if _, err := c.Exec(ctx, `savepoint sp`); !errors.As(err, &pgErr) || pgErr.Code != "25P01" {
+		t.Fatalf("savepoint outside block = %v; want SQLSTATE 25P01", err)
+	}
+	mustExec(t, c, `begin`)
+	if _, err := c.Exec(ctx, `rollback to savepoint nope`); !errors.As(err, &pgErr) || pgErr.Code != "3B001" {
+		t.Fatalf("unknown savepoint = %v; want SQLSTATE 3B001", err)
+	}
+	mustExec(t, c, `rollback`)
+}
+
+// TestTransactionNestedPgx: pgx models nested Begin calls as
+// savepoints — the inner "transaction" must roll back independently
+// while the outer one commits.
+func TestTransactionNestedPgx(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table t (id int primary key)`)
+
+	outer, err := c.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outer.Exec(ctx, `insert into t values (1)`); err != nil {
+		t.Fatal(err)
+	}
+	inner, err := outer.Begin(ctx) // SAVEPOINT under the hood
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.Exec(ctx, `insert into t values (2)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.Rollback(ctx); err != nil { // ROLLBACK TO SAVEPOINT
+		t.Fatal(err)
+	}
+	if err := outer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("count = %d err = %v; want only the outer row", n, err)
+	}
+
+	// And the commit path: an inner commit is RELEASE SAVEPOINT.
+	outer, err = c.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err = outer.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.Exec(ctx, `insert into t values (3)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.Commit(ctx); err != nil { // RELEASE SAVEPOINT
+		t.Fatal(err)
+	}
+	if err := outer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("count = %d err = %v; want 2", n, err)
+	}
+}

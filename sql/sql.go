@@ -16,6 +16,7 @@
 //	UPDATE t SET c = v, ... [WHERE ...]
 //	DELETE FROM t [WHERE ...]
 //	BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
+//	SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 //
 // FROM names one table or a left-deep chain of joins:
 //
@@ -71,8 +72,10 @@
 // appear in GROUP BY, aggregates ignore NULL inputs (COUNT(*) counts
 // rows), NULL group values form one group, an ungrouped aggregate
 // query returns exactly one row, HAVING filters groups, and ORDER BY
-// may sort by grouped columns or aggregates. Without ORDER BY, groups
-// return in ascending group-column order.
+// may sort by grouped columns or aggregates. A GROUP BY key may be an
+// integer ordinal naming a select-list position (GROUP BY 1), which
+// must resolve to a plain column. Without ORDER BY, groups return in
+// ascending group-column order.
 //
 // The dialect follows Postgres conventions: 'string' literals with ”
 // escapes, "quoted" identifiers, unquoted identifiers folded to
@@ -118,7 +121,14 @@
 // COMMIT | ROLLBACK blocks with Postgres semantics: the block is one
 // engine transaction; an error inside it fails the block, refusing
 // everything but ROLLBACK (COMMIT then rolls back, reporting so in
-// its tag); redundant control statements warn and do nothing. BEGIN
+// its tag); redundant control statements warn and do nothing.
+// SAVEPOINT marks a point inside the block — an O(1) copy-on-write
+// snapshot — that ROLLBACK TO rewinds to, clearing the failed state,
+// so a block can recover from an error instead of losing everything;
+// RELEASE drops the mark and keeps the work. Names may repeat
+// (references resolve to the most recent), and rewinding or releasing
+// destroys the savepoints made after the one named, as in Postgres.
+// BEGIN
 // accepts the standard transaction modes — isolation levels parse and
 // are ignored (the engine's single-writer transactions are
 // serializable, which satisfies them all) and READ ONLY is honored. A

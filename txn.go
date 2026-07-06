@@ -62,6 +62,27 @@ func (t *Txn) Commit() error { return t.tx.Commit() }
 // back a finished transaction is a no-op.
 func (t *Txn) Rollback() error { return t.tx.Rollback() }
 
+// Savepoint marks a point within a transaction that RollbackTo can
+// restore: an O(1) copy-on-write snapshot of the transaction's state.
+// The catalog needs no mark of its own — DDL cannot run inside a
+// transaction, so the schema cannot change between the mark and the
+// rollback.
+type Savepoint = btypedb.Savepoint[string, []byte]
+
+// Savepoint captures the transaction's current state. Savepoints
+// nest; rolling back to or releasing an earlier one destroys the
+// later ones, and any still outstanding at Commit or Rollback are
+// cleaned up with the transaction.
+func (t *Txn) Savepoint() (*Savepoint, error) { return t.tx.Savepoint() }
+
+// RollbackTo restores the transaction to the state sp captured,
+// discarding every change made after it. sp itself stays valid.
+func (t *Txn) RollbackTo(sp *Savepoint) error { return t.tx.RollbackTo(sp) }
+
+// Release discards sp — and every savepoint created after it — while
+// keeping all of the transaction's changes.
+func (t *Txn) Release(sp *Savepoint) error { return t.tx.Release(sp) }
+
 // Table returns the descriptor for a table name in the transaction's
 // catalog snapshot, or nil if absent.
 func (t *Txn) Table(name string) *TableDesc {

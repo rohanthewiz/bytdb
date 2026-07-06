@@ -203,14 +203,21 @@ func TestTxnControlParsing(t *testing.T) {
 		`begin transaction`: "BEGIN",
 		`begin isolation level repeatable read read only, not deferrable`: "BEGIN",
 		`start transaction isolation level serializable read write`:       "START TRANSACTION",
-		`commit`:               "COMMIT",
-		`commit work`:          "COMMIT",
-		`end`:                  "COMMIT",
-		`end transaction`:      "COMMIT",
-		`commit and no chain`:  "COMMIT",
-		`rollback`:             "ROLLBACK",
-		`abort`:                "ROLLBACK",
-		`rollback transaction`: "ROLLBACK",
+		`commit`:                                "COMMIT",
+		`commit work`:                           "COMMIT",
+		`end`:                                   "COMMIT",
+		`end transaction`:                       "COMMIT",
+		`commit and no chain`:                   "COMMIT",
+		`rollback`:                              "ROLLBACK",
+		`abort`:                                 "ROLLBACK",
+		`rollback transaction`:                  "ROLLBACK",
+		`savepoint sp1`:                         "SAVEPOINT",
+		`release sp1`:                           "RELEASE",
+		`release savepoint sp1`:                 "RELEASE",
+		`rollback to sp1`:                       "ROLLBACK",
+		`rollback to savepoint sp1`:             "ROLLBACK",
+		`rollback work to savepoint sp1`:        "ROLLBACK",
+		`rollback transaction to savepoint sp1`: "ROLLBACK",
 	} {
 		st, err := Parse(q)
 		if err != nil {
@@ -220,6 +227,12 @@ func TestTxnControlParsing(t *testing.T) {
 		if !ok || tc.Tag != want {
 			t.Fatalf("Parse(%q) = %#v; want tag %q", q, st, want)
 		}
+		if strings.Contains(q, "sp1") && tc.Name != "sp1" {
+			t.Fatalf("Parse(%q) name = %q; want sp1", q, tc.Name)
+		}
+	}
+	if st, _ := Parse(`rollback to savepoint sp1`); st.(*TxnControl).Kind != TxnRollbackTo {
+		t.Fatal("ROLLBACK TO parsed as plain rollback")
 	}
 	if st, _ := Parse(`begin read only`); !st.(*TxnControl).ReadOnly {
 		t.Fatal("READ ONLY not honored")
@@ -230,8 +243,11 @@ func TestTxnControlParsing(t *testing.T) {
 	for _, q := range []string{
 		`commit and chain`, // unsupported
 		`begin isolation level bogus`,
-		`rollback to savepoint sp1`, // savepoints don't exist
 		`start work`,
+		`savepoint`,             // missing name
+		`release`,               // missing name
+		`rollback to`,           // missing name
+		`commit to savepoint x`, // TO is ROLLBACK-only
 	} {
 		if _, err := Parse(q); err == nil {
 			t.Fatalf("Parse(%q) succeeded; want error", q)
@@ -244,4 +260,137 @@ func TestTxnControlParsing(t *testing.T) {
 		!strings.Contains(err.Error(), "require a Session") {
 		t.Fatalf("bare-DB begin err = %v", err)
 	}
+}
+
+func TestSessionSavepoints(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, v text)`)
+	s := d.NewSession()
+	defer s.Close()
+
+	// Rewind discards writes after the mark; the block stays open and
+	// commits everything else.
+	sessExec(t, s, `begin`)
+	sessExec(t, s, `insert into t values (1, 'a')`)
+	sessExec(t, s, `savepoint sp`)
+	sessExec(t, s, `insert into t values (2, 'b')`)
+	sessExec(t, s, `update t set v = 'a2' where id = 1`)
+	sessExec(t, s, `rollback to savepoint sp`)
+	if s.Status() != TxActive {
+		t.Fatalf("status after ROLLBACK TO = %c; want T", s.Status())
+	}
+	sessExec(t, s, `insert into t values (3, 'c')`)
+	sessExec(t, s, `commit`)
+	res := exec(t, d, `select id, v from t order by id`)
+	if len(res.Rows) != 2 || res.Rows[0][1] != "a" || res.Rows[1][0] != int64(3) {
+		t.Fatalf("rows after savepoint commit = %v", res.Rows)
+	}
+
+	// ROLLBACK TO recovers a failed block: the failed statement's
+	// partial writes and everything after the mark are gone, and the
+	// block commits cleanly.
+	sessExec(t, s, `begin`)
+	sessExec(t, s, `savepoint sp`)
+	sessExec(t, s, `insert into t values (4, 'd')`)
+	if _, err := s.Exec(`insert into t values (5, 'e'), (1, 'dup')`); err == nil {
+		t.Fatal("duplicate insert succeeded")
+	}
+	if s.Status() != TxFailed {
+		t.Fatalf("status = %c; want E", s.Status())
+	}
+	// SAVEPOINT and RELEASE are refused in a failed block.
+	if _, err := s.Exec(`savepoint other`); err == nil ||
+		!strings.Contains(err.Error(), "current transaction is aborted") {
+		t.Fatalf("savepoint in failed block err = %v", err)
+	}
+	if _, err := s.Exec(`release sp`); err == nil ||
+		!strings.Contains(err.Error(), "current transaction is aborted") {
+		t.Fatalf("release in failed block err = %v", err)
+	}
+	sessExec(t, s, `rollback to sp`)
+	if s.Status() != TxActive {
+		t.Fatalf("status after recovery = %c; want T", s.Status())
+	}
+	sessExec(t, s, `insert into t values (6, 'f')`)
+	sessExec(t, s, `commit`)
+	res = exec(t, d, `select id from t order by id`)
+	if len(res.Rows) != 3 || res.Rows[2][0] != int64(6) {
+		t.Fatalf("rows after recovered block = %v", res.Rows)
+	}
+
+	// RELEASE keeps changes and destroys the name (and later marks).
+	sessExec(t, s, `begin`)
+	sessExec(t, s, `savepoint a`)
+	sessExec(t, s, `insert into t values (7, 'g')`)
+	sessExec(t, s, `savepoint b`)
+	sessExec(t, s, `release savepoint a`)
+	if _, err := s.Exec(`rollback to b`); err == nil ||
+		!strings.Contains(err.Error(), `savepoint "b" does not exist`) {
+		t.Fatalf("rollback to released-past savepoint err = %v", err)
+	}
+	sessExec(t, s, `rollback`)
+
+	// A repeated name shadows; RELEASE unshadows the earlier one.
+	sessExec(t, s, `begin`)
+	sessExec(t, s, `savepoint a`)
+	sessExec(t, s, `insert into t values (8, 'h')`)
+	sessExec(t, s, `savepoint a`)
+	sessExec(t, s, `insert into t values (9, 'i')`)
+	sessExec(t, s, `rollback to a`) // the later mark: only id 9 unwinds
+	res = sessExec(t, s, `select count(*) from t where id in (8, 9)`)
+	if res.Rows[0][0] != int64(1) {
+		t.Fatalf("after rollback to shadowing mark: %v", res.Rows[0][0])
+	}
+	sessExec(t, s, `release a`)     // destroys the later mark...
+	sessExec(t, s, `rollback to a`) // ...resolving to the earlier one
+	res = sessExec(t, s, `select count(*) from t where id in (8, 9)`)
+	if res.Rows[0][0] != int64(0) {
+		t.Fatalf("after rollback to earlier mark: %v", res.Rows[0][0])
+	}
+	sessExec(t, s, `rollback`)
+}
+
+func TestSessionSavepointErrors(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key)`)
+	s := d.NewSession()
+	defer s.Close()
+
+	// Outside a block, savepoint statements are errors, not warnings.
+	for q, want := range map[string]string{
+		`savepoint sp`:            "SAVEPOINT can only be used in transaction blocks",
+		`release savepoint sp`:    "RELEASE SAVEPOINT can only be used in transaction blocks",
+		`rollback to savepoint x`: "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+	} {
+		if _, err := s.Exec(q); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%q err = %v; want %q", q, err, want)
+		}
+	}
+
+	// Unknown names, in healthy and failed blocks alike.
+	sessExec(t, s, `begin`)
+	if _, err := s.Exec(`rollback to nope`); err == nil ||
+		!strings.Contains(err.Error(), `savepoint "nope" does not exist`) {
+		t.Fatalf("unknown savepoint err = %v", err)
+	}
+	// That error itself failed the block; ROLLBACK TO with a bad name
+	// while failed still reports the name, and the block stays failed.
+	if s.Status() != TxFailed {
+		t.Fatalf("status = %c; want E", s.Status())
+	}
+	if _, err := s.Exec(`rollback to nope`); err == nil ||
+		!strings.Contains(err.Error(), `savepoint "nope" does not exist`) {
+		t.Fatalf("unknown savepoint in failed block err = %v", err)
+	}
+	if s.Status() != TxFailed {
+		t.Fatalf("status = %c; want E", s.Status())
+	}
+	sessExec(t, s, `rollback`)
+
+	// Savepoints work in read-only blocks.
+	sessExec(t, s, `begin read only`)
+	sessExec(t, s, `savepoint sp`)
+	sessExec(t, s, `rollback to sp`)
+	sessExec(t, s, `release sp`)
+	sessExec(t, s, `commit`)
 }

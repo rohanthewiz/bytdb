@@ -138,7 +138,27 @@ func resolveAgg(sc *scope, s *Select) (*aggQuery, error) {
 	}
 	q := &aggQuery{sc: sc}
 	groupIdx := map[int]int{} // combined ordinal -> groupOrds index
-	for _, col := range s.GroupBy {
+	for _, g := range s.GroupBy {
+		col := g.Col
+		if g.Pos > 0 { // GROUP BY n: a select-list position
+			if g.Pos > int64(len(s.Items)) {
+				return nil, serr.New("GROUP BY position is not in the select list",
+					"position", fmt.Sprint(g.Pos))
+			}
+			it := s.Items[g.Pos-1]
+			switch {
+			case it.Agg != AggNone:
+				return nil, serr.New("aggregate functions are not allowed in GROUP BY",
+					"position", fmt.Sprint(g.Pos))
+			case it.IsLit:
+				return nil, serr.New("literals are not supported in aggregate queries")
+			case it.Ex != nil:
+				return nil, serr.New("expressions are not supported in aggregate queries")
+			case it.Star:
+				return nil, serr.New("t.* is not allowed in an aggregate query", "table", it.Col.Table)
+			}
+			col = it.Col
+		}
 		ord, err := sc.resolve(col)
 		if err != nil {
 			return nil, err

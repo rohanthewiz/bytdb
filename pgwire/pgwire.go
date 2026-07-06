@@ -22,6 +22,9 @@
 //     NoticeResponse warnings, and a dropped connection rolls back.
 //     A writable block holds the engine's single-writer lock, so
 //     other connections' writes (not reads) wait behind it.
+//     SAVEPOINT / RELEASE / ROLLBACK TO work too — pgx's nested
+//     transactions ride on them — with ROLLBACK TO recovering a
+//     failed block ('E' back to 'T').
 //   - Errors travel structurally: the SQL layer's serr fields become
 //     ErrorResponse fields — a parse position becomes Position
 //     (1-based character offset), the rest become Detail — with a

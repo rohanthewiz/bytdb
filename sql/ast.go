@@ -356,6 +356,13 @@ type Insert struct {
 	Rows  [][]any
 }
 
+// GroupItem is one GROUP BY key: a column reference, or (Pos > 0) an
+// integer ordinal naming a select-list position, as in GROUP BY 1.
+type GroupItem struct {
+	Col ColRef
+	Pos int64 // 1-based select-list position; 0: Col names the key
+}
+
 // OrderItem is one ORDER BY key: a column, or (in an aggregate
 // query) an aggregate call.
 type OrderItem struct {
@@ -395,7 +402,7 @@ type Select struct {
 	Star    bool
 	Items   []SelectItem
 	Where   BoolExpr // nil: all rows
-	GroupBy []ColRef
+	GroupBy []GroupItem
 	Having  BoolExpr // nil: all groups; leaves may be aggregates
 	OrderBy []OrderItem
 	Limit   int64 // -1: no limit
@@ -430,18 +437,22 @@ const (
 	TxnBegin TxnKind = iota
 	TxnCommit
 	TxnRollback
+	TxnSavepoint  // SAVEPOINT name
+	TxnRelease    // RELEASE [SAVEPOINT] name
+	TxnRollbackTo // ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] name
 )
 
-// TxnControl is BEGIN / START TRANSACTION, COMMIT / END, or ROLLBACK
-// / ABORT, executed by a Session (a bare DB rejects it). Isolation
-// levels parse and are ignored — the engine's single-writer
-// transactions are serializable, which satisfies every level — and
-// READ ONLY is honored. Tag is the Postgres command tag of the form
-// used (END reports COMMIT, ABORT reports ROLLBACK).
+// TxnControl is BEGIN / START TRANSACTION, COMMIT / END, ROLLBACK /
+// ABORT, or a savepoint statement, executed by a Session (a bare DB
+// rejects it). Isolation levels parse and are ignored — the engine's
+// single-writer transactions are serializable, which satisfies every
+// level — and READ ONLY is honored. Tag is the Postgres command tag
+// of the form used (END reports COMMIT, ABORT reports ROLLBACK).
 type TxnControl struct {
 	Kind     TxnKind
 	ReadOnly bool
 	Tag      string
+	Name     string // savepoint name for the savepoint kinds
 }
 
 func (*CreateTable) stmt() {}

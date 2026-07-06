@@ -39,6 +39,10 @@ func sqlstate(msg string, hasPos bool) string {
 		return "25006" // read_only_sql_transaction
 	case strings.Contains(msg, "cannot run inside a transaction block"):
 		return "25001" // active_sql_transaction
+	case strings.Contains(msg, "can only be used in transaction blocks"):
+		return "25P01" // no_active_sql_transaction
+	case strings.Contains(msg, "savepoint") && strings.Contains(msg, "does not exist"):
+		return "3B001" // invalid_savepoint_specification
 	}
 	return "XX000"
 }

@@ -345,3 +345,70 @@ func TestManualTxn(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTxnSavepoint(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+	if _, err := e.CreateIndex("people", "by-age", false, "age"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Insert("people", 1, "ada", 36, "a@x"); err != nil {
+		t.Fatal(err)
+	}
+	sp, err := tx.Savepoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Insert("people", 2, "grace", 45, "g@x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Update("people", []any{1}, map[string]any{"age": int64(37)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// RollbackTo undoes the insert and the update — index entries
+	// included — and the transaction stays usable.
+	if err := tx.RollbackTo(sp); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := tx.Get("people", 2); ok {
+		t.Fatal("post-savepoint insert survived RollbackTo")
+	}
+	row, ok, err := tx.Get("people", 1)
+	if err != nil || !ok || row.Col("age") != int64(36) {
+		t.Fatalf("pre-savepoint row = %v, %v, %v; want age 36", row, ok, err)
+	}
+	var ages []int64
+	for r, err := range tx.ScanIndex("people", "by-age", nil, nil) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		ages = append(ages, r.Col("age").(int64))
+	}
+	if len(ages) != 1 || ages[0] != 36 {
+		t.Fatalf("index ages after RollbackTo = %v; want [36]", ages)
+	}
+
+	// A destroyed savepoint reports the sentinel error.
+	if err := tx.Release(sp); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.RollbackTo(sp); !errors.Is(err, btypedb.ErrSavepointInvalid) {
+		t.Fatalf("RollbackTo(released) = %v; want ErrSavepointInvalid", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := e.Get("people", 1); !ok {
+		t.Fatal("committed row missing")
+	}
+	if _, ok, _ := e.Get("people", 2); ok {
+		t.Fatal("rolled-back row committed")
+	}
+}

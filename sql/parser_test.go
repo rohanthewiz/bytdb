@@ -348,7 +348,7 @@ func TestParseAggregates(t *testing.T) {
 			{Agg: AggAvg, Col: col("age")},
 		},
 		Where:   cpred("age", OpGT, int64(18)),
-		GroupBy: []ColRef{col("city")},
+		GroupBy: []GroupItem{{Col: col("city")}},
 		Having: and(
 			apred(SelectItem{Agg: AggCount, Star: true}, OpGE, int64(2)),
 			apred(SelectItem{Agg: AggMin, Col: col("age")}, OpIsNotNull, nil),
@@ -372,6 +372,13 @@ func TestParseAggregates(t *testing.T) {
 	if s.Items[0].Agg != AggNone || s.Items[0].Col.Name != "count" {
 		t.Fatalf("got %#v", s.Items[0])
 	}
+
+	// GROUP BY ordinals parse as select-list positions, mixable with
+	// columns.
+	s = mustParse(t, `select city, age, count(*) from t group by 1, age`).(*Select)
+	if !reflect.DeepEqual(s.GroupBy, []GroupItem{{Pos: 1}, {Col: col("age")}}) {
+		t.Fatalf("got %#v", s.GroupBy)
+	}
 }
 
 func TestParseAggregateErrors(t *testing.T) {
@@ -380,6 +387,9 @@ func TestParseAggregateErrors(t *testing.T) {
 		`select count(*) from t having sum(v) = null`, // must use IS NULL
 		`select sum() from t`,                         // missing argument
 		`select sum(*) from t`,                        // * only for count
+		`select city from t group by 1.5`,             // non-integer constant
+		`select city from t group by 'city'`,          // non-integer constant
+		`select city from t group by 0`,               // position out of range
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%q): expected error", src)

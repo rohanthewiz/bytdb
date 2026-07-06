@@ -145,6 +145,8 @@ SELECT * | items FROM tables [WHERE ...] [GROUP BY ...] [HAVING ...]
        [ORDER BY item [DESC], ...] [LIMIT n] [OFFSET n]
 UPDATE t SET c = v, ... [WHERE ...]
 DELETE FROM t [WHERE ...]
+BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
+SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 ```
 
 `FROM` names one table or a left-deep chain of joins — `a [AS] x
@@ -159,7 +161,9 @@ Select items are columns or aggregates — `COUNT(*)`, `COUNT(c)`,
 throughout: aggregates ignore NULLs (`COUNT(*)` counts rows), NULL
 group values form one group, an ungrouped aggregate query returns
 exactly one row even over zero rows, `HAVING` filters groups, and
-`ORDER BY` can sort by grouped columns or aggregates:
+`ORDER BY` can sort by grouped columns or aggregates. A `GROUP BY`
+key is a column or an integer ordinal naming a select-list position
+(`GROUP BY 1`):
 
 ```sql
 SELECT city, count(*), avg(age) FROM users
@@ -235,7 +239,11 @@ multi-statement transactions, `DB.NewSession()` executes `BEGIN ...
 COMMIT | ROLLBACK` blocks with Postgres semantics: the block is one
 engine transaction, an error fails the block until `ROLLBACK`
 (`COMMIT` then rolls back and says so in its command tag), and
-redundant control statements warn without failing. Isolation levels
+redundant control statements warn without failing. `SAVEPOINT` marks
+a point inside the block — an O(1) copy-on-write snapshot of the
+transaction's state — that `ROLLBACK TO` rewinds to, clearing the
+failed state, so a block recovers from an error instead of losing
+everything; `RELEASE` drops the mark and keeps the work. Isolation levels
 parse and are ignored — single-writer transactions are serializable,
 which satisfies every level — and `READ ONLY` is honored. A writable
 block holds the engine's writer lock from `BEGIN` to its end (other
@@ -288,7 +296,8 @@ politely. Transaction blocks work as in Postgres: each connection is
 a `sql.Session`, `ReadyForQuery` reports the real status (idle / in
 transaction / failed), redundant `BEGIN`/`COMMIT` raise
 `NoticeResponse` warnings, and a dropped connection rolls back its
-open block. Cancellation, portal suspension, and COPY are not
+open block. Savepoints work over the wire too — pgx's nested
+transactions ride on them. Cancellation, portal suspension, and COPY are not
 implemented. The end-to-end tests drive a real
 pgx v5 client — including pgx's statement cache and its simple
 protocol mode, which renders every argument as a quoted literal and
@@ -330,8 +339,9 @@ Type tags are persistent format; they are never renumbered.
 What btypedb supplies underneath (the same contract CockroachDB asks
 of Pebble): ordered iteration with pivots, atomic multi-key commits
 (row + future index writes, all-or-nothing in the WAL), snapshot
-isolation via O(1) COW snapshots, `DeleteRange` for `DROP TABLE`, and
-fsync-before-ack durability with group commit.
+isolation via O(1) COW snapshots, savepoints as O(1) COW marks within
+a transaction, `DeleteRange` for `DROP TABLE`, and fsync-before-ack
+durability with group commit.
 
 ## Roadmap
 
@@ -348,7 +358,8 @@ fsync-before-ack durability with group commit.
 - [x] **Milestone 11**: system catalog — virtual `pg_catalog` + `information_schema` tables from the engine catalog through the ordinary executor; schema-qualified names, SELECT without FROM, literal select items, folded zero-arg functions (`version()`, `current_schema()`, ...), ORDER BY ordinals; catalog writes rejected
 - [x] **Milestone 12**: expression language — one grammar for select items and conditions (CASE, IN, `~`/`!~`/`~*`/`!~*`, `OPERATOR()`/`COLLATE`, `::` casts, arithmetic/`||`, functions with arguments, output aliases), lowered to the legacy predicate shapes where simple so pushdown survives; eval-time name resolution through an environment chain (correlated scalar subqueries, EXISTS, ARRAY(SELECT ...) — and unknown functions error only if a row reaches them); UNION [ALL]; catalog grown until psql's `\dt`, `\d`, `\d <table>`, `\d <index>`, `\di`, `\dn`, `\du`, `\l` all render
 - [x] **Milestone 13**: transaction blocks — `Engine.Begin`/`Txn.Commit`/`Txn.Rollback` over btypedb's manual transactions; `sql.Session` with Postgres block semantics (failed-block state and 25P02, `COMMIT`-of-failed reports `ROLLBACK`, warnings for redundant control, `READ ONLY`, isolation levels accepted as serializable, DDL refused in-block); pgwire sessions with real `ReadyForQuery` status, `NoticeResponse`, and rollback on disconnect
-- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, savepoints, EXPLAIN, GROUP BY ordinals/expressions
+- [x] **Milestone 14**: GROUP BY ordinals (`GROUP BY 1`); savepoints — btypedb v0.4 `Savepoint`/`RollbackTo`/`Release` as O(1) COW marks with WAL-batch truncation, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` in sessions with Postgres semantics (name shadowing, failed-block recovery, 3B001/25P01), pgx nested transactions over the wire
+- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, EXPLAIN, GROUP BY expressions
 
 ## Design notes
 
