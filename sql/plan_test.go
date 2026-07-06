@@ -79,6 +79,55 @@ func TestPlanIndexEqPrefixPlusRange(t *testing.T) {
 	}
 }
 
+// descPlanDesc: planDesc plus by_age_desc on (age DESC) and
+// by_city_agedesc on (city, age DESC).
+func descPlanDesc() *bytdb.TableDesc {
+	d := planDesc()
+	d.Indexes = append(d.Indexes,
+		bytdb.IndexDesc{ID: 4, Name: "by_age_desc", Cols: []int{2}, Desc: []bool{true}},
+		bytdb.IndexDesc{ID: 5, Name: "by_city_agedesc", Cols: []int{3, 2}, Desc: []bool{false, true}},
+	)
+	return d
+}
+
+func TestPlanDescRangeSwapsBounds(t *testing.T) {
+	// On a descending key column the upper bound starts the scan and
+	// the lower bound stops it.
+	p, err := planScan(descPlanDesc(), "users", and(
+		cpred("city", OpEQ, "Reno"),
+		cpred("age", OpGT, int64(21)),
+		cpred("age", OpLE, int64(65)),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.index != "by_city_agedesc" {
+		t.Fatalf("index: got %q", p.index)
+	}
+	if !reflect.DeepEqual(p.from, []any{"Reno", int64(65)}) {
+		t.Fatalf("from: got %#v", p.from)
+	}
+	if !reflect.DeepEqual(p.stops, []stop{{3, stopNE, "Reno"}, {2, stopLE, int64(21)}}) {
+		t.Fatalf("stops: got %#v", p.stops)
+	}
+}
+
+func TestPlanDescGEStopsLT(t *testing.T) {
+	p, err := planScan(descPlanDesc(), "users", cpred("age", OpGE, int64(30)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.index != "by_age_desc" {
+		t.Fatalf("index: got %q", p.index)
+	}
+	if p.from != nil {
+		t.Fatalf("from: got %#v", p.from)
+	}
+	if !reflect.DeepEqual(p.stops, []stop{{2, stopLT, int64(30)}}) {
+		t.Fatalf("stops: got %#v", p.stops)
+	}
+}
+
 func TestPlanPrimaryWinsTies(t *testing.T) {
 	// eq on id (pk) and eq on city (indexed) score equally at one
 	// equality column... they don't: pk eq is a point get. Use a range

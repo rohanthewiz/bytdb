@@ -39,6 +39,104 @@ func names(t *testing.T, seq func(func(Row, error) bool)) []string {
 	return out
 }
 
+func TestDescIndex(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+	insertPeople(t, e,
+		[]any{1, "grace", 45, "g@x"},
+		[]any{2, "ada", 36, "a@x"},
+		[]any{3, "edsger", 51, "e@x"},
+		[]any{4, "alan", 29, "n@x"},
+	)
+	if _, err := e.CreateIndexCols("people", "by-age-desc", false,
+		[]IndexCol{{Name: "age", Desc: true}}); err != nil {
+		t.Fatal(err)
+	}
+	got := names(t, e.ScanIndex("people", "by-age-desc", nil, nil))
+	if want := []string{"edsger", "grace", "ada", "alan"}; !slices.Equal(got, want) {
+		t.Fatalf("desc index scan = %v; want %v", got, want)
+	}
+
+	// Bounds are semantic values; the engine encodes them in key
+	// direction, so from/to follow the index's (descending) order.
+	got = names(t, e.ScanIndex("people", "by-age-desc", []any{51}, []any{36}))
+	if want := []string{"edsger", "grace"}; !slices.Equal(got, want) {
+		t.Fatalf("bounded desc scan = %v; want %v", got, want)
+	}
+
+	// Maintenance on insert and delete.
+	if err := e.Insert("people", 5, "barbara", 48, "b@x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Delete("people", 2); err != nil {
+		t.Fatal(err)
+	}
+	got = names(t, e.ScanIndex("people", "by-age-desc", nil, nil))
+	if want := []string{"edsger", "barbara", "grace", "alan"}; !slices.Equal(got, want) {
+		t.Fatalf("desc index after writes = %v; want %v", got, want)
+	}
+
+	// NULLs sort after values in a descending column.
+	if err := e.Insert("people", 6, "unknown", nil, "u@x"); err != nil {
+		t.Fatal(err)
+	}
+	got = names(t, e.ScanIndex("people", "by-age-desc", nil, nil))
+	if want := []string{"edsger", "barbara", "grace", "alan", "unknown"}; !slices.Equal(got, want) {
+		t.Fatalf("desc index with NULL = %v; want %v", got, want)
+	}
+}
+
+func TestDescIndexUniqueAndMixed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	e := openEngine(t, path)
+	defer e.Close()
+	peopleTable(t, e)
+	insertPeople(t, e,
+		[]any{1, "grace", 45, "g@x"},
+		[]any{2, "ada", 36, "a@x"},
+	)
+	if _, err := e.CreateIndexCols("people", "by-email", true,
+		[]IndexCol{{Name: "email", Desc: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("people", 3, "dupe", 20, "g@x"); err == nil ||
+		!strings.Contains(err.Error(), "unique index violation") {
+		t.Fatalf("descending unique index not enforced: %v", err)
+	}
+
+	// Mixed directions: name ascending, age descending.
+	if _, err := e.CreateIndexCols("people", "name-agedesc", false,
+		[]IndexCol{{Name: "name"}, {Name: "age", Desc: true}}); err != nil {
+		t.Fatal(err)
+	}
+	insertPeople(t, e,
+		[]any{4, "ada", 50, "a2@x"},
+		[]any{5, "ada", 10, "a3@x"},
+	)
+	var ages []int64
+	for row, err := range e.ScanIndex("people", "name-agedesc", []any{"ada"}, []any{"adaz"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		ages = append(ages, row.Col("age").(int64))
+	}
+	if want := []int64{50, 36, 10}; !slices.Equal(ages, want) {
+		t.Fatalf("mixed-direction scan ages = %v; want %v", ages, want)
+	}
+
+	// Reopen: the direction round-trips through the descriptor.
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e2 := openEngine(t, path)
+	defer e2.Close()
+	got := names(t, e2.ScanIndex("people", "name-agedesc", nil, nil))
+	if want := []string{"ada", "ada", "ada", "grace"}; !slices.Equal(got, want) {
+		t.Fatalf("after reopen = %v; want %v", got, want)
+	}
+}
+
 func TestCreateIndexBackfillAndScan(t *testing.T) {
 	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
 	defer e.Close()

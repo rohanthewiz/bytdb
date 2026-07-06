@@ -229,6 +229,90 @@ func randBytes(rng *rand.Rand) []byte {
 	return b
 }
 
+// TestDescOrderProperty: descending encodings reverse byte order and
+// round-trip through DecodeOne.
+func TestDescOrderProperty(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	vals := make([]any, 300)
+	encs := make([][]byte, len(vals))
+	for i := range vals {
+		vals[i] = randValue(rng)
+		enc, err := AppendDesc(nil, vals[i])
+		if err != nil {
+			t.Fatalf("AppendDesc(%v): %v", vals[i], err)
+		}
+		encs[i] = enc
+
+		out, rest, err := DecodeOne(enc, true)
+		if err != nil {
+			t.Fatalf("DecodeOne(desc %v): %v", vals[i], err)
+		}
+		if len(rest) != 0 {
+			t.Fatalf("DecodeOne(desc %v) left %d bytes", vals[i], len(rest))
+		}
+		if Compare([]any{out}, []any{vals[i]}) != 0 {
+			t.Fatalf("desc round trip changed value: %v vs %v", vals[i], out)
+		}
+	}
+	for i := range vals {
+		for j := range vals {
+			want := Compare([]any{vals[i]}, []any{vals[j]})
+			got := bytes.Compare(encs[i], encs[j])
+			if sign(got) != -sign(want) {
+				t.Fatalf("desc order not reversed: Compare(%v, %v)=%d but bytes=%d",
+					vals[i], vals[j], want, got)
+			}
+		}
+	}
+}
+
+// TestMixedDirections: ascending and descending elements interleave in
+// one key; each element decodes with its own direction, and the key
+// orders by the leading element's direction.
+func TestMixedDirections(t *testing.T) {
+	key := func(a string, b int64) []byte {
+		buf, err := Append(nil, a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if buf, err = AppendDesc(buf, b); err != nil {
+			t.Fatal(err)
+		}
+		return buf
+	}
+	k1 := key("acme", 10)
+	k2 := key("acme", 2)
+	k3 := key("beta", 1)
+	if !(bytes.Compare(k1, k2) < 0 && bytes.Compare(k2, k3) < 0) {
+		t.Fatalf("mixed-direction order wrong: % x, % x, % x", k1, k2, k3)
+	}
+	a, rest, err := DecodeOne(k1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, rest, err := DecodeOne(rest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != "acme" || b != int64(10) || len(rest) != 0 {
+		t.Fatalf("mixed decode: %v %v rest=%d", a, b, len(rest))
+	}
+}
+
+func TestDescNullsLast(t *testing.T) {
+	null, _ := AppendDesc(nil, nil)
+	max, _ := AppendDesc(nil, "zzz")
+	if bytes.Compare(null, max) <= 0 {
+		t.Fatal("descending NULL does not sort after values")
+	}
+}
+
+func TestDecodeOneEmpty(t *testing.T) {
+	if _, _, err := DecodeOne(nil, false); err == nil {
+		t.Fatal("DecodeOne on empty input succeeded")
+	}
+}
+
 func TestDecodeCorrupt(t *testing.T) {
 	for _, data := range [][]byte{
 		{tagInt, 0x01},               // truncated int

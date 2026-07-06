@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -186,6 +187,52 @@ func TestErrors(t *testing.T) {
 	var n int64
 	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("after errors: %v %d", err, n)
+	}
+}
+
+func TestConstraintsAndExplain(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table items (
+		id int primary key, name text not null, price int check (price > 0))`)
+
+	var pgErr *pgconn.PgError
+	if _, err := c.Exec(ctx, `insert into items values (1, null, 5)`); !errors.As(err, &pgErr) || pgErr.Code != "23502" {
+		t.Fatalf("not-null violation: %+v", err)
+	}
+	if !strings.Contains(pgErr.Message, `null value in column "name" of relation "items" violates not-null constraint`) {
+		t.Fatalf("not-null message: %q", pgErr.Message)
+	}
+	if _, err := c.Exec(ctx, `insert into items values (1, 'x', -3)`); !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("check violation: %+v", err)
+	}
+	if !strings.Contains(pgErr.Message, `violates check constraint "items_price_check"`) {
+		t.Fatalf("check message: %q", pgErr.Message)
+	}
+	mustExec(t, c, `insert into items values (1, 'x', 3)`)
+
+	// EXPLAIN over the wire: one text column, EXPLAIN command tag.
+	rows, err := c.Query(ctx, `explain select * from items where id = $1`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for rows.Next() {
+		var l string
+		if err := rows.Scan(&l); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, l)
+	}
+	rows.Close()
+	if tag := rows.CommandTag(); tag.String() != "EXPLAIN" {
+		t.Fatalf("tag: %q", tag)
+	}
+	if len(lines) != 2 || lines[0] != "Point Get on items" || lines[1] != "  Key: (id = 1)" {
+		t.Fatalf("explain lines: %q", lines)
+	}
+	if _, err := c.Exec(ctx, `explain analyze select * from items`); err == nil {
+		t.Fatal("EXPLAIN ANALYZE accepted")
 	}
 }
 

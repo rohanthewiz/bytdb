@@ -205,6 +205,10 @@ func (d *DB) userDescs() []*bytdb.TableDesc {
 // index is id 0.
 func indexOID(tableID uint64, indexID uint64) int64 { return int64(tableID*1000 + indexID) }
 
+// checkOID is the oid of a table's i-th check constraint, placed high
+// in the table's oid block, above any realistic index ID.
+func checkOID(tableID uint64, i int) int64 { return int64(tableID*1000+900) + int64(i) }
+
 var sysTables = map[string]*sysTableDef{
 	"pg_catalog.pg_namespace": {
 		desc: sysDesc("pg_namespace", sysCol("oid", bytdb.TInt),
@@ -233,22 +237,22 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("reltoastrelid", bytdb.TInt), sysCol("reloptions", bytdb.TString)),
 		rows: func(d *DB) [][]any {
 			var rows [][]any
-			rel := func(oid int64, name, kind string, hasIdx bool) {
+			rel := func(oid int64, name, kind string, hasIdx bool, nChecks int) {
 				am := amHeap
 				if kind == "i" {
 					am = amBtree
 				}
 				rows = append(rows, []any{
 					oid, name, oidPublic, kind, int64(10), "p", hasIdx, -1.0, int64(0),
-					am, int64(0), false, false, false, false, false, int64(0),
+					am, int64(nChecks), false, false, false, false, false, int64(0),
 					int64(0), "d", int64(0), nil,
 				})
 			}
 			for _, desc := range d.userDescs() {
-				rel(int64(desc.ID), desc.Name, "r", len(desc.Indexes) > 0)
-				rel(indexOID(desc.ID, 0), desc.Name+"_pkey", "i", false)
+				rel(int64(desc.ID), desc.Name, "r", len(desc.Indexes) > 0, len(desc.Checks))
+				rel(indexOID(desc.ID, 0), desc.Name+"_pkey", "i", false, 0)
 				for _, ix := range desc.Indexes {
-					rel(indexOID(desc.ID, ix.ID), ix.Name, "i", false)
+					rel(indexOID(desc.ID, ix.ID), ix.Name, "i", false, 0)
 				}
 			}
 			return rows
@@ -280,7 +284,7 @@ var sysTables = map[string]*sysTableDef{
 					pk[o] = true
 				}
 				for i, c := range desc.Columns {
-					attr(int64(desc.ID), i+1, c, pk[i])
+					attr(int64(desc.ID), i+1, c, pk[i] || c.NotNull)
 				}
 				// Index relations list their key columns too (\d idx).
 				for i, o := range desc.PKCols {
@@ -357,8 +361,8 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	// The tables below exist so psql's probes parse, bind, and return
-	// zero rows: bytdb has no access methods, defaults, collations,
-	// declared constraints (keys surface through pg_index), inheritance,
+	// zero rows (pg_constraint aside, which lists CHECK constraints):
+	// bytdb has no access methods, defaults, collations, inheritance,
 	// policies, extended statistics, or publications.
 	"pg_catalog.pg_am": {
 		desc: sysDesc("pg_am",
@@ -387,6 +391,21 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("contypid", bytdb.TInt), sysCol("conindid", bytdb.TInt),
 			sysCol("conparentid", bytdb.TInt), sysCol("confrelid", bytdb.TInt),
 			sysCol("conkey", bytdb.TString), sysCol("confkey", bytdb.TString)),
+		rows: func(d *DB) [][]any {
+			// CHECK constraints only; keys surface through pg_index.
+			var rows [][]any
+			for _, desc := range d.userDescs() {
+				for i, ck := range desc.Checks {
+					rows = append(rows, []any{
+						checkOID(desc.ID, i), ck.Name, oidPublic, "c",
+						false, false, true, int64(desc.ID),
+						int64(0), int64(0), int64(0), int64(0),
+						nil, nil,
+					})
+				}
+			}
+			return rows
+		},
 	},
 	"pg_catalog.pg_inherits": {
 		desc: sysDesc("pg_inherits",
@@ -484,7 +503,7 @@ var sysTables = map[string]*sysTableDef{
 				}
 				for i, c := range desc.Columns {
 					nullable := "YES"
-					if pk[i] {
+					if pk[i] || c.NotNull {
 						nullable = "NO"
 					}
 					rows = append(rows, []any{

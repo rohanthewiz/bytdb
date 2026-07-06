@@ -2,6 +2,7 @@ package bytdb
 
 import (
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -194,6 +195,78 @@ func TestDropColumnOrdinalShift(t *testing.T) {
 	}
 	if _, err := e2.Update("wide", []any{3}, map[string]any{"rank": 40}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNotNullColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	e := openEngine(t, path)
+	defer e.Close()
+	if _, err := e.CreateTable("t", []Column{
+		{Name: "id", Type: TInt}, {Name: "name", Type: TString, NotNull: true},
+	}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", 1, nil); err == nil ||
+		!strings.Contains(err.Error(), `null value in column "name" of relation "t" violates not-null constraint`) {
+		t.Fatalf("NULL insert into NOT NULL column: %v", err)
+	}
+	if err := e.Insert("t", 1, "ada"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Update("t", []any{1}, map[string]any{"name": nil}); err == nil ||
+		!strings.Contains(err.Error(), "violates not-null constraint") {
+		t.Fatalf("NULL update of NOT NULL column: %v", err)
+	}
+
+	// Adding a NOT NULL column: only while the table is empty.
+	if err := e.AddColumn("t", Column{Name: "email", Type: TString, NotNull: true}); err == nil ||
+		!strings.Contains(err.Error(), `column "email" of relation "t" contains null values`) {
+		t.Fatalf("NOT NULL add on non-empty table: %v", err)
+	}
+	if _, err := e.Delete("t", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddColumn("t", Column{Name: "email", Type: TString, NotNull: true}); err != nil {
+		t.Fatalf("NOT NULL add on empty table: %v", err)
+	}
+	if err := e.Insert("t", 2, "grace", nil); err == nil ||
+		!strings.Contains(err.Error(), "violates not-null constraint") {
+		t.Fatalf("added NOT NULL column not enforced: %v", err)
+	}
+
+	// The flag persists.
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e2 := openEngine(t, path)
+	defer e2.Close()
+	if d := e2.Table("t"); !d.Columns[1].NotNull || !d.Columns[2].NotNull {
+		t.Fatalf("NotNull not persisted: %+v", d.Columns)
+	}
+}
+
+func TestCheckDescStorage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	e := openEngine(t, path)
+	defer e.Close()
+	checks := []CheckDesc{{Name: "t_a_check", Expr: "a > 0"}, {Name: "t_check", Expr: "a < b"}}
+	if _, err := e.CreateTableWithChecks("t", []Column{
+		{Name: "a", Type: TInt}, {Name: "b", Type: TInt},
+	}, checks, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateTableWithChecks("u", []Column{{Name: "a", Type: TInt}},
+		[]CheckDesc{{Name: "x", Expr: "a > 0"}, {Name: "x", Expr: "a < 9"}}, "a"); err == nil {
+		t.Fatal("duplicate check names accepted")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e2 := openEngine(t, path)
+	defer e2.Close()
+	if got := e2.Table("t").Checks; !reflect.DeepEqual(got, checks) {
+		t.Fatalf("checks not persisted: %+v", got)
 	}
 }
 

@@ -46,8 +46,8 @@ func TestParseCreateTable(t *testing.T) {
 	want := &CreateTable{
 		Table: "users",
 		Cols: []ColDef{
-			{"id", bytdb.TInt}, {"name", bytdb.TString}, {"score", bytdb.TFloat},
-			{"active", bytdb.TBool}, {"blob", bytdb.TBytes},
+			{Name: "id", Type: bytdb.TInt}, {Name: "name", Type: bytdb.TString}, {Name: "score", Type: bytdb.TFloat},
+			{Name: "active", Type: bytdb.TBool}, {Name: "blob", Type: bytdb.TBytes},
 		},
 		PK: []string{"id"},
 	}
@@ -254,7 +254,7 @@ func TestParseDDLRest(t *testing.T) {
 		t.Fatalf("got %#v", st)
 	}
 	if st := mustParse(t, `alter table users add column email text`); !reflect.DeepEqual(st,
-		&AddColumn{Table: "users", Col: ColDef{"email", bytdb.TString}}) {
+		&AddColumn{Table: "users", Col: ColDef{Name: "email", Type: bytdb.TString}}) {
 		t.Fatalf("got %#v", st)
 	}
 	if st := mustParse(t, `alter table users drop email`); !reflect.DeepEqual(st,

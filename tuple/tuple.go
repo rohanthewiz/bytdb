@@ -54,28 +54,51 @@ func Encode(vals ...any) ([]byte, error) {
 
 // Append appends the encoding of vals to buf and returns the result.
 func Append(buf []byte, vals ...any) ([]byte, error) {
+	return appendVals(buf, 0x00, vals)
+}
+
+// AppendDesc appends vals encoded for descending order: each element's
+// ascending encoding, inverted byte-for-byte. Element encodings are
+// prefix-free (fixed width, or escape-terminated), so whole-element
+// inversion exactly reverses byte order and stays self-delimiting —
+// ascending and descending elements mix freely within one key.
+// Descending elements decode with DecodeOne(data, true); note that a
+// descending NULL sorts after every value, the mirror of ascending.
+func AppendDesc(buf []byte, vals ...any) ([]byte, error) {
+	return appendVals(buf, 0xFF, vals)
+}
+
+// appendVals encodes vals with every byte XORed by mask (0x00 keeps
+// ascending order; 0xFF reverses it).
+func appendVals(buf []byte, mask byte, vals []any) ([]byte, error) {
 	for _, v := range vals {
 		n, err := normalize(v)
 		if err != nil {
 			return nil, err
 		}
-		buf = appendValue(buf, n)
+		buf = appendValue(buf, mask, n)
 	}
 	return buf, nil
 }
 
-func appendValue(buf []byte, v any) []byte {
+func appendValue(buf []byte, mask byte, v any) []byte {
+	u64 := func(buf []byte, u uint64) []byte {
+		if mask != 0 {
+			u = ^u
+		}
+		return binary.BigEndian.AppendUint64(buf, u)
+	}
 	switch t := v.(type) {
 	case nil:
-		return append(buf, tagNull)
+		return append(buf, tagNull^mask)
 	case bool:
 		if t {
-			return append(buf, tagTrue)
+			return append(buf, tagTrue^mask)
 		}
-		return append(buf, tagFalse)
+		return append(buf, tagFalse^mask)
 	case int64:
-		buf = append(buf, tagInt)
-		return binary.BigEndian.AppendUint64(buf, uint64(t)^(1<<63))
+		buf = append(buf, tagInt^mask)
+		return u64(buf, uint64(t)^(1<<63))
 	case float64:
 		bits := math.Float64bits(t)
 		if bits&(1<<63) != 0 {
@@ -83,32 +106,32 @@ func appendValue(buf []byte, v any) []byte {
 		} else {
 			bits |= 1 << 63 // positive: set the top bit to sort above negatives
 		}
-		buf = append(buf, tagFloat)
-		return binary.BigEndian.AppendUint64(buf, bits)
+		buf = append(buf, tagFloat^mask)
+		return u64(buf, bits)
 	case []byte:
-		return appendEscaped(append(buf, tagBytes), t)
+		return appendEscaped(append(buf, tagBytes^mask), mask, t)
 	case string:
-		return appendEscaped(append(buf, tagString), []byte(t))
+		return appendEscaped(append(buf, tagString^mask), mask, []byte(t))
 	}
 	panic(fmt.Sprintf("tuple: unreachable type %T after normalize", v))
 }
 
-func appendEscaped(buf, s []byte) []byte {
+func appendEscaped(buf []byte, mask byte, s []byte) []byte {
 	for _, c := range s {
 		if c == escByte {
-			buf = append(buf, escByte, escaped00)
+			buf = append(buf, escByte^mask, escaped00^mask)
 		} else {
-			buf = append(buf, c)
+			buf = append(buf, c^mask)
 		}
 	}
-	return append(buf, escByte, terminator)
+	return append(buf, escByte^mask, terminator^mask)
 }
 
 // Decode decodes every element of an encoded tuple.
 func Decode(data []byte) ([]any, error) {
 	var out []any
 	for len(data) > 0 {
-		v, rest, err := decodeOne(data)
+		v, rest, err := decodeOne(data, 0x00)
 		if err != nil {
 			return nil, err
 		}
@@ -118,8 +141,32 @@ func Decode(data []byte) ([]any, error) {
 	return out, nil
 }
 
-func decodeOne(data []byte) (v any, rest []byte, err error) {
-	tag, data := data[0], data[1:]
+// DecodeOne decodes the first element of data — encoded ascending, or
+// descending (AppendDesc) when desc is true — returning the value and
+// the remaining bytes. Callers that mix directions within one key
+// decode element by element, passing each element's direction.
+func DecodeOne(data []byte, desc bool) (v any, rest []byte, err error) {
+	if len(data) == 0 {
+		return nil, nil, serr.New("tuple: empty input")
+	}
+	var mask byte
+	if desc {
+		mask = 0xFF
+	}
+	return decodeOne(data, mask)
+}
+
+// decodeOne decodes one element whose stored bytes are the ascending
+// encoding XOR mask.
+func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
+	u64 := func(b []byte) uint64 {
+		u := binary.BigEndian.Uint64(b)
+		if mask != 0 {
+			u = ^u
+		}
+		return u
+	}
+	tag, data := data[0]^mask, data[1:]
 	switch tag {
 	case tagNull:
 		return nil, data, nil
@@ -131,13 +178,13 @@ func decodeOne(data []byte) (v any, rest []byte, err error) {
 		if len(data) < 8 {
 			return nil, nil, serr.New("tuple: truncated int element")
 		}
-		u := binary.BigEndian.Uint64(data) ^ (1 << 63)
+		u := u64(data) ^ (1 << 63)
 		return int64(u), data[8:], nil
 	case tagFloat:
 		if len(data) < 8 {
 			return nil, nil, serr.New("tuple: truncated float element")
 		}
-		bits := binary.BigEndian.Uint64(data)
+		bits := u64(data)
 		if bits&(1<<63) != 0 {
 			bits &^= 1 << 63
 		} else {
@@ -145,7 +192,7 @@ func decodeOne(data []byte) (v any, rest []byte, err error) {
 		}
 		return math.Float64frombits(bits), data[8:], nil
 	case tagBytes, tagString:
-		raw, rest, err := unescape(data)
+		raw, rest, err := unescape(data, mask)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -157,17 +204,19 @@ func decodeOne(data []byte) (v any, rest []byte, err error) {
 	return nil, nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
 
-func unescape(data []byte) (raw, rest []byte, err error) {
+// unescape reads an escaped byte string whose stored bytes are XOR
+// mask, returning the logical bytes.
+func unescape(data []byte, mask byte) (raw, rest []byte, err error) {
 	raw = []byte{}
 	for i := 0; i < len(data); i++ {
-		if data[i] != escByte {
-			raw = append(raw, data[i])
+		if data[i]^mask != escByte {
+			raw = append(raw, data[i]^mask)
 			continue
 		}
 		if i+1 >= len(data) {
 			break
 		}
-		switch data[i+1] {
+		switch data[i+1] ^ mask {
 		case escaped00:
 			raw = append(raw, escByte)
 			i++

@@ -552,7 +552,13 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 		return indexdef(env.d, oid, colNo), nil
 	case "array_to_string", "array_length": // no arrays exist: NULL in, NULL out
 		return nil, nil
-	case "pg_get_expr", "pg_get_constraintdef", "pg_get_partkeydef",
+	case "pg_get_constraintdef":
+		oid, ok := argN(0).(int64)
+		if !ok {
+			return nil, nil
+		}
+		return constraintdef(env.d, oid), nil
+	case "pg_get_expr", "pg_get_partkeydef",
 		"pg_get_viewdef", "pg_get_triggerdef", "pg_get_ruledef",
 		"pg_get_statisticsobjdef_columns",
 		"obj_description", "col_description", "shobj_description":
@@ -614,6 +620,7 @@ func indexdef(d *DB, oid int64, colNo int64) any {
 	for _, desc := range d.userDescs() {
 		var name string
 		var cols []int
+		var descs []bool
 		unique := false
 		found := false
 		if oid == indexOID(desc.ID, 0) {
@@ -622,6 +629,7 @@ func indexdef(d *DB, oid int64, colNo int64) any {
 			for _, ix := range desc.Indexes {
 				if oid == indexOID(desc.ID, ix.ID) {
 					name, cols, unique, found = ix.Name, ix.Cols, ix.Unique, true
+					descs = ix.Desc
 					break
 				}
 			}
@@ -630,10 +638,15 @@ func indexdef(d *DB, oid int64, colNo int64) any {
 			continue
 		}
 		names := make([]string, len(cols))
+		keys := make([]string, len(cols))
 		for i, o := range cols {
 			names[i] = desc.Columns[o].Name
+			keys[i] = names[i]
+			if i < len(descs) && descs[i] {
+				keys[i] += " DESC"
+			}
 		}
-		if colNo > 0 {
+		if colNo > 0 { // the per-column form returns the bare column name
 			if int(colNo) <= len(names) {
 				return names[colNo-1]
 			}
@@ -644,7 +657,20 @@ func indexdef(d *DB, oid int64, colNo int64) any {
 			u = "UNIQUE "
 		}
 		return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING btree (%s)",
-			u, name, desc.Name, strings.Join(names, ", "))
+			u, name, desc.Name, strings.Join(keys, ", "))
+	}
+	return nil
+}
+
+// constraintdef renders pg_get_constraintdef for a check constraint's
+// oid, in Postgres's shape: CHECK ((expr)).
+func constraintdef(d *DB, oid int64) any {
+	for _, desc := range d.userDescs() {
+		for i, ck := range desc.Checks {
+			if oid == checkOID(desc.ID, i) {
+				return "CHECK ((" + ck.Expr + "))"
+			}
+		}
 	}
 	return nil
 }

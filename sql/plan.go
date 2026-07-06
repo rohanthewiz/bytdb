@@ -19,6 +19,7 @@ type plan struct {
 	stops  []stop   // early-termination checks, in key-column order
 	filter BoolExpr // residual filter: the full condition (nil: all rows)
 	binds  binds    // the filter's operand ordinals within this table's rows
+	pushed []*Pred  // the conjuncts behind get/from/stops (EXPLAIN's Index Cond)
 }
 
 type stopKind int
@@ -27,13 +28,17 @@ const (
 	stopNE stopKind = iota // stop when col != val (an equality prefix has ended)
 	stopGE                 // stop when col >= val (pushed: col < val)
 	stopGT                 // stop when col > val  (pushed: col <= val)
+	stopLE                 // stop when col <= val (pushed: col > val, descending column)
+	stopLT                 // stop when col < val  (pushed: col >= val, descending column)
 )
 
 // stop ends a scan at the first row where the column at ordinal ord
-// leaves the pushed-down region. NULL column values never trigger a
-// range stop: NULL sorts before every value in the key encoding, so a
-// NULL here means the scan is still inside (or entering) the region's
-// NULL group, which the residual filter discards row by row.
+// leaves the pushed-down region. NULL column values never trigger an
+// ascending range stop: NULL sorts before every value in the key
+// encoding, so a NULL there means the scan is still inside (or
+// entering) the region's NULL group, which the residual filter
+// discards row by row. On a descending column NULLs sort after every
+// value, so a NULL does stop the descending kinds.
 type stop struct {
 	ord  int
 	kind stopKind
@@ -82,7 +87,7 @@ func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error
 	// First usable conjunct per column, by kind. Only literals that
 	// fit the column type are pushed; column-to-column comparisons and
 	// the rest stay residual-only.
-	eq := map[int]any{}
+	eq := map[int]*Pred{}
 	lo := map[int]*Pred{}
 	hi := map[int]*Pred{}
 	for _, pr := range conjuncts(where) {
@@ -93,7 +98,7 @@ func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error
 		switch pr.Op {
 		case OpEQ:
 			if _, ok := eq[ord]; !ok {
-				eq[ord] = pr.Val
+				eq[ord] = pr
 			}
 		case OpGT, OpGE:
 			if _, ok := lo[ord]; !ok {
@@ -110,7 +115,8 @@ func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error
 	if k := eqPrefix(desc.PKCols, eq); k == len(desc.PKCols) {
 		p.get = make([]any, k)
 		for i, ord := range desc.PKCols {
-			p.get[i] = eq[ord]
+			p.get[i] = eq[ord].Val
+			p.pushed = append(p.pushed, eq[ord])
 		}
 		return p, nil
 	}
@@ -118,35 +124,60 @@ func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error
 	// Otherwise score the primary index and every secondary index;
 	// equality columns dominate, a bounded range column breaks ties.
 	// The primary index wins ties (no entry -> row indirection).
-	bestCols, bestIndex, bestScore := desc.PKCols, "", pathScore(desc.PKCols, eq, lo, hi)
+	var bestIdx *bytdb.IndexDesc // nil: the primary index
+	bestCols, bestScore := desc.PKCols, pathScore(desc.PKCols, eq, lo, hi)
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
 		if s := pathScore(idx.Cols, eq, lo, hi); s > bestScore {
-			bestCols, bestIndex, bestScore = idx.Cols, idx.Name, s
+			bestIdx, bestCols, bestScore = idx, idx.Cols, s
 		}
 	}
 	if bestScore == 0 {
 		return p, nil // full scan of the primary index
 	}
-	p.index = bestIndex
+	if bestIdx != nil {
+		p.index = bestIdx.Name
+	}
 	k := eqPrefix(bestCols, eq)
 	for i := 0; i < k; i++ {
-		v := eq[bestCols[i]]
-		p.from = append(p.from, v)
-		p.stops = append(p.stops, stop{bestCols[i], stopNE, v})
+		pr := eq[bestCols[i]]
+		p.from = append(p.from, pr.Val)
+		p.stops = append(p.stops, stop{bestCols[i], stopNE, pr.Val})
+		p.pushed = append(p.pushed, pr)
 	}
 	if k < len(bestCols) {
-		if l, ok := lo[bestCols[k]]; ok {
-			// The bound is inclusive; for OpGT the residual filter
-			// discards the rows equal to it.
-			p.from = append(p.from, l.Val)
-		}
-		if h, ok := hi[bestCols[k]]; ok {
-			kind := stopGE
-			if h.Op == OpLE {
-				kind = stopGT
+		if bestIdx != nil && bestIdx.DescAt(k) {
+			// A descending key column scans from high to low: the upper
+			// bound starts the scan (inclusive; for OpLT the residual
+			// filter discards the rows equal to it) and the lower bound
+			// stops it.
+			if h, ok := hi[bestCols[k]]; ok {
+				p.from = append(p.from, h.Val)
+				p.pushed = append(p.pushed, h)
 			}
-			p.stops = append(p.stops, stop{bestCols[k], kind, h.Val})
+			if l, ok := lo[bestCols[k]]; ok {
+				kind := stopLE
+				if l.Op == OpGE {
+					kind = stopLT
+				}
+				p.stops = append(p.stops, stop{bestCols[k], kind, l.Val})
+				p.pushed = append(p.pushed, l)
+			}
+		} else {
+			if l, ok := lo[bestCols[k]]; ok {
+				// The bound is inclusive; for OpGT the residual filter
+				// discards the rows equal to it.
+				p.from = append(p.from, l.Val)
+				p.pushed = append(p.pushed, l)
+			}
+			if h, ok := hi[bestCols[k]]; ok {
+				kind := stopGE
+				if h.Op == OpLE {
+					kind = stopGT
+				}
+				p.stops = append(p.stops, stop{bestCols[k], kind, h.Val})
+				p.pushed = append(p.pushed, h)
+			}
 		}
 	}
 	return p, nil
@@ -171,7 +202,7 @@ func conjuncts(e BoolExpr) []*Pred {
 
 // eqPrefix is the number of leading key columns with an equality
 // predicate.
-func eqPrefix(cols []int, eq map[int]any) int {
+func eqPrefix(cols []int, eq map[int]*Pred) int {
 	k := 0
 	for k < len(cols) {
 		if _, ok := eq[cols[k]]; !ok {
@@ -182,7 +213,7 @@ func eqPrefix(cols []int, eq map[int]any) int {
 	return k
 }
 
-func pathScore(cols []int, eq map[int]any, lo, hi map[int]*Pred) int {
+func pathScore(cols []int, eq, lo, hi map[int]*Pred) int {
 	k := eqPrefix(cols, eq)
 	score := 4 * k
 	if k < len(cols) {

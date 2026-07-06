@@ -33,6 +33,8 @@ func numParams(st Statement) int {
 		notePredVals(s.Where, note)
 	case *Select:
 		noteSelectVals(s, note)
+	case *Explain:
+		return numParams(s.Stmt)
 	}
 	return n
 }
@@ -152,6 +154,12 @@ func bindParams(st Statement, args []any) (Statement, error) {
 		return &c, nil
 	case *Select:
 		return bindSelect(s, sub), nil
+	case *Explain:
+		inner, err := bindParams(s.Stmt, args)
+		if err != nil {
+			return nil, err
+		}
+		return &Explain{Stmt: inner}, nil
 	}
 	return st, nil
 }

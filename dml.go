@@ -135,8 +135,13 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 		if err != nil {
 			return false, serr.Wrap(err, "table", desc.Name, "column", col)
 		}
-		if cv == nil && desc.isPK(ord) {
-			return false, serr.New("primary key column may not be NULL", "table", desc.Name, "column", col)
+		if cv == nil {
+			if desc.isPK(ord) {
+				return false, serr.New("primary key column may not be NULL", "table", desc.Name, "column", col)
+			}
+			if desc.Columns[ord].NotNull {
+				return false, notNullErr(desc, col)
+			}
 		}
 		newVals[ord] = cv
 	}
@@ -315,7 +320,7 @@ func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, erro
 // --- row/key plumbing ---
 
 // coerceRow validates arity and coerces every value to its column
-// type, rejecting nil in primary-key columns.
+// type, rejecting nil in primary-key and NOT NULL columns.
 func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 	if len(vals) != len(desc.Columns) {
 		return nil, serr.New("wrong number of values",
@@ -328,13 +333,24 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 		if err != nil {
 			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
 		}
-		if cv == nil && desc.isPK(i) {
-			return nil, serr.New("primary key column may not be NULL",
-				"table", desc.Name, "column", c.Name)
+		if cv == nil {
+			if desc.isPK(i) {
+				return nil, serr.New("primary key column may not be NULL",
+					"table", desc.Name, "column", c.Name)
+			}
+			if c.NotNull {
+				return nil, notNullErr(desc, c.Name)
+			}
 		}
 		out[i] = cv
 	}
 	return out, nil
+}
+
+// notNullErr is the NOT NULL violation, worded as Postgres words it.
+func notNullErr(desc *TableDesc, col string) error {
+	return serr.New(`null value in column "` + col + `" of relation "` +
+		desc.Name + `" violates not-null constraint`)
 }
 
 // coerce maps v onto the canonical Go type for a column type.

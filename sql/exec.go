@@ -68,10 +68,13 @@ func stopped(stops []stop, row bytdb.Row) bool {
 	for _, st := range stops {
 		c, ok := compareVals(row.Vals[st.ord], st.val)
 		if !ok {
-			if st.kind == stopNE {
+			switch st.kind {
+			case stopNE:
 				return true // the equality region cannot contain NULL
+			case stopLE, stopLT:
+				return true // descending column: NULLs sort after every value
 			}
-			continue // a range column's NULL group sorts before its values
+			continue // an ascending range column's NULL group sorts before its values
 		}
 		switch st.kind {
 		case stopNE:
@@ -84,6 +87,14 @@ func stopped(stops []stop, row bytdb.Row) bool {
 			}
 		case stopGT:
 			if c > 0 {
+				return true
+			}
+		case stopLE:
+			if c <= 0 {
+				return true
+			}
+		case stopLT:
+			if c < 0 {
 				return true
 			}
 		}
@@ -572,6 +583,14 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 				ords = append(ords, ord)
 			}
 		}
+		checks, err := tableChecks(desc)
+		if err != nil {
+			return err
+		}
+		var env *exEnv
+		if len(checks) > 0 {
+			env = d.tableEnv(tx, s.Table, desc)
+		}
 		for _, row := range s.Rows {
 			vals := row
 			if ords != nil {
@@ -581,6 +600,12 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 				vals = make([]any, len(desc.Columns))
 				for i, ord := range ords {
 					vals[ord] = row[i]
+				}
+			}
+			// Arity mismatches fall through to the engine's error.
+			if env != nil && len(vals) == len(desc.Columns) {
+				if err := checkRow(env, s.Table, checks, vals); err != nil {
+					return err
 				}
 			}
 			if err := tx.Insert(s.Table, vals...); err != nil {
@@ -606,13 +631,43 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		if err != nil {
 			return err
 		}
-		// Materialize matching keys before writing: updates move rows
-		// and index entries under a live scan.
-		pks, err := collectPKs(tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc))
+		checks, err := tableChecks(desc)
 		if err != nil {
 			return err
 		}
-		for _, pk := range pks {
+		setOrds := map[string]int{}
+		for col := range s.Set {
+			ord := desc.ColIndex(col)
+			if ord < 0 {
+				return serr.New("no such column", "table", s.Table, "column", col)
+			}
+			setOrds[col] = ord
+		}
+		// Materialize matching rows before writing: updates move rows
+		// and index entries under a live scan.
+		env := d.tableEnv(tx, s.Table, desc)
+		var rows [][]any
+		err = scanPlan(tx, s.Table, pl, env, func(r bytdb.Row) bool {
+			rows = append(rows, r.Vals)
+			return true
+		})
+		if err != nil {
+			return err
+		}
+		for _, rv := range rows {
+			if len(checks) > 0 {
+				nv := slices.Clone(rv)
+				for col, v := range s.Set {
+					nv[setOrds[col]] = v
+				}
+				if err := checkRow(env, s.Table, checks, nv); err != nil {
+					return err
+				}
+			}
+			pk := make([]any, len(desc.PKCols))
+			for i, ord := range desc.PKCols {
+				pk[i] = rv[ord]
+			}
 			ok, err := tx.Update(s.Table, pk, s.Set)
 			if err != nil {
 				return err

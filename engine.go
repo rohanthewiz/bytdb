@@ -48,35 +48,56 @@ const (
 // when the column is created and is never reused within its table —
 // row values are stored as (column ID, value) pairs, which is what
 // lets AddColumn and DropColumn skip rewriting rows. Leave ID zero
-// when declaring columns; input values are ignored.
+// when declaring columns; input values are ignored. A NotNull column
+// rejects NULL on insert and update.
 type Column struct {
-	Name string  `json:"name"`
-	Type ColType `json:"type"`
-	ID   uint32  `json:"id"`
+	Name    string  `json:"name"`
+	Type    ColType `json:"type"`
+	ID      uint32  `json:"id"`
+	NotNull bool    `json:"not_null,omitempty"`
+}
+
+// CheckDesc is one CHECK constraint: a SQL boolean expression over the
+// table's columns, stored as text. The engine stores and reports
+// checks; enforcing them belongs to the SQL layer, which owns the
+// expression language — writes through the engine API alone do not
+// evaluate them.
+type CheckDesc struct {
+	Name string `json:"name"`
+	Expr string `json:"expr"`
 }
 
 // TableDesc describes a table: its columns in declared order, which of
-// them (by ordinal) form the primary key in key order, and its
-// secondary indexes. Descriptors are persisted as JSON rows of the
-// system descriptors table.
+// them (by ordinal) form the primary key in key order, its secondary
+// indexes, and its CHECK constraints. Descriptors are persisted as
+// JSON rows of the system descriptors table.
 type TableDesc struct {
 	ID        uint64      `json:"id"`
 	Name      string      `json:"name"`
 	Columns   []Column    `json:"columns"`
 	PKCols    []int       `json:"pk_cols"`
 	Indexes   []IndexDesc `json:"indexes,omitempty"`
+	Checks    []CheckDesc `json:"checks,omitempty"`
 	NextColID uint32      `json:"next_col_id"`
 }
 
 // IndexDesc describes one secondary index: which columns (by ordinal)
 // it orders, in key order. A unique index rejects two rows with equal
 // indexed values, except that rows with NULL in any indexed column
-// never conflict (SQL semantics).
+// never conflict (SQL semantics). Desc marks which key columns order
+// descending (nil: all ascending); a descending column's NULLs sort
+// after its values, mirroring ascending.
 type IndexDesc struct {
 	ID     uint64 `json:"id"`
 	Name   string `json:"name"`
 	Cols   []int  `json:"cols"`
 	Unique bool   `json:"unique"`
+	Desc   []bool `json:"desc,omitempty"`
+}
+
+// DescAt reports whether the i-th key column orders descending.
+func (x *IndexDesc) DescAt(i int) bool {
+	return i < len(x.Desc) && x.Desc[i]
 }
 
 // Index returns the named index's descriptor, or nil.
@@ -94,6 +115,7 @@ func (d *TableDesc) clone() *TableDesc {
 	c.Columns = slices.Clone(d.Columns)
 	c.PKCols = slices.Clone(d.PKCols)
 	c.Indexes = slices.Clone(d.Indexes)
+	c.Checks = slices.Clone(d.Checks)
 	return &c
 }
 

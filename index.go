@@ -21,11 +21,27 @@ import (
 // index, so NULLs never conflict — SQL semantics. Entry arity tells
 // the two forms apart on decode.
 
-// CreateIndex registers a secondary index over table and backfills it
-// from existing rows. The backfill, any uniqueness check, and the
-// descriptor update commit atomically: either the index exists
-// complete, or not at all.
+// IndexCol names one index key column and its direction.
+type IndexCol struct {
+	Name string
+	Desc bool
+}
+
+// CreateIndex registers a secondary index over table (all key columns
+// ascending) and backfills it from existing rows. The backfill, any
+// uniqueness check, and the descriptor update commit atomically:
+// either the index exists complete, or not at all.
 func (e *Engine) CreateIndex(table, name string, unique bool, cols ...string) (*IndexDesc, error) {
+	keys := make([]IndexCol, len(cols))
+	for i, c := range cols {
+		keys[i] = IndexCol{Name: c}
+	}
+	return e.CreateIndexCols(table, name, unique, keys)
+}
+
+// CreateIndexCols is CreateIndex with per-column directions: a Desc
+// key column orders descending in the index's key space.
+func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCol) (*IndexDesc, error) {
 	if name == "" {
 		return nil, serr.New("index name is required", "table", table)
 	}
@@ -47,15 +63,23 @@ func (e *Engine) CreateIndex(table, name string, unique bool, cols ...string) (*
 			idx.ID = x.ID + 1
 		}
 	}
+	anyDesc := false
 	for _, c := range cols {
-		ord := old.ColIndex(c)
+		ord := old.ColIndex(c.Name)
 		if ord < 0 {
-			return nil, serr.New("indexed column not declared", "table", table, "index", name, "column", c)
+			return nil, serr.New("indexed column not declared", "table", table, "index", name, "column", c.Name)
 		}
 		if slices.Contains(idx.Cols, ord) {
-			return nil, serr.New("duplicate indexed column", "table", table, "index", name, "column", c)
+			return nil, serr.New("duplicate indexed column", "table", table, "index", name, "column", c.Name)
 		}
 		idx.Cols = append(idx.Cols, ord)
+		anyDesc = anyDesc || c.Desc
+	}
+	if anyDesc {
+		idx.Desc = make([]bool, len(cols))
+		for i, c := range cols {
+			idx.Desc[i] = c.Desc
+		}
 	}
 	desc := old.clone()
 	desc.Indexes = append(desc.Indexes, idx)
@@ -211,6 +235,23 @@ func scanIndexRows(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any) it
 	}
 }
 
+// appendDirected appends vals to buf, each with its key column's
+// direction.
+func appendDirected(buf []byte, idx *IndexDesc, vals []any) ([]byte, error) {
+	var err error
+	for i, v := range vals {
+		if idx.DescAt(i) {
+			buf, err = tuple.AppendDesc(buf, v)
+		} else {
+			buf, err = tuple.Append(buf, v)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
 // indexEntry builds one row's entry for one index from a coerced row.
 // enforced reports whether the entry participates in uniqueness (and
 // so must be collision-checked before writing).
@@ -223,7 +264,7 @@ func indexEntry(desc *TableDesc, idx *IndexDesc, row []any) (key string, val []b
 		}
 		vals[i] = row[ord]
 	}
-	buf, err := tuple.Append(indexPrefix(desc.ID, idx.ID), vals...)
+	buf, err := appendDirected(indexPrefix(desc.ID, idx.ID), idx, vals)
 	if err != nil {
 		return "", nil, false, serr.Wrap(err, "op", "encode index entry", "index", idx.Name)
 	}
@@ -256,7 +297,7 @@ func indexBound(desc *TableDesc, idx *IndexDesc, prefix []byte, vals []any) (str
 		}
 		coerced[i] = cv
 	}
-	buf, err := tuple.Append(prefix, coerced...)
+	buf, err := appendDirected(prefix, idx, coerced)
 	if err != nil {
 		return "", serr.Wrap(err, "op", "encode index scan bound")
 	}
@@ -265,22 +306,27 @@ func indexBound(desc *TableDesc, idx *IndexDesc, prefix []byte, vals []any) (str
 
 // rowFromIndexEntry resolves an index entry to its full row. The entry
 // form is recognized by arity: pk-suffixed keys carry the primary key
-// themselves; unique-form keys carry it in the value.
+// themselves; unique-form keys carry it in the value. Indexed values
+// decode each with its key column's direction; the pk suffix is always
+// ascending.
 func rowFromIndexEntry(v kvView, desc *TableDesc, idx *IndexDesc, key string, val []byte) (Row, error) {
-	keyVals, err := tuple.Decode([]byte(key))
-	if err != nil {
-		return Row{}, serr.Wrap(err, "op", "decode index entry", "index", idx.Name)
+	data := []byte(key)
+	var err error
+	// Skip the (tableID, indexID) header and the indexed values.
+	for i := 0; i < 2+len(idx.Cols); i++ {
+		if _, data, err = tuple.DecodeOne(data, i >= 2 && idx.DescAt(i-2)); err != nil {
+			return Row{}, serr.Wrap(err, "op", "decode index entry", "index", idx.Name)
+		}
 	}
 	var pk []any
-	switch len(keyVals) {
-	case 2 + len(idx.Cols) + len(desc.PKCols): // pk in the key
-		pk = keyVals[2+len(idx.Cols):]
-	case 2 + len(idx.Cols): // unique form: pk in the value
+	if len(data) > 0 { // pk in the key
+		if pk, err = tuple.Decode(data); err != nil {
+			return Row{}, serr.Wrap(err, "op", "decode index entry", "index", idx.Name)
+		}
+	} else { // unique form: pk in the value
 		if pk, err = tuple.Decode(val); err != nil {
 			return Row{}, serr.Wrap(err, "op", "decode index entry value", "index", idx.Name)
 		}
-	default:
-		return Row{}, serr.New("index entry has wrong arity", "table", desc.Name, "index", idx.Name)
 	}
 	if len(pk) != len(desc.PKCols) {
 		return Row{}, serr.New("index entry primary key has wrong arity", "table", desc.Name, "index", idx.Name)

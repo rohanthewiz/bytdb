@@ -3,13 +3,16 @@
 //
 // Supported statements:
 //
-//	CREATE TABLE t (id int PRIMARY KEY, name text, ...)
-//	CREATE TABLE t (a int, b int, ..., PRIMARY KEY (a, b))
+//	CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL,
+//	       price int CHECK (price > 0), ...)
+//	CREATE TABLE t (a int, b int, ..., PRIMARY KEY (a, b),
+//	       [CONSTRAINT name] CHECK (expr), ...)
 //	DROP TABLE t
-//	ALTER TABLE t ADD [COLUMN] c type
+//	ALTER TABLE t ADD [COLUMN] c type [NOT NULL]
 //	ALTER TABLE t DROP [COLUMN] c
-//	CREATE [UNIQUE] INDEX idx ON t (c, ...)
+//	CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 //	DROP INDEX idx [ON t]
+//	EXPLAIN statement
 //	INSERT INTO t [(c, ...)] VALUES (v, ...), ...
 //	SELECT * | items FROM tables [WHERE ...] [GROUP BY c, ...] [HAVING ...]
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
@@ -108,6 +111,32 @@
 // current_database(), current_schema(), current_user(),
 // session_user(), optionally pg_catalog-qualified), and ORDER BY
 // takes select-list positions (ORDER BY 1, 2).
+//
+// Constraints: a NOT NULL column rejects NULL on insert and update
+// (and may be added by ALTER TABLE only while the table is empty). A
+// CHECK constraint — column-level or table-level, optionally named
+// with CONSTRAINT — is any row-level boolean expression over the
+// table's columns (no aggregates, subqueries, or placeholders),
+// stored as text in the table descriptor and re-checked on every
+// INSERT and UPDATE; a row is rejected only when a check is
+// definitely false, so NULLs pass, per SQL. Errors carry Postgres's
+// wording ("violates not-null constraint", "violates check
+// constraint") and SQLSTATEs (23502, 23514) over the wire, checks
+// appear in pg_constraint and pg_get_constraintdef (psql's \d shows
+// them), and a column a check mentions cannot be dropped. DEFAULT,
+// UNIQUE column constraints, and REFERENCES are rejected at parse.
+//
+// A CREATE INDEX key column may be DESC: the index stores that
+// column's keys byte-inverted, so scans (and the rows a bounded scan
+// visits) run high-to-low, with NULLs last — the mirror of ascending.
+// The planner pushes range predicates on a descending column by
+// swapping which side starts the scan and which stops it.
+//
+// EXPLAIN renders the plan the executor would run — Point Get, Index
+// Scan (with Index Cond vs Filter), Seq Scan, Nested Loop, Aggregate,
+// Sort, Limit, Append — as Postgres-shaped text, one row per line. No
+// costs are shown (bytdb has no cost model), and EXPLAIN ANALYZE is
+// rejected rather than pretending to instrument execution.
 //
 // Statements may use $1-style placeholders wherever a literal may
 // appear: comparison values in WHERE, ON, and HAVING, INSERT values,
@@ -254,9 +283,13 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 	case *CreateTable:
 		cols := make([]bytdb.Column, len(s.Cols))
 		for i, c := range s.Cols {
-			cols[i] = bytdb.Column{Name: c.Name, Type: c.Type}
+			cols[i] = bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull}
 		}
-		if _, err := d.e.CreateTable(s.Table, cols, s.PK...); err != nil {
+		checks, err := resolveChecks(s, cols)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := d.e.CreateTableWithChecks(s.Table, cols, checks, s.PK...); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
@@ -266,17 +299,25 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		}
 		return &Result{}, nil
 	case *AddColumn:
-		if err := d.e.AddColumn(s.Table, bytdb.Column{Name: s.Col.Name, Type: s.Col.Type}); err != nil {
+		col := bytdb.Column{Name: s.Col.Name, Type: s.Col.Type, NotNull: s.Col.NotNull}
+		if err := d.e.AddColumn(s.Table, col); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
 	case *DropColumn:
+		if err := d.checkDropColumn(s.Table, s.Col); err != nil {
+			return nil, err
+		}
 		if err := d.e.DropColumn(s.Table, s.Col); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
 	case *CreateIndex:
-		if _, err := d.e.CreateIndex(s.Table, s.Name, s.Unique, s.Cols...); err != nil {
+		keys := make([]bytdb.IndexCol, len(s.Cols))
+		for i, c := range s.Cols {
+			keys[i] = bytdb.IndexCol{Name: c, Desc: i < len(s.Desc) && s.Desc[i]}
+		}
+		if _, err := d.e.CreateIndexCols(s.Table, s.Name, s.Unique, keys); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
@@ -293,6 +334,8 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		return d.execUpdate(s)
 	case *Delete:
 		return d.execDelete(s)
+	case *Explain:
+		return d.execExplain(s)
 	case *TxnControl:
 		// Sessions intercept these before run; a bare DB has no
 		// transaction state to control.

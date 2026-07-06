@@ -12,10 +12,12 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–12: a working relational store, queryable in SQL — in
-process or over the Postgres wire protocol, with enough system
-catalog and expression language that psql's `\dt`, `\d`, `\d <table>`,
-`\di`, `\du`, and `\l` render for real.
+Milestones 1–16: a working relational store, queryable in SQL — in
+process or over the Postgres wire protocol, with transaction blocks
+and savepoints, NOT NULL and CHECK constraints, descending index
+columns, EXPLAIN, and enough system catalog and expression language
+that psql's `\dt`, `\d`, `\d <table>`, `\di`, `\du`, and `\l` render
+for real — check constraints included.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -28,9 +30,10 @@ catalog and expression language that psql's `\dt`, `\d`, `\d <table>`,
   `Scan`/`ScanRange` in primary-key order with partial-prefix bounds on
   composite keys.
 - **secondary indexes** — `CreateIndex` (with atomic backfill over
-  existing rows), `DropIndex`, unique indexes, and `ScanIndex` with
-  range bounds; every insert and delete maintains all indexes in the
-  same atomic commit as the row.
+  existing rows), `DropIndex`, unique indexes, per-column DESC key
+  ordering (byte-inverted encoding), and `ScanIndex` with range
+  bounds; every insert and delete maintains all indexes in the same
+  atomic commit as the row.
 - **row updates and transactions** — `Update` sets columns by name
   (primary-key changes move the row), with every affected index entry
   moved and uniqueness re-checked before anything is written;
@@ -46,7 +49,8 @@ catalog and expression language that psql's `\dt`, `\d`, `\d <table>`,
   SELECT/UPDATE/DELETE with a planner that pushes WHERE predicates
   down to point gets and bounded key scans, aggregates with GROUP BY
   and HAVING, INNER/LEFT/CROSS joins executed as index nested loops,
-  prepared statements with `$1`-style parameters, and an expression
+  prepared statements with `$1`-style parameters, NOT NULL and CHECK
+  constraints with Postgres wording, EXPLAIN, and an expression
   language: CASE, IN, regex matches (`~`, `!~`, ...), `::` casts,
   arithmetic and `||`, output aliases, correlated scalar subqueries,
   EXISTS, and UNION [ALL].
@@ -363,7 +367,8 @@ durability with group commit.
 - [x] **Milestone 13**: transaction blocks — `Engine.Begin`/`Txn.Commit`/`Txn.Rollback` over btypedb's manual transactions; `sql.Session` with Postgres block semantics (failed-block state and 25P02, `COMMIT`-of-failed reports `ROLLBACK`, warnings for redundant control, `READ ONLY`, isolation levels accepted as serializable, DDL refused in-block); pgwire sessions with real `ReadyForQuery` status, `NoticeResponse`, and rollback on disconnect
 - [x] **Milestone 14**: GROUP BY ordinals (`GROUP BY 1`); savepoints — btypedb v0.4 `Savepoint`/`RollbackTo`/`Release` as O(1) COW marks with WAL-batch truncation, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` in sessions with Postgres semantics (name shadowing, failed-block recovery, 3B001/25P01), pgx nested transactions over the wire
 - [x] **Milestone 15**: aggregate expressions — GROUP BY keys as arbitrary expressions (columns, ordinals, `age / 10`, CASE); select items, HAVING, and ORDER BY rewritten against the keys (matching subtrees read the group's key value, aggregate calls read accumulators, leftover columns get the classic must-appear-in-GROUP-BY error) and evaluated per group by the ordinary expression evaluator; aggregate calls over expressions (`SUM(a * b)`)
-- [ ] Later: DESC key columns (byte inversion), CHECK/NOT NULL constraints, EXPLAIN
+- [x] **Milestone 16**: DESC index columns — per-column byte-inverted key encoding (CRDB-style), mixed-direction composite keys, planner range pushdown swapped on descending columns, `pg_get_indexdef` rendering; NOT NULL and CHECK constraints — NOT NULL enforced in the engine, CHECK expressions stored as text in the descriptor and enforced by the SQL layer on INSERT/UPDATE (NULLs pass, Postgres wording and SQLSTATEs 23502/23514, `pg_constraint` + `pg_get_constraintdef` so `\d` shows them); EXPLAIN — the Postgres-shaped plan tree (Point Get / Index Scan / Seq Scan, Index Cond vs Filter, Nested Loop / Aggregate / Sort / Limit / Append), no invented costs, ANALYZE rejected
+- [ ] Later: `count(distinct x)`, `= ANY(array)`, ALTER TABLE ADD/DROP CONSTRAINT
 
 ## Design notes
 

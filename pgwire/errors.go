@@ -31,6 +31,12 @@ func sqlstate(msg string, hasPos bool) string {
 	case strings.Contains(msg, "duplicate primary key"),
 		strings.Contains(msg, "unique index violation"):
 		return "23505" // unique_violation
+	case strings.Contains(msg, "violates not-null constraint"),
+		strings.Contains(msg, "primary key column may not be NULL"),
+		strings.Contains(msg, "contains null values"):
+		return "23502" // not_null_violation
+	case strings.Contains(msg, "violates check constraint"):
+		return "23514" // check_violation
 	case strings.Contains(msg, "wrong number of parameters"):
 		return "08P01" // protocol_violation
 	case strings.Contains(msg, "current transaction is aborted"):

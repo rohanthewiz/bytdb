@@ -18,6 +18,13 @@ var validTypes = map[ColType]bool{
 // key order; every name must be a declared column. The descriptor
 // write and table-ID allocation commit atomically.
 func (e *Engine) CreateTable(name string, cols []Column, pk ...string) (*TableDesc, error) {
+	return e.CreateTableWithChecks(name, cols, nil, pk...)
+}
+
+// CreateTableWithChecks is CreateTable with CHECK constraints stored
+// in the descriptor. The engine treats each check's expression as
+// opaque text (see CheckDesc); names must be non-empty and distinct.
+func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []CheckDesc, pk ...string) (*TableDesc, error) {
 	if name == "" {
 		return nil, serr.New("table name is required")
 	}
@@ -27,7 +34,17 @@ func (e *Engine) CreateTable(name string, cols []Column, pk ...string) (*TableDe
 	if len(pk) == 0 {
 		return nil, serr.New("a primary key is required", "table", name)
 	}
-	desc := &TableDesc{Name: name, Columns: slices.Clone(cols)}
+	desc := &TableDesc{Name: name, Columns: slices.Clone(cols), Checks: slices.Clone(checks)}
+	seenCheck := map[string]bool{}
+	for _, ck := range checks {
+		if ck.Name == "" {
+			return nil, serr.New("check constraint name is required", "table", name)
+		}
+		if seenCheck[ck.Name] {
+			return nil, serr.New("duplicate check constraint name", "table", name, "constraint", ck.Name)
+		}
+		seenCheck[ck.Name] = true
+	}
 	seen := map[string]bool{}
 	for _, c := range cols {
 		if c.Name == "" {
@@ -116,7 +133,9 @@ func (e *Engine) DropTable(name string) error {
 
 // AddColumn appends a column to a table. No rows are rewritten:
 // existing rows read the new column as NULL. Subsequent inserts must
-// supply the new arity.
+// supply the new arity. A NOT NULL column can only be added while the
+// table is empty (existing rows would read it as NULL), checked in
+// the same transaction that publishes the descriptor.
 func (e *Engine) AddColumn(table string, col Column) error {
 	e.ddlMu.Lock()
 	defer e.ddlMu.Unlock()
@@ -137,10 +156,28 @@ func (e *Engine) AddColumn(table string, col Column) error {
 	col.ID = desc.NextColID
 	desc.NextColID++
 	desc.Columns = append(desc.Columns, col)
-	if err := e.writeDesc(table, desc); err != nil {
+	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+		if col.NotNull && hasRows(tx, desc.ID) {
+			return serr.New(`column "` + col.Name + `" of relation "` + table +
+				`" contains null values`)
+		}
+		return e.writeDescIn(tx, table, desc)
+	})
+	if err != nil {
 		return serr.Wrap(err, "op", "add column", "table", table, "column", col.Name)
 	}
 	return nil
+}
+
+// hasRows reports whether the table's primary index holds any row in
+// tx's view.
+func hasRows(tx *btypedb.Tx[string, []byte], tableID uint64) bool {
+	prefix := tablePrefix(tableID)
+	end := string(tuple.PrefixEnd(prefix))
+	for k := range tx.Ascend(string(prefix)) {
+		return k < end
+	}
+	return false
 }
 
 // DropColumn removes a column from a table. No rows are rewritten:
@@ -196,18 +233,24 @@ func (e *Engine) DropColumn(table, name string) error {
 // last step inside the transaction (callers hold ddlMu).
 func (e *Engine) writeDesc(table string, desc *TableDesc) error {
 	return e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
-		blob, err := json.Marshal(desc)
-		if err != nil {
-			return serr.Wrap(err, "op", "encode table descriptor")
-		}
-		if err := tx.Set(descKey(table), blob); err != nil {
-			return err
-		}
-		e.mu.Lock()
-		e.tables[table] = desc
-		e.mu.Unlock()
-		return nil
+		return e.writeDescIn(tx, table, desc)
 	})
+}
+
+// writeDescIn stages the descriptor write and publishes it within an
+// existing transaction (callers hold ddlMu).
+func (e *Engine) writeDescIn(tx *btypedb.Tx[string, []byte], table string, desc *TableDesc) error {
+	blob, err := json.Marshal(desc)
+	if err != nil {
+		return serr.Wrap(err, "op", "encode table descriptor")
+	}
+	if err := tx.Set(descKey(table), blob); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.tables[table] = desc
+	e.mu.Unlock()
+	return nil
 }
 
 // Tables returns the names of all tables, sorted.

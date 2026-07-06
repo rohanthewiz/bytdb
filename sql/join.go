@@ -189,11 +189,13 @@ type joinStep struct {
 }
 
 // predTmpl is "this table's column op the value at srcOrd of the
-// outer row".
+// outer row". pr is the conjunct it was made from (EXPLAIN needs the
+// identity; execution does not).
 type predTmpl struct {
 	item   SelectItem
 	op     PredOp
 	srcOrd int
+	pr     *Pred
 }
 
 // prepareFrom builds the scope, binds every ON (against the tables
@@ -236,9 +238,9 @@ func prepareFrom(lk tableLookup, items []FromItem, where BoolExpr) (*fromPlan, e
 			case lIn && (bd.r < 0 || rIn):
 				step.static = append(step.static, pr)
 			case lIn && bd.r >= 0 && bd.r < st.off:
-				step.tmpls = append(step.tmpls, predTmpl{item: pr.Item, op: pr.Op, srcOrd: bd.r})
+				step.tmpls = append(step.tmpls, predTmpl{item: pr.Item, op: pr.Op, srcOrd: bd.r, pr: pr})
 			case rIn && bd.l < st.off:
-				step.tmpls = append(step.tmpls, predTmpl{item: *pr.RItem, op: flip(pr.Op), srcOrd: bd.l})
+				step.tmpls = append(step.tmpls, predTmpl{item: *pr.RItem, op: flip(pr.Op), srcOrd: bd.l, pr: pr})
 			}
 		}
 		fp.steps = append(fp.steps, step)

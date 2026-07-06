@@ -15,7 +15,7 @@ func Parse(src string) (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, src: src}
 	st, err := p.statement()
 	if err != nil {
 		return nil, err
@@ -27,8 +27,26 @@ func Parse(src string) (Statement, error) {
 	return st, nil
 }
 
+// parseCheckExpr parses a stored CHECK constraint expression.
+func parseCheckExpr(src string) (Expr, error) {
+	toks, err := lex(src)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, src: src}
+	ex, err := p.expression()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().kind != tEOF {
+		return nil, p.unexpected("end of expression")
+	}
+	return ex, nil
+}
+
 type parser struct {
 	toks []token
+	src  string // for slicing verbatim expression text (CHECK constraints)
 	i    int
 }
 
@@ -130,6 +148,8 @@ func (p *parser) statement() (Statement, error) {
 		return p.update()
 	case p.acceptKw("delete"):
 		return p.deleteStmt()
+	case p.acceptKw("explain"):
+		return p.explainStmt()
 	case p.acceptKw("begin"):
 		if !p.acceptKw("work") {
 			p.acceptKw("transaction")
@@ -159,6 +179,91 @@ func (p *parser) statement() (Statement, error) {
 		return &TxnControl{Kind: TxnRelease, Tag: "RELEASE", Name: name}, nil
 	}
 	return nil, p.unexpected("a SQL statement")
+}
+
+// explainStmt parses EXPLAIN [(option, ...)] | [ANALYZE] [VERBOSE]
+// followed by an explainable statement. ANALYZE is rejected — bytdb
+// does not instrument execution, and pretending to would lie about
+// what ran; the other Postgres options parse and are ignored except
+// FORMAT, which must be TEXT.
+func (p *parser) explainStmt() (Statement, error) {
+	analyze := false
+	if p.cur().kind == tOp && p.cur().text == "(" {
+		p.advance()
+		for {
+			opt, err := p.ident("an EXPLAIN option")
+			if err != nil {
+				return nil, err
+			}
+			switch opt {
+			case "analyze", "analyse":
+				analyze = p.explainOptBool()
+			case "verbose", "costs", "buffers", "timing", "summary",
+				"settings", "wal", "generic_plan", "memory", "serialize":
+				p.explainOptBool()
+			case "format":
+				f, err := p.ident("a format name")
+				if err != nil {
+					return nil, err
+				}
+				if f != "text" {
+					return nil, serr.New("only EXPLAIN (FORMAT TEXT) is supported", "format", f)
+				}
+			default:
+				return nil, serr.New("unrecognized EXPLAIN option", "option", opt)
+			}
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	} else {
+		for {
+			switch {
+			case p.acceptKw("analyze"), p.acceptKw("analyse"):
+				analyze = true
+			case p.acceptKw("verbose"):
+			default:
+				goto stmt
+			}
+		}
+	}
+stmt:
+	if analyze {
+		return nil, serr.New("EXPLAIN ANALYZE is not supported")
+	}
+	st, err := p.statement()
+	if err != nil {
+		return nil, err
+	}
+	switch st.(type) {
+	case *Select, *Insert, *Update, *Delete:
+		return &Explain{Stmt: st}, nil
+	}
+	return nil, serr.New("EXPLAIN supports SELECT, INSERT, UPDATE, and DELETE")
+}
+
+// explainOptBool consumes an EXPLAIN option's optional boolean
+// argument, defaulting to true (naming an option turns it on).
+func (p *parser) explainOptBool() bool {
+	t := p.cur()
+	if t.kind == tIdent {
+		switch t.text {
+		case "true", "on", "yes":
+			p.advance()
+			return true
+		case "false", "off", "no":
+			p.advance()
+			return false
+		}
+	}
+	if t.kind == tNumber && (t.text == "0" || t.text == "1") {
+		p.advance()
+		return t.text == "1"
+	}
+	return true
 }
 
 // txnModes parses BEGIN's transaction modes, in any order with
@@ -248,7 +353,20 @@ func (p *parser) createTable() (Statement, error) {
 	}
 	ct := &CreateTable{Table: name}
 	for {
-		if p.acceptKw("primary") {
+		// A table-level constraint: [CONSTRAINT name] PRIMARY KEY (...)
+		// or [CONSTRAINT name] CHECK (expr). Postgres has no stored name
+		// for a bytdb primary key, so a name there is accepted and
+		// dropped.
+		cname := ""
+		named := false
+		if p.acceptKw("constraint") {
+			if cname, err = p.ident("a constraint name"); err != nil {
+				return nil, err
+			}
+			named = true
+		}
+		switch {
+		case p.acceptKw("primary"):
 			if err := p.expectKw("key"); err != nil {
 				return nil, err
 			}
@@ -258,8 +376,16 @@ func (p *parser) createTable() (Statement, error) {
 			if ct.PK, err = p.identList("a primary key column"); err != nil {
 				return nil, err
 			}
-		} else {
-			col, inlinePK, err := p.colDef()
+		case p.acceptKw("check"):
+			ex, text, err := p.checkExpr()
+			if err != nil {
+				return nil, err
+			}
+			ct.Checks = append(ct.Checks, CheckDef{Name: cname, Ex: ex, Text: text})
+		case named:
+			return nil, p.unexpected("PRIMARY KEY or CHECK after CONSTRAINT name")
+		default:
+			col, inlinePK, checks, err := p.colDef()
 			if err != nil {
 				return nil, err
 			}
@@ -270,6 +396,7 @@ func (p *parser) createTable() (Statement, error) {
 				ct.PK = []string{col.Name}
 			}
 			ct.Cols = append(ct.Cols, col)
+			ct.Checks = append(ct.Checks, checks...)
 		}
 		if !p.acceptOp(",") {
 			break
@@ -281,24 +408,85 @@ func (p *parser) createTable() (Statement, error) {
 	return ct, nil
 }
 
-// colDef parses "name type [PRIMARY KEY]".
-func (p *parser) colDef() (ColDef, bool, error) {
+// colDef parses "name type" followed by column constraints: PRIMARY
+// KEY, NOT NULL, NULL, and [CONSTRAINT name] CHECK (expr), in any
+// order. DEFAULT, UNIQUE, and REFERENCES are recognized and rejected
+// with a clear error.
+func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
+	fail := func(err error) (ColDef, bool, []CheckDef, error) {
+		return ColDef{}, false, nil, err
+	}
 	name, err := p.ident("a column name")
 	if err != nil {
-		return ColDef{}, false, err
+		return fail(err)
 	}
 	typ, err := p.typeName()
 	if err != nil {
-		return ColDef{}, false, err
+		return fail(err)
 	}
+	col := ColDef{Name: name, Type: typ}
 	pk := false
-	if p.acceptKw("primary") {
-		if err := p.expectKw("key"); err != nil {
-			return ColDef{}, false, err
+	var checks []CheckDef
+	for {
+		cname := ""
+		named := false
+		if p.acceptKw("constraint") {
+			if cname, err = p.ident("a constraint name"); err != nil {
+				return fail(err)
+			}
+			named = true
 		}
-		pk = true
+		switch {
+		case p.acceptKw("primary"):
+			if err := p.expectKw("key"); err != nil {
+				return fail(err)
+			}
+			pk = true
+		case p.acceptKw("not"):
+			if err := p.expectKw("null"); err != nil {
+				return fail(err)
+			}
+			col.NotNull = true
+		case p.acceptKw("null"):
+			col.NotNull = false
+		case p.acceptKw("check"):
+			ex, text, err := p.checkExpr()
+			if err != nil {
+				return fail(err)
+			}
+			checks = append(checks, CheckDef{Name: cname, Col: name, Ex: ex, Text: text})
+		case p.acceptKw("default"):
+			return fail(serr.New("DEFAULT is not supported", "column", name))
+		case p.acceptKw("unique"):
+			return fail(serr.New("UNIQUE column constraints are not supported; use CREATE UNIQUE INDEX",
+				"column", name))
+		case p.acceptKw("references"):
+			return fail(serr.New("REFERENCES is not supported", "column", name))
+		case named:
+			return fail(p.unexpected("CHECK after CONSTRAINT name"))
+		default:
+			return col, pk, checks, nil
+		}
 	}
-	return ColDef{Name: name, Type: typ}, pk, nil
+}
+
+// checkExpr parses CHECK's "( expr )", returning both the parsed
+// expression and its verbatim source text (what the table descriptor
+// stores).
+func (p *parser) checkExpr() (Expr, string, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, "", err
+	}
+	start := p.cur().pos
+	ex, err := p.expression()
+	if err != nil {
+		return nil, "", err
+	}
+	end := p.cur().pos // the closing ")"
+	if err := p.expectOp(")"); err != nil {
+		return nil, "", err
+	}
+	return ex, strings.TrimSpace(p.src[start:end]), nil
 }
 
 // typeName parses a column type, accepting common Postgres aliases.
@@ -371,11 +559,40 @@ func (p *parser) createIndex(unique bool) (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	cols, err := p.identList("an indexed column")
-	if err != nil {
+	ci := &CreateIndex{Name: name, Table: table, Unique: unique}
+	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
-	return &CreateIndex{Name: name, Table: table, Unique: unique, Cols: cols}, nil
+	anyDesc := false
+	for {
+		col, err := p.ident("an indexed column")
+		if err != nil {
+			return nil, err
+		}
+		desc := false
+		if p.acceptKw("desc") {
+			desc = true
+		} else {
+			p.acceptKw("asc")
+		}
+		if p.acceptKw("nulls") {
+			return nil, serr.New("NULLS FIRST/LAST is not supported",
+				"hint", "ascending columns put NULLs first, descending columns last")
+		}
+		ci.Cols = append(ci.Cols, col)
+		ci.Desc = append(ci.Desc, desc)
+		anyDesc = anyDesc || desc
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if !anyDesc {
+		ci.Desc = nil
+	}
+	return ci, nil
 }
 
 func (p *parser) dropIndex() (Statement, error) {
@@ -403,12 +620,16 @@ func (p *parser) alterTable() (Statement, error) {
 	switch {
 	case p.acceptKw("add"):
 		p.acceptKw("column")
-		col, pk, err := p.colDef()
+		col, pk, checks, err := p.colDef()
 		if err != nil {
 			return nil, err
 		}
 		if pk {
 			return nil, serr.New("cannot add a primary key column", "table", table, "column", col.Name)
+		}
+		if len(checks) > 0 {
+			return nil, serr.New("ADD COLUMN with a CHECK constraint is not supported",
+				"table", table, "column", col.Name)
 		}
 		return &AddColumn{Table: table, Col: col}, nil
 	case p.acceptKw("drop"):

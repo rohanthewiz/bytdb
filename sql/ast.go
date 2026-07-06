@@ -317,16 +317,30 @@ type SelectItem struct {
 
 // ColDef is one column of a CREATE TABLE or ALTER TABLE ADD COLUMN.
 type ColDef struct {
-	Name string
-	Type bytdb.ColType
+	Name    string
+	Type    bytdb.ColType
+	NotNull bool
 }
 
-// CreateTable is CREATE TABLE t (col type [PRIMARY KEY], ...,
-// [PRIMARY KEY (col, ...)]).
+// CheckDef is one CHECK constraint of a CREATE TABLE: the parsed
+// expression plus its source text (which is what the descriptor
+// stores). Col names the column a column-level check was declared on
+// (naming only — the expression may reference any column, as in
+// Postgres); "" for a table-level check.
+type CheckDef struct {
+	Name string // from CONSTRAINT name; "": named by convention
+	Col  string
+	Ex   Expr
+	Text string
+}
+
+// CreateTable is CREATE TABLE t (col type [constraints], ...,
+// [PRIMARY KEY (col, ...)], [[CONSTRAINT name] CHECK (expr)], ...).
 type CreateTable struct {
-	Table string
-	Cols  []ColDef
-	PK    []string
+	Table  string
+	Cols   []ColDef
+	PK     []string
+	Checks []CheckDef
 }
 
 // DropTable is DROP TABLE t.
@@ -341,12 +355,14 @@ type AddColumn struct {
 // DropColumn is ALTER TABLE t DROP [COLUMN] col.
 type DropColumn struct{ Table, Col string }
 
-// CreateIndex is CREATE [UNIQUE] INDEX name ON t (col, ...).
+// CreateIndex is CREATE [UNIQUE] INDEX name ON t (col [ASC|DESC], ...).
+// Desc is parallel to Cols (nil: all ascending).
 type CreateIndex struct {
 	Name   string
 	Table  string
 	Unique bool
 	Cols   []string
+	Desc   []bool
 }
 
 // DropIndex is DROP INDEX name [ON t]. With no ON clause the index is
@@ -462,7 +478,14 @@ type TxnControl struct {
 	Name     string // savepoint name for the savepoint kinds
 }
 
+// Explain is EXPLAIN <statement>: describe the statement's access
+// plan without executing it. ANALYZE is rejected (bytdb does not
+// instrument execution); VERBOSE, COSTS, and FORMAT TEXT parse and
+// are ignored.
+type Explain struct{ Stmt Statement }
+
 func (*CreateTable) stmt() {}
+func (*Explain) stmt()     {}
 func (*DropTable) stmt()   {}
 func (*AddColumn) stmt()   {}
 func (*DropColumn) stmt()  {}

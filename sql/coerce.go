@@ -29,6 +29,12 @@ import (
 func (d *DB) coerceLiterals(st Statement) (Statement, error) {
 	lk := d.lookup(d.e.Table)
 	switch s := st.(type) {
+	case *Explain:
+		inner, err := d.coerceLiterals(s.Stmt)
+		if err != nil {
+			return nil, err
+		}
+		return &Explain{Stmt: inner}, nil
 	case *Insert:
 		desc, _ := lk(s.Table)
 		if desc == nil {

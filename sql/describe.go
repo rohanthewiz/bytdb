@@ -11,7 +11,7 @@ import (
 // SELECT will produce.
 type StmtInfo struct {
 	// Command is the statement's command tag word(s): SELECT, INSERT,
-	// UPDATE, DELETE, CREATE TABLE, DROP TABLE, ALTER TABLE,
+	// UPDATE, DELETE, EXPLAIN, CREATE TABLE, DROP TABLE, ALTER TABLE,
 	// CREATE INDEX, DROP INDEX, BEGIN, START TRANSACTION, COMMIT, or
 	// ROLLBACK.
 	Command string
@@ -38,12 +38,29 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 			info.Params[p-1] = t
 		}
 	}
-	lk := s.db.lookup(s.db.e.Table)
-	switch st := s.st.(type) {
+	if err := s.db.describeInto(s.st, note, info); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// describeInto infers a statement's parameter types and output shape
+// into info.
+func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *StmtInfo) error {
+	lk := d.lookup(d.e.Table)
+	switch st := st.(type) {
+	case *Explain:
+		// Parameters are the inner statement's; the output is always
+		// one text column of plan lines.
+		if err := d.describeInto(st.Stmt, note, &StmtInfo{}); err != nil {
+			return err
+		}
+		info.Cols = []string{"QUERY PLAN"}
+		info.Types = []bytdb.ColType{bytdb.TString}
 	case *Insert:
 		desc, _ := lk(st.Table)
 		if desc == nil {
-			return nil, serr.New("no such table", "table", st.Table)
+			return serr.New("no such table", "table", st.Table)
 		}
 		var colTypes []bytdb.ColType
 		if st.Cols == nil {
@@ -54,7 +71,7 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 			for _, name := range st.Cols {
 				i := desc.ColIndex(name)
 				if i < 0 {
-					return nil, serr.New("no such column", "table", st.Table, "column", name)
+					return serr.New("no such column", "table", st.Table, "column", name)
 				}
 				colTypes = append(colTypes, desc.Columns[i].Type)
 			}
@@ -69,42 +86,42 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 	case *Update:
 		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
 		if err != nil {
-			return nil, err
+			return err
 		}
 		desc := sc.tables[0].desc
 		for name, v := range st.Set {
 			i := desc.ColIndex(name)
 			if i < 0 {
-				return nil, serr.New("no such column", "table", st.Table, "column", name)
+				return serr.New("no such column", "table", st.Table, "column", name)
 			}
 			note(v, desc.Columns[i].Type)
 		}
 		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
-			return nil, err
+			return err
 		}
 	case *Delete:
 		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
-			return nil, err
+			return err
 		}
 	case *Select:
 		res := &Result{}
 		if err := describeSelect(lk, st, note, res); err != nil {
-			return nil, err
+			return err
 		}
 		// A UNION's shape is its first arm's; later arms only
 		// contribute parameter positions.
 		for _, arm := range st.Union {
 			if err := describeSelect(lk, arm.Sel, note, &Result{}); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		info.Cols, info.Types = res.Cols, res.Types
 	}
-	return info, nil
+	return nil
 }
 
 // describeSelect infers one SELECT core's parameter types and output
@@ -167,6 +184,8 @@ func command(st Statement) string {
 		return "UPDATE"
 	case *Delete:
 		return "DELETE"
+	case *Explain:
+		return "EXPLAIN"
 	}
 	return ""
 }

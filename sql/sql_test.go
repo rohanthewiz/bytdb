@@ -3,6 +3,7 @@ package sql
 import (
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/rohanthewiz/bytdb"
@@ -71,6 +72,176 @@ func TestSQLCrud(t *testing.T) {
 	}
 	if res := exec(t, d, `select * from users`); len(res.Rows) != 3 {
 		t.Fatalf("%d rows left", len(res.Rows))
+	}
+}
+
+func TestSQLDescIndex(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+	exec(t, d, `create index by_age on users (age desc)`)
+
+	// The planner picks the descending index for the range; without
+	// ORDER BY the rows come back in its (descending) key order.
+	res := exec(t, d, `select name from users where age > 36`)
+	want := [][]any{{"grace"}, {"alan"}, {"edsger"}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("desc index range: got %v", res.Rows)
+	}
+	res = exec(t, d, `select name from users where age >= 36 and age < 45`)
+	if want := [][]any{{"alan"}, {"edsger"}, {"ada"}}; !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("bounded desc range: got %v", res.Rows)
+	}
+	res = exec(t, d, `select name from users where age = 41`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"alan"}}) {
+		t.Fatalf("desc index equality: got %v", res.Rows)
+	}
+
+	// pg_get_indexdef renders the direction.
+	res = exec(t, d, `select pg_get_indexdef(oid) from pg_class where relname = 'by_age'`)
+	if want := "CREATE INDEX by_age ON public.users USING btree (age DESC)"; len(res.Rows) != 1 || res.Rows[0][0] != want {
+		t.Fatalf("indexdef: got %v", res.Rows)
+	}
+
+	// Mixed directions parse and plan.
+	exec(t, d, `create index by_city_age on users (city asc, age desc)`)
+	res = exec(t, d, `select name from users where city = 'london'`)
+	if want := [][]any{{"alan"}, {"ada"}}; !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("mixed index eq: got %v", res.Rows)
+	}
+
+	if _, err := d.Exec(`create index bad on users (age desc nulls first)`); err == nil {
+		t.Fatal("NULLS FIRST accepted")
+	}
+}
+
+func TestSQLNotNull(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, name text not null, note text null)`)
+	if _, err := d.Exec(`insert into t values (1, null, 'x')`); err == nil ||
+		!strings.Contains(err.Error(), `null value in column "name" of relation "t" violates not-null constraint`) {
+		t.Fatalf("NULL insert: %v", err)
+	}
+	// A column omitted from the column list inserts as NULL, which a
+	// NOT NULL column rejects.
+	if _, err := d.Exec(`insert into t (id, note) values (2, 'x')`); err == nil ||
+		!strings.Contains(err.Error(), "violates not-null constraint") {
+		t.Fatalf("omitted NOT NULL column: %v", err)
+	}
+	exec(t, d, `insert into t values (3, 'ada', null)`)
+	if _, err := d.Exec(`update t set name = null where id = 3`); err == nil ||
+		!strings.Contains(err.Error(), "violates not-null constraint") {
+		t.Fatalf("NULL update: %v", err)
+	}
+
+	// ALTER TABLE ADD COLUMN ... NOT NULL only on an empty table.
+	if _, err := d.Exec(`alter table t add column email text not null`); err == nil ||
+		!strings.Contains(err.Error(), "contains null values") {
+		t.Fatalf("NOT NULL add on non-empty table: %v", err)
+	}
+
+	// attnotnull and is_nullable reflect the flag.
+	res := exec(t, d, `select attname, attnotnull from pg_attribute where attrelid = 't'::regclass order by attnum`)
+	want := [][]any{{"id", true}, {"name", true}, {"note", false}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("attnotnull: got %v", res.Rows)
+	}
+	res = exec(t, d, `select column_name, is_nullable from information_schema.columns where table_name = 't' order by ordinal_position`)
+	want = [][]any{{"id", "NO"}, {"name", "NO"}, {"note", "YES"}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("is_nullable: got %v", res.Rows)
+	}
+}
+
+func TestSQLCheckConstraints(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table items (
+		id int primary key,
+		price int check (price > 0),
+		qty int,
+		tag text,
+		constraint qty_sane check (qty >= 0 and qty <= 100),
+		check (price * qty < 10000)
+	)`)
+
+	// Definitely-false rows are rejected, naming the constraint.
+	if _, err := d.Exec(`insert into items values (1, -5, 1, 'a')`); err == nil ||
+		!strings.Contains(err.Error(), `new row for relation "items" violates check constraint "items_price_check"`) {
+		t.Fatalf("column check: %v", err)
+	}
+	if _, err := d.Exec(`insert into items values (1, 5, 200, 'a')`); err == nil ||
+		!strings.Contains(err.Error(), `violates check constraint "qty_sane"`) {
+		t.Fatalf("named check: %v", err)
+	}
+	if _, err := d.Exec(`insert into items values (1, 500, 50, 'a')`); err == nil ||
+		!strings.Contains(err.Error(), `violates check constraint "items_check"`) {
+		t.Fatalf("table check: %v", err)
+	}
+	// NULLs pass: a check rejects only definite falsehood.
+	exec(t, d, `insert into items values (2, null, null, 'b')`)
+	exec(t, d, `insert into items values (3, 10, 5, 'c')`)
+
+	// UPDATE re-checks the new row.
+	if _, err := d.Exec(`update items set qty = -1 where id = 3`); err == nil ||
+		!strings.Contains(err.Error(), `violates check constraint "qty_sane"`) {
+		t.Fatalf("update check: %v", err)
+	}
+	exec(t, d, `update items set qty = 7 where id = 3`)
+
+	// Dropping a checked column is blocked, as without CASCADE.
+	if _, err := d.Exec(`alter table items drop column qty`); err == nil ||
+		!strings.Contains(err.Error(), "because other objects depend on it") {
+		t.Fatalf("drop checked column: %v", err)
+	}
+	exec(t, d, `alter table items drop column tag`) // unreferenced: fine
+
+	// The catalog serves psql's check-constraint query.
+	res := exec(t, d, `select conname, pg_get_constraintdef(oid) from pg_constraint
+		where conrelid = 'items'::regclass and contype = 'c' order by 1`)
+	want := [][]any{
+		{"items_check", "CHECK ((price * qty < 10000))"},
+		{"items_price_check", "CHECK ((price > 0))"},
+		{"qty_sane", "CHECK ((qty >= 0 and qty <= 100))"},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("pg_constraint: got %v", res.Rows)
+	}
+	res = exec(t, d, `select relchecks from pg_class where relname = 'items'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(3)}}) {
+		t.Fatalf("relchecks: got %v", res.Rows)
+	}
+}
+
+func TestSQLCheckValidation(t *testing.T) {
+	d := openDB(t)
+	cases := []struct{ q, want string }{
+		{`create table t (a int primary key check (count(a) > 0))`,
+			"aggregate functions are not allowed in check constraints"},
+		{`create table t (a int primary key check ((select 1) = 1))`,
+			"cannot use subquery in check constraint"},
+		{`create table t (a int primary key check (b > 0))`,
+			"no such column"},
+		{`create table t (a int primary key check ($1 > 0))`,
+			"placeholders are not allowed in check constraints"},
+		{`create table t (a int primary key default 5)`,
+			"DEFAULT is not supported"},
+		{`create table t (a int primary key, b int unique)`,
+			"UNIQUE column constraints are not supported"},
+		{`create table t (a int primary key,
+			constraint c check (a > 0), constraint c check (a < 9))`,
+			"duplicate constraint name"},
+	}
+	for _, c := range cases {
+		if _, err := d.Exec(c.q); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s\n  got: %v\n  want: %s", c.q, err, c.want)
+		}
+	}
+
+	// Default names dedup with numeric suffixes, as in Postgres.
+	exec(t, d, `create table t (a int primary key check (a > 0) check (a < 100), check (a != 13))`)
+	res := exec(t, d, `select conname from pg_constraint where conrelid = 't'::regclass order by 1`)
+	want := [][]any{{"t_a_check"}, {"t_a_check1"}, {"t_check"}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("default names: got %v", res.Rows)
 	}
 }
 
