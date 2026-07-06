@@ -227,6 +227,14 @@ func walkExpr(e Expr, visit func(Expr) bool) {
 		for _, sub := range n.Elems {
 			walkExpr(sub, visit)
 		}
+	case *ExWindow:
+		walkExpr(n.Arg, visit)
+		for _, sub := range n.Partition {
+			walkExpr(sub, visit)
+		}
+		for _, o := range n.OrderBy {
+			walkExpr(o.Ex, visit)
+		}
 	case *ExArith:
 		walkExpr(n.L, visit)
 		walkExpr(n.R, visit)
@@ -248,6 +256,7 @@ func (*ExFunc) expr()   {}
 func (*ExCast) expr()   {}
 func (*ExIndex) expr()  {}
 func (*ExArray) expr()  {}
+func (*ExWindow) expr() {}
 func (*ExArith) expr()  {}
 func (*ExSub) expr()    {}
 
@@ -300,6 +309,53 @@ func (f AggFunc) name() string {
 		}
 	}
 	return ""
+}
+
+// WinFunc identifies a window-only function (the ranking family).
+// Aggregate windows (SUM(x) OVER ...) carry an AggFunc instead.
+type WinFunc int
+
+const (
+	WinNone WinFunc = iota
+	WinRowNumber
+	WinRank
+	WinDenseRank
+)
+
+var winNames = map[string]WinFunc{
+	"row_number": WinRowNumber, "rank": WinRank, "dense_rank": WinDenseRank,
+}
+
+func (f WinFunc) name() string {
+	for n, fn := range winNames {
+		if fn == f {
+			return n
+		}
+	}
+	return ""
+}
+
+// ExWindow is a window function call: fn(args) OVER (PARTITION BY ...
+// ORDER BY ...). Exactly one of Win (ranking family) or Agg (an
+// aggregate evaluated over the frame) is set. Explicit frames are not
+// supported; the frame is the whole partition when there is no ORDER
+// BY, else running (UNBOUNDED PRECEDING .. CURRENT ROW with peers,
+// the Postgres RANGE default).
+type ExWindow struct {
+	Win       WinFunc
+	Agg       AggFunc // AggNone unless an aggregate window
+	Arg       Expr    // aggregate argument; nil for COUNT(*) and ranking fns
+	Star      bool    // COUNT(*) OVER (...)
+	Partition []Expr
+	OrderBy   []OrderItem
+}
+
+// fnName is the window function's name, ranking or aggregate.
+func (w *ExWindow) fnName() string {
+	if w.Win != WinNone {
+		return w.Win.name()
+	}
+	return w.Agg.name()
 }
 
 // ColRef names a column, optionally qualified by a table name or

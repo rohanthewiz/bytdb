@@ -12,7 +12,7 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–18: a working relational store, queryable in SQL — in
+Milestones 1–19: a working relational store, queryable in SQL — in
 process or over the Postgres wire protocol, with transaction blocks
 and savepoints, NOT NULL and CHECK constraints, descending index
 columns, EXPLAIN, and enough system catalog and expression language
@@ -373,7 +373,8 @@ durability with group commit.
 - [x] **Milestone 16**: DESC index columns — per-column byte-inverted key encoding (CRDB-style), mixed-direction composite keys, planner range pushdown swapped on descending columns, `pg_get_indexdef` rendering; NOT NULL and CHECK constraints — NOT NULL enforced in the engine, CHECK expressions stored as text in the descriptor and enforced by the SQL layer on INSERT/UPDATE (NULLs pass, Postgres wording and SQLSTATEs 23502/23514, `pg_constraint` + `pg_get_constraintdef` so `\d` shows them); EXPLAIN — the Postgres-shaped plan tree (Point Get / Index Scan / Seq Scan, Index Cond vs Filter, Nested Loop / Aggregate / Sort / Limit / Append), no invented costs, ANALYZE rejected
 - [x] **Milestone 17**: DISTINCT aggregates — `COUNT(DISTINCT x)` and friends, deduplicated per group by the order-preserving tuple encoding (the same equivalence GROUP BY uses); ALTER TABLE ADD/DROP CONSTRAINT — `AddCheck` verifies every existing row satisfies a new check inside the transaction that publishes the descriptor (`is violated by some row`, SQLSTATE 23514), `DROP CONSTRAINT [IF EXISTS]` removes checks by name (42704 when absent), which also unblocks dropping a previously check-referenced column
 - [x] **Milestone 18**: `op ANY(...)` / `op ALL(...)` — a right-hand side that is an `ARRAY[...]` constructor, a single-column subquery, or a Postgres `'{...}'` array-literal string (elements coerce to the left operand's type); Postgres three-valued logic (empty array is ANY→false, ALL→true even against a NULL left side), so `= ANY` generalizes `IN` and `<> ALL` generalizes `NOT IN`; `ARRAY[...]` is also a value that renders as `{...}`
-- [ ] Later: window functions (`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`), ORDER BY exploiting index order
+- [x] **Milestone 19**: window functions — `ROW_NUMBER`/`RANK`/`DENSE_RANK` and aggregate windows (`SUM/COUNT/AVG/MIN/MAX(...) OVER (PARTITION BY ... ORDER BY ...)`) as a third execution shape that emits every input row: materialize post-filter rows, partition by the order-preserving tuple encoding (the GROUP BY equivalence), sort each partition, assign per-row values (ranking by ordinal / prior-key compare; aggregates whole-partition when unordered, else running with the Postgres RANGE peer-sharing default); window calls rewrite to environment refs so the ordinary evaluator handles nesting (`rn + 1`); `EXPLAIN` gains a WindowAgg node; explicit ROWS/RANGE frames, `DISTINCT`, and window+GROUP BY are rejected
+- [ ] Later: window frames (`ROWS/RANGE BETWEEN`), `LAG`/`LEAD`/`FIRST_VALUE`, ORDER BY exploiting index order
 
 ## Design notes
 

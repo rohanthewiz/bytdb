@@ -1686,7 +1686,31 @@ func (p *parser) exprPrimary() (Expr, error) {
 				agg.Arg = e
 			}
 		}
-		return agg, p.expectOp(")")
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		if p.cur().kind == tIdent && p.cur().text == "over" {
+			if agg.Distinct {
+				return nil, serr.New("DISTINCT is not supported in a window function")
+			}
+			w := &ExWindow{Agg: agg.Fn, Arg: agg.Arg, Star: agg.Star}
+			if agg.Arg == nil && !agg.Star {
+				w.Arg = &ExCol{Col: agg.Col}
+			}
+			return p.windowOver(w)
+		}
+		return agg, nil
+	}
+	// Ranking window functions: row_number()/rank()/dense_rank(), which
+	// take no arguments and require an OVER clause.
+	if t.kind == tIdent && winNames[t.text] != WinNone && p.peekOp("(") {
+		fn := winNames[t.text]
+		p.advance() // name
+		p.advance() // (
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		return p.windowOver(&ExWindow{Win: fn})
 	}
 	if t.kind == tIdent && p.peekOp("(") {
 		name := t.text
@@ -1737,6 +1761,56 @@ func (p *parser) funcCall(name string) (Expr, error) {
 		}
 	}
 	return f, p.expectOp(")")
+}
+
+// windowOver parses the OVER (PARTITION BY ... ORDER BY ...) clause and
+// attaches it to w; cur is the "over" keyword. Explicit frame clauses
+// (ROWS/RANGE) are rejected — the frame is implied by ORDER BY.
+func (p *parser) windowOver(w *ExWindow) (Expr, error) {
+	p.advance() // over
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("partition") {
+		if err := p.expectKw("by"); err != nil {
+			return nil, err
+		}
+		for {
+			e, err := p.expression()
+			if err != nil {
+				return nil, err
+			}
+			w.Partition = append(w.Partition, e)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	if p.acceptKw("order") {
+		if err := p.expectKw("by"); err != nil {
+			return nil, err
+		}
+		for {
+			e, err := p.expression()
+			if err != nil {
+				return nil, err
+			}
+			o := OrderItem{SelectItem: SelectItem{Ex: e}}
+			if p.acceptKw("desc") {
+				o.Desc = true
+			} else {
+				p.acceptKw("asc")
+			}
+			w.OrderBy = append(w.OrderBy, o)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	if t := p.cur(); t.kind == tIdent && (t.text == "rows" || t.text == "range" || t.text == "groups") {
+		return nil, serr.New("explicit window frames (ROWS/RANGE/GROUPS) are not supported")
+	}
+	return w, p.expectOp(")")
 }
 
 // caseExpr parses both CASE forms; "case" is consumed.

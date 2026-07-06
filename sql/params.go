@@ -299,6 +299,19 @@ func bindExpr(e Expr, sub func(any) any) Expr {
 			c.Elems[i] = bindExpr(el, sub)
 		}
 		return c
+	case *ExWindow:
+		c := *n
+		c.Arg = bindExpr(n.Arg, sub)
+		c.Partition = make([]Expr, len(n.Partition))
+		for i, e := range n.Partition {
+			c.Partition[i] = bindExpr(e, sub)
+		}
+		c.OrderBy = make([]OrderItem, len(n.OrderBy))
+		for i, o := range n.OrderBy {
+			o.Ex = bindExpr(o.Ex, sub)
+			c.OrderBy[i] = o
+		}
+		return &c
 	case *ExArith:
 		return &ExArith{Op: n.Op, L: bindExpr(n.L, sub), R: bindExpr(n.R, sub)}
 	case *ExSub:

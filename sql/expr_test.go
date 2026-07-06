@@ -132,6 +132,85 @@ func TestExprAnyAll(t *testing.T) {
 	}
 }
 
+func TestExprWindow(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+
+	// ROW_NUMBER partitioned by city, ordered by age within partition.
+	res := exec(t, d, `select name, row_number() over (partition by city order by age) as rn
+		from users order by city, age`)
+	want := [][]any{
+		{"edsger", int64(1)},                  // austin
+		{"ada", int64(1)}, {"alan", int64(2)}, // london
+		{"barbara", int64(1)}, {"grace", int64(2)}, // nyc
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("row_number: %v", res.Rows)
+	}
+	if res.Cols[1] != "rn" {
+		t.Fatalf("cols %v", res.Cols)
+	}
+
+	// Whole-partition aggregate window: the city's total age on every row.
+	res = exec(t, d, `select name, sum(age) over (partition by city) as s
+		from users order by name`)
+	want = [][]any{
+		{"ada", int64(77)}, {"alan", int64(77)}, {"barbara", int64(73)},
+		{"edsger", int64(39)}, {"grace", int64(73)},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("sum over partition: %v", res.Rows)
+	}
+
+	// Running aggregate: SUM(age) OVER (ORDER BY age) is a cumulative sum.
+	res = exec(t, d, `select name, sum(age) over (order by age) as running
+		from users order by age`)
+	want = [][]any{
+		{"barbara", int64(28)}, {"ada", int64(64)}, {"edsger", int64(103)},
+		{"alan", int64(144)}, {"grace", int64(189)},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("running sum: %v", res.Rows)
+	}
+
+	// COUNT(*) OVER () with no partition is the whole-result count, named
+	// bare "count" like Postgres.
+	res = exec(t, d, `select count(*) over () as c from users`)
+	if len(res.Rows) != 5 {
+		t.Fatalf("count over rows: %v", res.Rows)
+	}
+	for _, r := range res.Rows {
+		if r[0] != int64(5) {
+			t.Fatalf("count over (): %v", res.Rows)
+		}
+	}
+	res = exec(t, d, `select count(*) over () from users limit 1`)
+	if res.Cols[0] != "count" {
+		t.Fatalf("bare window name: %v", res.Cols)
+	}
+}
+
+func TestExprWindowRankTies(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table s (id int primary key, grp text, v int)`)
+	exec(t, d, `insert into s values (1,'a',10),(2,'a',10),(3,'a',20),(4,'b',5)`)
+
+	// RANK leaves gaps after ties; DENSE_RANK does not.
+	res := exec(t, d, `select id,
+		rank() over (partition by grp order by v) as r,
+		dense_rank() over (partition by grp order by v) as dr
+		from s order by grp, v, id`)
+	want := [][]any{
+		{int64(1), int64(1), int64(1)}, // a, v10 (tie)
+		{int64(2), int64(1), int64(1)}, // a, v10 (tie)
+		{int64(3), int64(3), int64(2)}, // a, v20 — rank jumps to 3, dense to 2
+		{int64(4), int64(1), int64(1)}, // b, v5
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("rank/dense_rank: %v", res.Rows)
+	}
+}
+
 func TestExprArithCastsFuncs(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)

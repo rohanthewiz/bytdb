@@ -330,36 +330,8 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 		if proj, exprs, err = projectSelect(sc, s, res); err != nil {
 			return err
 		}
-		for _, o := range s.OrderBy {
-			if o.IsLit { // ORDER BY n: a select-list position
-				pe, err := ordinalEntry(o.Lit, proj)
-				if err != nil {
-					return err
-				}
-				if pe.ord >= 0 {
-					keys = append(keys, sortKey{pe.ord, o.Desc})
-				}
-				continue // a literal output is a constant key: no effect
-			}
-			if o.Ex != nil { // a hidden sort expression, appended like an item
-				keys = append(keys, sortKey{sc.width + len(exprs), o.Desc})
-				exprs = append(exprs, o.Ex)
-				continue
-			}
-			// A bare name matching an output alias sorts by that output.
-			if o.Col.Table == "" {
-				if pe, ok := aliasEntry(sc, s, proj, o.Col.Name); ok {
-					if pe.ord >= 0 {
-						keys = append(keys, sortKey{pe.ord, o.Desc})
-					}
-					continue
-				}
-			}
-			ord, err := sc.resolve(o.Col)
-			if err != nil {
-				return err
-			}
-			keys = append(keys, sortKey{ord, o.Desc})
+		if keys, exprs, err = buildSortKeys(sc, s, proj, exprs); err != nil {
+			return err
 		}
 		env := &exEnv{d: d, tx: tx, sc: sc}
 		var evalErr error
@@ -387,6 +359,15 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	sortOffsetProject(res, rows, keys, proj, s.Offset, s.Limit)
+	return res, nil
+}
+
+// sortOffsetProject finishes a non-grouped result: a stable multi-key
+// sort (skipped when there are no keys), then OFFSET/LIMIT, then
+// projection of each combined row down to the output columns. It fills
+// res.Rows. Shared by the plain and window SELECT paths.
+func sortOffsetProject(res *Result, rows [][]any, keys []sortKey, proj []projEntry, offset, limit int64) {
 	if len(keys) > 0 {
 		slices.SortStableFunc(rows, func(a, b []any) int {
 			for _, k := range keys {
@@ -401,15 +382,15 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 			return 0
 		})
 	}
-	if s.Offset > 0 {
-		if s.Offset >= int64(len(rows)) {
+	if offset > 0 {
+		if offset >= int64(len(rows)) {
 			rows = nil
 		} else {
-			rows = rows[s.Offset:]
+			rows = rows[offset:]
 		}
 	}
-	if s.Limit >= 0 && int64(len(rows)) > s.Limit {
-		rows = rows[:s.Limit]
+	if limit >= 0 && int64(len(rows)) > limit {
+		rows = rows[:limit]
 	}
 	res.Rows = make([][]any, len(rows))
 	for i, r := range rows {
@@ -423,12 +404,51 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 		}
 		res.Rows[i] = out
 	}
-	return res, nil
 }
 
 type sortKey struct {
 	ord  int
 	desc bool
+}
+
+// buildSortKeys resolves a SELECT's ORDER BY into combined-row sort
+// keys: select-list ordinals (ORDER BY n), output aliases, hidden sort
+// expressions (appended to exprs, evaluated per row like select items),
+// or FROM columns. It returns the keys and the possibly-extended exprs.
+func buildSortKeys(sc *scope, s *Select, proj []projEntry, exprs []Expr) ([]sortKey, []Expr, error) {
+	var keys []sortKey
+	for _, o := range s.OrderBy {
+		if o.IsLit { // ORDER BY n: a select-list position
+			pe, err := ordinalEntry(o.Lit, proj)
+			if err != nil {
+				return nil, nil, err
+			}
+			if pe.ord >= 0 {
+				keys = append(keys, sortKey{pe.ord, o.Desc})
+			}
+			continue // a literal output is a constant key: no effect
+		}
+		if o.Ex != nil { // a hidden sort expression, appended like an item
+			keys = append(keys, sortKey{sc.width + len(exprs), o.Desc})
+			exprs = append(exprs, o.Ex)
+			continue
+		}
+		// A bare name matching an output alias sorts by that output.
+		if o.Col.Table == "" {
+			if pe, ok := aliasEntry(sc, s, proj, o.Col.Name); ok {
+				if pe.ord >= 0 {
+					keys = append(keys, sortKey{pe.ord, o.Desc})
+				}
+				continue
+			}
+		}
+		ord, err := sc.resolve(o.Col)
+		if err != nil {
+			return nil, nil, err
+		}
+		keys = append(keys, sortKey{ord, o.Desc})
+	}
+	return keys, exprs, nil
 }
 
 // projEntry is one projected output: a combined-row ordinal, or a
@@ -742,7 +762,13 @@ func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, en
 // runSelectCore executes one UNION arm (or a whole plain SELECT).
 func (d *DB) runSelectCore(s *Select) (*Result, error) {
 	if s.isAggregate() {
+		if hasWindow(s) {
+			return nil, serr.New("window functions with GROUP BY or aggregates are not supported")
+		}
 		return d.execSelectAgg(s)
+	}
+	if hasWindow(s) {
+		return d.execSelectWindow(s)
 	}
 	return d.execSelect(s)
 }

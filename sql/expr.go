@@ -31,6 +31,7 @@ type exEnv struct {
 	sc    *scope
 	row   []any
 	grp   *group // current group in an aggregate query's group phase
+	win   []any  // current row's precomputed window values (window queries)
 	outer *exEnv
 }
 
@@ -47,8 +48,18 @@ type exAccRef struct {
 	typ bytdb.ColType
 }
 
+// exWinRef reads a precomputed window value from the environment's
+// per-row window slice; execSelectWindow rewrites each ExWindow into
+// one of these. It never comes from the parser.
+type exWinRef struct {
+	idx  int
+	typ  bytdb.ColType
+	name string // the window function's name, for output column naming
+}
+
 func (*exGroupRef) expr() {}
 func (*exAccRef) expr()   {}
+func (*exWinRef) expr()   {}
 
 // lookupVal resolves a column reference against the environment
 // chain, innermost scope first. An ON condition evaluates against a
@@ -209,6 +220,14 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 			return nil, serr.New("aggregate reference outside an aggregate query")
 		}
 		return env.grp.accs[n.idx].value(), nil
+	case *exWinRef:
+		if env.win == nil {
+			return nil, serr.New("window reference outside a window query")
+		}
+		return env.win[n.idx], nil
+	case *ExWindow:
+		return nil, serr.New("window functions are only allowed in the SELECT list and ORDER BY",
+			"function", n.fnName())
 	case *ExSub:
 		return evalSubquery(env, n.Sel)
 	}
@@ -1165,6 +1184,10 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 		return n.typ
 	case *exAccRef:
 		return n.typ
+	case *exWinRef:
+		return n.typ
+	case *ExWindow:
+		return n.resultType(sc)
 	case *ExArith:
 		if n.Op == "||" {
 			return bytdb.TString
@@ -1213,6 +1236,10 @@ func exprName(e Expr) string {
 		return n.Name
 	case *ExAgg:
 		return n.Fn.name() // sum(a*b) names its column "sum", as Postgres does
+	case *ExWindow:
+		return n.fnName()
+	case *exWinRef:
+		return n.name
 	case *ExCase:
 		return "case"
 	case *ExCast:

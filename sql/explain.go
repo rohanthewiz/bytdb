@@ -194,6 +194,22 @@ func (x *explainer) coreNode(s *Select) (*planNode, error) {
 	if _, _, err := projectSelect(fp.sc, s, &Result{}); err != nil {
 		return nil, err // validate the select list as execution would
 	}
+	if hasWindow(s) {
+		win := &planNode{title: "WindowAgg", children: []*planNode{n}}
+		visit := func(e Expr) bool {
+			if w, ok := e.(*ExWindow); ok {
+				win.details = append(win.details, "Window: "+windowText(w))
+			}
+			return true
+		}
+		for _, it := range s.Items {
+			walkExpr(it.Ex, visit)
+		}
+		for _, o := range s.OrderBy {
+			walkExpr(o.Ex, visit)
+		}
+		return win, nil
+	}
 	return n, nil
 }
 
@@ -535,6 +551,8 @@ func exprText(e Expr) string {
 			txts[i] = exprText(el)
 		}
 		return "ARRAY[" + strings.Join(txts, ", ") + "]"
+	case *ExWindow:
+		return windowText(n)
 	case *ExArith:
 		return "(" + exprText(n.L) + " " + n.Op + " " + exprText(n.R) + ")"
 	case *ExSub:
