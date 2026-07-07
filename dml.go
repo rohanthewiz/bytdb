@@ -318,15 +318,19 @@ func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, erro
 }
 
 // ScanRangeRev iterates rows with fromPK <= pk < toPK in descending
-// primary-key order — ScanRange read backward.
-func (e *Engine) ScanRangeRev(table string, fromPK, toPK []any) iter.Seq2[Row, error] {
+// primary-key order — ScanRange read backward. toIncl closes the upper
+// bound instead: rows whose leading key columns equal toPK (the whole
+// toPK prefix group) are included — a region a partial-prefix exclusive
+// bound cannot express, and the natural upper edge when reversing a
+// scan pinned by column equality.
+func (e *Engine) ScanRangeRev(table string, fromPK, toPK []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		desc, err := e.desc(table)
 		if err != nil {
 			yield(Row{}, err)
 			return
 		}
-		scanRowsRev(e.kv, desc, fromPK, toPK)(yield)
+		scanRowsRev(e.kv, desc, fromPK, toPK, toIncl)(yield)
 	}
 }
 
@@ -334,8 +338,9 @@ func (e *Engine) ScanRangeRev(table string, fromPK, toPK []any) iter.Seq2[Row, e
 // mirroring scanRows. Descend starts at the last key <= the exclusive
 // upper bound: the first yield lands at or past it, so keys >= end are
 // skipped, and the walk stops once it drops below the inclusive lower
-// bound.
-func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, error] {
+// bound. toIncl widens the upper bound to the end of toPK's prefix
+// group (every key with that prefix sorts below its PrefixEnd).
+func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		prefix := tablePrefix(desc.ID)
 		start := string(prefix)
@@ -351,6 +356,9 @@ func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, e
 			if end, err = boundKey(desc, prefix, toPK); err != nil {
 				yield(Row{}, err)
 				return
+			}
+			if toIncl {
+				end = string(tuple.PrefixEnd([]byte(end)))
 			}
 		}
 		for k, val := range v.Descend(end) {

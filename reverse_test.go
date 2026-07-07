@@ -19,21 +19,27 @@ func TestScanRangeRev(t *testing.T) {
 		[]any{4, "alan", 29, "n@x"},
 	)
 
-	got := names(t, e.ScanRangeRev("people", nil, nil))
+	got := names(t, e.ScanRangeRev("people", nil, nil, false))
 	if want := []string{"alan", "edsger", "ada", "grace"}; !slices.Equal(got, want) {
 		t.Fatalf("full reverse scan = %v; want %v", got, want)
 	}
 
 	// Same [from, to) region as ScanRange, just descending.
-	got = names(t, e.ScanRangeRev("people", []any{2}, []any{4}))
+	got = names(t, e.ScanRangeRev("people", []any{2}, []any{4}, false))
 	if want := []string{"edsger", "ada"}; !slices.Equal(got, want) {
 		t.Fatalf("bounded reverse scan = %v; want %v", got, want)
+	}
+
+	// toIncl closes the upper bound over the whole toPK group: pk <= 4.
+	got = names(t, e.ScanRangeRev("people", []any{2}, []any{4}, true))
+	if want := []string{"alan", "edsger", "ada"}; !slices.Equal(got, want) {
+		t.Fatalf("inclusive-bounded reverse scan = %v; want %v", got, want)
 	}
 
 	// A reverse scan is the forward scan read back to front.
 	fwd := names(t, e.ScanRange("people", nil, nil))
 	slices.Reverse(fwd)
-	if rev := names(t, e.ScanRangeRev("people", nil, nil)); !slices.Equal(fwd, rev) {
+	if rev := names(t, e.ScanRangeRev("people", nil, nil, false)); !slices.Equal(fwd, rev) {
 		t.Fatalf("reverse != forward reversed: %v vs %v", rev, fwd)
 	}
 }
@@ -54,9 +60,20 @@ func TestScanIndexRev(t *testing.T) {
 	}
 
 	// Ascending index read backward = descending age.
-	got := names(t, e.ScanIndexRev("people", "by-age", nil, nil))
+	got := names(t, e.ScanIndexRev("people", "by-age", nil, nil, false))
 	if want := []string{"edsger", "grace", "ada", "alan"}; !slices.Equal(got, want) {
 		t.Fatalf("reverse index scan = %v; want %v", got, want)
+	}
+
+	// Bounded: 30 <= age < 45 descending, then the same region with the
+	// upper bound closed over age = 45.
+	got = names(t, e.ScanIndexRev("people", "by-age", []any{30}, []any{45}, false))
+	if want := []string{"ada"}; !slices.Equal(got, want) {
+		t.Fatalf("bounded reverse index scan = %v; want %v", got, want)
+	}
+	got = names(t, e.ScanIndexRev("people", "by-age", []any{30}, []any{45}, true))
+	if want := []string{"grace", "ada"}; !slices.Equal(got, want) {
+		t.Fatalf("inclusive-bounded reverse index scan = %v; want %v", got, want)
 	}
 
 	// Reverse of a DESC index yields ascending age.
@@ -64,14 +81,14 @@ func TestScanIndexRev(t *testing.T) {
 		[]IndexCol{{Name: "age", Desc: true}}); err != nil {
 		t.Fatal(err)
 	}
-	got = names(t, e.ScanIndexRev("people", "by-age-desc", nil, nil))
+	got = names(t, e.ScanIndexRev("people", "by-age-desc", nil, nil, false))
 	if want := []string{"alan", "ada", "grace", "edsger"}; !slices.Equal(got, want) {
 		t.Fatalf("reverse desc-index scan = %v; want %v", got, want)
 	}
 
 	fwd := names(t, e.ScanIndex("people", "by-age", nil, nil))
 	slices.Reverse(fwd)
-	if rev := names(t, e.ScanIndexRev("people", "by-age", nil, nil)); !slices.Equal(fwd, rev) {
+	if rev := names(t, e.ScanIndexRev("people", "by-age", nil, nil, false)); !slices.Equal(fwd, rev) {
 		t.Fatalf("reverse index != forward reversed: %v vs %v", rev, fwd)
 	}
 }
@@ -90,7 +107,7 @@ func TestScanRevInTxn(t *testing.T) {
 		if err := tx.Insert("people", 2, "ada", 36, "a@x"); err != nil {
 			return err
 		}
-		got := names(t, tx.ScanRangeRev("people", nil, nil))
+		got := names(t, tx.ScanRangeRev("people", nil, nil, false))
 		if want := []string{"edsger", "ada", "grace"}; !slices.Equal(got, want) {
 			t.Fatalf("txn reverse scan = %v; want %v", got, want)
 		}

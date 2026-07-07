@@ -34,12 +34,19 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb
 		}
 		return nil
 	}
+	// A reverse scan swaps the roles of the plan's edges: the stops mark
+	// where a forward walk would end, so they become the reverse walk's
+	// entry bound (revEnd), and from — the forward entry — becomes where
+	// the engine stops descending. Both edges are then key bounds, so no
+	// stop checks run per row.
 	var seq iter.Seq2[bytdb.Row, error]
 	switch {
-	case p.reverse && p.index == "": // reverse is set only for an unbounded scan
-		seq = tx.ScanRangeRev(table, nil, nil)
+	case p.reverse && p.index == "":
+		to, incl := p.revEnd()
+		seq = tx.ScanRangeRev(table, p.from, to, incl)
 	case p.reverse:
-		seq = tx.ScanIndexRev(table, p.index, nil, nil)
+		to, incl := p.revEnd()
+		seq = tx.ScanIndexRev(table, p.index, p.from, to, incl)
 	case p.index == "":
 		seq = tx.ScanRange(table, p.from, nil)
 	default:
@@ -49,7 +56,7 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb
 		if err != nil {
 			return err
 		}
-		if stopped(p.stops, row) {
+		if !p.reverse && stopped(p.stops, row) {
 			return nil
 		}
 		hit, err := p.matches(env, row)

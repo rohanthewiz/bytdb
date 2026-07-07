@@ -12,7 +12,7 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–20: a working relational store, queryable in SQL — in
+Milestones 1–21: a working relational store, queryable in SQL — in
 process or over the Postgres wire protocol, with transaction blocks
 and savepoints, NOT NULL and CHECK constraints, descending index
 columns, EXPLAIN, and enough system catalog and expression language
@@ -375,7 +375,8 @@ durability with group commit.
 - [x] **Milestone 18**: `op ANY(...)` / `op ALL(...)` — a right-hand side that is an `ARRAY[...]` constructor, a single-column subquery, or a Postgres `'{...}'` array-literal string (elements coerce to the left operand's type); Postgres three-valued logic (empty array is ANY→false, ALL→true even against a NULL left side), so `= ANY` generalizes `IN` and `<> ALL` generalizes `NOT IN`; `ARRAY[...]` is also a value that renders as `{...}`
 - [x] **Milestone 19**: window functions — `ROW_NUMBER`/`RANK`/`DENSE_RANK` and aggregate windows (`SUM/COUNT/AVG/MIN/MAX(...) OVER (PARTITION BY ... ORDER BY ...)`) as a third execution shape that emits every input row: materialize post-filter rows, partition by the order-preserving tuple encoding (the GROUP BY equivalence), sort each partition, assign per-row values (ranking by ordinal / prior-key compare; aggregates whole-partition when unordered, else running with the Postgres RANGE peer-sharing default); window calls rewrite to environment refs so the ordinary evaluator handles nesting (`rn + 1`); `EXPLAIN` gains a WindowAgg node; explicit ROWS/RANGE frames, `DISTINCT`, and window+GROUP BY are rejected
 - [x] **Milestone 20**: ORDER BY exploiting index order — a single-table SELECT whose sort matches a scan's key order skips the sort (and, under a LIMIT, stops early). The chosen path's key columns each advance a fixed way (ascending, or descending for a DESC index column); an equality-pinned prefix carries no order and is skipped, so `WHERE a = 1 ORDER BY b` reads a `(a, b)` index directly. A fully-reversed match runs the scan backward (new engine `ScanRangeRev`/`ScanIndexRev` over btypedb's `Descend`), giving bounded `ORDER BY … DESC LIMIT n`; when no WHERE pushes a path and a LIMIT bounds the result, a NOT NULL indexed column's ordered walk replaces the full scan + sort. Ordering columns must be NOT NULL (the key encoding places NULLs opposite to `NULLS LAST`/`FIRST`), so nullable columns keep the sort; `EXPLAIN` shows `Index Scan [Backward] …` and drops the `Sort`
-- [ ] Later: bounded reverse scans (equality-prefix + `ORDER BY … DESC`), order-aware path selection among redundant indexes, window frames (`ROWS/RANGE BETWEEN`), `LAG`/`LEAD`/`FIRST_VALUE`
+- [x] **Milestone 21**: bounded reverse scans — any pushed-down scan region can now be read backward, not just an unbounded one. A forward plan's region is already key-delimited on both edges (`from` below, the early-stops above), so reversing converts the stops into the backward walk's entry bound: equality-prefix values plus the range-stop value, closed over the value's group or open by stop kind (`revEnd`); the engine's `ScanRangeRev`/`ScanIndexRev` gained a `toIncl` upper bound closing over a whole key-prefix group (`tuple.PrefixEnd`), which an exclusive partial-prefix bound cannot express. So `WHERE cat = 2 ORDER BY pri DESC LIMIT n` on a `(cat, pri)` index walks just the tail of the `cat = 2` region backward — no sort, early termination — and `WHERE id > 2 ORDER BY id DESC`, range predicates on the ordered column, and DESC-index ranges read in reverse all elide the sort too
+- [ ] Later: order-aware path selection among redundant indexes, window frames (`ROWS/RANGE BETWEEN`), `LAG`/`LEAD`/`FIRST_VALUE`
 
 ## Design notes
 

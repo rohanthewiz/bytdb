@@ -53,14 +53,21 @@ func TestOrderPrimaryScan(t *testing.T) {
 		`  Index Cond: (id > 2)`)
 	wantIDs(t, d, `select id from users where id > 2 order by id`, 3, 4, 5)
 
-	// A bounded scan cannot be run backward (deferred), so ORDER BY id
-	// DESC with a lower bound still sorts — but the answer is the same.
+	// A bounded scan reverses too: the pushed lower bound becomes the
+	// backward walk's stopping edge, so the sort still drops.
 	wantPlan(t, d, `explain select id from users where id > 2 order by id desc`,
-		`Sort`,
-		`  Sort Key: id DESC`,
-		`  ->  Index Scan using users_pkey on users`,
-		`        Index Cond: (id > 2)`)
+		`Index Scan Backward using users_pkey on users`,
+		`  Index Cond: (id > 2)`)
 	wantIDs(t, d, `select id from users where id > 2 order by id desc`, 5, 4, 3)
+
+	// An upper bound reverses as the backward walk's entry edge —
+	// exclusive (<) or closed over the bound's group (<=).
+	wantPlan(t, d, `explain select id from users where id < 4 order by id desc`,
+		`Index Scan Backward using users_pkey on users`,
+		`  Index Cond: (id < 4)`)
+	wantIDs(t, d, `select id from users where id < 4 order by id desc`, 3, 2, 1)
+	wantIDs(t, d, `select id from users where id <= 4 order by id desc`, 4, 3, 2, 1)
+	wantIDs(t, d, `select id from users where id > 1 and id < 5 order by id desc`, 4, 3, 2)
 }
 
 // TestOrderIndexScan: with no WHERE and a LIMIT, ORDER BY a NOT NULL
@@ -108,9 +115,17 @@ func TestOrderCompositeIndex(t *testing.T) {
 		`Limit`,
 		`  ->  Index Scan using by_ab on t`,
 		`        Index Cond: (a = 2)`)
-	wantIDs(t, d, `select id from t where a = 2 order by b`, 3, 5, 1)         // b: 20,25,30
-	wantIDs(t, d, `select id from t where a = 2 order by a, b`, 3, 5, 1)      // leading eq col ignored
-	wantIDs(t, d, `select id from t where a = 2 order by b desc`, 1, 5, 3)   // bounded reverse: sorts, still right
+	wantIDs(t, d, `select id from t where a = 2 order by b`, 3, 5, 1)    // b: 20,25,30
+	wantIDs(t, d, `select id from t where a = 2 order by a, b`, 3, 5, 1) // leading eq col ignored
+
+	// The reverse walk enters at the top of the a = 2 group (the whole
+	// equality region is the bound) and stops leaving it.
+	wantPlan(t, d, `explain select id from t where a = 2 order by b desc limit 2`,
+		`Limit`,
+		`  ->  Index Scan Backward using by_ab on t`,
+		`        Index Cond: (a = 2)`)
+	wantIDs(t, d, `select id from t where a = 2 order by b desc`, 1, 5, 3) // b: 30,25,20
+	wantIDs(t, d, `select id from t where a = 2 order by b desc limit 2`, 1, 5)
 }
 
 // TestOrderDescIndex: a DESC index serves ORDER BY ... DESC with a
@@ -130,6 +145,38 @@ func TestOrderDescIndex(t *testing.T) {
 		`Limit`,
 		`  ->  Index Scan Backward using by_a_desc on t`)
 	wantIDs(t, d, `select id from t order by a limit 3`, 4, 2, 1) // 5,10,20
+
+	// A range on the DESC column reverses too: forward pushes a > 10 as
+	// an early-stop, which reverse turns into its entry bound.
+	wantPlan(t, d, `explain select id from t where a > 10 order by a`,
+		`Index Scan Backward using by_a_desc on t`,
+		`  Index Cond: (a > 10)`)
+	wantIDs(t, d, `select id from t where a > 10 order by a`, 1, 5, 3)     // 20,25,30
+	wantIDs(t, d, `select id from t where a >= 10 order by a`, 2, 1, 5, 3) // closed bound keeps a = 10
+}
+
+// TestOrderBoundedReverse: the motivating shape for bounded reverse —
+// an equality prefix plus ORDER BY the next index column DESC under a
+// LIMIT reads just the tail of the region, backward from its high edge.
+// Range predicates on the ordered column bound both edges of the walk.
+func TestOrderBoundedReverse(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table ev (id int primary key, cat int not null, pri int not null)`)
+	exec(t, d, `insert into ev values
+		(1, 1, 10), (2, 2, 40), (3, 2, 10), (4, 2, 30), (5, 1, 50), (6, 2, 20)`)
+	exec(t, d, `create index by_cat_pri on ev (cat, pri)`)
+
+	wantPlan(t, d, `explain select id from ev where cat = 2 order by pri desc limit 2`,
+		`Limit`,
+		`  ->  Index Scan Backward using by_cat_pri on ev`,
+		`        Index Cond: (cat = 2)`)
+	wantIDs(t, d, `select id from ev where cat = 2 order by pri desc limit 2`, 2, 4) // pri: 40,30
+	wantIDs(t, d, `select id from ev where cat = 2 order by pri desc`, 2, 4, 6, 3)
+
+	// Both range bounds push: from stops the reverse walk, the upper
+	// bound starts it — exclusive (<) or closed over the group (<=).
+	wantIDs(t, d, `select id from ev where cat = 2 and pri > 10 and pri < 40 order by pri desc`, 4, 6)      // 30,20
+	wantIDs(t, d, `select id from ev where cat = 2 and pri >= 20 and pri <= 40 order by pri desc`, 2, 4, 6) // 40,30,20
 }
 
 // TestOrderNullableNotOptimized: a nullable column's index orders NULLs

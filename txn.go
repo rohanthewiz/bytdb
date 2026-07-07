@@ -194,21 +194,22 @@ func (t *Txn) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, erro
 }
 
 // ScanRangeRev iterates rows with fromPK <= pk < toPK in descending
-// primary-key order in the transaction's view (see Engine.ScanRangeRev).
-func (t *Txn) ScanRangeRev(table string, fromPK, toPK []any) iter.Seq2[Row, error] {
+// primary-key order in the transaction's view (see Engine.ScanRangeRev,
+// including toIncl's prefix-group upper bound).
+func (t *Txn) ScanRangeRev(table string, fromPK, toPK []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		desc, err := t.desc(table)
 		if err != nil {
 			yield(Row{}, err)
 			return
 		}
-		scanRowsRev(t.tx, desc, fromPK, toPK)(yield)
+		scanRowsRev(t.tx, desc, fromPK, toPK, toIncl)(yield)
 	}
 }
 
 // ScanIndexRev iterates rows in descending order of the named index in
 // the transaction's view (see Engine.ScanIndexRev).
-func (t *Txn) ScanIndexRev(table, index string, from, to []any) iter.Seq2[Row, error] {
+func (t *Txn) ScanIndexRev(table, index string, from, to []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		desc, err := t.desc(table)
 		if err != nil {
@@ -220,6 +221,6 @@ func (t *Txn) ScanIndexRev(table, index string, from, to []any) iter.Seq2[Row, e
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
-		scanIndexRowsRev(t.tx, desc, idx, from, to)(yield)
+		scanIndexRowsRev(t.tx, desc, idx, from, to, toIncl)(yield)
 	}
 }

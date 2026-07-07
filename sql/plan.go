@@ -19,7 +19,7 @@ type plan struct {
 	index   string   // secondary index to scan; "" scans the primary index
 	from    []any    // inclusive lower bound pushed into the scan; nil is unbounded
 	stops   []stop   // early-termination checks, in key-column order
-	reverse bool     // read the path backward (descending key order); set only for an unbounded scan
+	reverse bool     // read the path backward (descending key order); from/stops become key bounds via revEnd
 	filter  BoolExpr // residual filter: the full condition (nil: all rows)
 	binds   binds    // the filter's operand ordinals within this table's rows
 	pushed  []*Pred  // the conjuncts behind get/from/stops (EXPLAIN's Index Cond)
@@ -257,8 +257,8 @@ func litFits(v any, t bytdb.ColType) bool {
 // chooseOrderedPlan picks the scan path for a single-table SELECT,
 // preferring one that reads rows already in ORDER BY order so the sort
 // can be skipped. It starts from the ordinary WHERE-driven plan: if
-// that path already serves the order (forward, or — when unbounded —
-// reversed) it uses it. Otherwise, only when the WHERE pushed nothing
+// that path already serves the order (forward or reversed — bounds
+// reverse along with the walk) it uses it. Otherwise, only when the WHERE pushed nothing
 // and a LIMIT bounds the result, it looks for a secondary index whose
 // order serves the sort, trading a full scan plus sort for a bounded
 // ordered index walk. The second result reports whether the sort can
@@ -305,9 +305,10 @@ func chooseOrderedPlan(desc *bytdb.TableDesc, alias string, where BoolExpr, keys
 // direction. NULLs are the catch: the key encoding orders them opposite
 // to ORDER BY's NULLS LAST/FIRST, so any column that can hold NULL
 // cannot have its order served from the scan — every ordering column
-// must be NOT NULL (a primary-key column always is). Reverse applies
-// only to an unbounded scan; a pushed lower bound or early-stop marks a
-// forward-only region.
+// must be NOT NULL (a primary-key column always is). Bounds are no
+// obstacle to reversing: the region a forward scan visits is delimited
+// by keys on both edges (from below, the stops above), so the reverse
+// walk just enters at the high edge (revEnd) and stops at from.
 func (p *plan) orderSatisfied(desc *bytdb.TableDesc, keys []sortKey) (ok, reverse bool) {
 	if p.get != nil {
 		return false, false
@@ -357,8 +358,35 @@ func (p *plan) orderSatisfied(desc *bytdb.TableDesc, keys []sortKey) (ok, revers
 	if try(false) {
 		return true, false
 	}
-	if p.from == nil && len(p.stops) == 0 && try(true) {
+	if try(true) {
 		return true, true
 	}
 	return false, false
+}
+
+// revEnd derives a reverse scan's upper bound from the plan's forward
+// stops. The stops describe where a forward walk of the region would
+// end; read backward that edge is where the walk begins, so it must
+// become a key bound (the stop checks themselves are forward-
+// directional and are skipped in reverse — see scanPlan). Each stopNE
+// contributes its pinned equality value; the range stop, if any,
+// contributes its value with the bound closed or open by kind: a
+// forward walk stopping AT the value excludes its group (stopGE/
+// stopLE), one stopping only PAST it includes the group (stopGT/
+// stopLT). With no range stop the bound stays closed, covering the
+// whole equality region. Values sit in path-column order, matching the
+// engine's partial-prefix bound encoding (a DESC index column's value
+// is byte-inverted there just as it was when pushed forward).
+func (p *plan) revEnd() (to []any, toIncl bool) {
+	toIncl = true
+	for _, st := range p.stops {
+		to = append(to, st.val)
+		switch st.kind {
+		case stopGE, stopLE:
+			toIncl = false
+		case stopGT, stopLT:
+			toIncl = true
+		}
+	}
+	return to, toIncl
 }

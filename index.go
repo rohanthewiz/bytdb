@@ -202,8 +202,10 @@ func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, e
 }
 
 // ScanIndexRev iterates rows in descending order of the named index —
-// ScanIndex read backward. See ScanIndex on the snapshot caveat.
-func (e *Engine) ScanIndexRev(table, index string, from, to []any) iter.Seq2[Row, error] {
+// ScanIndex read backward. toIncl closes the upper bound: rows whose
+// leading indexed columns equal to (the whole prefix group) are
+// included (see ScanRangeRev). See ScanIndex on the snapshot caveat.
+func (e *Engine) ScanIndexRev(table, index string, from, to []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		desc, err := e.desc(table)
 		if err != nil {
@@ -221,13 +223,14 @@ func (e *Engine) ScanIndexRev(table, index string, from, to []any) iter.Seq2[Row
 			return
 		}
 		defer tx.Rollback()
-		scanIndexRowsRev(tx, desc, idx, from, to)(yield)
+		scanIndexRowsRev(tx, desc, idx, from, to, toIncl)(yield)
 	}
 }
 
 // scanIndexRowsRev iterates an index's rows in descending order,
-// mirroring scanIndexRows (and scanRowsRev's bound handling).
-func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any) iter.Seq2[Row, error] {
+// mirroring scanIndexRows (and scanRowsRev's bound handling, including
+// toIncl's prefix-group upper bound).
+func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		prefix := indexPrefix(desc.ID, idx.ID)
 		start := string(prefix)
@@ -243,6 +246,9 @@ func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any)
 			if end, err = indexBound(desc, idx, prefix, to); err != nil {
 				yield(Row{}, err)
 				return
+			}
+			if toIncl {
+				end = string(tuple.PrefixEnd([]byte(end)))
 			}
 		}
 		for k, val := range v.Descend(end) {
