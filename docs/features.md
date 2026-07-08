@@ -1,0 +1,203 @@
+# Features & Examples
+
+Every example on this page is verified by a test in the repository — file
+references point at the proof.
+
+## Column types
+
+Five storage types, with the Postgres aliases you'd expect
+(`sql/parser.go:525-557`):
+
+| Declared as | Stored as |
+|---|---|
+| `INT`, `INTEGER`, `BIGINT`, `INT2/4/8`, `SMALLINT` | `int64` |
+| `FLOAT`, `FLOAT4/8`, `REAL`, `DOUBLE PRECISION` | `float64` |
+| `TEXT`, `STRING`, `VARCHAR(n)` (length ignored) | `string` |
+| `BOOL`, `BOOLEAN` | `bool` |
+| `BYTEA`, `BYTES` | `[]byte` |
+
+There are deliberately **no** date/time, decimal, uuid, json, or array column
+types — see [Gotchas](gotchas.md).
+
+## Tables and constraints
+
+```sql
+CREATE TABLE items (
+    id    INT PRIMARY KEY,
+    price INT CHECK (price > 0),
+    qty   INT,
+    tag   TEXT,
+    CONSTRAINT qty_sane CHECK (qty >= 0 AND qty <= 100),
+    CHECK (price * qty < 10000)
+)
+```
+*(verified in `sql/sql_test.go:157-164`)*
+
+- Composite primary keys: `PRIMARY KEY (a, b)`.
+- `NOT NULL` columns; NULL rejected with Postgres-worded errors (SQLSTATE 23502).
+- `CHECK` constraints, column-level or table-level, named or auto-named,
+  enforced on INSERT and UPDATE with Postgres wording:
+  `new row for relation "items" violates check constraint "items_price_check"`
+  (SQLSTATE 23514).
+- `ALTER TABLE t ADD COLUMN c type` — **O(1)**: no rows are rewritten; existing
+  rows read the new column as NULL.
+- `ALTER TABLE t DROP COLUMN c` — also O(1); data stays under a retired column
+  ID and is skipped on decode.
+- `ALTER TABLE t ADD CONSTRAINT n CHECK (...)` validates existing rows;
+  `DROP CONSTRAINT [IF EXISTS] n`.
+
+## Indexes
+
+```sql
+CREATE UNIQUE INDEX users_email ON users (email);
+CREATE INDEX orders_by_age ON orders (age DESC, id);
+DROP INDEX orders_by_age ON orders;
+```
+
+- Unique and non-unique, multi-column, per-column `ASC`/`DESC`.
+- NULL never conflicts in a unique index (SQL semantics).
+- Backfill is atomic with the descriptor write: the index exists complete, or
+  not at all.
+- The planner uses indexes for equality and range predicates and can exploit
+  index order to satisfy `ORDER BY` without sorting; `EXPLAIN` shows the plan.
+
+## Queries
+
+### Joins
+
+`INNER`, `LEFT [OUTER]`, and `CROSS` (including comma syntax), in left-deep
+chains, executed as index nested loops:
+
+```sql
+-- anti-join: users with no orders (sql/join_test.go:85-87)
+SELECT u.name FROM users u
+    LEFT JOIN orders o ON u.id = o.user_id
+    WHERE o.id IS NULL
+```
+
+### Aggregates and grouping
+
+`COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `SUM`, `AVG`, `MIN`, `MAX`, over
+columns or expressions; `GROUP BY` a column, an expression, or an ordinal;
+`HAVING` filters groups:
+
+```sql
+SELECT age / 10 AS decade, count(*) AS n, max(age)
+FROM users WHERE age > 18
+GROUP BY age / 10 HAVING count(*) >= 2
+ORDER BY n DESC, decade LIMIT 3
+```
+
+### Window functions
+
+`ROW_NUMBER`, `RANK`, `DENSE_RANK`, and aggregate windows over
+`PARTITION BY ... ORDER BY ...`:
+
+```sql
+SELECT grp, v,
+    rank()       OVER (PARTITION BY grp ORDER BY v) AS r,
+    dense_rank() OVER (PARTITION BY grp ORDER BY v) AS dr
+FROM t
+```
+*(verified in `sql/expr_test.go:199-201`; running sums like
+`sum(age) OVER (ORDER BY age)` also work)*
+
+### Expressions
+
+- Comparisons `= != <> < <= > >=`, `IS [NOT] NULL`, regex `~ !~ ~* !~*`
+- Three-valued `AND` / `OR` / `NOT`; arithmetic `+ - * / %`; string `||`
+- `CASE WHEN`, `IN` / `NOT IN`, `BETWEEN`-free but `op ANY(...)` / `op ALL(...)`
+  with `ARRAY[...]`, subqueries, or `'{...}'` literals
+- `::` casts (int family, text family, bool, float/numeric, reg* types)
+- Correlated scalar subqueries, `EXISTS`, `ARRAY(SELECT ...)`:
+
+```sql
+DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
+```
+
+- Scalar functions: `coalesce`, `nullif`, `lower`, `upper`, `length`, plus the
+  Postgres introspection functions ORMs call (`format_type`,
+  `pg_get_indexdef`, `pg_table_is_visible`, ...)
+- `UNION [ALL]`, `SELECT` without `FROM` (`SELECT 1`)
+
+### Parameters
+
+`$1`-style placeholders anywhere a literal may appear — WHERE/ON/HAVING,
+INSERT values, UPDATE SET (not LIMIT/OFFSET):
+
+```go
+db.Exec(`INSERT INTO users VALUES ($1, $2, $3)`, 1, "ada", 36)
+stmt, _ := db.Prepare(`SELECT name FROM users WHERE id = $1`) // parse once
+res, _ := stmt.Exec(int64(1))                                  // execute many
+```
+
+## Transactions
+
+Postgres block semantics via a `Session` (`sql/session.go`):
+
+```sql
+BEGIN;
+UPDATE accounts SET bal = bal - 100 WHERE id = 1;
+SAVEPOINT s1;                -- O(1) copy-on-write snapshot
+UPDATE accounts SET bal = bal + 100 WHERE id = 99999;  -- fails: no such row? block enters failed state
+ROLLBACK TO s1;              -- recover instead of losing everything
+UPDATE accounts SET bal = bal + 100 WHERE id = 2;
+COMMIT;
+```
+
+- A failed block refuses everything but `ROLLBACK` (SQLSTATE 25P02); `COMMIT`
+  of a failed block performs — and reports — `ROLLBACK`, as in Postgres.
+- `SAVEPOINT` / `ROLLBACK TO` / `RELEASE`, with Postgres name-shadowing rules.
+- Isolation levels parse and are ignored: the single-writer engine is
+  serializable, which satisfies all of them. `READ ONLY` is honored.
+- Every bare statement is atomic — a multi-row `INSERT` that fails on row 900
+  leaves nothing behind.
+
+## The Go APIs
+
+Three levels, all usable in one program:
+
+```go
+// 1. SQL (most apps): bsql.New(engine).Exec / Prepare / Session
+// 2. Engine: typed relational operations without SQL
+e.CreateTable("users",
+    []bytdb.Column{{Name: "id", Type: bytdb.TInt}, {Name: "name", Type: bytdb.TString}},
+    "id")
+e.Insert("users", int64(1), "ada")
+row, found, _ := e.Get("users", int64(1))
+
+// engine transactions: snapshot reads, single writer
+e.WriteTxn(func(tx *bytdb.Txn) error {
+    tx.Insert("users", int64(2), "bob")
+    return tx.Update("users", []any{int64(1)}, map[string]any{"name": "ada l."})
+})
+
+// 3. btypedb directly: ordered typed KV with TTL
+kv, _ := btypedb.Open("cache.db", btypedb.StringCodec, btypedb.BytesCodec)
+kv.SetTTL("session:abc", token, 30*time.Minute) // expires, survives restart
+for k, v := range kv.Ascend("session:") { ... } // ordered iteration
+```
+
+btypedb also offers range deletes, savepoints, runtime custom-comparator
+indexes, and tunable sync/compaction policies — see
+[Architecture](architecture.md).
+
+## The wire server
+
+```sh
+go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd -db app.db -addr 127.0.0.1:5433
+```
+
+Tested against real clients, not just protocol specs:
+
+- **pgx v5** end-to-end, including its statement cache and simple-protocol mode
+- **psql 17**: `\dt`, `\d table`, `\di`, `\du`, `\l` run their real catalog queries
+- **ORM probes** sent verbatim in tests: GORM's `HasTable`
+  (`information_schema.tables`), SQLAlchemy's `select pg_catalog.version()`,
+  ActiveRecord/SQLAlchemy column introspection over
+  `pg_attribute`/`pg_class`/`pg_type` (`pgwire/orm_test.go`)
+- **`database/sql`** via the pgx stdlib adapter
+
+Errors carry Postgres SQLSTATEs (42P01 undefined_table, 23505
+unique_violation, 25P02 in_failed_sql_transaction, ...) and 1-based statement
+positions, so client error handling behaves as against Postgres.

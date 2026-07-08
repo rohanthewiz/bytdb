@@ -1,0 +1,67 @@
+[
+  {
+    "target": "bytdb-always",
+    "note": "embedded, SyncAlways (fsync per commit)",
+    "us_per_op": {
+      "insert_batch": 6.50964,
+      "insert_point": 4221.6172,
+      "read_point": 4.15085,
+      "scan_agg": 31152.6,
+      "update_point": 4571.3504
+    }
+  },
+  {
+    "target": "bytdb-lazy",
+    "note": "embedded, SyncEverySecond",
+    "us_per_op": {
+      "insert_batch": 1.86168,
+      "insert_point": 16.7742,
+      "read_point": 4.04565,
+      "scan_agg": 30601.35,
+      "update_point": 22.8388
+    }
+  },
+  {
+    "target": "bytdb-pgwire",
+    "note": "pgwire TCP loopback, SyncEverySecond",
+    "us_per_op": {
+      "insert_batch": 1.95846,
+      "insert_point": 50.9406,
+      "read_point": 35.88525,
+      "scan_agg": 31020.7,
+      "update_point": 60.4174
+    }
+  },
+  {
+    "target": "postgres",
+    "note": "Postgres 16, Docker, PGDATA on tmpfs",
+    "us_per_op": {
+      "insert_batch": 3.3828,
+      "insert_point": 173.7638,
+      "read_point": 199.59085,
+      "scan_agg": 4836.7,
+      "update_point": 212.3236
+    }
+  },
+  {
+    "target": "duckdb",
+    "note": "in-memory, database/sql driver",
+    "us_per_op": {
+      "insert_batch": 6.30906,
+      "insert_point": 161.2224,
+      "read_point": 76.1666,
+      "scan_agg": 386.8,
+      "update_point": 117.9548
+    }
+  },
+  {
+    "target": "redis",
+    "note": "local server, default persistence (RDB), pipelined batch",
+    "us_per_op": {
+      "insert_batch": 1.22716,
+      "insert_point": 31.1872,
+      "read_point": 30.41355,
+      "update_point": 29.1406
+    }
+  }
+]

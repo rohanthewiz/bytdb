@@ -1,2 +1,7 @@
 *.db
 *.db.compact
+
+# docs build output and bench artifacts
+site/
+bench/bench
+.claude/settings.local.json

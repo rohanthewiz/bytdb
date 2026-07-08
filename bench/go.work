@@ -1,0 +1,10 @@
+// Nested workspace so this module resolves standalone: the repo-root
+// go.work does not include bench (keeping benchmark deps out of the
+// main workspace), and a nested go.work shadows it for files here.
+go 1.26.1
+
+use (
+	.
+	..
+	../pgwire
+)
