@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -92,6 +93,16 @@ func (a *accum) add(env *exEnv, vals []any) error {
 	case AggSum, AggAvg:
 		switch n := v.(type) {
 		case int64:
+			// SUM over an integer argument returns int64, so the running
+			// total is overflow-checked like scalar '+' (Postgres widens
+			// SUM(bigint) to numeric; bytdb has no wider integer type, so
+			// a sum that leaves int64's range errors instead of silently
+			// wrapping). AVG reads only sumF, so its int input never
+			// takes this error — a wrapped sumI is dead state there.
+			if a.fn == AggSum && a.intSum &&
+				((n > 0 && a.sumI > math.MaxInt64-n) || (n < 0 && a.sumI < math.MinInt64-n)) {
+				return errIntRange()
+			}
 			a.sumI += n
 			a.sumF += float64(n)
 		case float64:

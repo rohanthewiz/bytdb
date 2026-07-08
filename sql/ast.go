@@ -526,10 +526,16 @@ type UnionArm struct {
 	Sel *Select
 }
 
-// Update is UPDATE t SET col = lit, ... [WHERE ...].
+// Update is UPDATE t SET col = expr, ... [WHERE ...]. Plain literal
+// (and $n placeholder) assignments live in Set — the fast path: they
+// coerce once per statement and need no per-row evaluation. Anything
+// else (SET age = age + 1, a CASE, a scalar subquery) lands in SetEx
+// and is evaluated against each matching row at execution. A column
+// appears in at most one of the two maps.
 type Update struct {
 	Table string
 	Set   map[string]any
+	SetEx map[string]Expr
 	Where BoolExpr
 }
 

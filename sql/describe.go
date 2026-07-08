@@ -96,6 +96,18 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 			}
 			note(v, desc.Columns[i].Type)
 		}
+		// Placeholders inside a SET expression infer as the target
+		// column's type — best-effort, but right for the dominant shape
+		// (SET age = age + $1), and note keeps the first inference, so a
+		// $n also compared against a column elsewhere is unaffected.
+		for name, ex := range st.SetEx {
+			i := desc.ColIndex(name)
+			if i < 0 {
+				return serr.New("no such column", "table", st.Table, "column", name)
+			}
+			t := desc.Columns[i].Type
+			noteExprVals(ex, func(v any) { note(v, t) })
+		}
 		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
 			return err
 		}

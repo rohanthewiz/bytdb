@@ -28,6 +28,9 @@ func numParams(st Statement) int {
 		for _, v := range s.Set {
 			note(v)
 		}
+		for _, ex := range s.SetEx {
+			noteExprVals(ex, note)
+		}
 		notePredVals(s.Where, note)
 	case *Delete:
 		notePredVals(s.Where, note)
@@ -145,6 +148,10 @@ func bindParams(st Statement, args []any) (Statement, error) {
 		c.Set = make(map[string]any, len(s.Set))
 		for k, v := range s.Set {
 			c.Set[k] = sub(v)
+		}
+		c.SetEx = make(map[string]Expr, len(s.SetEx))
+		for k, ex := range s.SetEx {
+			c.SetEx[k] = bindExpr(ex, sub)
 		}
 		c.Where = bindBool(s.Where, sub)
 		return &c, nil

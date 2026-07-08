@@ -83,6 +83,13 @@ func TestDescribe(t *testing.T) {
 			params:  []bytdb.ColType{bytdb.TString, bytdb.TInt, bytdb.TInt},
 		},
 		{
+			// A placeholder inside a SET expression infers as the target
+			// column's type.
+			q:       `update users set age = age + $1 where id = $2`,
+			command: "UPDATE",
+			params:  []bytdb.ColType{bytdb.TInt, bytdb.TInt},
+		},
+		{
 			q:       `delete from users where age < $1`,
 			command: "DELETE",
 			params:  []bytdb.ColType{bytdb.TInt},
@@ -127,6 +134,7 @@ func TestDescribeErrors(t *testing.T) {
 		{`select nope from users`, "no such column"},
 		{`insert into users (id, nope) values ($1, $2)`, "no such column"},
 		{`update users set nope = $1`, "no such column"},
+		{`update users set nope = age + $1`, "no such column"},
 		{`select city from users group by city having sum(name) > $1`, "numeric"},
 	} {
 		st, err := d.Prepare(c.q)

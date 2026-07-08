@@ -928,7 +928,7 @@ func (p *parser) update() (Statement, error) {
 	if err := p.expectKw("set"); err != nil {
 		return nil, err
 	}
-	u := &Update{Table: table, Set: map[string]any{}}
+	u := &Update{Table: table, Set: map[string]any{}, SetEx: map[string]Expr{}}
 	for {
 		col, err := p.ident("a column name")
 		if err != nil {
@@ -937,14 +937,32 @@ func (p *parser) update() (Statement, error) {
 		if err := p.expectOp("="); err != nil {
 			return nil, err
 		}
-		val, err := p.literal()
+		ex, err := p.expression()
 		if err != nil {
 			return nil, err
+		}
+		// Aggregates and windows have no row set to aggregate over in an
+		// UPDATE; Postgres rejects them here too.
+		if findAgg(ex) != AggNone {
+			return nil, serr.New("aggregate functions are not allowed in UPDATE")
+		}
+		if hasWindowExpr(ex) {
+			return nil, serr.New("window functions are not allowed in UPDATE")
 		}
 		if _, dup := u.Set[col]; dup {
 			return nil, serr.New("duplicate column in SET", "column", col)
 		}
-		u.Set[col] = val
+		if _, dup := u.SetEx[col]; dup {
+			return nil, serr.New("duplicate column in SET", "column", col)
+		}
+		// A bare literal (or $n placeholder) keeps the pre-expression
+		// representation: Set values coerce once per statement and skip
+		// per-row evaluation. Everything else evaluates per row.
+		if lit, ok := ex.(*ExLit); ok {
+			u.Set[col] = lit.Val
+		} else {
+			u.SetEx[col] = ex
+		}
 		if !p.acceptOp(",") {
 			break
 		}
@@ -1351,6 +1369,22 @@ func findAgg(e Expr) AggFunc {
 			found = a.Fn
 		}
 		return true
+	})
+	return found
+}
+
+// hasWindowExpr reports a window call anywhere in an expression, not
+// descending into subqueries (their windows are their own).
+func hasWindowExpr(e Expr) bool {
+	found := false
+	walkExpr(e, func(sub Expr) bool {
+		if _, isSub := sub.(*ExSub); isSub {
+			return false
+		}
+		if _, ok := sub.(*ExWindow); ok {
+			found = true
+		}
+		return !found
 	})
 	return found
 }

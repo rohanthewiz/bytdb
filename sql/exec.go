@@ -762,6 +762,13 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 			}
 			setOrds[col] = ord
 		}
+		for col := range s.SetEx {
+			ord := desc.ColIndex(col)
+			if ord < 0 {
+				return serr.New("no such column", "table", s.Table, "column", col)
+			}
+			setOrds[col] = ord
+		}
 		// CHECK expressions must judge the row tx.Update will actually
 		// store, so the SET values coerce to their column types before
 		// the check row is built — a quoted '5' into an int column has
@@ -793,10 +800,41 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 			return err
 		}
 		for _, rv := range rows {
+			// SET expressions evaluate against the pre-update row (SET age
+			// = age + 1 reads the old age; Postgres semantics), then coerce
+			// string results to the column type exactly like a quoted
+			// literal would. The merged map starts from the uncoerced
+			// literal Set — tx.Update applies its own coercion to those,
+			// preserving the literal-only path's behavior byte for byte.
+			set := s.Set
+			if len(s.SetEx) > 0 {
+				set = make(map[string]any, len(s.Set)+len(s.SetEx))
+				for col, v := range s.Set {
+					set[col] = v
+				}
+				env.row = rv
+				for col, ex := range s.SetEx {
+					v, err := evalEx(env, ex)
+					if err != nil {
+						return err
+					}
+					cv, err := coerceLit(v, desc.Columns[setOrds[col]].Type)
+					if err != nil {
+						return serr.Wrap(err, "table", s.Table, "column", col)
+					}
+					set[col] = cv
+				}
+			}
 			if len(checks) > 0 {
 				nv := slices.Clone(rv)
 				for col, v := range setVals {
 					nv[setOrds[col]] = v
+				}
+				// Expression results are already evaluated and coerced in
+				// the merged map; the check row must judge those values,
+				// not the expressions' raw text.
+				for col := range s.SetEx {
+					nv[setOrds[col]] = set[col]
 				}
 				if err := checkRow(env, s.Table, checks, nv); err != nil {
 					return err
@@ -806,7 +844,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 			for i, ord := range desc.PKCols {
 				pk[i] = rv[ord]
 			}
-			ok, err := tx.Update(s.Table, pk, s.Set)
+			ok, err := tx.Update(s.Table, pk, set)
 			if err != nil {
 				return err
 			}
