@@ -814,7 +814,42 @@ func (p *parser) insert() (Statement, error) {
 			break
 		}
 	}
+	if ins.Ret, err = p.returningClause(); err != nil {
+		return nil, err
+	}
 	return ins, nil
+}
+
+// returningClause parses [RETURNING * | item, ...] at the end of an
+// INSERT, UPDATE, or DELETE; nil when the clause is absent. Items are
+// select-list items (expressions with optional aliases, t.*), but
+// there is no row set to aggregate or window over, so those are
+// rejected here, as in Postgres.
+func (p *parser) returningClause() (*Returning, error) {
+	if !p.acceptKw("returning") {
+		return nil, nil
+	}
+	if p.acceptOp("*") {
+		return &Returning{Star: true}, nil
+	}
+	ret := &Returning{}
+	for {
+		it, err := p.selectListItem()
+		if err != nil {
+			return nil, err
+		}
+		if it.Agg != AggNone || findAgg(it.Ex) != AggNone {
+			return nil, serr.New("aggregate functions are not allowed in RETURNING")
+		}
+		if it.Ex != nil && hasWindowExpr(it.Ex) {
+			return nil, serr.New("window functions are not allowed in RETURNING")
+		}
+		ret.Items = append(ret.Items, it)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return ret, nil
 }
 
 func (p *parser) selectStmt() (Statement, error) {
@@ -1021,6 +1056,9 @@ func (p *parser) update() (Statement, error) {
 			return nil, err
 		}
 	}
+	if u.Ret, err = p.returningClause(); err != nil {
+		return nil, err
+	}
 	return u, nil
 }
 
@@ -1037,6 +1075,9 @@ func (p *parser) deleteStmt() (Statement, error) {
 		if d.Where, err = p.boolExpr(false); err != nil {
 			return nil, err
 		}
+	}
+	if d.Ret, err = p.returningClause(); err != nil {
+		return nil, err
 	}
 	return d, nil
 }

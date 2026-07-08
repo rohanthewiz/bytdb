@@ -15,11 +15,11 @@
 //	CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 //	DROP INDEX idx [ON t]
 //	EXPLAIN statement
-//	INSERT INTO t [(c, ...)] VALUES (v, ...), ...
+//	INSERT INTO t [(c, ...)] VALUES (v, ...), ... [RETURNING items]
 //	SELECT * | items FROM tables [WHERE ...] [GROUP BY c, ...] [HAVING ...]
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
-//	UPDATE t SET c = v, ... [WHERE ...]
-//	DELETE FROM t [WHERE ...]
+//	UPDATE t SET c = v, ... [WHERE ...] [RETURNING items]
+//	DELETE FROM t [WHERE ...] [RETURNING items]
 //	BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
 //	SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 //
@@ -149,9 +149,21 @@
 // costs are shown (bytdb has no cost model), and EXPLAIN ANALYZE is
 // rejected rather than pretending to instrument execution.
 //
+// INSERT, UPDATE, and DELETE take a RETURNING clause: a select list
+// (expressions, aliases, * and t.*, but no aggregates or window
+// functions — there is no row set to fold) evaluated against each
+// affected row and returned like a SELECT's rows, while the command
+// tag still reports the write. INSERT returns rows as stored —
+// identity columns filled, values coerced to their column types — so
+// RETURNING id is how a client reads back server-generated keys;
+// UPDATE returns the post-update image; DELETE returns each row as it
+// was. The clause runs inside the statement's transaction and sees
+// exactly the rows it wrote.
+//
 // Statements may use $1-style placeholders wherever a literal may
 // appear: comparison values in WHERE, ON, and HAVING, INSERT values,
-// and UPDATE SET values (LIMIT and OFFSET take literal counts only).
+// UPDATE SET values, and RETURNING expressions (LIMIT and OFFSET take
+// literal counts only).
 // Exec binds its trailing arguments to them, and Prepare parses a
 // statement once for repeated execution. Parameters are numbered: a
 // statement takes exactly as many values as its highest $n, and the

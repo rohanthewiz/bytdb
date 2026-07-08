@@ -458,12 +458,23 @@ type CreateIndex struct {
 // resolved by name across tables.
 type DropIndex struct{ Name, Table string }
 
+// Returning is the RETURNING clause of an INSERT, UPDATE, or DELETE:
+// a select list evaluated against each affected row — as stored for
+// INSERT (identity columns filled, values coerced), post-update for
+// UPDATE, and as it was for DELETE. Star is RETURNING * (Items then
+// empty); a nil *Returning field means no clause.
+type Returning struct {
+	Star  bool
+	Items []SelectItem
+}
+
 // Insert is INSERT INTO t [(cols)] VALUES (lit, ...), .... Values are
 // parsed literals: int64, float64, string, bool, or nil.
 type Insert struct {
 	Table string
 	Cols  []string // nil: values in declared column order
 	Rows  [][]any
+	Ret   *Returning
 }
 
 // GroupItem is one GROUP BY key: a column reference, an integer
@@ -540,12 +551,14 @@ type Update struct {
 	Set   map[string]any
 	SetEx map[string]Expr
 	Where BoolExpr
+	Ret   *Returning
 }
 
 // Delete is DELETE FROM t [WHERE ...].
 type Delete struct {
 	Table string
 	Where BoolExpr
+	Ret   *Returning
 }
 
 // TxnKind distinguishes the transaction-control statements.

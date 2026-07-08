@@ -187,29 +187,48 @@ func (t *Txn) desc(table string) (*TableDesc, error) {
 
 // Insert stores one row within the transaction (see Engine.Insert).
 func (t *Txn) Insert(table string, vals ...any) error {
+	_, err := t.InsertReturning(table, vals...)
+	return err
+}
+
+// InsertReturning is Insert returning the row as stored: identity
+// columns filled and values coerced to their column types.
+func (t *Txn) InsertReturning(table string, vals ...any) (Row, error) {
 	desc, err := t.desc(table)
 	if err != nil {
-		return err
+		return Row{}, err
 	}
-	if err := insertRow(t.tx, desc, vals); err != nil {
-		return serr.Wrap(err, "op", "insert", "table", table)
+	stored, err := insertRow(t.tx, desc, vals)
+	if err != nil {
+		return Row{}, serr.Wrap(err, "op", "insert", "table", table)
 	}
-	return nil
+	return Row{Desc: desc, Vals: stored}, nil
 }
 
 // Update modifies a row within the transaction (see Engine.Update).
 // A failed update stages no writes, so the transaction remains
 // committable if the error is handled.
 func (t *Txn) Update(table string, pkVals []any, set map[string]any) (bool, error) {
+	_, updated, err := t.UpdateReturning(table, pkVals, set)
+	return updated, err
+}
+
+// UpdateReturning is Update returning the row as stored after the
+// update. A false updated means the row does not exist (the Row is
+// then zero).
+func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (Row, bool, error) {
 	desc, err := t.desc(table)
 	if err != nil {
-		return false, err
+		return Row{}, false, err
 	}
-	updated, err := updateRow(t.tx, desc, pkVals, set)
+	newVals, updated, err := updateRow(t.tx, desc, pkVals, set)
 	if err != nil {
-		return false, serr.Wrap(err, "op", "update", "table", table)
+		return Row{}, false, serr.Wrap(err, "op", "update", "table", table)
 	}
-	return updated, nil
+	if !updated {
+		return Row{}, false, nil
+	}
+	return Row{Desc: desc, Vals: newVals}, true, nil
 }
 
 // Delete removes a row within the transaction (see Engine.Delete).

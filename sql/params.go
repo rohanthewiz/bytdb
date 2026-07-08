@@ -24,6 +24,7 @@ func numParams(st Statement) int {
 				note(v)
 			}
 		}
+		noteReturningVals(s.Ret, note)
 	case *Update:
 		for _, v := range s.Set {
 			note(v)
@@ -32,8 +33,10 @@ func numParams(st Statement) int {
 			noteExprVals(ex, note)
 		}
 		notePredVals(s.Where, note)
+		noteReturningVals(s.Ret, note)
 	case *Delete:
 		notePredVals(s.Where, note)
+		noteReturningVals(s.Ret, note)
 	case *Select:
 		noteSelectVals(s, note)
 	case *Explain:
@@ -92,6 +95,19 @@ func noteCondVals(e BoolExpr, note func(any)) {
 	}
 }
 
+// noteReturningVals feeds every literal in a RETURNING list to note.
+func noteReturningVals(r *Returning, note func(any)) {
+	if r == nil {
+		return
+	}
+	for _, it := range r.Items {
+		if it.IsLit {
+			note(it.Lit)
+		}
+		noteExprVals(it.Ex, note)
+	}
+}
+
 func noteExprVals(e Expr, note func(any)) {
 	walkExpr(e, func(sub Expr) bool {
 		switch n := sub.(type) {
@@ -142,6 +158,7 @@ func bindParams(st Statement, args []any) (Statement, error) {
 			}
 			c.Rows[i] = r
 		}
+		c.Ret = bindReturning(s.Ret, sub)
 		return &c, nil
 	case *Update:
 		c := *s
@@ -154,10 +171,12 @@ func bindParams(st Statement, args []any) (Statement, error) {
 			c.SetEx[k] = bindExpr(ex, sub)
 		}
 		c.Where = bindBool(s.Where, sub)
+		c.Ret = bindReturning(s.Ret, sub)
 		return &c, nil
 	case *Delete:
 		c := *s
 		c.Where = bindBool(s.Where, sub)
+		c.Ret = bindReturning(s.Ret, sub)
 		return &c, nil
 	case *Select:
 		return bindSelect(s, sub), nil
@@ -206,6 +225,23 @@ func bindSelect(s *Select, sub func(any) any) *Select {
 	copy(c.Union, s.Union)
 	for i := range c.Union {
 		c.Union[i].Sel = bindSelect(c.Union[i].Sel, sub)
+	}
+	return &c
+}
+
+// bindReturning clones a RETURNING list with placeholders substituted.
+func bindReturning(r *Returning, sub func(any) any) *Returning {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	c.Items = make([]SelectItem, len(r.Items))
+	copy(c.Items, r.Items)
+	for i := range c.Items {
+		if c.Items[i].IsLit {
+			c.Items[i].Lit = sub(c.Items[i].Lit)
+		}
+		c.Items[i].Ex = bindExpr(c.Items[i].Ex, sub)
 	}
 	return &c
 }

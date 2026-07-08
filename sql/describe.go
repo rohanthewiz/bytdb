@@ -83,6 +83,9 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 				}
 			}
 		}
+		if err := describeReturning(lk, st.Table, st.Ret, info); err != nil {
+			return err
+		}
 	case *Update:
 		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
 		if err != nil {
@@ -111,12 +114,18 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
 			return err
 		}
+		if err := describeReturning(lk, st.Table, st.Ret, info); err != nil {
+			return err
+		}
 	case *Delete:
 		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
 		if err != nil {
 			return err
 		}
 		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
+			return err
+		}
+		if err := describeReturning(lk, st.Table, st.Ret, info); err != nil {
 			return err
 		}
 	case *Select:
@@ -133,6 +142,27 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		}
 		info.Cols, info.Types = res.Cols, res.Types
 	}
+	return nil
+}
+
+// describeReturning fills info's output shape from a DML statement's
+// RETURNING list — the piece that lets a wire client's Describe see
+// row-returning INSERT/UPDATE/DELETE. A nil ret leaves info empty
+// (the statement returns no rows). Placeholders inside RETURNING
+// expressions stay untyped; they present as text on the wire.
+func describeReturning(lk tableLookup, table string, ret *Returning, info *StmtInfo) error {
+	if ret == nil {
+		return nil
+	}
+	sc, err := buildScope(lk, []FromItem{{Table: table}})
+	if err != nil {
+		return err
+	}
+	res := &Result{}
+	if _, _, err := projectSelect(sc, &Select{Star: ret.Star, Items: ret.Items}, res); err != nil {
+		return err
+	}
+	info.Cols, info.Types = res.Cols, res.Types
 	return nil
 }
 

@@ -146,11 +146,11 @@ ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
 ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 CREATE [UNIQUE] INDEX idx ON t (c, ...)
 DROP INDEX idx [ON t]
-INSERT INTO t [(cols)] VALUES (...), (...)
+INSERT INTO t [(cols)] VALUES (...), (...) [RETURNING items]
 SELECT * | items FROM tables [WHERE ...] [GROUP BY ...] [HAVING ...]
        [ORDER BY item [DESC], ...] [LIMIT n] [OFFSET n]
-UPDATE t SET c = v, ... [WHERE ...]
-DELETE FROM t [WHERE ...]
+UPDATE t SET c = v, ... [WHERE ...] [RETURNING items]
+DELETE FROM t [WHERE ...] [RETURNING items]
 BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
 SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 ```

@@ -686,6 +686,7 @@ func orderCmp(a, b any) int {
 }
 
 func (d *DB) execInsert(s *Insert) (*Result, error) {
+	res := &Result{}
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
@@ -707,8 +708,12 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 			return err
 		}
 		var env *exEnv
-		if len(checks) > 0 {
+		if len(checks) > 0 || s.Ret != nil {
 			env = d.tableEnv(tx, s.Table, desc)
+		}
+		rp, err := resolveReturning(env, s.Ret, res)
+		if err != nil {
+			return err
 		}
 		for _, row := range s.Rows {
 			vals := row
@@ -722,24 +727,40 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 				}
 			}
 			// Arity mismatches fall through to the engine's error.
-			if env != nil && len(vals) == len(desc.Columns) {
+			if len(checks) > 0 && len(vals) == len(desc.Columns) {
 				if err := checkRow(env, s.Table, checks, vals); err != nil {
 					return err
 				}
 			}
-			if err := tx.Insert(s.Table, vals...); err != nil {
+			if rp == nil {
+				if err := tx.Insert(s.Table, vals...); err != nil {
+					return err
+				}
+				continue
+			}
+			// RETURNING sees the row as stored: identity columns filled,
+			// values coerced.
+			stored, err := tx.InsertReturning(s.Table, vals...)
+			if err != nil {
 				return err
 			}
+			out, err := rp.row(env, stored.Vals)
+			if err != nil {
+				return err
+			}
+			res.Rows = append(res.Rows, out)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Result{RowsAffected: len(s.Rows)}, nil
+	res.RowsAffected = len(s.Rows)
+	return res, nil
 }
 
 func (d *DB) execUpdate(s *Update) (*Result, error) {
+	res := &Result{}
 	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
@@ -791,6 +812,10 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		// Materialize matching rows before writing: updates move rows
 		// and index entries under a live scan.
 		env := d.tableEnv(tx, s.Table, desc)
+		rp, err := resolveReturning(env, s.Ret, res)
+		if err != nil {
+			return err
+		}
 		var rows [][]any
 		err = scanPlan(tx, s.Table, pl, env, func(r bytdb.Row) bool {
 			rows = append(rows, r.Vals)
@@ -844,23 +869,42 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 			for i, ord := range desc.PKCols {
 				pk[i] = rv[ord]
 			}
-			ok, err := tx.Update(s.Table, pk, set)
+			if rp == nil {
+				ok, err := tx.Update(s.Table, pk, set)
+				if err != nil {
+					return err
+				}
+				if ok {
+					affected++
+				}
+				continue
+			}
+			// RETURNING sees the row as stored after the update.
+			updated, ok, err := tx.UpdateReturning(s.Table, pk, set)
 			if err != nil {
 				return err
 			}
-			if ok {
-				affected++
+			if !ok {
+				continue
 			}
+			affected++
+			out, err := rp.row(env, updated.Vals)
+			if err != nil {
+				return err
+			}
+			res.Rows = append(res.Rows, out)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Result{RowsAffected: affected}, nil
+	res.RowsAffected = affected
+	return res, nil
 }
 
 func (d *DB) execDelete(s *Delete) (*Result, error) {
+	res := &Result{}
 	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
@@ -871,25 +915,63 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		if err != nil {
 			return err
 		}
-		pks, err := collectPKs(tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc))
+		env := d.tableEnv(tx, s.Table, desc)
+		rp, err := resolveReturning(env, s.Ret, res)
 		if err != nil {
 			return err
 		}
-		for _, pk := range pks {
+		if rp == nil {
+			pks, err := collectPKs(tx, s.Table, desc, pl, env)
+			if err != nil {
+				return err
+			}
+			for _, pk := range pks {
+				ok, err := tx.Delete(s.Table, pk...)
+				if err != nil {
+					return err
+				}
+				if ok {
+					affected++
+				}
+			}
+			return nil
+		}
+		// RETURNING sees each row as it was: materialize the full rows
+		// (not just their keys) before deleting under the scan.
+		var rows [][]any
+		err = scanPlan(tx, s.Table, pl, env, func(r bytdb.Row) bool {
+			rows = append(rows, r.Vals)
+			return true
+		})
+		if err != nil {
+			return err
+		}
+		for _, rv := range rows {
+			pk := make([]any, len(desc.PKCols))
+			for i, ord := range desc.PKCols {
+				pk[i] = rv[ord]
+			}
 			ok, err := tx.Delete(s.Table, pk...)
 			if err != nil {
 				return err
 			}
-			if ok {
-				affected++
+			if !ok {
+				continue
 			}
+			affected++
+			out, err := rp.row(env, rv)
+			if err != nil {
+				return err
+			}
+			res.Rows = append(res.Rows, out)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Result{RowsAffected: affected}, nil
+	res.RowsAffected = affected
+	return res, nil
 }
 
 // tableEnv is the evaluation environment for a single-table scan

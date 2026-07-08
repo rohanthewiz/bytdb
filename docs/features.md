@@ -72,6 +72,28 @@ INSERT INTO users (name) VALUES ('edsger');          -- id 11, no collision
   non-nullable with a serial-style `column_default`, which is what
   introspecting ORMs key "omit on insert" off.
 
+## RETURNING
+
+`INSERT`, `UPDATE`, and `DELETE` take a `RETURNING` clause — the piece ORMs
+can't live without once ids are server-generated:
+
+```sql
+INSERT INTO users (name) VALUES ('ada') RETURNING id;          -- read the id back
+UPDATE users SET age = age + 1 WHERE id = 1 RETURNING *;       -- post-update image
+DELETE FROM users WHERE city = 'nyc' RETURNING id, name;       -- rows as they were
+```
+*(verified in `sql/returning_test.go` and, over the wire,
+`pgwire/returning_test.go`)*
+
+- The clause is a select list: expressions, aliases, `*` and `t.*`
+  (aggregates and window functions are rejected, as in Postgres).
+- `INSERT` returns rows **as stored** — identity columns filled, values
+  coerced; `UPDATE` the post-update image; `DELETE` each row as it was.
+- The command tag still reports the write (`INSERT 0 2`), rows ride along —
+  wire clients and `Describe` see the row shape exactly as Postgres sends it.
+- Embedded callers get the same without SQL: `Engine.InsertReturning` /
+  `Txn.InsertReturning` / `Txn.UpdateReturning`.
+
 ## Indexes
 
 ```sql
@@ -149,7 +171,7 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
 ### Parameters
 
 `$1`-style placeholders anywhere a literal may appear — WHERE/ON/HAVING,
-INSERT values, UPDATE SET (not LIMIT/OFFSET):
+INSERT values, UPDATE SET, RETURNING expressions (not LIMIT/OFFSET):
 
 ```go
 db.Exec(`INSERT INTO users VALUES ($1, $2, $3)`, 1, "ada", 36)
