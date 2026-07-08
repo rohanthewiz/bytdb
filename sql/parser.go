@@ -54,6 +54,12 @@ func parseCheckExpr(src string) (Expr, error) {
 // levels) while costing only a few thousand Go frames.
 const maxParseDepth = 1000
 
+// maxParamNumber bounds $n placeholders. 65535 is the wire protocol's
+// own ceiling (Bind carries the parameter count as an int16), so no
+// conforming client can bind more; see the tParam case in literal for
+// why an unbounded $n is dangerous.
+const maxParamNumber = 65535
+
 type parser struct {
 	toks []token
 	src  string // for slicing verbatim expression text (CHECK constraints)
@@ -2026,6 +2032,16 @@ func (p *parser) literal() (any, error) {
 		n, err := strconv.Atoi(t.text[1:])
 		if err != nil || n < 1 {
 			return nil, serr.New("parameter numbers start at $1", "param", t.text, "pos", fmt.Sprint(t.pos))
+		}
+		// Cap $n at the wire protocol's limit (Bind counts parameters in
+		// an int16). The statement's parameter count is the highest $n it
+		// mentions, and Describe allocates one slot per parameter — an
+		// unbounded $n would let a 30-byte query demand a terabyte-sized
+		// allocation, which is a fatal OOM, not a recoverable error.
+		// (Found by FuzzMessageParse.)
+		if n > maxParamNumber {
+			return nil, serr.New("parameter number out of range",
+				"param", t.text, "max", fmt.Sprint(maxParamNumber), "pos", fmt.Sprint(t.pos))
 		}
 		p.advance()
 		return Param(n), nil

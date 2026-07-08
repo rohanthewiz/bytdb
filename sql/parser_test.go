@@ -1,8 +1,8 @@
 package sql
 
 import (
-	"strings"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/rohanthewiz/bytdb"
@@ -420,12 +420,12 @@ func TestParseDepthLimit(t *testing.T) {
 	}
 	// 100k levels of each self-nesting construct; all must error.
 	for _, src := range []string{
-		deep(100_000, "(", "1", ")"),                      // parens: expression -> exprPrimary cycle
-		deep(100_000, "(select ", "1", ")"),               // scalar subqueries
-		deep(100_000, "not ", "true", ""),                 // NOT chains: exprNot self-recursion
+		deep(100_000, "(", "1", ")"),                       // parens: expression -> exprPrimary cycle
+		deep(100_000, "(select ", "1", ")"),                // scalar subqueries
+		deep(100_000, "not ", "true", ""),                  // NOT chains: exprNot self-recursion
 		deep(100_000, "case when true then ", "1", " end"), // CASE nesting
-		deep(100_000, "-(", "1", ")"),                     // unary minus + parens
-		deep(100_000, "abs(", "1", ")"),                   // function-call nesting
+		deep(100_000, "-(", "1", ")"),                      // unary minus + parens
+		deep(100_000, "abs(", "1", ")"),                    // function-call nesting
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%.40q...): expected a depth error", src)
@@ -439,5 +439,30 @@ func TestParseDepthLimit(t *testing.T) {
 		if _, err := Parse(src); err != nil {
 			t.Errorf("Parse(%.40q...): unexpected error: %v", src, err)
 		}
+	}
+}
+
+// TestParamNumberLimit locks in the $n cap: the statement's parameter
+// count is its highest $n, and Describe allocates one slot per
+// parameter, so an unbounded $n turns a tiny query into an OOM-fatal
+// terabyte allocation. (Found by FuzzMessageParse: `select
+// $100000000000`.)
+func TestParamNumberLimit(t *testing.T) {
+	for _, src := range []string{
+		"select $100000000000",
+		"select $65536",
+		"select 1 where 1 = $99999999999999999999", // overflows int too
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Errorf("Parse(%q): expected a parameter-number error", src)
+		}
+	}
+	// The cap itself is usable.
+	st, err := Parse("select $65535")
+	if err != nil {
+		t.Fatalf("Parse($65535): %v", err)
+	}
+	if n := numParams(st); n != 65535 {
+		t.Fatalf("numParams = %d; want 65535", n)
 	}
 }

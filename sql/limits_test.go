@@ -42,8 +42,8 @@ func TestCmpFloatNaN(t *testing.T) {
 		a, b float64
 		want int
 	}{
-		{nan, nan, 0},   // NaN groups with itself
-		{nan, inf, 1},   // NaN above even +Inf
+		{nan, nan, 0}, // NaN groups with itself
+		{nan, inf, 1}, // NaN above even +Inf
 		{inf, nan, -1},
 		{nan, 1.5, 1},
 		{1.5, nan, -1},

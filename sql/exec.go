@@ -224,10 +224,19 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 	}
 	if v != nil && lit != nil {
 		if _, ok := compareVals(v, lit); !ok {
-			if s, isS := v.(string); isS {
-				if cv, err := coerceLit(s, kindOf(lit)); err == nil {
-					v = cv
-				}
+			if _, isS := v.(string); isS {
+				// A text column (or text expression) against a typed
+				// non-string value. Postgres refuses this outright
+				// ("operator does not exist: text < integer") and so do
+				// we: silently parsing the *stored* text per row would
+				// make `text_col < 5` match or skip rows by whether each
+				// value happens to parse — data-dependent semantics, not
+				// a type rule. Note the asymmetry with the branch below:
+				// a string *literal* is untyped and adapts to the column
+				// (Postgres quoted-literal semantics), but a string
+				// *column value* is typed text and never converts.
+				return triUnknown, serr.New(fmt.Sprintf(
+					"operator does not exist: text %s %s", opText(op), kindOf(lit)))
 			} else if s, isS := lit.(string); isS {
 				if cl, err := coerceLit(s, kindOf(v)); err == nil {
 					lit = cl
