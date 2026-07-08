@@ -223,8 +223,19 @@ descriptor in one atomic kv transaction.
 
 ## Compaction
 
-The WAL grows with every write, so a background compaction periodically rewrites
-it as one set-record per live key — the log doubles as a snapshot. The rewrite
+There is no separate data file — **the WAL *is* the database file**. Every
+write appends a record to one append-only log, and `Open` reconstructs the
+in-memory trees by replaying it from the top. A file that only ever grows
+accumulates dead weight: a key overwritten 100 times has 100 records but only
+the last one matters, and deleted or expired keys still occupy space as stale
+records.
+
+**Compaction is what "resetting" or "snapshotting" the WAL means here.**
+`Compact()` rewrites the log down to its minimal equivalent — one set-record
+per live key (TTL deadlines preserved, already-expired keys dropped entirely) —
+so the log doubles as a snapshot. There is no separate checkpoint file and no
+in-place truncation: the snapshot lives as the head of the freshly rewritten
+log, and replaying the new file reconstructs identical state. The rewrite
 pauses writers only twice, briefly:
 
 ```mermaid
@@ -235,8 +246,23 @@ flowchart TD
     ren --> done([old or new complete log —<br/>never a mix])
 ```
 
-A crash at any point leaves either the old complete log or the new one; a
-leftover `.compact` temp is discarded at next open.
+The compacted file is literally *snapshot + recent tail*: writers keep
+appending to the live log while the snapshot streams, and pause B splices those
+records onto the end of the temp file before the atomic rename swaps it into
+place. A crash at any point leaves either the old complete log or the new one —
+never a mix; a leftover `.compact` temp is discarded at next open, since it
+only ever becomes live via the rename.
+
+Auto-compaction runs in the background once the log is ≥ 32 MB **and** has
+grown ≥ 100% past its post-last-compaction size — roughly whenever the log
+doubles. Both thresholds are tunable, auto-compaction can be disabled, and
+`Compact()` can be called manually at any time.
+
+One design consequence: because compaction rewrites the entire live dataset,
+its cost is proportional to **data size, not garbage size** — fine for the
+single-file embedded use case, and the reason the growth-percentage trigger
+exists (compact only when there's enough garbage to make the rewrite
+worthwhile).
 
 ## TTL
 
