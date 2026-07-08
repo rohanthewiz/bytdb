@@ -33,7 +33,16 @@ func (r Row) Col(name string) any {
 //
 // The descriptor is resolved inside the write transaction, so an
 // insert serialized after a CreateIndex maintains the new index.
+//
+// An error does not guarantee the row was discarded: the kv store
+// makes a commit visible to new snapshots before its WAL append and
+// fsync, so a failure there can leave the row readable until the
+// process restarts (replay then drops it). Treat an error as
+// "durability unknown," not "definitely not applied."
 func (e *Engine) Insert(table string, vals ...any) error {
+	if err := e.checkReentrantWrite("insert"); err != nil {
+		return err
+	}
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.desc(table)
 		if err != nil {
@@ -93,6 +102,9 @@ func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) erro
 // key column moves the row; every affected index entry moves with it,
 // with uniqueness re-checked. All checks run before any write.
 func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, error) {
+	if err := e.checkReentrantWrite("update"); err != nil {
+		return false, err
+	}
 	updated := false
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.desc(table)
@@ -223,6 +235,9 @@ func (e *Engine) Get(table string, pkVals ...any) (Row, bool, error) {
 // Delete removes the row with the given primary-key values — and its
 // secondary-index entries, atomically — reporting whether it existed.
 func (e *Engine) Delete(table string, pkVals ...any) (bool, error) {
+	if err := e.checkReentrantWrite("delete"); err != nil {
+		return false, err
+	}
 	existed := false
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.desc(table)

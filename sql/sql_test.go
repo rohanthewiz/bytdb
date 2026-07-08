@@ -995,3 +995,62 @@ func TestSQLAggregateExpressions(t *testing.T) {
 		t.Fatalf("got %v", res.Rows)
 	}
 }
+
+// TestUpdateCheckCoercion locks in that UPDATE evaluates CHECK
+// constraints against the coerced SET values — what the engine will
+// store — for every way a value can arrive (literal, quoted literal,
+// parameter), and that a NULL SET value passes a comparison check
+// (unknown is not a violation, per SQL).
+func TestUpdateCheckCoercion(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table items (id int primary key, price int check (price > 0))`)
+	exec(t, d, `insert into items values (1, 10)`)
+
+	// Quoted literals and string params coerce to int before the check.
+	for _, c := range []struct {
+		q    string
+		args []any
+	}{
+		{`update items set price = '5' where id = 1`, nil},
+		{`update items set price = $1 where id = 1`, []any{"6"}},
+		{`update items set price = $1 where id = 1`, []any{int64(7)}},
+	} {
+		res, err := d.Exec(c.q, c.args...)
+		if err != nil || res.RowsAffected != 1 {
+			t.Fatalf("%s %v: affected=%v err=%v", c.q, c.args, res, err)
+		}
+	}
+
+	// The violation direction must still fail, coerced or not.
+	for _, c := range []struct {
+		q    string
+		args []any
+	}{
+		{`update items set price = '-5' where id = 1`, nil},
+		{`update items set price = $1 where id = 1`, []any{"-5"}},
+		{`update items set price = 0 where id = 1`, nil},
+	} {
+		if _, err := d.Exec(c.q, c.args...); err == nil ||
+			!strings.Contains(err.Error(), "violates check constraint") {
+			t.Fatalf("%s %v: want check violation, got %v", c.q, c.args, err)
+		}
+	}
+
+	// NULL is not definitely false for price > 0: the update proceeds.
+	res, err := d.Exec(`update items set price = null where id = 1`)
+	if err != nil || res.RowsAffected != 1 {
+		t.Fatalf("SET NULL: affected=%v err=%v", res, err)
+	}
+
+	// A malformed quoted literal is a type error, not a check violation.
+	if _, err := d.Exec(`update items set price = 'abc' where id = 1`); err == nil ||
+		!strings.Contains(err.Error(), "invalid input syntax") {
+		t.Fatalf("SET 'abc': want invalid input syntax, got %v", err)
+	}
+
+	// Nothing above corrupted the row: price is NULL from the SET NULL.
+	res = exec(t, d, `select price from items where id = 1`)
+	if len(res.Rows) != 1 || res.Rows[0][0] != nil {
+		t.Fatalf("final price: %v", res.Rows)
+	}
+}

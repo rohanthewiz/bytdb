@@ -44,11 +44,37 @@ func parseCheckExpr(src string) (Expr, error) {
 	return ex, nil
 }
 
+// maxParseDepth bounds expression nesting. The parser is recursive
+// descent, so input depth is call-stack depth: without a bound, a few
+// MB of nested parens is a fatal stack overflow that recover() cannot
+// catch — a remote kill for any server embedding the parser. The limit
+// also bounds AST depth, protecting every later recursive walk
+// (lowering, planning, evaluation). 1000 is far beyond any real query
+// (Postgres's default max_stack_depth allows on the order of a hundred
+// levels) while costing only a few thousand Go frames.
+const maxParseDepth = 1000
+
 type parser struct {
 	toks []token
 	src  string // for slicing verbatim expression text (CHECK constraints)
 	i    int
+
+	// depth is the current expression-nesting depth; see enter.
+	depth int
 }
+
+// enter counts one level of expression nesting, rejecting input past
+// maxParseDepth; every call must pair with leave (via defer).
+func (p *parser) enter() error {
+	p.depth++
+	if p.depth > maxParseDepth {
+		return serr.New("expression is nested too deeply",
+			"limit", fmt.Sprint(maxParseDepth), "pos", fmt.Sprint(p.cur().pos))
+	}
+	return nil
+}
+
+func (p *parser) leave() { p.depth-- }
 
 func (p *parser) cur() token { return p.toks[p.i] }
 
@@ -1337,7 +1363,19 @@ func flippable(op PredOp) bool {
 // loosest, then AND, NOT, comparisons (with IS NULL, IN, ANY, and
 // COLLATE postfixes), additive (+ - ||), multiplicative (* / %),
 // unary sign, and the :: cast and [] subscript postfixes.
-func (p *parser) expression() (Expr, error) { return p.exprOr() }
+//
+// Every nesting construct — parens, subqueries, CASE, function and
+// list arguments — re-enters through here, so this single depth guard
+// bounds them all. The one exception is NOT, which recurses inside
+// exprNot without coming back through expression; exprNot guards
+// itself.
+func (p *parser) expression() (Expr, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+	return p.exprOr()
+}
 
 func (p *parser) exprOr() (Expr, error) {
 	e, err := p.exprAnd()
@@ -1379,6 +1417,12 @@ func (p *parser) exprAnd() (Expr, error) {
 
 func (p *parser) exprNot() (Expr, error) {
 	if p.acceptKw("not") {
+		// NOT chains recurse here directly, bypassing expression's
+		// depth guard, so each NOT counts its own level.
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		e, err := p.exprNot()
 		if err != nil {
 			return nil, err

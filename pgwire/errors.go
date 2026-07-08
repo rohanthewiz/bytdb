@@ -58,6 +58,23 @@ func sqlstate(msg string, hasPos bool) string {
 	return "XX000"
 }
 
+// fatalBody builds an ErrorResponse body at FATAL severity — the
+// severity Postgres uses when the server, not the statement, is about
+// to end the connection (e.g. the idle-in-transaction timeout).
+func fatalBody(msg, code string) wbuf {
+	var b wbuf
+	b.byte('S')
+	b.cstr("FATAL")
+	b.byte('V')
+	b.cstr("FATAL")
+	b.byte('C')
+	b.cstr(code)
+	b.byte('M')
+	b.cstr(msg)
+	b.byte(0)
+	return b
+}
+
 // noticeBody builds a NoticeResponse body for a statement warning —
 // the same field format as ErrorResponse, at WARNING severity, with
 // the code Postgres uses for the same notice.

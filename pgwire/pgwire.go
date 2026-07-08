@@ -39,14 +39,30 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rohanthewiz/bytdb/sql"
 )
+
+// DefaultIdleTxTimeout is the idle-in-transaction timeout applied when
+// Server.IdleTxTimeout is zero. Postgres ships with this protection
+// off, but bytdb cannot afford that default: a writable transaction
+// block holds the engine's single global writer lock, so one client
+// that sends BEGIN and then goes silent stalls every other
+// connection's writes server-wide, indefinitely.
+const DefaultIdleTxTimeout = 5 * time.Minute
 
 // Server serves one bytdb SQL frontend to any number of concurrent
 // client connections.
 type Server struct {
 	db *sql.DB
+
+	// IdleTxTimeout bounds how long a connection may sit idle inside a
+	// transaction block before the server terminates it (rolling the
+	// block back, which releases the engine's writer lock). Zero means
+	// DefaultIdleTxTimeout; negative disables the timeout. Set before
+	// Serve.
+	IdleTxTimeout time.Duration
 
 	nextPID atomic.Int32
 
@@ -54,6 +70,17 @@ type Server struct {
 	ln     net.Listener
 	conns  map[net.Conn]struct{}
 	closed bool
+}
+
+// idleTxTimeout resolves the configured timeout to an effective one.
+func (s *Server) idleTxTimeout() time.Duration {
+	switch {
+	case s.IdleTxTimeout < 0:
+		return 0 // disabled
+	case s.IdleTxTimeout == 0:
+		return DefaultIdleTxTimeout
+	}
+	return s.IdleTxTimeout
 }
 
 // NewServer wraps a SQL frontend for serving.
@@ -106,6 +133,8 @@ func (s *Server) Serve(ln net.Listener) error {
 			}()
 			c := &conn{
 				srv:     s,
+				nc:      nc,
+				idleTx:  s.idleTxTimeout(),
 				r:       bufio.NewReader(nc),
 				w:       bufio.NewWriter(nc),
 				sess:    s.db.NewSession(),

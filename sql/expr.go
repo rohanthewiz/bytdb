@@ -533,6 +533,11 @@ func compileRegex(pat string, insensitive bool) (*regexp.Regexp, error) {
 
 // --- arithmetic and concatenation ---
 
+// errIntRange matches Postgres's message (SQLSTATE 22003) for integer
+// arithmetic whose true result does not fit int64. A fresh error per
+// use keeps serr stack context; the constructor is trivial.
+func errIntRange() error { return serr.New("bigint out of range") }
+
 func arith(op string, l, r any) (any, error) {
 	if op == "||" {
 		if l == nil || r == nil {
@@ -546,16 +551,39 @@ func arith(op string, l, r any) (any, error) {
 	li, lInt := l.(int64)
 	ri, rInt := r.(int64)
 	if lInt && rInt {
+		// Integer arithmetic is checked: on overflow Postgres raises
+		// "bigint out of range", and silently wrapping two's-complement
+		// (MaxInt64 + 1 = MinInt64) would corrupt results instead.
 		switch op {
 		case "+":
+			// Overflow iff the true sum leaves int64's range, tested
+			// against the bound before computing.
+			if (ri > 0 && li > math.MaxInt64-ri) || (ri < 0 && li < math.MinInt64-ri) {
+				return nil, errIntRange()
+			}
 			return li + ri, nil
 		case "-":
+			if (ri < 0 && li > math.MaxInt64+ri) || (ri > 0 && li < math.MinInt64+ri) {
+				return nil, errIntRange()
+			}
 			return li - ri, nil
 		case "*":
-			return li * ri, nil
+			p := li * ri
+			// Divide the wrapped product back out: a mismatch means it
+			// overflowed. The one case division can't witness is
+			// -1 * MinInt64, because MinInt64 / -1 itself wraps (to
+			// MinInt64, matching), so it is tested explicitly.
+			if li != 0 && (p/li != ri || (li == -1 && ri == math.MinInt64)) {
+				return nil, errIntRange()
+			}
+			return p, nil
 		case "/":
 			if ri == 0 {
 				return nil, serr.New("division by zero")
+			}
+			// The single overflowing quotient: -MinInt64 is not an int64.
+			if li == math.MinInt64 && ri == -1 {
+				return nil, errIntRange()
 			}
 			return li / ri, nil
 		case "%":

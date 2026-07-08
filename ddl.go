@@ -2,7 +2,7 @@ package bytdb
 
 import (
 	"encoding/binary"
-	"encoding/json"
+	"fmt"
 	"slices"
 
 	"github.com/rohanthewiz/btypedb"
@@ -73,6 +73,9 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		desc.PKCols = append(desc.PKCols, ord)
 	}
 
+	if err := e.checkReentrantWrite("create table"); err != nil {
+		return nil, err
+	}
 	e.ddlMu.Lock()
 	defer e.ddlMu.Unlock()
 	if e.Table(name) != nil {
@@ -82,24 +85,30 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		// Allocate the next table ID from the sequence key.
 		next := uint64(firstUserTableID)
 		if raw, ok := tx.Get(seqKey()); ok {
+			// A malformed sequence value is corruption, and restarting
+			// the sequence at the default would be worse than failing:
+			// the next table would take an ID an existing table already
+			// owns, silently interleaving their rows.
+			if len(raw) != 8 {
+				return serr.New("table-id sequence value is corrupt",
+					"len", fmt.Sprint(len(raw)))
+			}
 			next = binary.BigEndian.Uint64(raw)
 		}
 		desc.ID = next
 		if err := tx.Set(seqKey(), binary.BigEndian.AppendUint64(nil, next+1)); err != nil {
 			return err
 		}
-		blob, err := json.Marshal(desc)
+		blob, err := marshalDesc(desc)
 		if err != nil {
-			return serr.Wrap(err, "op", "encode table descriptor")
+			return err
 		}
 		return tx.Set(descKey(name), blob)
 	})
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "create table", "table", name)
 	}
-	e.mu.Lock()
-	e.tables[name] = desc
-	e.mu.Unlock()
+	e.publishDesc(name, desc)
 	return desc, nil
 }
 
@@ -113,19 +122,20 @@ func (e *Engine) DropTable(name string) error {
 		return serr.New("no such table", "table", name)
 	}
 	prefix := tableSpace(desc.ID)
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
 			return err
 		}
 		if _, err := tx.Delete(descKey(name)); err != nil {
 			return err
 		}
-		e.mu.Lock()
-		delete(e.tables, name)
-		e.mu.Unlock()
+		e.publishDescPending(name, nil)
 		return nil
 	})
 	if err != nil {
+		// The closure removed the table from the in-memory catalog
+		// before the failed commit; put it back (see restoreDesc).
+		e.restoreDesc(name, desc)
 		return serr.Wrap(err, "op", "drop table", "table", name)
 	}
 	return nil
@@ -156,7 +166,7 @@ func (e *Engine) AddColumn(table string, col Column) error {
 	col.ID = desc.NextColID
 	desc.NextColID++
 	desc.Columns = append(desc.Columns, col)
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		if col.NotNull && hasRows(tx, desc.ID) {
 			return serr.New(`column "` + col.Name + `" of relation "` + table +
 				`" contains null values`)
@@ -164,6 +174,7 @@ func (e *Engine) AddColumn(table string, col Column) error {
 		return e.writeDescIn(tx, table, desc)
 	})
 	if err != nil {
+		e.restoreDesc(table, old)
 		return serr.Wrap(err, "op", "add column", "table", table, "column", col.Name)
 	}
 	return nil
@@ -253,7 +264,7 @@ func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) 
 	}
 	desc := old.clone()
 	desc.Checks = append(desc.Checks, ck)
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		if validate != nil {
 			for row, err := range scanRows(tx, old, nil, nil) {
 				if err != nil {
@@ -267,6 +278,7 @@ func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) 
 		return e.writeDescIn(tx, table, desc)
 	})
 	if err != nil {
+		e.restoreDesc(table, old)
 		return serr.Wrap(err, "op", "add check", "table", table, "constraint", ck.Name)
 	}
 	return nil
@@ -294,26 +306,31 @@ func (e *Engine) DropCheck(table, name string) (bool, error) {
 }
 
 // writeDesc persists an updated descriptor and publishes it as the
-// last step inside the transaction (callers hold ddlMu).
+// last step inside the transaction (callers hold ddlMu). A failed
+// commit un-publishes (see restoreDesc), so the in-memory catalog
+// never advertises a descriptor that missed the disk.
 func (e *Engine) writeDesc(table string, desc *TableDesc) error {
-	return e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	old := e.Table(table)
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		return e.writeDescIn(tx, table, desc)
 	})
+	if err != nil {
+		e.restoreDesc(table, old)
+	}
+	return err
 }
 
 // writeDescIn stages the descriptor write and publishes it within an
 // existing transaction (callers hold ddlMu).
 func (e *Engine) writeDescIn(tx *btypedb.Tx[string, []byte], table string, desc *TableDesc) error {
-	blob, err := json.Marshal(desc)
+	blob, err := marshalDesc(desc)
 	if err != nil {
-		return serr.Wrap(err, "op", "encode table descriptor")
+		return err
 	}
 	if err := tx.Set(descKey(table), blob); err != nil {
 		return err
 	}
-	e.mu.Lock()
-	e.tables[table] = desc
-	e.mu.Unlock()
+	e.publishDescPending(table, desc)
 	return nil
 }
 

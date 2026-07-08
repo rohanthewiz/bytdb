@@ -401,3 +401,33 @@ func TestExprParams(t *testing.T) {
 		t.Fatalf("got %v", res.Rows)
 	}
 }
+
+// TestExprIntOverflow locks in checked bigint arithmetic: results that
+// leave int64's range must raise "bigint out of range" (as Postgres
+// does), never wrap silently — MaxInt64 * 2 used to return -2.
+func TestExprIntOverflow(t *testing.T) {
+	d := openDB(t)
+
+	for _, q := range []string{
+		`select 9223372036854775807 + 1`,
+		`select -9223372036854775807 - 2`,
+		`select 9223372036854775807 * 2`,
+		`select -9223372036854775807 * -2`,
+		`select -1 * (-9223372036854775807 - 1)`,
+		`select (-9223372036854775807 - 1) * -1`,
+		`select (-9223372036854775807 - 1) / -1`,
+	} {
+		if _, err := d.Exec(q); err == nil || !strings.Contains(err.Error(), "bigint out of range") {
+			t.Errorf("%s: want bigint out of range, got %v", q, err)
+		}
+	}
+
+	// The extremes themselves still compute.
+	res := exec(t, d, `select 9223372036854775806 + 1, -9223372036854775807 - 1,
+		(-9223372036854775807 - 1) % -1, 3037000499 * 3037000499`)
+	want := [][]any{{int64(9223372036854775807), int64(-9223372036854775808),
+		int64(0), int64(9223372030926249001)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v", res.Rows)
+	}
+}

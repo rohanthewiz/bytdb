@@ -1,7 +1,6 @@
 package bytdb
 
 import (
-	"encoding/json"
 	"iter"
 	"slices"
 
@@ -84,7 +83,7 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 	desc := old.clone()
 	desc.Indexes = append(desc.Indexes, idx)
 
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		// Collect entries in one stable pass over the rows, then write.
 		type entry struct {
 			key string
@@ -115,21 +114,21 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 				return err
 			}
 		}
-		blob, err := json.Marshal(desc)
+		blob, err := marshalDesc(desc)
 		if err != nil {
-			return serr.Wrap(err, "op", "encode table descriptor")
+			return err
 		}
 		if err := tx.Set(descKey(table), blob); err != nil {
 			return err
 		}
 		// Publish last, so any error path above leaves the catalog
 		// untouched; a write serialized after this commit sees the index.
-		e.mu.Lock()
-		e.tables[table] = desc
-		e.mu.Unlock()
+		// If the commit itself fails, the caller un-publishes (restoreDesc).
+		e.publishDescPending(table, desc)
 		return nil
 	})
 	if err != nil {
+		e.restoreDesc(table, old)
 		return nil, serr.Wrap(err, "op", "create index", "table", table, "index", name)
 	}
 	return desc.Index(name), nil
@@ -150,24 +149,23 @@ func (e *Engine) DropIndex(table, name string) error {
 	desc := old.clone()
 	desc.Indexes = slices.DeleteFunc(desc.Indexes, func(x IndexDesc) bool { return x.Name == name })
 
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		prefix := indexPrefix(desc.ID, idx.ID)
 		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
 			return err
 		}
-		blob, err := json.Marshal(desc)
+		blob, err := marshalDesc(desc)
 		if err != nil {
-			return serr.Wrap(err, "op", "encode table descriptor")
+			return err
 		}
 		if err := tx.Set(descKey(table), blob); err != nil {
 			return err
 		}
-		e.mu.Lock()
-		e.tables[table] = desc
-		e.mu.Unlock()
+		e.publishDescPending(table, desc)
 		return nil
 	})
 	if err != nil {
+		e.restoreDesc(table, old)
 		return serr.Wrap(err, "op", "drop index", "table", table, "index", name)
 	}
 	return nil
@@ -179,7 +177,17 @@ func (e *Engine) DropIndex(table, name string) error {
 // unbounded. The scan runs on a consistent snapshot.
 func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
-		desc, err := e.desc(table)
+		// A snapshot keeps the entry -> row lookup consistent and
+		// lock-free while we iterate. readSnapshot pairs it with a
+		// matching catalog view, so the descriptor resolved below can
+		// never describe an index the snapshot's backfill predates.
+		t, err := e.readSnapshot()
+		if err != nil {
+			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))
+			return
+		}
+		defer t.Rollback()
+		desc, err := t.desc(table)
 		if err != nil {
 			yield(Row{}, err)
 			return
@@ -189,15 +197,7 @@ func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, e
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
-		// A snapshot keeps the entry -> row lookup consistent and
-		// lock-free while we iterate.
-		tx, err := e.kv.Begin(false)
-		if err != nil {
-			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))
-			return
-		}
-		defer tx.Rollback()
-		scanIndexRows(tx, desc, idx, from, to)(yield)
+		scanIndexRows(t.tx, desc, idx, from, to)(yield)
 	}
 }
 
@@ -207,7 +207,13 @@ func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, e
 // included (see ScanRangeRev). See ScanIndex on the snapshot caveat.
 func (e *Engine) ScanIndexRev(table, index string, from, to []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
-		desc, err := e.desc(table)
+		t, err := e.readSnapshot()
+		if err != nil {
+			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))
+			return
+		}
+		defer t.Rollback()
+		desc, err := t.desc(table)
 		if err != nil {
 			yield(Row{}, err)
 			return
@@ -217,13 +223,7 @@ func (e *Engine) ScanIndexRev(table, index string, from, to []any, toIncl bool) 
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
-		tx, err := e.kv.Begin(false)
-		if err != nil {
-			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))
-			return
-		}
-		defer tx.Rollback()
-		scanIndexRowsRev(tx, desc, idx, from, to, toIncl)(yield)
+		scanIndexRowsRev(t.tx, desc, idx, from, to, toIncl)(yield)
 	}
 }
 

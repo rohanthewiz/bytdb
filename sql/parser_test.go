@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"strings"
 	"reflect"
 	"testing"
 
@@ -405,6 +406,38 @@ func TestParseAggregateErrors(t *testing.T) {
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%q): expected error", src)
+		}
+	}
+}
+
+// TestParseDepthLimit locks in the recursion guard: pathologically
+// nested input must come back as a normal parse error, never a fatal
+// stack overflow (which recover() cannot catch — it would kill any
+// server embedding the parser).
+func TestParseDepthLimit(t *testing.T) {
+	deep := func(n int, open, mid, close string) string {
+		return "select " + strings.Repeat(open, n) + mid + strings.Repeat(close, n)
+	}
+	// 100k levels of each self-nesting construct; all must error.
+	for _, src := range []string{
+		deep(100_000, "(", "1", ")"),                      // parens: expression -> exprPrimary cycle
+		deep(100_000, "(select ", "1", ")"),               // scalar subqueries
+		deep(100_000, "not ", "true", ""),                 // NOT chains: exprNot self-recursion
+		deep(100_000, "case when true then ", "1", " end"), // CASE nesting
+		deep(100_000, "-(", "1", ")"),                     // unary minus + parens
+		deep(100_000, "abs(", "1", ")"),                   // function-call nesting
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Errorf("Parse(%.40q...): expected a depth error", src)
+		}
+	}
+	// Reasonable nesting still parses.
+	for _, src := range []string{
+		deep(500, "(", "1", ")"),
+		deep(500, "not ", "true", ""),
+	} {
+		if _, err := Parse(src); err != nil {
+			t.Errorf("Parse(%.40q...): unexpected error: %v", src, err)
 		}
 	}
 }

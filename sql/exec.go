@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"fmt"
 	"iter"
+	"math"
 	"slices"
 
 	"github.com/rohanthewiz/bytdb"
@@ -282,7 +283,8 @@ func (p *plan) matches(env *exEnv, row bytdb.Row) (bool, error) {
 }
 
 // compareVals orders two non-NULL values. ok is false for NULLs and
-// for incomparable kinds; int64 and float64 compare numerically.
+// for incomparable kinds; int64 and float64 compare numerically, with
+// NaN handled per Postgres (see cmpFloat).
 func compareVals(a, b any) (int, bool) {
 	if a == nil || b == nil {
 		return 0, false
@@ -293,14 +295,14 @@ func compareVals(a, b any) (int, bool) {
 		case int64:
 			return cmp.Compare(av, bv), true
 		case float64:
-			return cmp.Compare(float64(av), bv), true
+			return cmpFloat(float64(av), bv), true
 		}
 	case float64:
 		switch bv := b.(type) {
 		case float64:
-			return cmp.Compare(av, bv), true
+			return cmpFloat(av, bv), true
 		case int64:
-			return cmp.Compare(av, float64(bv)), true
+			return cmpFloat(av, float64(bv)), true
 		}
 	case string:
 		if bv, ok := b.(string); ok {
@@ -316,6 +318,25 @@ func compareVals(a, b any) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// cmpFloat compares floats with Postgres's NaN convention: NaN is
+// greater than every non-NaN value and equal to itself, so it sorts
+// last ascending and groups deterministically. Go's cmp.Compare does
+// the opposite (NaN smallest), which would silently diverge in ORDER
+// BY, MIN/MAX, and range comparisons. The store rejects NaN in keys,
+// but expressions and parameters can still produce one.
+func cmpFloat(a, b float64) int {
+	an, bn := math.IsNaN(a), math.IsNaN(b)
+	switch {
+	case an && bn:
+		return 0
+	case an:
+		return 1
+	case bn:
+		return -1
+	}
+	return cmp.Compare(a, b)
 }
 
 func btoi(b bool) int {
@@ -370,7 +391,7 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 				vals = append(vals, v)
 			}
 			rows = append(rows, vals)
-			return len(keys) > 0 || s.Limit < 0 || int64(len(rows)) < s.Offset+s.Limit
+			return len(keys) > 0 || s.Limit < 0 || int64(len(rows)) < satAdd(s.Offset, s.Limit)
 		})
 		if err != nil {
 			return err
@@ -425,6 +446,17 @@ func sortOffsetProject(res *Result, rows [][]any, keys []sortKey, proj []projEnt
 		}
 		res.Rows[i] = out
 	}
+}
+
+// satAdd adds two non-negative int64s, saturating at MaxInt64. The
+// collection cutoff above is OFFSET+LIMIT; huge (but individually
+// valid) values would wrap that sum negative and silently truncate
+// the result after the first row.
+func satAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 type sortKey struct {
@@ -721,6 +753,25 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 			}
 			setOrds[col] = ord
 		}
+		// CHECK expressions must judge the row tx.Update will actually
+		// store, so the SET values coerce to their column types before
+		// the check row is built — a quoted '5' into an int column has
+		// to check as the integer 5, not the string "5". run() already
+		// literal-coerced s.Set against the engine's current catalog,
+		// but this executor resolves the transaction's catalog; coercing
+		// here (a no-op on already-coerced values) removes that hidden
+		// coupling instead of trusting it.
+		setVals := s.Set
+		if len(checks) > 0 {
+			setVals = make(map[string]any, len(s.Set))
+			for col, v := range s.Set {
+				cv, err := coerceLit(v, desc.Columns[setOrds[col]].Type)
+				if err != nil {
+					return serr.Wrap(err, "table", s.Table, "column", col)
+				}
+				setVals[col] = cv
+			}
+		}
 		// Materialize matching rows before writing: updates move rows
 		// and index entries under a live scan.
 		env := d.tableEnv(tx, s.Table, desc)
@@ -735,7 +786,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		for _, rv := range rows {
 			if len(checks) > 0 {
 				nv := slices.Clone(rv)
-				for col, v := range s.Set {
+				for col, v := range setVals {
 					nv[setOrds[col]] = v
 				}
 				if err := checkRow(env, s.Table, checks, nv); err != nil {

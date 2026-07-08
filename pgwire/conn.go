@@ -8,8 +8,14 @@ package pgwire
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"net"
+	"os"
+	"runtime/debug"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/sql"
@@ -17,10 +23,12 @@ import (
 )
 
 type conn struct {
-	srv  *Server
-	r    *bufio.Reader
-	w    *bufio.Writer
-	sess *sql.Session
+	srv    *Server
+	nc     net.Conn      // the raw socket, for read deadlines
+	idleTx time.Duration // idle-in-transaction timeout; 0 = disabled
+	r      *bufio.Reader
+	w      *bufio.Writer
+	sess   *sql.Session
 
 	stmts   map[string]*prepared
 	portals map[string]*portal
@@ -58,13 +66,42 @@ func (p *prepared) paramOID(i int) uint32 {
 }
 
 // run drives the session; the connection closes when it returns.
-func (c *conn) run() error {
+//
+// A recover() fence turns any panic reachable from parse, plan, or
+// execution into the loss of this one connection instead of the whole
+// process — without it, one hostile or buggy statement would kill
+// every other client's connection and the server itself. The client
+// gets a best-effort ErrorResponse (XX000 internal_error), and the
+// deferred close in Serve tears down the socket and rolls back any
+// open transaction, so the engine's writer lock is never leaked.
+func (c *conn) run() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "pgwire: panic on connection: %v\n%s", r, debug.Stack())
+			c.send(msgErrorResponse, errorBody(
+				serr.New("internal error", "panic", fmt.Sprint(r)), "", 0))
+			c.w.Flush()
+			err = serr.New("panic on connection", "panic", fmt.Sprint(r))
+		}
+	}()
 	if err := c.startup(); err != nil {
 		return err
 	}
 	for {
+		c.armIdleDeadline()
 		typ, body, err := readMessage(c.r)
 		if err != nil {
+			if c.idleTxExpired(err) {
+				// The client sat inside a transaction block past the
+				// timeout. Terminate it as Postgres does (FATAL 25P03);
+				// the deferred session close in Serve rolls the block
+				// back, releasing the engine's writer lock.
+				c.send(msgErrorResponse, fatalBody(
+					"terminating connection due to idle-in-transaction timeout",
+					"25P03"))
+				c.w.Flush()
+				return serr.New("idle-in-transaction timeout")
+			}
 			return err
 		}
 		if c.inErr && typ != msgSync && typ != msgTerminate {
@@ -101,6 +138,30 @@ func (c *conn) run() error {
 			return err
 		}
 	}
+}
+
+// armIdleDeadline sets a read deadline while the session is inside a
+// transaction block ('T' or failed 'E' — both hold state; a writable
+// block holds the engine's global writer lock) and clears it when the
+// session is idle, where a silent client costs nothing.
+func (c *conn) armIdleDeadline() {
+	if c.nc == nil || c.idleTx <= 0 {
+		return
+	}
+	if c.sess.Status() != sql.TxIdle {
+		c.nc.SetReadDeadline(time.Now().Add(c.idleTx))
+	} else {
+		c.nc.SetReadDeadline(time.Time{})
+	}
+}
+
+// idleTxExpired reports whether a read error is the armed
+// idle-in-transaction deadline firing, as opposed to any other I/O
+// failure.
+func (c *conn) idleTxExpired(err error) bool {
+	var ne net.Error
+	return c.idleTx > 0 && c.sess.Status() != sql.TxIdle &&
+		errors.As(err, &ne) && ne.Timeout()
 }
 
 // startup performs the handshake: refuse SSL and GSS encryption
@@ -154,9 +215,18 @@ func (c *conn) startup() error {
 	}
 }
 
+// testPanicQuery, when set to a non-empty string, makes the matching
+// simple query panic. Only tests set it, to exercise run's recover
+// fence — there is no known statement that panics, and there should
+// never be one. Atomic because connection goroutines read it.
+var testPanicQuery atomic.Value // string
+
 // simpleQuery runs a Query buffer: each ;-separated statement in
 // order, stopping at the first error. Results are always text format.
 func (c *conn) simpleQuery(q string) {
+	if s, _ := testPanicQuery.Load().(string); s != "" && strings.TrimSpace(q) == s {
+		panic("test-injected panic: " + q)
+	}
 	parts := splitStatements(q)
 	if len(parts) == 0 {
 		c.send(msgEmptyQuery, nil)

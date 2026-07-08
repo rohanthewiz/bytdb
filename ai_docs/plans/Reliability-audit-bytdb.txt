@@ -1,0 +1,47 @@
+ Reliability audit — bytdb
+
+  Four parallel audits (durability/crash-safety, panics/error paths, concurrency, test gaps) plus coverage profiling. Overall: the foundation is genuinely solid — btypedb gives you
+  CRC-framed WAL records, torn-tail truncation on open, all-or-nothing batch replay, fsync-before-ack by default, and crash-safe compaction, all tested with fault injection on its side.
+  Multi-key commits (row + index entries) are atomic across restart. The suite (175 tests, ~82% statements) is strong. What remains falls into three tiers.
+
+  Tier 1 — Confirmed bugs (I verified each in the code, one empirically)
+
+  1. Parser stack overflow = remote server kill. No depth limit in the recursive-descent parser (sql/parser.go); ~2M nested parens crashes the process with a fatal error that recover()
+  cannot catch. Fix: a depth counter in expression()/exprPrimary() returning a parse error past a bound (~1000).
+  2. No recover() in per-connection goroutines (pgwire/pgwire.go:100-118). Any SQL-layer panic on one connection kills every connection. Fix: defer recover() in the connection handler →
+  ErrorResponse + close that one connection. (Independent of #1, which recover can't help.)
+  3. DDL publishes the in-memory catalog before commit (index.go:128,166, ddl.go:123,315 — CreateIndex, DropIndex, DropTable, and all ALTER paths via writeDescIn). If the WAL
+  append/fsync fails, the engine believes a schema that isn't on disk — phantom indexes, wrong results, divergence until restart. Subtlety the audits cross-checked:
+  publish-inside-the-closure is deliberate (writerMu is held through commit, closing an insert race), so the fix is to restore the old descriptor when kv.Update returns an error — not
+  to move the publish.
+  4. Silent int64 overflow (sql/expr.go:548-556): SELECT 9223372036854775807 * 2 returns -2 instead of erroring. Use math/bits checked ops → "bigint out of range".
+  5. UPDATE evaluates CHECK against the raw uncoerced SET value (exec.go:738-740): nv[ord] = v uses the raw literal while tx.Update coerces, so SET price='5' checks the string, not the
+  int. Coerce before building the check row.
+
+  Tier 2 — Robustness gaps
+
+  6. Idle-in-transaction holds the global writer lock forever — a client that sends BEGIN then goes silent blocks all writes server-wide, no timeout (session.go, pgwire/conn.go). Needs
+  a read/idle deadline.
+  7. Read Txn can see a catalog newer than its data snapshot (txn.go:35-54): the kv snapshot and catalog snapshot aren't taken atomically, so a concurrent CreateIndex can hand a reader
+  an index with zero backfilled entries → missing rows.
+  8. Offset+Limit overflow truncates results (exec.go:373); NaN sorts opposite to Postgres (low); no SIGTERM handler in bytdbd (safe only under default SyncAlways);
+  binary.BigEndian.Uint64 on the seq key without a length check (ddl.go:85).
+
+  Tier 3 — Test coverage (the "maximize coverage" ask)
+
+  Zero fuzz targets and only one concurrency test in the whole tree. Highest-value additions:
+  - 3 fuzz targets: FuzzTupleRoundTrip/FuzzTupleOrder (the codec is the correctness foundation), FuzzParse (would have caught #1), FuzzMessageParse (wire frames). Seed corpus = existing
+  test fixtures.
+  - 2 property tests: index-scan ≡ seq-scan+filter+sort over random queries (turns the whole planner into a checked equivalence); ScanRangeRev ≡ reverse(ScanRange).
+  - Crash/fault tests (none exist at the bytdb level — all reopen tests Close cleanly first): reopen-after-kill under SyncNever, corrupt/truncated-file open, DDL commit-failure leaves
+  catalog unchanged (locks in #3).
+  - Concurrency tests under -race: read-Txn + CreateIndex (#7), idle-BEGIN blocking (#6), panicking statement leaves server up (#2).
+  - Semantic gaps: UPDATE that scans the index it mutates; NOT IN/IN with NULL in list; multi-row DML via secondary-index range; LIMIT 0/LIMIT $1; statement-level rollback when row 3 of
+  5 fails a constraint.
+
+  ---
+  Suggested sequence: fix #1 and #2 first (they turn a small query into a full crash — highest severity, small diffs), then the correctness bugs #3–#5, adding the regression test
+  alongside each. Then the fuzz + property + crash tests, which would have caught most of this class automatically.
+
+  Want me to start implementing? I'd do it as a milestone: Tier-1 fixes with their regression tests, then the fuzz/property/crash test suites. I can also produce a shareable artifact of
+  this report if useful.
