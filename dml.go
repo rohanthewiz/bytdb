@@ -44,7 +44,7 @@ func (e *Engine) Insert(table string, vals ...any) error {
 		return err
 	}
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
-		desc, err := e.desc(table)
+		desc, err := e.descFromView(tx, table)
 		if err != nil {
 			return err
 		}
@@ -107,7 +107,7 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 	}
 	updated := false
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
-		desc, err := e.desc(table)
+		desc, err := e.descFromView(tx, table)
 		if err != nil {
 			return err
 		}
@@ -214,22 +214,30 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 	return true, nil
 }
 
-// Get returns the row with the given primary-key values.
+// Get returns the row with the given primary-key values. Descriptor
+// and row come from one snapshot, so the decode always matches the
+// schema the row was stored under (as of that snapshot).
 func (e *Engine) Get(table string, pkVals ...any) (Row, bool, error) {
-	desc, err := e.desc(table)
-	if err != nil {
-		return Row{}, false, err
-	}
-	key, err := fullPKKey(desc, pkVals)
-	if err != nil {
-		return Row{}, false, err
-	}
-	val, ok := e.kv.Get(key)
-	if !ok {
-		return Row{}, false, nil
-	}
-	row, err := decodeRow(desc, key, val)
-	return row, err == nil, err
+	var row Row
+	found := false
+	err := e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
+		desc, err := e.descFromView(tx, table)
+		if err != nil {
+			return err
+		}
+		key, err := fullPKKey(desc, pkVals)
+		if err != nil {
+			return err
+		}
+		val, ok := tx.Get(key)
+		if !ok {
+			return nil
+		}
+		row, err = decodeRow(desc, key, val)
+		found = err == nil
+		return err
+	})
+	return row, found, err
 }
 
 // Delete removes the row with the given primary-key values — and its
@@ -240,7 +248,7 @@ func (e *Engine) Delete(table string, pkVals ...any) (bool, error) {
 	}
 	existed := false
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
-		desc, err := e.desc(table)
+		desc, err := e.descFromView(tx, table)
 		if err != nil {
 			return err
 		}
@@ -289,15 +297,22 @@ func (e *Engine) Scan(table string) iter.Seq2[Row, error] {
 
 // ScanRange iterates rows with fromPK <= pk < toPK in primary-key
 // order. Bounds may be partial prefixes of a composite key (e.g. just
-// the first key column); a nil bound is unbounded on that side.
+// the first key column); a nil bound is unbounded on that side. The
+// scan runs on a consistent snapshot, descriptor included.
 func (e *Engine) ScanRange(table string, fromPK, toPK []any) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
-		desc, err := e.desc(table)
+		t, err := e.readSnapshot()
+		if err != nil {
+			yield(Row{}, serr.Wrap(err, "op", "begin scan"))
+			return
+		}
+		defer t.Rollback()
+		desc, err := t.desc(table)
 		if err != nil {
 			yield(Row{}, err)
 			return
 		}
-		scanRows(e.kv, desc, fromPK, toPK)(yield)
+		scanRows(t.tx, desc, fromPK, toPK)(yield)
 	}
 }
 
@@ -340,12 +355,18 @@ func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, erro
 // scan pinned by column equality.
 func (e *Engine) ScanRangeRev(table string, fromPK, toPK []any, toIncl bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
-		desc, err := e.desc(table)
+		t, err := e.readSnapshot()
+		if err != nil {
+			yield(Row{}, serr.Wrap(err, "op", "begin scan"))
+			return
+		}
+		defer t.Rollback()
+		desc, err := t.desc(table)
 		if err != nil {
 			yield(Row{}, err)
 			return
 		}
-		scanRowsRev(e.kv, desc, fromPK, toPK, toIncl)(yield)
+		scanRowsRev(t.tx, desc, fromPK, toPK, toIncl)(yield)
 	}
 }
 

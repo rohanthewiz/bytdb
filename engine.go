@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
-	"maps"
 	"runtime"
 	"slices"
 	"strings"
@@ -176,34 +175,26 @@ func (d *TableDesc) isPK(ordinal int) bool {
 
 // Engine is a relational store in a single btypedb file. It is safe
 // for concurrent use.
+//
+// The kv keyspace is the single source of truth for the catalog:
+// every transaction — read or write — resolves table descriptors from
+// its own kv snapshot, so the schema a transaction sees is exactly the
+// schema of the data it sees, by construction. There is no separate
+// in-memory catalog to keep coherent (an earlier design had one, plus
+// a seqlock to patch the resulting torn-snapshot window); the only
+// in-memory state is a parse cache keyed by descriptor bytes.
 type Engine struct {
 	kv *btypedb.DB[string, []byte]
 
-	// ddlMu serializes schema changes against each other. Schema
-	// visibility for DML is handled differently: writes resolve their
-	// descriptor inside their own kv transaction, and DDL publishes the
-	// new descriptor (under mu) as the last step inside its own — so a
-	// write serialized after an index creation always sees the index.
-	ddlMu sync.Mutex
-
-	mu     sync.RWMutex
-	tables map[string]*TableDesc
-	// catVer versions the catalog, seqlock-style, so read transactions
-	// can make their two snapshots — kv and catalog — atomic without a
-	// lock spanning both. Even = the catalog matches the committed disk
-	// state; odd = a DDL has published its new descriptor but its commit
-	// is still in flight (DDL publishes before commit, deliberately —
-	// see updateDDL). Readers take the catalog only at an even version,
-	// open the kv snapshot, then re-check the version: unchanged proves
-	// the pair describes one moment. On odd they wait on catStable
-	// (closed when the DDL's outcome lands) rather than spinning through
-	// the commit's fsync. This optimistic scheme is deliberate: the
-	// alternative — a lock held across the DDL commit that readers
-	// share — would either invert lock order against writable Begin
-	// (btypedb's writer lock, then mu) or stall every reader behind DDL
-	// queued on a long-lived write transaction.
-	catVer    uint64
-	catStable chan struct{} // non-nil iff catVer is odd
+	// descCache avoids re-parsing descriptor JSON on every resolution.
+	// One entry per table name, validated by blob identity: a hit
+	// counts only when the snapshot's stored bytes equal the cached
+	// ones, so a stale entry can never leak across a DDL — at worst a
+	// reader over an old snapshot re-parses. Parsed descriptors are
+	// immutable (DDL clones and rewrites), so sharing one *TableDesc
+	// across transactions is safe.
+	cacheMu   sync.RWMutex
+	descCache map[string]descCacheEntry
 
 	// writerGID is the ID of the goroutine holding the open writable
 	// transaction (from WriteTxn or Begin(true)), or 0. The kv writer
@@ -215,28 +206,31 @@ type Engine struct {
 
 	// testCommitErr, when non-nil, replaces a successful DDL commit's
 	// result (see updateDDL). Only tests set it, to simulate a WAL
-	// append or fsync failing after the transaction closure — and its
-	// in-closure catalog publish — already ran.
+	// append or fsync failing after the transaction closure ran.
 	testCommitErr error
 }
 
-// updateDDL runs one DDL transaction. DDL publishes its new descriptor
-// inside the closure — deliberately before commit, so a write that the
-// kv store serializes after the commit can never resolve a stale
-// descriptor (e.g. miss a just-created index). The cost of that order
-// is the failure path this wrapper exists for: when the commit itself
-// fails (WAL append, fsync), the in-memory catalog already advertises
-// a schema that never reached disk, and the caller must un-publish it.
-// See restoreDesc.
+type descCacheEntry struct {
+	blob string // the exact stored bytes the desc was parsed from
+	desc *TableDesc
+}
+
+// updateDDL runs one DDL transaction. With the catalog in the kv
+// keyspace, the descriptor write commits — or rolls back — atomically
+// with the schema change's data (backfill, range deletes), so there is
+// no publish/un-publish dance and no window where the engine
+// advertises schema that missed the disk. Concurrent DDL serializes on
+// the kv writer lock; each DDL resolves the descriptor it mutates
+// inside its own transaction, so it always builds on the committed
+// state of the one before it.
 func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error {
 	if err := e.checkReentrantWrite("ddl"); err != nil {
 		return err
 	}
 	if e.testCommitErr != nil {
-		// Simulate the failed commit faithfully: run the closure — so
-		// its catalog publish happens, as it would for real — but roll
-		// the transaction back, leaving disk exactly as a failed WAL
-		// append would: unchanged.
+		// Simulate the failed commit: run the closure, then roll the
+		// transaction back, leaving both disk and the catalog exactly
+		// as a failed WAL append would — unchanged.
 		tx, err := e.kv.Begin(true)
 		if err != nil {
 			return err
@@ -247,62 +241,7 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 		}
 		return e.testCommitErr
 	}
-	err := e.kv.Update(fn)
-	if err == nil {
-		// The publish the closure made pending is now durable; return
-		// the catalog version to even so readers proceed. Failure paths
-		// stabilize in restoreDesc instead, after un-publishing.
-		e.stabilizeCatalog()
-	}
-	return err
-}
-
-// publishDesc installs desc under name (nil removes the entry) as a
-// stable publish: the caller's kv commit has already succeeded, so the
-// catalog version advances by two and stays even (see catVer). Used by
-// CreateTable, which publishes after commit.
-func (e *Engine) publishDesc(name string, desc *TableDesc) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.setDescLocked(name, desc)
-	e.catVer += 2
-}
-
-// publishDescPending installs desc under name while its kv commit is
-// still in flight: the version goes odd, telling readers the catalog
-// is ahead of disk until stabilizeCatalog resolves the outcome. Called
-// from inside DDL transaction closures (callers hold ddlMu, so at most
-// one publish is ever pending).
-func (e *Engine) publishDescPending(name string, desc *TableDesc) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.setDescLocked(name, desc)
-	e.catVer++
-	if e.catVer&1 == 1 {
-		e.catStable = make(chan struct{})
-	}
-}
-
-// stabilizeCatalog marks a pending publish resolved — the DDL commit
-// succeeded, or a failure was rolled back (restoreDesc) — returning
-// the version to even and waking any waiting readers. A no-op when
-// nothing is pending.
-func (e *Engine) stabilizeCatalog() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.catVer&1 == 1 {
-		e.catVer++
-		close(e.catStable)
-		e.catStable = nil
-	}
-}
-
-func (e *Engine) setDescLocked(name string, desc *TableDesc) {
-	if desc == nil {
-		delete(e.tables, name)
-	} else {
-		e.tables[name] = desc
-	}
+	return e.kv.Update(fn)
 }
 
 // checkReentrantWrite refuses a one-shot write, DDL, or nested writable
@@ -338,37 +277,14 @@ func curGID() uint64 {
 	return id
 }
 
-// restoreDesc rolls the in-memory catalog back to old after a failed
-// DDL transaction (a nil old removes the entry, undoing a CreateTable-
-// style publish) and stabilizes the version. Correct in both failure
-// shapes: if the closure failed before publishing, the catalog already
-// equals old (same pointer) and the version is already even — a pure
-// no-op; if the commit failed after the publish, disk still holds old,
-// so this undoes the phantom and resolves the pending version, waking
-// readers. Callers hold ddlMu, so no other DDL can interleave. A
-// one-shot write that begins in the narrow window between the failed
-// commit returning and this restore could still resolve the phantom
-// descriptor — closing that fully needs the catalog inside the kv
-// keyspace (or a commit hook), a planned follow-on.
-func (e *Engine) restoreDesc(name string, old *TableDesc) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.setDescLocked(name, old)
-	if e.catVer&1 == 1 {
-		e.catVer++
-		close(e.catStable)
-		e.catStable = nil
-	}
-}
-
-// Open opens (creating if necessary) the database at path and loads
-// the catalog.
+// Open opens (creating if necessary) the database at path and
+// validates the catalog.
 func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 	kv, err := btypedb.Open(path, btypedb.StringCodec, btypedb.BytesCodec, opts...)
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "open kv store")
 	}
-	e := &Engine{kv: kv, tables: map[string]*TableDesc{}}
+	e := &Engine{kv: kv, descCache: map[string]descCacheEntry{}}
 	if err := e.loadCatalog(); err != nil {
 		kv.Close()
 		return nil, err
@@ -379,12 +295,12 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 // Close closes the underlying store.
 func (e *Engine) Close() error { return e.kv.Close() }
 
-// loadCatalog reads every table descriptor. Unreadable or too-new
-// descriptors fail the open — silently skipping one would hide the
-// table's rows and let a re-CREATE reuse key space an existing table
-// owns — but all offenders are collected first, so one error message
-// names every broken descriptor instead of surfacing them one restart
-// at a time.
+// loadCatalog validates every table descriptor at open, warming the
+// parse cache. Unreadable or too-new descriptors fail the open —
+// silently skipping one would hide the table's rows and let a
+// re-CREATE reuse key space an existing table owns — but all offenders
+// are collected first, so one error message names every broken
+// descriptor instead of surfacing them one restart at a time.
 func (e *Engine) loadCatalog() error {
 	prefix := descTablePrefix()
 	end := string(tuple.PrefixEnd([]byte(prefix)))
@@ -393,18 +309,12 @@ func (e *Engine) loadCatalog() error {
 		if k >= end {
 			break
 		}
-		desc := &TableDesc{}
-		if err := json.Unmarshal(v, desc); err != nil {
+		desc, err := parseDesc(v)
+		if err != nil {
 			bad = append(bad, fmt.Sprintf("%s: %v", descKeyName(k), err))
 			continue
 		}
-		if desc.FormatVersion > descFormatVersion {
-			bad = append(bad, fmt.Sprintf(
-				"%s: descriptor format version %d is newer than this bytdb supports (%d); upgrade bytdb",
-				desc.Name, desc.FormatVersion, descFormatVersion))
-			continue
-		}
-		e.tables[desc.Name] = desc
+		e.cacheStore(desc.Name, string(v), desc)
 	}
 	if len(bad) > 0 {
 		// The offenders go in the message itself, not structured
@@ -414,6 +324,21 @@ func (e *Engine) loadCatalog() error {
 			len(bad), strings.Join(bad, "; ")))
 	}
 	return nil
+}
+
+// parseDesc decodes one stored descriptor, refusing versions from the
+// future (misreading a newer layout is worse than failing).
+func parseDesc(blob []byte) (*TableDesc, error) {
+	desc := &TableDesc{}
+	if err := json.Unmarshal(blob, desc); err != nil {
+		return nil, err
+	}
+	if desc.FormatVersion > descFormatVersion {
+		return nil, fmt.Errorf(
+			"descriptor format version %d is newer than this bytdb supports (%d); upgrade bytdb",
+			desc.FormatVersion, descFormatVersion)
+	}
+	return desc, nil
 }
 
 // descKeyName recovers the table name from a descriptor key for error
@@ -427,51 +352,49 @@ func descKeyName(k string) string {
 	return fmt.Sprintf("key %q", k)
 }
 
-// desc returns the descriptor for a table name.
-func (e *Engine) desc(table string) (*TableDesc, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	d := e.tables[table]
-	if d == nil {
+// tableFromView resolves a table's descriptor from a kv view — the
+// caller's transaction or snapshot, making the schema seen exactly the
+// schema of the data seen. Absent tables return (nil, nil); a stored
+// descriptor that will not parse is an error (possible only through
+// external corruption: loadCatalog validated everything at open, and
+// every writer since was this process).
+func (e *Engine) tableFromView(v kvView, name string) (*TableDesc, error) {
+	blob, ok := v.Get(descKey(name))
+	if !ok {
+		return nil, nil
+	}
+	bs := string(blob)
+	e.cacheMu.RLock()
+	ent, hit := e.descCache[name]
+	e.cacheMu.RUnlock()
+	if hit && ent.blob == bs {
+		return ent.desc, nil
+	}
+	desc, err := parseDesc(blob)
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "decode table descriptor", "table", name)
+	}
+	e.cacheStore(name, bs, desc)
+	return desc, nil
+}
+
+// descFromView is tableFromView with the absent case as an error, for
+// callers that require the table to exist.
+func (e *Engine) descFromView(v kvView, table string) (*TableDesc, error) {
+	desc, err := e.tableFromView(v, table)
+	if err != nil {
+		return nil, err
+	}
+	if desc == nil {
 		return nil, serr.New("no such table", "table", table)
 	}
-	return d, nil
+	return desc, nil
 }
 
-// catalogSnapshot returns a point-in-time view of the catalog.
-// Descriptors are never mutated in place (DDL clones and swaps), so a
-// shallow clone is a consistent snapshot. Writable transactions use
-// this directly: they hold the kv writer lock, which every DDL holds
-// through publish and commit, so their catalog can never be ahead of
-// their data.
-func (e *Engine) catalogSnapshot() map[string]*TableDesc {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return maps.Clone(e.tables)
-}
-
-// stableCatalogSnapshot returns the catalog and its version, waiting
-// out any pending DDL publish first (see catVer): the returned version
-// is always even, so a later equality check against catalogVersion
-// proves no publish landed in between.
-func (e *Engine) stableCatalogSnapshot() (map[string]*TableDesc, uint64) {
-	for {
-		e.mu.RLock()
-		if e.catVer&1 == 0 {
-			snap, ver := maps.Clone(e.tables), e.catVer
-			e.mu.RUnlock()
-			return snap, ver
-		}
-		ch := e.catStable
-		e.mu.RUnlock()
-		<-ch // closed when the pending DDL's outcome lands
-	}
-}
-
-func (e *Engine) catalogVersion() uint64 {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.catVer
+func (e *Engine) cacheStore(name, blob string, desc *TableDesc) {
+	e.cacheMu.Lock()
+	e.descCache[name] = descCacheEntry{blob: blob, desc: desc}
+	e.cacheMu.Unlock()
 }
 
 // kvView is the read surface shared by the store and its transactions;

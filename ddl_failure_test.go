@@ -1,12 +1,12 @@
 package bytdb
 
-// ddl_failure_test.go: the DDL commit-failure paths. Every schema
-// change publishes its new descriptor inside its kv transaction —
-// before commit, deliberately (see updateDDL) — so a failed commit
-// must roll the in-memory catalog back to what disk still holds, or
-// the engine would advertise phantom schema until restart. Failures
-// are injected via testCommitErr, which simulates the WAL append or
-// fsync failing after the closure ran.
+// ddl_failure_test.go: the DDL commit-failure paths. The catalog
+// lives in the kv keyspace, so a schema change's descriptor write
+// commits — or rolls back — atomically with its data: after a failed
+// commit the engine must keep advertising exactly what disk holds,
+// with no phantom schema to un-publish. Failures are injected via
+// testCommitErr, which simulates the WAL append or fsync failing
+// after the transaction closure ran.
 
 import (
 	"errors"

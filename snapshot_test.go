@@ -1,13 +1,14 @@
 package bytdb
 
-// snapshot_test.go: the atomic dual snapshot. A read transaction takes
-// two snapshots — the kv data view and the catalog — and the two must
-// describe the same moment: a reader must never hold a descriptor
-// advertising an index whose backfill its data snapshot predates
-// (ScanIndex over the empty range would silently drop every row), nor
-// one still naming an index whose entries the snapshot has already
-// lost to DropIndex. These tests hammer the create/drop window from
-// concurrent readers; run them under -race.
+// snapshot_test.go: catalog/data snapshot consistency. A reader must
+// never hold a descriptor advertising an index whose backfill its
+// data snapshot predates (ScanIndex over the empty range would
+// silently drop every row), nor one still naming an index whose
+// entries the snapshot has already lost to DropIndex. With the
+// catalog in the kv keyspace the invariant holds by construction —
+// descriptors resolve from the same snapshot as the data — but these
+// tests, written against an earlier two-snapshot design, stay as the
+// regression guard for whatever scheme provides it; run under -race.
 
 import (
 	"path/filepath"
@@ -59,7 +60,7 @@ func TestReadTxnSnapshotConsistency(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { // DDL churn: the publish/commit window under attack
+	go func() { // DDL churn: the commit window under attack
 		defer wg.Done()
 		for !stop.Load() {
 			if _, err := e.CreateIndex("t", "v_idx", false, "v"); err != nil {

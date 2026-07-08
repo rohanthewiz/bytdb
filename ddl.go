@@ -73,15 +73,13 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		desc.PKCols = append(desc.PKCols, ord)
 	}
 
-	if err := e.checkReentrantWrite("create table"); err != nil {
-		return nil, err
-	}
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	if e.Table(name) != nil {
-		return nil, serr.New("table already exists", "table", name)
-	}
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
+		// The existence check lives inside the transaction: the kv
+		// writer lock serializes DDL, so racing CreateTables see each
+		// other's committed descriptor, never a stale catalog.
+		if tx.Contains(descKey(name)) {
+			return serr.New("table already exists", "table", name)
+		}
 		// Allocate the next table ID from the sequence key.
 		next := uint64(firstUserTableID)
 		if raw, ok := tx.Get(seqKey()); ok {
@@ -99,43 +97,30 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		if err := tx.Set(seqKey(), binary.BigEndian.AppendUint64(nil, next+1)); err != nil {
 			return err
 		}
-		blob, err := marshalDesc(desc)
-		if err != nil {
-			return err
-		}
-		return tx.Set(descKey(name), blob)
+		return writeDescIn(tx, name, desc)
 	})
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "create table", "table", name)
 	}
-	e.publishDesc(name, desc)
 	return desc, nil
 }
 
 // DropTable removes a table — descriptor, rows, and every index —
 // atomically.
 func (e *Engine) DropTable(name string) error {
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	desc := e.Table(name)
-	if desc == nil {
-		return serr.New("no such table", "table", name)
-	}
-	prefix := tableSpace(desc.ID)
 	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
+		desc, err := e.descFromView(tx, name)
+		if err != nil {
+			return err
+		}
+		prefix := tableSpace(desc.ID)
 		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
 			return err
 		}
-		if _, err := tx.Delete(descKey(name)); err != nil {
-			return err
-		}
-		e.publishDescPending(name, nil)
-		return nil
+		_, err = tx.Delete(descKey(name))
+		return err
 	})
 	if err != nil {
-		// The closure removed the table from the in-memory catalog
-		// before the failed commit; put it back (see restoreDesc).
-		e.restoreDesc(name, desc)
 		return serr.Wrap(err, "op", "drop table", "table", name)
 	}
 	return nil
@@ -147,34 +132,27 @@ func (e *Engine) DropTable(name string) error {
 // table is empty (existing rows would read it as NULL), checked in
 // the same transaction that publishes the descriptor.
 func (e *Engine) AddColumn(table string, col Column) error {
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	old := e.Table(table)
-	if old == nil {
-		return serr.New("no such table", "table", table)
-	}
 	if col.Name == "" {
 		return serr.New("column name is required", "table", table)
-	}
-	if old.ColIndex(col.Name) >= 0 {
-		return serr.New("column already exists", "table", table, "column", col.Name)
 	}
 	if !validTypes[col.Type] {
 		return serr.New("unknown column type", "table", table, "column", col.Name, "type", string(col.Type))
 	}
-	desc := old.clone()
-	col.ID = desc.NextColID
-	desc.NextColID++
-	desc.Columns = append(desc.Columns, col)
-	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		if old.ColIndex(col.Name) >= 0 {
+			return nil, serr.New("column already exists", "table", table, "column", col.Name)
+		}
+		desc := old.clone()
+		col.ID = desc.NextColID
+		desc.NextColID++
+		desc.Columns = append(desc.Columns, col)
 		if col.NotNull && hasRows(tx, desc.ID) {
-			return serr.New(`column "` + col.Name + `" of relation "` + table +
+			return nil, serr.New(`column "` + col.Name + `" of relation "` + table +
 				`" contains null values`)
 		}
-		return e.writeDescIn(tx, table, desc)
+		return desc, nil
 	})
 	if err != nil {
-		e.restoreDesc(table, old)
 		return serr.Wrap(err, "op", "add column", "table", table, "column", col.Name)
 	}
 	return nil
@@ -198,43 +176,40 @@ func hasRows(tx *btypedb.Tx[string, []byte], tableID uint64) bool {
 // with the same name gets a fresh ID, so the old data can never
 // resurface.
 func (e *Engine) DropColumn(table, name string) error {
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	old := e.Table(table)
-	if old == nil {
-		return serr.New("no such table", "table", table)
-	}
-	ord := old.ColIndex(name)
-	if ord < 0 {
-		return serr.New("no such column", "table", table, "column", name)
-	}
-	if old.isPK(ord) {
-		return serr.New("cannot drop a primary key column", "table", table, "column", name)
-	}
-	for i := range old.Indexes {
-		if slices.Contains(old.Indexes[i].Cols, ord) {
-			return serr.New("cannot drop an indexed column; drop the index first",
-				"table", table, "column", name, "index", old.Indexes[i].Name)
+	err := e.alterDesc(table, func(_ *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		ord := old.ColIndex(name)
+		if ord < 0 {
+			return nil, serr.New("no such column", "table", table, "column", name)
 		}
-	}
-	desc := old.clone()
-	desc.Columns = slices.Delete(desc.Columns, ord, ord+1)
-	// Ordinal references above the removed column shift down by one.
-	for i, p := range desc.PKCols {
-		if p > ord {
-			desc.PKCols[i] = p - 1
+		if old.isPK(ord) {
+			return nil, serr.New("cannot drop a primary key column", "table", table, "column", name)
 		}
-	}
-	for i := range desc.Indexes {
-		cols := slices.Clone(desc.Indexes[i].Cols)
-		for j, c := range cols {
-			if c > ord {
-				cols[j] = c - 1
+		for i := range old.Indexes {
+			if slices.Contains(old.Indexes[i].Cols, ord) {
+				return nil, serr.New("cannot drop an indexed column; drop the index first",
+					"table", table, "column", name, "index", old.Indexes[i].Name)
 			}
 		}
-		desc.Indexes[i].Cols = cols
-	}
-	if err := e.writeDesc(table, desc); err != nil {
+		desc := old.clone()
+		desc.Columns = slices.Delete(desc.Columns, ord, ord+1)
+		// Ordinal references above the removed column shift down by one.
+		for i, p := range desc.PKCols {
+			if p > ord {
+				desc.PKCols[i] = p - 1
+			}
+		}
+		for i := range desc.Indexes {
+			cols := slices.Clone(desc.Indexes[i].Cols)
+			for j, c := range cols {
+				if c > ord {
+					cols[j] = c - 1
+				}
+			}
+			desc.Indexes[i].Cols = cols
+		}
+		return desc, nil
+	})
+	if err != nil {
 		return serr.Wrap(err, "op", "drop column", "table", table, "column", name)
 	}
 	return nil
@@ -247,38 +222,31 @@ func (e *Engine) DropColumn(table, name string) error {
 // caller can verify the constraint holds with no write slipping in
 // between. The name must be non-empty and unused.
 func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) error {
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	old := e.Table(table)
-	if old == nil {
-		return serr.New("no such table", "table", table)
-	}
 	if ck.Name == "" {
 		return serr.New("check constraint name is required", "table", table)
 	}
-	for _, c := range old.Checks {
-		if c.Name == ck.Name {
-			return serr.New(`constraint "` + ck.Name + `" for relation "` + table +
-				`" already exists`)
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		for _, c := range old.Checks {
+			if c.Name == ck.Name {
+				return nil, serr.New(`constraint "` + ck.Name + `" for relation "` + table +
+					`" already exists`)
+			}
 		}
-	}
-	desc := old.clone()
-	desc.Checks = append(desc.Checks, ck)
-	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
+		desc := old.clone()
+		desc.Checks = append(desc.Checks, ck)
 		if validate != nil {
 			for row, err := range scanRows(tx, old, nil, nil) {
 				if err != nil {
-					return err
+					return nil, err
 				}
 				if err := validate(row); err != nil {
-					return err
+					return nil, err
 				}
 			}
 		}
-		return e.writeDescIn(tx, table, desc)
+		return desc, nil
 	})
 	if err != nil {
-		e.restoreDesc(table, old)
 		return serr.Wrap(err, "op", "add check", "table", table, "constraint", ck.Name)
 	}
 	return nil
@@ -287,68 +255,84 @@ func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) 
 // DropCheck removes the named CHECK constraint, reporting whether it
 // existed.
 func (e *Engine) DropCheck(table, name string) (bool, error) {
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	old := e.Table(table)
-	if old == nil {
-		return false, serr.New("no such table", "table", table)
-	}
-	i := slices.IndexFunc(old.Checks, func(c CheckDesc) bool { return c.Name == name })
-	if i < 0 {
-		return false, nil
-	}
-	desc := old.clone()
-	desc.Checks = slices.Delete(desc.Checks, i, i+1)
-	if err := e.writeDesc(table, desc); err != nil {
-		return false, serr.Wrap(err, "op", "drop check", "table", table, "constraint", name)
-	}
-	return true, nil
-}
-
-// writeDesc persists an updated descriptor and publishes it as the
-// last step inside the transaction (callers hold ddlMu). A failed
-// commit un-publishes (see restoreDesc), so the in-memory catalog
-// never advertises a descriptor that missed the disk.
-func (e *Engine) writeDesc(table string, desc *TableDesc) error {
-	old := e.Table(table)
-	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
-		return e.writeDescIn(tx, table, desc)
+	existed := false
+	err := e.alterDesc(table, func(_ *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		i := slices.IndexFunc(old.Checks, func(c CheckDesc) bool { return c.Name == name })
+		if i < 0 {
+			return nil, nil // absent: a no-op, not an error
+		}
+		existed = true
+		desc := old.clone()
+		desc.Checks = slices.Delete(desc.Checks, i, i+1)
+		return desc, nil
 	})
 	if err != nil {
-		e.restoreDesc(table, old)
+		return false, serr.Wrap(err, "op", "drop check", "table", table, "constraint", name)
 	}
-	return err
+	return existed, nil
 }
 
-// writeDescIn stages the descriptor write and publishes it within an
-// existing transaction (callers hold ddlMu).
-func (e *Engine) writeDescIn(tx *btypedb.Tx[string, []byte], table string, desc *TableDesc) error {
+// alterDesc runs one descriptor-rewriting DDL: it resolves the current
+// descriptor inside the transaction, applies mutate, and persists the
+// result — all under the kv writer lock, so concurrent DDL serializes
+// and each mutation builds on the committed descriptor before it.
+// mutate returning (nil, nil) means "nothing to change": the
+// transaction commits without a descriptor write.
+func (e *Engine) alterDesc(table string, mutate func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error)) error {
+	return e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
+		old, err := e.descFromView(tx, table)
+		if err != nil {
+			return err
+		}
+		desc, err := mutate(tx, old)
+		if err != nil || desc == nil {
+			return err
+		}
+		return writeDescIn(tx, table, desc)
+	})
+}
+
+// writeDescIn stages the descriptor write within a DDL transaction.
+// Committing it is what publishes the schema change: any reader or
+// writer serialized after the commit resolves the new descriptor from
+// its own snapshot.
+func writeDescIn(tx *btypedb.Tx[string, []byte], table string, desc *TableDesc) error {
 	blob, err := marshalDesc(desc)
 	if err != nil {
 		return err
 	}
-	if err := tx.Set(descKey(table), blob); err != nil {
-		return err
-	}
-	e.publishDescPending(table, desc)
-	return nil
+	return tx.Set(descKey(table), blob)
 }
 
-// Tables returns the names of all tables, sorted.
+// Tables returns the names of all tables, sorted, as of the committed
+// state at the call.
 func (e *Engine) Tables() []string {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	names := make([]string, 0, len(e.tables))
-	for name := range e.tables {
-		names = append(names, name)
-	}
-	slices.Sort(names)
+	var names []string
+	e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
+		prefix := descTablePrefix()
+		end := string(tuple.PrefixEnd([]byte(prefix)))
+		// Descriptor keys are tuple-encoded by name, so key order is
+		// name order — no re-sort needed.
+		for k := range tx.Ascend(prefix) {
+			if k >= end {
+				break
+			}
+			names = append(names, descKeyName(k))
+		}
+		return nil
+	})
 	return names
 }
 
-// Table returns the descriptor for a table name, or nil if absent.
+// Table returns the descriptor for a table name, or nil if absent —
+// resolved from the committed state at the call. Transactions should
+// use Txn.Table, which resolves from their own snapshot.
 func (e *Engine) Table(name string) *TableDesc {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.tables[name]
+	var desc *TableDesc
+	e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
+		var err error
+		desc, err = e.tableFromView(tx, name)
+		return err
+	})
+	return desc
 }

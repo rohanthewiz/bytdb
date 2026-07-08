@@ -47,44 +47,41 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 	if len(cols) == 0 {
 		return nil, serr.New("at least one indexed column is required", "table", table, "index", name)
 	}
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	old := e.Table(table)
-	if old == nil {
-		return nil, serr.New("no such table", "table", table)
-	}
-	if old.Index(name) != nil {
-		return nil, serr.New("index already exists", "table", table, "index", name)
-	}
-	idx := IndexDesc{Name: name, Unique: unique, ID: primaryIndexID + 1}
-	for _, x := range old.Indexes {
-		if x.ID >= idx.ID {
-			idx.ID = x.ID + 1
+	var created *IndexDesc
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		if old.Index(name) != nil {
+			return nil, serr.New("index already exists", "table", table, "index", name)
 		}
-	}
-	anyDesc := false
-	for _, c := range cols {
-		ord := old.ColIndex(c.Name)
-		if ord < 0 {
-			return nil, serr.New("indexed column not declared", "table", table, "index", name, "column", c.Name)
+		idx := IndexDesc{Name: name, Unique: unique, ID: primaryIndexID + 1}
+		for _, x := range old.Indexes {
+			if x.ID >= idx.ID {
+				idx.ID = x.ID + 1
+			}
 		}
-		if slices.Contains(idx.Cols, ord) {
-			return nil, serr.New("duplicate indexed column", "table", table, "index", name, "column", c.Name)
+		anyDesc := false
+		for _, c := range cols {
+			ord := old.ColIndex(c.Name)
+			if ord < 0 {
+				return nil, serr.New("indexed column not declared", "table", table, "index", name, "column", c.Name)
+			}
+			if slices.Contains(idx.Cols, ord) {
+				return nil, serr.New("duplicate indexed column", "table", table, "index", name, "column", c.Name)
+			}
+			idx.Cols = append(idx.Cols, ord)
+			anyDesc = anyDesc || c.Desc
 		}
-		idx.Cols = append(idx.Cols, ord)
-		anyDesc = anyDesc || c.Desc
-	}
-	if anyDesc {
-		idx.Desc = make([]bool, len(cols))
-		for i, c := range cols {
-			idx.Desc[i] = c.Desc
+		if anyDesc {
+			idx.Desc = make([]bool, len(cols))
+			for i, c := range cols {
+				idx.Desc[i] = c.Desc
+			}
 		}
-	}
-	desc := old.clone()
-	desc.Indexes = append(desc.Indexes, idx)
+		desc := old.clone()
+		desc.Indexes = append(desc.Indexes, idx)
 
-	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
-		// Collect entries in one stable pass over the rows, then write.
+		// Backfill: collect entries in one stable pass over the rows,
+		// then write. The backfill and the descriptor commit atomically —
+		// either the index exists complete, or not at all.
 		type entry struct {
 			key string
 			val []byte
@@ -98,74 +95,47 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 			}
 			row, err := decodeRow(desc, k, v)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			ek, ev, _, err := indexEntry(desc, &idx, row.Vals)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			entries = append(entries, entry{ek, ev})
 		}
 		for _, en := range entries {
 			if idx.Unique && tx.Contains(en.key) {
-				return serr.New("existing rows violate unique index", "table", table, "index", name)
+				return nil, serr.New("existing rows violate unique index", "table", table, "index", name)
 			}
 			if err := tx.Set(en.key, en.val); err != nil {
-				return err
+				return nil, err
 			}
 		}
-		blob, err := marshalDesc(desc)
-		if err != nil {
-			return err
-		}
-		if err := tx.Set(descKey(table), blob); err != nil {
-			return err
-		}
-		// Publish last, so any error path above leaves the catalog
-		// untouched; a write serialized after this commit sees the index.
-		// If the commit itself fails, the caller un-publishes (restoreDesc).
-		e.publishDescPending(table, desc)
-		return nil
+		created = desc.Index(name)
+		return desc, nil
 	})
 	if err != nil {
-		e.restoreDesc(table, old)
 		return nil, serr.Wrap(err, "op", "create index", "table", table, "index", name)
 	}
-	return desc.Index(name), nil
+	return created, nil
 }
 
 // DropIndex removes a secondary index and its entries atomically.
 func (e *Engine) DropIndex(table, name string) error {
-	e.ddlMu.Lock()
-	defer e.ddlMu.Unlock()
-	old := e.Table(table)
-	if old == nil {
-		return serr.New("no such table", "table", table)
-	}
-	idx := old.Index(name)
-	if idx == nil {
-		return serr.New("no such index", "table", table, "index", name)
-	}
-	desc := old.clone()
-	desc.Indexes = slices.DeleteFunc(desc.Indexes, func(x IndexDesc) bool { return x.Name == name })
-
-	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		idx := old.Index(name)
+		if idx == nil {
+			return nil, serr.New("no such index", "table", table, "index", name)
+		}
+		desc := old.clone()
+		desc.Indexes = slices.DeleteFunc(desc.Indexes, func(x IndexDesc) bool { return x.Name == name })
 		prefix := indexPrefix(desc.ID, idx.ID)
 		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
-			return err
+			return nil, err
 		}
-		blob, err := marshalDesc(desc)
-		if err != nil {
-			return err
-		}
-		if err := tx.Set(descKey(table), blob); err != nil {
-			return err
-		}
-		e.publishDescPending(table, desc)
-		return nil
+		return desc, nil
 	})
 	if err != nil {
-		e.restoreDesc(table, old)
 		return serr.Wrap(err, "op", "drop index", "table", table, "index", name)
 	}
 	return nil
@@ -178,9 +148,9 @@ func (e *Engine) DropIndex(table, name string) error {
 func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		// A snapshot keeps the entry -> row lookup consistent and
-		// lock-free while we iterate. readSnapshot pairs it with a
-		// matching catalog view, so the descriptor resolved below can
-		// never describe an index the snapshot's backfill predates.
+		// lock-free while we iterate — and the descriptor resolves from
+		// that same snapshot, so it can never describe an index whose
+		// backfill the data predates.
 		t, err := e.readSnapshot()
 		if err != nil {
 			yield(Row{}, serr.Wrap(err, "op", "begin index scan"))

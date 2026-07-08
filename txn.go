@@ -7,19 +7,26 @@ import (
 	"github.com/rohanthewiz/serr"
 )
 
-// Txn is an engine transaction: a consistent snapshot of both data and
-// catalog, taken at begin. A writable transaction sees its own changes
-// and commits them atomically; only one runs at a time, so isolation
-// is serializable. Reads and scans are lock-free over the snapshot.
+// Txn is an engine transaction: one kv snapshot serving data and
+// catalog alike. Descriptors resolve lazily from the snapshot itself,
+// so the schema a transaction sees is exactly the schema of the data
+// it sees — there is no second snapshot to tear. A writable
+// transaction sees its own changes and commits them atomically; only
+// one runs at a time, so isolation is serializable. Reads and scans
+// are lock-free over the snapshot.
 //
 // DDL (CreateTable, CreateIndex, ...) cannot run inside a transaction
 // — a schema change is its own transaction.
 type Txn struct {
-	tx     *btypedb.Tx[string, []byte]
-	tables map[string]*TableDesc
-	// e is set only on writable transactions from Begin, so Commit and
-	// Rollback can clear the engine's reentrancy marker (writerGID).
-	e *Engine
+	tx *btypedb.Tx[string, []byte]
+	e  *Engine
+	// releaseW marks a writable transaction from Begin, so Commit and
+	// Rollback clear the engine's reentrancy marker (writerGID).
+	releaseW bool
+	// descs memoizes descriptor resolutions for the transaction's
+	// lifetime (including nil for absent tables — the snapshot cannot
+	// change underneath, so a miss is a miss for good).
+	descs map[string]*TableDesc
 }
 
 // WriteTxn runs fn in a writable transaction: committed if fn returns
@@ -42,7 +49,7 @@ func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
 		// goroutine so its own re-entrant writes fail fast.
 		e.writerGID.Store(curGID())
 		defer e.writerGID.Store(0)
-		return fn(&Txn{tx: tx, tables: e.catalogSnapshot()})
+		return fn(&Txn{tx: tx, e: e})
 	})
 }
 
@@ -50,27 +57,12 @@ func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
 // every table, unaffected by concurrent writes. Writes through it
 // return btypedb.ErrTxNotWritable.
 //
-// The catalog and data snapshots are taken atomically (see
-// readSnapshot): fn never sees, say, an index in the catalog whose
-// backfill postdates the data snapshot.
+// Catalog and data share the one snapshot, so fn can never see, say,
+// an index in the catalog whose backfill postdates its data.
 func (e *Engine) ReadTxn(fn func(tx *Txn) error) error {
-	for {
-		tables, ver := e.stableCatalogSnapshot()
-		retry := false
-		err := e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
-			// The kv snapshot exists now; if the catalog version still
-			// matches, tables describes exactly this snapshot's schema.
-			if e.catalogVersion() != ver {
-				retry = true
-				return nil
-			}
-			return fn(&Txn{tx: tx, tables: tables})
-		})
-		if retry {
-			continue // a DDL publish raced the snapshot; retake both
-		}
-		return err
-	}
+	return e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
+		return fn(&Txn{tx: tx, e: e})
+	})
 }
 
 // Begin starts a transaction the caller must end with Commit or
@@ -85,40 +77,24 @@ func (e *Engine) Begin(writable bool) (*Txn, error) {
 		if err := e.checkReentrantWrite("begin"); err != nil {
 			return nil, err
 		}
-		// A writable Begin needs no version dance: it blocks on the
-		// kv writer lock, which every DDL holds through commit and
-		// publish, so the catalog read after Begin returns is always
-		// exactly the schema of the acquired snapshot.
 		tx, err := e.kv.Begin(true)
 		if err != nil {
 			return nil, err
 		}
 		e.writerGID.Store(curGID())
-		return &Txn{tx: tx, tables: e.catalogSnapshot(), e: e}, nil
+		return &Txn{tx: tx, e: e, releaseW: true}, nil
 	}
 	return e.readSnapshot()
 }
 
-// readSnapshot opens a read-only transaction whose catalog and data
-// views are mutually consistent. The two snapshots cannot be taken
-// under one lock (see catVer for why), so it validates seqlock-style:
-// take the catalog at a stable (even) version, open the kv snapshot,
-// and retry if the version moved in between. An unchanged even version
-// proves no DDL published across the pair — without this a concurrent
-// CreateIndex could hand the reader an index whose backfill the data
-// snapshot predates, and index scans would silently miss every row.
+// readSnapshot opens a read-only transaction. Catalog consistency is
+// free: descriptors resolve from the same snapshot as the data.
 func (e *Engine) readSnapshot() (*Txn, error) {
-	for {
-		tables, ver := e.stableCatalogSnapshot()
-		tx, err := e.kv.Begin(false)
-		if err != nil {
-			return nil, err
-		}
-		if e.catalogVersion() == ver {
-			return &Txn{tx: tx, tables: tables}, nil
-		}
-		tx.Rollback() // a DDL publish raced the snapshot; retake both
+	tx, err := e.kv.Begin(false)
+	if err != nil {
+		return nil, err
 	}
+	return &Txn{tx: tx, e: e}, nil
 }
 
 // Commit publishes the transaction's writes atomically and releases
@@ -147,7 +123,7 @@ func (t *Txn) Rollback() error {
 // released either way. A no-op for read transactions and for the
 // closure-scoped WriteTxn, which clears its own marker.
 func (t *Txn) releaseWriter() {
-	if t.e != nil {
+	if t.releaseW {
 		t.e.writerGID.Store(0)
 	}
 }
@@ -174,13 +150,35 @@ func (t *Txn) RollbackTo(sp *Savepoint) error { return t.tx.RollbackTo(sp) }
 func (t *Txn) Release(sp *Savepoint) error { return t.tx.Release(sp) }
 
 // Table returns the descriptor for a table name in the transaction's
-// catalog snapshot, or nil if absent.
+// view, or nil if absent. A corrupt stored descriptor also reads as
+// nil here; desc, which every data path uses, surfaces it as an error.
 func (t *Txn) Table(name string) *TableDesc {
-	return t.tables[name]
+	d, _ := t.table(name)
+	return d
+}
+
+// table resolves and memoizes one descriptor from the transaction's
+// snapshot; nil means the table does not exist there.
+func (t *Txn) table(name string) (*TableDesc, error) {
+	if d, ok := t.descs[name]; ok {
+		return d, nil
+	}
+	d, err := t.e.tableFromView(t.tx, name)
+	if err != nil {
+		return nil, err
+	}
+	if t.descs == nil {
+		t.descs = map[string]*TableDesc{}
+	}
+	t.descs[name] = d
+	return d, nil
 }
 
 func (t *Txn) desc(table string) (*TableDesc, error) {
-	d := t.tables[table]
+	d, err := t.table(table)
+	if err != nil {
+		return nil, err
+	}
 	if d == nil {
 		return nil, serr.New("no such table", "table", table)
 	}
