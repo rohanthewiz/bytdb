@@ -57,8 +57,15 @@ func (e *Engine) Insert(table string, vals ...any) error {
 }
 
 // insertRow stages one row plus its index entries in tx. Checks run
-// before any write, so a failed insert leaves the transaction clean.
+// before any write, so a failed insert leaves the transaction clean —
+// except identity counter draws and bumps, which stay: they are
+// harmless (at worst a gap) and roll back with the transaction anyway
+// if it aborts.
 func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) error {
+	vals, err := fillIdentity(tx, desc, vals)
+	if err != nil {
+		return err
+	}
 	row, err := coerceRow(desc, vals)
 	if err != nil {
 		return err
@@ -151,7 +158,8 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 			if desc.isPK(ord) {
 				return false, serr.New("primary key column may not be NULL", "table", desc.Name, "column", col)
 			}
-			if desc.Columns[ord].NotNull {
+			// Identity implies NOT NULL.
+			if desc.Columns[ord].NotNull || desc.Columns[ord].Identity {
 				return false, notNullErr(desc, col)
 			}
 		}
@@ -433,7 +441,9 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 				return nil, serr.New("primary key column may not be NULL",
 					"table", desc.Name, "column", c.Name)
 			}
-			if c.NotNull {
+			// Identity implies NOT NULL (insert never gets here with one:
+			// fillIdentity already drew the value).
+			if c.NotNull || c.Identity {
 				return nil, notNullErr(desc, c.Name)
 			}
 		}

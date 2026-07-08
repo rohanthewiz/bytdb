@@ -294,7 +294,7 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 	case *CreateTable:
 		cols := make([]bytdb.Column, len(s.Cols))
 		for i, c := range s.Cols {
-			cols[i] = bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull}
+			cols[i] = bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Identity: c.Identity}
 		}
 		checks, err := resolveChecks(s, cols)
 		if err != nil {
@@ -310,7 +310,7 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		}
 		return &Result{}, nil
 	case *AddColumn:
-		col := bytdb.Column{Name: s.Col.Name, Type: s.Col.Type, NotNull: s.Col.NotNull}
+		col := bytdb.Column{Name: s.Col.Name, Type: s.Col.Type, NotNull: s.Col.NotNull, Identity: s.Col.Identity}
 		if err := d.e.AddColumn(s.Table, col); err != nil {
 			return nil, err
 		}

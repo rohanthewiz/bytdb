@@ -8,8 +8,9 @@
 //	tuple(tableID, indexID, pk...) -> tuple(non-pk columns in order)
 //
 // System state lives at reserved table IDs: table descriptors are rows
-// of a descriptors table keyed by name, and the table-ID sequence is a
-// single key. User tables start at ID 100.
+// of a descriptors table keyed by name, the table-ID sequence is a
+// single key, and named sequences (see seq.go) are rows of a sequences
+// table keyed by name. User tables start at ID 100.
 package bytdb
 
 import (
@@ -30,9 +31,16 @@ import (
 const (
 	sysIDSeqTableID  = 0 // single key: next table ID to allocate
 	sysDescTableID   = 1 // (name) -> JSON TableDesc
+	sysSeqTableID    = 2 // (name) -> big-endian uint64: sequence's next value
 	firstUserTableID = 100
 
 	primaryIndexID = 1
+
+	// identitySeqIndexID is the "index" within the system sequences
+	// table holding identity-column counters, keyed by (tableID, colID)
+	// — a namespace of their own, so they can never collide with named
+	// sequences (index 1) and survive table renames.
+	identitySeqIndexID = 2
 )
 
 // ColType is a column's SQL-ish type. It decides how Insert coerces
@@ -53,11 +61,17 @@ const (
 // lets AddColumn and DropColumn skip rewriting rows. Leave ID zero
 // when declaring columns; input values are ignored. A NotNull column
 // rejects NULL on insert and update.
+//
+// An Identity column (int only) auto-fills: inserting NULL draws the
+// next value from the column's own durable counter (starting at 1),
+// and inserting an explicit value bumps the counter past it so later
+// draws cannot collide. Identity implies NOT NULL.
 type Column struct {
-	Name    string  `json:"name"`
-	Type    ColType `json:"type"`
-	ID      uint32  `json:"id"`
-	NotNull bool    `json:"not_null,omitempty"`
+	Name     string  `json:"name"`
+	Type     ColType `json:"type"`
+	ID       uint32  `json:"id"`
+	NotNull  bool    `json:"not_null,omitempty"`
+	Identity bool    `json:"identity,omitempty"`
 }
 
 // CheckDesc is one CHECK constraint: a SQL boolean expression over the
@@ -443,6 +457,22 @@ func descKey(name string) string {
 
 func seqKey() string {
 	return string(mustEncode(int64(sysIDSeqTableID)))
+}
+
+// seqNameKey is a named sequence's key in the system sequences table.
+func seqNameKey(name string) string {
+	return string(mustEncode(int64(sysSeqTableID), int64(primaryIndexID), name))
+}
+
+// identitySeqKey is an identity column's counter key.
+func identitySeqKey(tableID uint64, colID uint32) string {
+	return string(mustEncode(int64(sysSeqTableID), int64(identitySeqIndexID), int64(tableID), int64(colID)))
+}
+
+// identitySeqTablePrefix covers every identity counter of one table,
+// for DropTable's cleanup.
+func identitySeqTablePrefix(tableID uint64) []byte {
+	return mustEncode(int64(sysSeqTableID), int64(identitySeqIndexID), int64(tableID))
 }
 
 // rowKey builds a table's primary-index key from already-coerced PK

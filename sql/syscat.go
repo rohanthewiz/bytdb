@@ -507,12 +507,18 @@ var sysTables = map[string]*sysTableDef{
 				}
 				for i, c := range desc.Columns {
 					nullable := "YES"
-					if pk[i] || c.NotNull {
+					if pk[i] || c.NotNull || c.Identity {
 						nullable = "NO"
+					}
+					// Identity columns report a serial-style default, which
+					// is what introspecting clients key "omit on insert" off.
+					var dflt any
+					if c.Identity {
+						dflt = fmt.Sprintf("nextval('%s_%s_seq'::regclass)", desc.Name, c.Name)
 					}
 					rows = append(rows, []any{
 						sysDatabase, "public", desc.Name, c.Name,
-						int64(i + 1), nil, nullable, sqlTypeName(c.Type), udtName(c.Type),
+						int64(i + 1), dflt, nullable, sqlTypeName(c.Type), udtName(c.Type),
 					})
 				}
 			}

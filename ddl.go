@@ -1,8 +1,6 @@
 package bytdb
 
 import (
-	"encoding/binary"
-	"fmt"
 	"slices"
 
 	"github.com/rohanthewiz/btypedb"
@@ -57,6 +55,10 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		if !validTypes[c.Type] {
 			return nil, serr.New("unknown column type", "table", name, "column", c.Name, "type", string(c.Type))
 		}
+		if c.Identity && c.Type != TInt {
+			return nil, serr.New("identity column must be an int column",
+				"table", name, "column", c.Name, "type", string(c.Type))
+		}
 	}
 	for i := range desc.Columns {
 		desc.Columns[i].ID = uint32(i + 1)
@@ -81,22 +83,11 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 			return serr.New("table already exists", "table", name)
 		}
 		// Allocate the next table ID from the sequence key.
-		next := uint64(firstUserTableID)
-		if raw, ok := tx.Get(seqKey()); ok {
-			// A malformed sequence value is corruption, and restarting
-			// the sequence at the default would be worse than failing:
-			// the next table would take an ID an existing table already
-			// owns, silently interleaving their rows.
-			if len(raw) != 8 {
-				return serr.New("table-id sequence value is corrupt",
-					"len", fmt.Sprint(len(raw)))
-			}
-			next = binary.BigEndian.Uint64(raw)
-		}
-		desc.ID = next
-		if err := tx.Set(seqKey(), binary.BigEndian.AppendUint64(nil, next+1)); err != nil {
+		next, err := nextFromCounter(tx, seqKey(), firstUserTableID, "table-id")
+		if err != nil {
 			return err
 		}
+		desc.ID = next
 		return writeDescIn(tx, name, desc)
 	})
 	if err != nil {
@@ -115,6 +106,12 @@ func (e *Engine) DropTable(name string) error {
 		}
 		prefix := tableSpace(desc.ID)
 		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
+			return err
+		}
+		// The table's identity counters live in the system sequences
+		// table, outside its own key space.
+		idPrefix := identitySeqTablePrefix(desc.ID)
+		if _, err := tx.DeleteRange(string(idPrefix), string(tuple.PrefixEnd(idPrefix))); err != nil {
 			return err
 		}
 		_, err = tx.Delete(descKey(name))
@@ -137,6 +134,11 @@ func (e *Engine) AddColumn(table string, col Column) error {
 	}
 	if !validTypes[col.Type] {
 		return serr.New("unknown column type", "table", table, "column", col.Name, "type", string(col.Type))
+	}
+	if col.Identity {
+		// Existing rows would need backfilled values; defer until there
+		// is a story for that.
+		return serr.New("adding an identity column is not supported", "table", table, "column", col.Name)
 	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		if old.ColIndex(col.Name) >= 0 {
@@ -176,10 +178,17 @@ func hasRows(tx *btypedb.Tx[string, []byte], tableID uint64) bool {
 // with the same name gets a fresh ID, so the old data can never
 // resurface.
 func (e *Engine) DropColumn(table, name string) error {
-	err := e.alterDesc(table, func(_ *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(name)
 		if ord < 0 {
 			return nil, serr.New("no such column", "table", table, "column", name)
+		}
+		if old.Columns[ord].Identity {
+			// The counter goes with the column; the column ID is never
+			// reused, so nothing can resurrect it.
+			if _, err := tx.Delete(identitySeqKey(old.ID, old.Columns[ord].ID)); err != nil {
+				return nil, err
+			}
 		}
 		if old.isPK(ord) {
 			return nil, serr.New("cannot drop a primary key column", "table", table, "column", name)

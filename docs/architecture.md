@@ -43,6 +43,7 @@ same keyspace it describes:
 |---|---|
 | `0` | The table-ID sequence: a single key holding the next ID to allocate |
 | `1` | Table descriptors: `(name) -> JSON TableDesc` |
+| `2` | Sequences: named (`(name) -> uint64` next value, `seq.go`) and identity-column counters (`(tableID, colID) -> uint64`, `identity.go`), in separate index spaces |
 | `100+` | User tables |
 
 Because descriptors live in the kv keyspace, every transaction resolves schema
