@@ -191,8 +191,11 @@ func (t *Txn) Insert(table string, vals ...any) error {
 	return err
 }
 
-// InsertReturning is Insert returning the row as stored: identity
-// columns filled and values coerced to their column types.
+// InsertReturning is Insert, additionally returning the row as stored:
+// values coerced to their column types and identity columns filled.
+// This is what INSERT ... RETURNING reports — the engine is the only
+// party that knows a drawn identity value, so it must hand the final
+// row back rather than have callers reconstruct it.
 func (t *Txn) InsertReturning(table string, vals ...any) (Row, error) {
 	desc, err := t.desc(table)
 	if err != nil {
@@ -213,9 +216,10 @@ func (t *Txn) Update(table string, pkVals []any, set map[string]any) (bool, erro
 	return updated, err
 }
 
-// UpdateReturning is Update returning the row as stored after the
-// update. A false updated means the row does not exist (the Row is
-// then zero).
+// UpdateReturning is Update, additionally returning the row as stored
+// (a zero Row and false when no row matched). RETURNING reports these
+// values instead of re-applying the SET map itself so it can never
+// drift from the engine's own coercion.
 func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (Row, bool, error) {
 	desc, err := t.desc(table)
 	if err != nil {

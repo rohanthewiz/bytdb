@@ -83,7 +83,11 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 				}
 			}
 		}
-		if err := describeReturning(lk, st.Table, st.Ret, info); err != nil {
+		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
+		if err != nil {
+			return err
+		}
+		if err := describeReturning(sc, &st.Returning, info); err != nil {
 			return err
 		}
 	case *Update:
@@ -114,7 +118,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
 			return err
 		}
-		if err := describeReturning(lk, st.Table, st.Ret, info); err != nil {
+		if err := describeReturning(sc, &st.Returning, info); err != nil {
 			return err
 		}
 	case *Delete:
@@ -125,7 +129,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		if err := inferPredParams(st.Where, columnType(sc), note); err != nil {
 			return err
 		}
-		if err := describeReturning(lk, st.Table, st.Ret, info); err != nil {
+		if err := describeReturning(sc, &st.Returning, info); err != nil {
 			return err
 		}
 	case *Select:
@@ -145,21 +149,17 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 	return nil
 }
 
-// describeReturning fills info's output shape from a DML statement's
-// RETURNING list — the piece that lets a wire client's Describe see
-// row-returning INSERT/UPDATE/DELETE. A nil ret leaves info empty
-// (the statement returns no rows). Placeholders inside RETURNING
-// expressions stay untyped; they present as text on the wire.
-func describeReturning(lk tableLookup, table string, ret *Returning, info *StmtInfo) error {
-	if ret == nil {
+// describeReturning fills a DML statement's output shape from its
+// RETURNING clause — the piece that makes INSERT ... RETURNING work
+// over the extended protocol, where clients learn the row description
+// from Describe before any row is produced. Without the clause the
+// statement keeps its rowless shape.
+func describeReturning(sc *scope, r *Returning, info *StmtInfo) error {
+	if !r.hasReturning() {
 		return nil
 	}
-	sc, err := buildScope(lk, []FromItem{{Table: table}})
-	if err != nil {
-		return err
-	}
 	res := &Result{}
-	if _, _, err := projectSelect(sc, &Select{Star: ret.Star, Items: ret.Items}, res); err != nil {
+	if _, _, err := projectSelect(sc, r.retSelect(), res); err != nil {
 		return err
 	}
 	info.Cols, info.Types = res.Cols, res.Types

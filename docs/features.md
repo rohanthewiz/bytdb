@@ -74,25 +74,27 @@ INSERT INTO users (name) VALUES ('edsger');          -- id 11, no collision
 
 ## RETURNING
 
-`INSERT`, `UPDATE`, and `DELETE` take a `RETURNING` clause — the piece ORMs
-can't live without once ids are server-generated:
-
 ```sql
-INSERT INTO users (name) VALUES ('ada') RETURNING id;          -- read the id back
-UPDATE users SET age = age + 1 WHERE id = 1 RETURNING *;       -- post-update image
-DELETE FROM users WHERE city = 'nyc' RETURNING id, name;       -- rows as they were
+INSERT INTO users (name) VALUES ('ada') RETURNING id;         -- the ORM idiom
+INSERT INTO users (name) VALUES ('x'), ('y') RETURNING *;
+UPDATE users SET age = age + 1 WHERE id = 1 RETURNING id, age;
+DELETE FROM users WHERE city = 'nyc' RETURNING id, name AS gone;
 ```
-*(verified in `sql/returning_test.go` and, over the wire,
-`pgwire/returning_test.go`)*
+*(verified in `sql/returning_test.go` and `pgwire/returning_test.go`)*
 
-- The clause is a select list: expressions, aliases, `*` and `t.*`
-  (aggregates and window functions are rejected, as in Postgres).
-- `INSERT` returns rows **as stored** — identity columns filled, values
-  coerced; `UPDATE` the post-update image; `DELETE` each row as it was.
-- The command tag still reports the write (`INSERT 0 2`), rows ride along —
-  wire clients and `Describe` see the row shape exactly as Postgres sends it.
+- INSERT and UPDATE report each row **as stored** — a `SERIAL` column's drawn
+  value, coerced values, SET applied — straight from the engine, so the client
+  learns server-generated IDs without a second round trip. DELETE reports the
+  row as it was before removal.
+- The clause is a full select list: expressions, aliases, `*`, `t.*`, and `$n`
+  placeholders. Aggregates and window functions are rejected at parse, as in
+  Postgres — each affected row yields exactly one output row.
+- Works over both wire protocol paths: `Describe` announces the row shape
+  before execution, and the command tag still carries the affected count
+  (`INSERT 0 2` alongside the rows).
 - Embedded callers get the same without SQL: `Engine.InsertReturning` /
-  `Txn.InsertReturning` / `Txn.UpdateReturning`.
+  `Txn.InsertReturning` / `Txn.UpdateReturning` return the stored `Row`
+  (verified in `returning_test.go`).
 
 ## Indexes
 
@@ -171,7 +173,7 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
 ### Parameters
 
 `$1`-style placeholders anywhere a literal may appear — WHERE/ON/HAVING,
-INSERT values, UPDATE SET, RETURNING expressions (not LIMIT/OFFSET):
+INSERT values, UPDATE SET (not LIMIT/OFFSET):
 
 ```go
 db.Exec(`INSERT INTO users VALUES ($1, $2, $3)`, 1, "ada", 36)

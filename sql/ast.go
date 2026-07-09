@@ -458,24 +458,36 @@ type CreateIndex struct {
 // resolved by name across tables.
 type DropIndex struct{ Name, Table string }
 
-// Returning is the RETURNING clause of an INSERT, UPDATE, or DELETE:
-// a select list evaluated against each affected row — as stored for
-// INSERT (identity columns filled, values coerced), post-update for
-// UPDATE, and as it was for DELETE. Star is RETURNING * (Items then
-// empty); a nil *Returning field means no clause.
-type Returning struct {
-	Star  bool
-	Items []SelectItem
-}
-
-// Insert is INSERT INTO t [(cols)] VALUES (lit, ...), .... Values are
-// parsed literals: int64, float64, string, bool, or nil.
+// Insert is INSERT INTO t [(cols)] VALUES (lit, ...), ...
+// [RETURNING ...]. Values are parsed literals: int64, float64, string,
+// bool, or nil.
 type Insert struct {
 	Table string
 	Cols  []string // nil: values in declared column order
 	Rows  [][]any
-	Ret   *Returning
+	Returning
 }
+
+// Returning is the optional RETURNING clause of INSERT, UPDATE, and
+// DELETE: select items evaluated against each affected row (as stored
+// for INSERT/UPDATE — identity values filled, SET applied — and as it
+// was for DELETE). Star is RETURNING *; the two are exclusive, as in
+// a select list. A statement with neither returns no rows.
+type Returning struct {
+	RetItems []SelectItem
+	RetStar  bool
+}
+
+// hasReturning reports whether the statement carries a RETURNING
+// clause at all — the executor's switch between "count only" and
+// "count plus rows".
+func (r *Returning) hasReturning() bool { return r.RetStar || len(r.RetItems) > 0 }
+
+// retSelect wraps the clause as a synthetic single-table SELECT so the
+// projection machinery (projectSelect, describeSelect's typing) can be
+// reused verbatim: RETURNING is exactly a select list whose FROM is
+// the statement's target table.
+func (r *Returning) retSelect() *Select { return &Select{Star: r.RetStar, Items: r.RetItems} }
 
 // GroupItem is one GROUP BY key: a column reference, an integer
 // ordinal naming a select-list position (Pos > 0, as in GROUP BY 1),
@@ -540,25 +552,25 @@ type UnionArm struct {
 	Sel *Select
 }
 
-// Update is UPDATE t SET col = expr, ... [WHERE ...]. Plain literal
-// (and $n placeholder) assignments live in Set — the fast path: they
-// coerce once per statement and need no per-row evaluation. Anything
-// else (SET age = age + 1, a CASE, a scalar subquery) lands in SetEx
-// and is evaluated against each matching row at execution. A column
-// appears in at most one of the two maps.
+// Update is UPDATE t SET col = expr, ... [WHERE ...] [RETURNING ...].
+// Plain literal (and $n placeholder) assignments live in Set — the
+// fast path: they coerce once per statement and need no per-row
+// evaluation. Anything else (SET age = age + 1, a CASE, a scalar
+// subquery) lands in SetEx and is evaluated against each matching row
+// at execution. A column appears in at most one of the two maps.
 type Update struct {
 	Table string
 	Set   map[string]any
 	SetEx map[string]Expr
 	Where BoolExpr
-	Ret   *Returning
+	Returning
 }
 
-// Delete is DELETE FROM t [WHERE ...].
+// Delete is DELETE FROM t [WHERE ...] [RETURNING ...].
 type Delete struct {
 	Table string
 	Where BoolExpr
-	Ret   *Returning
+	Returning
 }
 
 // TxnKind distinguishes the transaction-control statements.

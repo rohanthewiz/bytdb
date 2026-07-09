@@ -59,7 +59,8 @@ func (e *Engine) Insert(table string, vals ...any) error {
 
 // InsertReturning is Insert returning the row as stored: identity
 // columns filled and values coerced to their column types. It is how
-// an embedded caller learns the ID an identity column drew.
+// an embedded caller learns the ID an identity column drew without
+// opening a transaction.
 func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 	if err := e.checkReentrantWrite("insert"); err != nil {
 		return Row{}, err
@@ -83,12 +84,13 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 	return row, nil
 }
 
-// insertRow stages one row plus its index entries in tx, returning
-// the row as stored: identity columns filled, values coerced. Checks
-// run before any write, so a failed insert leaves the transaction
-// clean — except identity counter draws and bumps, which stay: they
-// are harmless (at worst a gap) and roll back with the transaction
-// anyway if it aborts.
+// insertRow stages one row plus its index entries in tx, returning the
+// row as stored — coerced, with identity columns filled — so callers
+// that must report the final values (RETURNING) get engine truth
+// rather than re-deriving it. Checks run before any write, so a failed
+// insert leaves the transaction clean — except identity counter draws
+// and bumps, which stay: they are harmless (at worst a gap) and roll
+// back with the transaction anyway if it aborts.
 func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]any, error) {
 	vals, err := fillIdentity(tx, desc, vals)
 	if err != nil {
@@ -129,7 +131,10 @@ func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]a
 			return nil, err
 		}
 	}
-	return row, tx.Set(key, val)
+	if err := tx.Set(key, val); err != nil {
+		return nil, err
+	}
+	return row, nil
 }
 
 // Update modifies the row with the given primary-key values, setting
@@ -156,9 +161,11 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 }
 
 // updateRow stages an in-place or key-moving row update in tx,
-// returning the row as stored after the update (nil when the row does
-// not exist). Phase 1 computes and validates everything; phase 2
-// writes — so any error leaves the transaction unmutated.
+// returning the row as stored — every SET value coerced onto the old
+// row — so callers reporting the final values (RETURNING) get engine
+// truth. Phase 1 computes and validates everything; phase 2 writes —
+// so any error leaves the transaction unmutated. A missing row is
+// (nil, false, nil), not an error.
 func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, set map[string]any) ([]any, bool, error) {
 	oldKey, err := fullPKKey(desc, pkVals)
 	if err != nil {

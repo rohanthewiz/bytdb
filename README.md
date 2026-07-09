@@ -47,7 +47,9 @@ for real — check constraints included.
 - **SQL frontend** — the `sql` package parses, plans, and executes a
   small Postgres-flavored dialect over the engine: full DDL, INSERT,
   SELECT/UPDATE/DELETE with a planner that pushes WHERE predicates
-  down to point gets and bounded key scans, aggregates with GROUP BY
+  down to point gets and bounded key scans, RETURNING on every DML
+  statement (reporting rows as stored — drawn SERIAL values included),
+  aggregates with GROUP BY
   and HAVING, INNER/LEFT/CROSS joins executed as index nested loops,
   prepared statements with `$1`-style parameters, NOT NULL and CHECK
   constraints with Postgres wording, EXPLAIN, and an expression

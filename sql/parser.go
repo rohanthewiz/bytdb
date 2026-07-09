@@ -814,42 +814,43 @@ func (p *parser) insert() (Statement, error) {
 			break
 		}
 	}
-	if ins.Ret, err = p.returningClause(); err != nil {
+	if err := p.returningClause(&ins.Returning); err != nil {
 		return nil, err
 	}
 	return ins, nil
 }
 
-// returningClause parses [RETURNING * | item, ...] at the end of an
-// INSERT, UPDATE, or DELETE; nil when the clause is absent. Items are
-// select-list items (expressions with optional aliases, t.*), but
-// there is no row set to aggregate or window over, so those are
-// rejected here, as in Postgres.
-func (p *parser) returningClause() (*Returning, error) {
+// returningClause parses an optional RETURNING * | item, ... into ret.
+// Items are full select-list entries (expressions, aliases, t.*), but
+// aggregates and window functions are rejected here as in Postgres:
+// there is no row set to aggregate over — each affected row yields
+// exactly one output row.
+func (p *parser) returningClause(ret *Returning) error {
 	if !p.acceptKw("returning") {
-		return nil, nil
+		return nil
 	}
 	if p.acceptOp("*") {
-		return &Returning{Star: true}, nil
+		ret.RetStar = true
+		return nil
 	}
-	ret := &Returning{}
 	for {
-		it, err := p.selectListItem()
+		item, err := p.selectListItem()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if it.Agg != AggNone || findAgg(it.Ex) != AggNone {
-			return nil, serr.New("aggregate functions are not allowed in RETURNING")
+		// The lowered legacy shape (COUNT(*) → item.Agg) and aggregates
+		// buried in expressions both count.
+		if item.Agg != AggNone || (item.Ex != nil && findAgg(item.Ex) != AggNone) {
+			return serr.New("aggregate functions are not allowed in RETURNING")
 		}
-		if it.Ex != nil && hasWindowExpr(it.Ex) {
-			return nil, serr.New("window functions are not allowed in RETURNING")
+		if item.Ex != nil && hasWindowExpr(item.Ex) {
+			return serr.New("window functions are not allowed in RETURNING")
 		}
-		ret.Items = append(ret.Items, it)
+		ret.RetItems = append(ret.RetItems, item)
 		if !p.acceptOp(",") {
-			break
+			return nil
 		}
 	}
-	return ret, nil
 }
 
 func (p *parser) selectStmt() (Statement, error) {
@@ -1056,7 +1057,7 @@ func (p *parser) update() (Statement, error) {
 			return nil, err
 		}
 	}
-	if u.Ret, err = p.returningClause(); err != nil {
+	if err := p.returningClause(&u.Returning); err != nil {
 		return nil, err
 	}
 	return u, nil
@@ -1076,7 +1077,7 @@ func (p *parser) deleteStmt() (Statement, error) {
 			return nil, err
 		}
 	}
-	if d.Ret, err = p.returningClause(); err != nil {
+	if err := p.returningClause(&d.Returning); err != nil {
 		return nil, err
 	}
 	return d, nil
