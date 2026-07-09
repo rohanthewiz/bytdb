@@ -152,6 +152,13 @@ func (e *Engine) AddColumn(table string, col Column) error {
 			return nil, serr.New(`column "` + col.Name + `" of relation "` + table +
 				`" contains null values`)
 		}
+		// Postgres backfills existing rows with the default; this engine
+		// leaves stored rows untouched (they would read NULL), so the two
+		// are only equivalent on an empty table.
+		if col.Default != "" && hasRows(tx, desc.ID) {
+			return nil, serr.New("adding a column with DEFAULT to a non-empty table is not supported",
+				"table", table, "column", col.Name)
+		}
 		return desc, nil
 	})
 	if err != nil {

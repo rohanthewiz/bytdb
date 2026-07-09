@@ -53,7 +53,7 @@ Parse-time rejections with pointed errors:
 
 | Not supported | Use instead / note |
 |---|---|
-| `DEFAULT` column values | Supply values explicitly |
+| `DEFAULT now()` / expression defaults | Constant defaults work; store epoch ints, set in the app |
 | `UNIQUE` column constraint | `CREATE UNIQUE INDEX` |
 | `REFERENCES` / foreign keys | Enforce in application code |
 | `ALTER TABLE ... ADD PRIMARY KEY / ADD UNIQUE` | Declare PK at create; unique via index |

@@ -72,6 +72,11 @@ type Column struct {
 	ID       uint32  `json:"id"`
 	NotNull  bool    `json:"not_null,omitempty"`
 	Identity bool    `json:"identity,omitempty"`
+	// Default is the column's DEFAULT as SQL literal text ("" = none).
+	// Like checks, it is stored and reported by the engine but applied
+	// by the SQL layer, which owns the literal syntax — engine-API
+	// inserts take explicit values for every column.
+	Default string `json:"default,omitempty"`
 }
 
 // CheckDesc is one CHECK constraint: a SQL boolean expression over the

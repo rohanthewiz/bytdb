@@ -137,8 +137,23 @@
 // satisfies it — in the transaction that publishes it, so no write
 // slips in between — and ALTER TABLE DROP CONSTRAINT removes one by
 // name (checks only: the primary key is structural, and unique
-// constraints are indexes here). DEFAULT, UNIQUE column constraints,
-// and REFERENCES are rejected at parse.
+// constraints are indexes here). UNIQUE column constraints and
+// REFERENCES are rejected at parse.
+//
+// A column may declare DEFAULT <constant> — a literal of the column's
+// type (quoted literals adapt), stored as text in the descriptor. A
+// column-list INSERT fills omitted columns with their defaults, the
+// DEFAULT keyword works as a VALUES entry, and INSERT ... DEFAULT
+// VALUES inserts a whole row of them; an explicit NULL still inserts
+// NULL (DEFAULT NULL declares the absence of a default, as it does in
+// Postgres). Only constants are accepted: bytdb has no date/time
+// types, so now() and CURRENT_TIMESTAMP are rejected with a pointer
+// to epoch integers, and other expressions are rejected because a
+// default is applied, not evaluated. information_schema.columns
+// reports the stored text in column_default. ALTER TABLE ADD COLUMN
+// with a DEFAULT is allowed only while the table is empty — Postgres
+// backfills existing rows; this engine leaves rows untouched, and the
+// two are only equivalent when there are none.
 //
 // A CREATE INDEX key column may be DESC: the index stores that
 // column's keys byte-inverted, so scans (and the rows a bounded scan
@@ -309,6 +324,22 @@ func (s *Stmt) NumParams() int { return s.n }
 // placeholders.
 func (s *Stmt) Exec(args ...any) (*Result, error) { return s.db.run(s.st, args) }
 
+// toEngineColumn maps a parsed column definition onto the engine's,
+// validating a DEFAULT against the column type (a quoted literal
+// adapts, Postgres-style) and rendering it to the literal text the
+// descriptor stores.
+func toEngineColumn(c ColDef) (bytdb.Column, error) {
+	col := bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Identity: c.Identity}
+	if c.HasDefault {
+		cv, err := coerceLit(c.Default, c.Type)
+		if err != nil {
+			return bytdb.Column{}, serr.Wrap(err, "clause", "DEFAULT", "column", c.Name)
+		}
+		col.Default = renderLit(cv)
+	}
+	return col, nil
+}
+
 // run binds args into st, adapts quoted literals to their column
 // types, and dispatches it.
 func (d *DB) run(st Statement, args []any) (*Result, error) {
@@ -326,7 +357,11 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 	case *CreateTable:
 		cols := make([]bytdb.Column, len(s.Cols))
 		for i, c := range s.Cols {
-			cols[i] = bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Identity: c.Identity}
+			col, err := toEngineColumn(c)
+			if err != nil {
+				return nil, err
+			}
+			cols[i] = col
 		}
 		checks, err := resolveChecks(s, cols)
 		if err != nil {
@@ -342,7 +377,10 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		}
 		return &Result{}, nil
 	case *AddColumn:
-		col := bytdb.Column{Name: s.Col.Name, Type: s.Col.Type, NotNull: s.Col.NotNull, Identity: s.Col.Identity}
+		col, err := toEngineColumn(s.Col)
+		if err != nil {
+			return nil, err
+		}
 		if err := d.e.AddColumn(s.Table, col); err != nil {
 			return nil, err
 		}

@@ -741,6 +741,49 @@ func (rp *retProj) row(vals []any) ([]any, error) {
 	return out, nil
 }
 
+// columnDefaults parses each column's stored DEFAULT into its
+// insert-ready value, coerced to the column type; nil entries mean
+// no default (insert NULL).
+func columnDefaults(desc *bytdb.TableDesc) ([]any, error) {
+	out := make([]any, len(desc.Columns))
+	for i := range desc.Columns {
+		c := &desc.Columns[i]
+		if c.Default == "" {
+			continue
+		}
+		v, err := parseStoredLiteral(c.Default)
+		if err != nil {
+			return nil, serr.Wrap(err, "op", "parse column default", "column", c.Name)
+		}
+		if out[i], err = coerceLit(v, c.Type); err != nil {
+			return nil, serr.Wrap(err, "op", "parse column default", "column", c.Name)
+		}
+	}
+	return out, nil
+}
+
+// resolveDefaultMarkers replaces DEFAULT-keyword values with the
+// column's default (NULL without one). Full-arity rows alias the
+// statement's parsed AST, so a row carrying a marker is cloned before
+// the write — prepared statements re-execute against the original.
+func resolveDefaultMarkers(vals, defaults []any) []any {
+	cloned := false
+	for i, v := range vals {
+		if _, ok := v.(defaultMarker); !ok {
+			continue
+		}
+		if !cloned {
+			vals, cloned = slices.Clone(vals), true
+		}
+		if i < len(defaults) { // arity mismatches error at the engine
+			vals[i] = defaults[i]
+		} else {
+			vals[i] = nil
+		}
+	}
+	return vals
+}
+
 func (d *DB) execInsert(s *Insert) (*Result, error) {
 	res := &Result{}
 	affected := 0
@@ -768,6 +811,10 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		defaults, err := columnDefaults(desc)
+		if err != nil {
+			return err
+		}
 		up, err := d.prepareUpsert(tx, s.Table, desc, s.Conflict, checks)
 		if err != nil {
 			return err
@@ -778,15 +825,20 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		}
 		for _, row := range s.Rows {
 			vals := row
-			if ords != nil {
+			// s.Cols (not ords) is the column-list signal: DEFAULT VALUES
+			// parses as an empty list, where ords stays nil too.
+			if s.Cols != nil {
 				if len(row) != len(ords) {
 					return serr.New("INSERT row has wrong number of values", "table", s.Table)
 				}
-				vals = make([]any, len(desc.Columns))
+				// Unnamed columns take their defaults (nil entries are the
+				// old insert-as-NULL behavior).
+				vals = slices.Clone(defaults)
 				for i, ord := range ords {
 					vals[ord] = row[i]
 				}
 			}
+			vals = resolveDefaultMarkers(vals, defaults)
 			// Arity mismatches skip the conflict probe too and fall
 			// through to the engine's error.
 			if up != nil && len(vals) == len(desc.Columns) {

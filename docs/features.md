@@ -45,6 +45,12 @@ CREATE TABLE items (
   ID and is skipped on decode.
 - `ALTER TABLE t ADD CONSTRAINT n CHECK (...)` validates existing rows;
   `DROP CONSTRAINT [IF EXISTS] n`.
+- **Constant `DEFAULT` values** (`price INT DEFAULT 0`, `tag TEXT DEFAULT 'new'`):
+  applied when a column-list insert omits the column, as a `DEFAULT` keyword in
+  `VALUES`, and via `INSERT ... DEFAULT VALUES`. Expression defaults —
+  `now()` above all — are rejected with a pointer to epoch integers
+  (see [Gotchas](gotchas.md)); `ADD COLUMN ... DEFAULT` needs an empty table
+  (no backfill). *(verified in `sql/default_test.go`)*
 
 ## Auto-increment
 

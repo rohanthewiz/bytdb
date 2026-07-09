@@ -511,10 +511,13 @@ var sysTables = map[string]*sysTableDef{
 						nullable = "NO"
 					}
 					// Identity columns report a serial-style default, which
-					// is what introspecting clients key "omit on insert" off.
+					// is what introspecting clients key "omit on insert" off;
+					// declared defaults report their stored literal text.
 					var dflt any
 					if c.Identity {
 						dflt = fmt.Sprintf("nextval('%s_%s_seq'::regclass)", desc.Name, c.Name)
+					} else if c.Default != "" {
+						dflt = c.Default
 					}
 					rows = append(rows, []any{
 						sysDatabase, "public", desc.Name, c.Name,

@@ -396,6 +396,11 @@ type ColDef struct {
 	Type     bytdb.ColType
 	NotNull  bool
 	Identity bool
+	// Default is the column's DEFAULT constant; HasDefault
+	// distinguishes an absent clause (DEFAULT NULL parses as absent —
+	// it declares what a defaultless column already does).
+	Default    any
+	HasDefault bool
 }
 
 // CheckDef is one CHECK constraint of a CREATE TABLE: the parsed
@@ -458,9 +463,14 @@ type CreateIndex struct {
 // resolved by name across tables.
 type DropIndex struct{ Name, Table string }
 
+// defaultMarker is the DEFAULT keyword as an INSERT value: resolved
+// at execution to the column's default, or NULL without one.
+type defaultMarker struct{}
+
 // Insert is INSERT INTO t [(cols)] VALUES (lit, ...), ...
 // [RETURNING ...]. Values are parsed literals: int64, float64, string,
-// bool, or nil.
+// bool, nil — or a defaultMarker. INSERT ... DEFAULT VALUES parses as
+// an empty column list with one empty row.
 type Insert struct {
 	Table    string
 	Cols     []string // nil: values in declared column order

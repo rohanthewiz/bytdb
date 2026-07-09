@@ -527,9 +527,21 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 			if col.Type != bytdb.TInt {
 				return fail(serr.New("identity column must be an int column", "column", name))
 			}
+			if col.HasDefault {
+				return fail(serr.New("conflicting DEFAULT for identity column", "column", name))
+			}
 			col.Identity, col.NotNull = true, true
 		case p.acceptKw("default"):
-			return fail(serr.New("DEFAULT is not supported", "column", name))
+			if col.Identity {
+				return fail(serr.New("conflicting DEFAULT for identity column", "column", name))
+			}
+			v, err := p.defaultLiteral(name)
+			if err != nil {
+				return fail(err)
+			}
+			if v != nil { // DEFAULT NULL declares the absence of a default
+				col.Default, col.HasDefault = v, true
+			}
 		case p.acceptKw("unique"):
 			return fail(serr.New("UNIQUE column constraints are not supported; use CREATE UNIQUE INDEX",
 				"column", name))
@@ -541,6 +553,64 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 			return col, pk, checks, nil
 		}
 	}
+}
+
+// defaultLiteral parses a column DEFAULT, constants only: bytdb has
+// no date/time types, so the defaults people most want (now(),
+// CURRENT_TIMESTAMP) have nothing to evaluate to, and accepting any
+// expression would imply re-evaluation per insert. Postgres-legal
+// non-constants are named in the rejection so the fix is obvious.
+func (p *parser) defaultLiteral(col string) (any, error) {
+	if t := p.cur(); t.kind == tIdent {
+		switch t.text {
+		case "now", "current_timestamp", "current_date", "current_time", "localtimestamp":
+			return nil, serr.New(
+				"DEFAULT "+t.text+" is not supported: bytdb has no date/time types; "+
+					"store epoch integers and set them in the application", "column", col)
+		}
+	}
+	if p.cur().kind == tParam {
+		return nil, serr.New("placeholders are not allowed in DEFAULT", "column", col)
+	}
+	v, err := p.literal()
+	if err != nil {
+		return nil, serr.New("DEFAULT must be a constant", "column", col)
+	}
+	return v, nil
+}
+
+// renderLit renders a constant as the SQL literal text a descriptor
+// stores (DEFAULT values), the inverse of parseStoredLiteral.
+func renderLit(v any) string {
+	switch n := v.(type) {
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case float64:
+		return strconv.FormatFloat(n, 'g', -1, 64)
+	case bool:
+		return strconv.FormatBool(n)
+	case string:
+		return "'" + strings.ReplaceAll(n, "'", "''") + "'"
+	}
+	return "null"
+}
+
+// parseStoredLiteral reads a descriptor-stored literal back to its
+// value.
+func parseStoredLiteral(src string) (any, error) {
+	toks, err := lex(src)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks, src: src}
+	v, err := p.literal()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().kind != tEOF {
+		return nil, serr.New("trailing tokens in stored literal", "text", src)
+	}
+	return v, nil
 }
 
 // checkExpr parses CHECK's "( expr )", returning both the parsed
@@ -788,30 +858,47 @@ func (p *parser) insert() (Statement, error) {
 			seen[c] = true
 		}
 	}
-	if err := p.expectKw("values"); err != nil {
-		return nil, err
-	}
-	for {
-		if err := p.expectOp("("); err != nil {
+	if p.acceptKw("default") {
+		// INSERT INTO t DEFAULT VALUES: one row, every column its
+		// default (NULL without one) — modeled as an empty column list
+		// with an empty row, which the executor already fills.
+		if err := p.expectKw("values"); err != nil {
 			return nil, err
 		}
-		var row []any
+		ins.Cols, ins.Rows = []string{}, [][]any{{}}
+	} else {
+		if err := p.expectKw("values"); err != nil {
+			return nil, err
+		}
 		for {
-			v, err := p.literal()
-			if err != nil {
+			if err := p.expectOp("("); err != nil {
 				return nil, err
 			}
-			row = append(row, v)
+			var row []any
+			for {
+				// DEFAULT as a value slots the column's default in at
+				// execution (NULL without one), as in Postgres.
+				if t := p.cur(); t.kind == tIdent && t.text == "default" {
+					p.advance()
+					row = append(row, defaultMarker{})
+				} else {
+					v, err := p.literal()
+					if err != nil {
+						return nil, err
+					}
+					row = append(row, v)
+				}
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			ins.Rows = append(ins.Rows, row)
 			if !p.acceptOp(",") {
 				break
 			}
-		}
-		if err := p.expectOp(")"); err != nil {
-			return nil, err
-		}
-		ins.Rows = append(ins.Rows, row)
-		if !p.acceptOp(",") {
-			break
 		}
 	}
 	if ins.Conflict, err = p.onConflictClause(table); err != nil {
