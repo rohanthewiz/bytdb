@@ -48,7 +48,8 @@ func (e *Engine) Insert(table string, vals ...any) error {
 		if err != nil {
 			return err
 		}
-		return insertRow(tx, desc, vals)
+		_, err = insertRow(tx, desc, vals)
+		return err
 	})
 	if err != nil {
 		return serr.Wrap(err, "op", "insert", "table", table)
@@ -56,30 +57,32 @@ func (e *Engine) Insert(table string, vals ...any) error {
 	return nil
 }
 
-// insertRow stages one row plus its index entries in tx. Checks run
-// before any write, so a failed insert leaves the transaction clean —
-// except identity counter draws and bumps, which stay: they are
-// harmless (at worst a gap) and roll back with the transaction anyway
-// if it aborts.
-func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) error {
+// insertRow stages one row plus its index entries in tx, returning the
+// row as stored — coerced, with identity columns filled — so callers
+// that must report the final values (RETURNING) get engine truth
+// rather than re-deriving it. Checks run before any write, so a failed
+// insert leaves the transaction clean — except identity counter draws
+// and bumps, which stay: they are harmless (at worst a gap) and roll
+// back with the transaction anyway if it aborts.
+func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]any, error) {
 	vals, err := fillIdentity(tx, desc, vals)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	row, err := coerceRow(desc, vals)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	key, err := rowKey(desc, pkValues(desc, row))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	val, err := encodeRowValue(desc, row)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if tx.Contains(key) {
-		return serr.New("duplicate primary key", "table", desc.Name)
+		return nil, serr.New("duplicate primary key", "table", desc.Name)
 	}
 	type entry struct {
 		key string
@@ -89,19 +92,22 @@ func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) erro
 	for i := range desc.Indexes {
 		ek, ev, enforced, err := indexEntry(desc, &desc.Indexes[i], row)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if enforced && tx.Contains(ek) {
-			return serr.New("unique index violation", "table", desc.Name, "index", desc.Indexes[i].Name)
+			return nil, serr.New("unique index violation", "table", desc.Name, "index", desc.Indexes[i].Name)
 		}
 		entries[i] = entry{ek, ev}
 	}
 	for _, en := range entries {
 		if err := tx.Set(en.key, en.val); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return tx.Set(key, val)
+	if err := tx.Set(key, val); err != nil {
+		return nil, err
+	}
+	return row, nil
 }
 
 // Update modifies the row with the given primary-key values, setting
@@ -118,7 +124,7 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 		if err != nil {
 			return err
 		}
-		updated, err = updateRow(tx, desc, pkVals, set)
+		_, updated, err = updateRow(tx, desc, pkVals, set)
 		return err
 	})
 	if err != nil {
@@ -127,54 +133,57 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 	return updated, nil
 }
 
-// updateRow stages an in-place or key-moving row update in tx. Phase 1
-// computes and validates everything; phase 2 writes — so any error
-// leaves the transaction unmutated.
-func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, set map[string]any) (bool, error) {
+// updateRow stages an in-place or key-moving row update in tx,
+// returning the row as stored — every SET value coerced onto the old
+// row — so callers reporting the final values (RETURNING) get engine
+// truth. Phase 1 computes and validates everything; phase 2 writes —
+// so any error leaves the transaction unmutated. A missing row is
+// (nil, false, nil), not an error.
+func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, set map[string]any) ([]any, bool, error) {
 	oldKey, err := fullPKKey(desc, pkVals)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	oldVal, ok := tx.Get(oldKey)
 	if !ok {
-		return false, nil
+		return nil, false, nil
 	}
 	oldRow, err := decodeRow(desc, oldKey, oldVal)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 
 	newVals := slices.Clone(oldRow.Vals)
 	for col, v := range set {
 		ord := desc.ColIndex(col)
 		if ord < 0 {
-			return false, serr.New("no such column", "table", desc.Name, "column", col)
+			return nil, false, serr.New("no such column", "table", desc.Name, "column", col)
 		}
 		cv, err := coerce(v, desc.Columns[ord].Type)
 		if err != nil {
-			return false, serr.Wrap(err, "table", desc.Name, "column", col)
+			return nil, false, serr.Wrap(err, "table", desc.Name, "column", col)
 		}
 		if cv == nil {
 			if desc.isPK(ord) {
-				return false, serr.New("primary key column may not be NULL", "table", desc.Name, "column", col)
+				return nil, false, serr.New("primary key column may not be NULL", "table", desc.Name, "column", col)
 			}
 			// Identity implies NOT NULL.
 			if desc.Columns[ord].NotNull || desc.Columns[ord].Identity {
-				return false, notNullErr(desc, col)
+				return nil, false, notNullErr(desc, col)
 			}
 		}
 		newVals[ord] = cv
 	}
 	newKey, err := rowKey(desc, pkValues(desc, newVals))
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	newVal, err := encodeRowValue(desc, newVals)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if newKey != oldKey && tx.Contains(newKey) {
-		return false, serr.New("duplicate primary key", "table", desc.Name)
+		return nil, false, serr.New("duplicate primary key", "table", desc.Name)
 	}
 	// Index entries that change: compute and uniqueness-check them all
 	// before writing anything. An occupant of a changed unique key must
@@ -188,38 +197,38 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 		idx := &desc.Indexes[i]
 		ok, ov, _, err := indexEntry(desc, idx, oldRow.Vals)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		nk, nv, enforced, err := indexEntry(desc, idx, newVals)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		if ok == nk && bytes.Equal(ov, nv) {
 			continue
 		}
 		if enforced && nk != ok && tx.Contains(nk) {
-			return false, serr.New("unique index violation", "table", desc.Name, "index", idx.Name)
+			return nil, false, serr.New("unique index violation", "table", desc.Name, "index", idx.Name)
 		}
 		moves = append(moves, move{ok, nk, nv})
 	}
 
 	for _, m := range moves {
 		if _, err := tx.Delete(m.oldKey); err != nil {
-			return false, err
+			return nil, false, err
 		}
 		if err := tx.Set(m.newKey, m.newVal); err != nil {
-			return false, err
+			return nil, false, err
 		}
 	}
 	if newKey != oldKey {
 		if _, err := tx.Delete(oldKey); err != nil {
-			return false, err
+			return nil, false, err
 		}
 	}
 	if err := tx.Set(newKey, newVal); err != nil {
-		return false, err
+		return nil, false, err
 	}
-	return true, nil
+	return newVals, true, nil
 }
 
 // Get returns the row with the given primary-key values. Descriptor

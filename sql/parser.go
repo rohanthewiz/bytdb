@@ -814,7 +814,43 @@ func (p *parser) insert() (Statement, error) {
 			break
 		}
 	}
+	if err := p.returningClause(&ins.Returning); err != nil {
+		return nil, err
+	}
 	return ins, nil
+}
+
+// returningClause parses an optional RETURNING * | item, ... into ret.
+// Items are full select-list entries (expressions, aliases, t.*), but
+// aggregates and window functions are rejected here as in Postgres:
+// there is no row set to aggregate over — each affected row yields
+// exactly one output row.
+func (p *parser) returningClause(ret *Returning) error {
+	if !p.acceptKw("returning") {
+		return nil
+	}
+	if p.acceptOp("*") {
+		ret.RetStar = true
+		return nil
+	}
+	for {
+		item, err := p.selectListItem()
+		if err != nil {
+			return err
+		}
+		// The lowered legacy shape (COUNT(*) → item.Agg) and aggregates
+		// buried in expressions both count.
+		if item.Agg != AggNone || (item.Ex != nil && findAgg(item.Ex) != AggNone) {
+			return serr.New("aggregate functions are not allowed in RETURNING")
+		}
+		if item.Ex != nil && hasWindowExpr(item.Ex) {
+			return serr.New("window functions are not allowed in RETURNING")
+		}
+		ret.RetItems = append(ret.RetItems, item)
+		if !p.acceptOp(",") {
+			return nil
+		}
+	}
 }
 
 func (p *parser) selectStmt() (Statement, error) {
@@ -1021,6 +1057,9 @@ func (p *parser) update() (Statement, error) {
 			return nil, err
 		}
 	}
+	if err := p.returningClause(&u.Returning); err != nil {
+		return nil, err
+	}
 	return u, nil
 }
 
@@ -1037,6 +1076,9 @@ func (p *parser) deleteStmt() (Statement, error) {
 		if d.Where, err = p.boolExpr(false); err != nil {
 			return nil, err
 		}
+	}
+	if err := p.returningClause(&d.Returning); err != nil {
+		return nil, err
 	}
 	return d, nil
 }

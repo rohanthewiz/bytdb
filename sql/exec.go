@@ -685,11 +685,72 @@ func orderCmp(a, b any) int {
 	return c
 }
 
+// retProj is a resolved RETURNING clause: the projection over the
+// target table's row shape, ready to map each affected row to an
+// output row. Built inside the statement's transaction so the column
+// set matches the descriptor the writes run against.
+type retProj struct {
+	env   *exEnv
+	proj  []projEntry
+	exprs []Expr
+}
+
+// prepareReturning resolves a DML statement's RETURNING clause against
+// its target table, filling res.Cols and res.Types. A statement
+// without the clause resolves to nil — the executor's signal to skip
+// row collection entirely.
+func (d *DB) prepareReturning(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, r *Returning, res *Result) (*retProj, error) {
+	if !r.hasReturning() {
+		return nil, nil
+	}
+	env := d.tableEnv(tx, table, desc)
+	proj, exprs, err := projectSelect(env.sc, r.retSelect(), res)
+	if err != nil {
+		return nil, err
+	}
+	return &retProj{env: env, proj: proj, exprs: exprs}, nil
+}
+
+// row projects one affected row (full values in declared column order)
+// to a RETURNING output row, evaluating expression items against it —
+// the same combined-row convention as execSelect: expression results
+// append past the table's width, where the projection ordinals expect
+// them.
+func (rp *retProj) row(vals []any) ([]any, error) {
+	combined := vals
+	if len(rp.exprs) > 0 {
+		combined = slices.Clone(vals)
+		for _, ex := range rp.exprs {
+			rowEnv := *rp.env
+			rowEnv.row = vals
+			v, err := evalEx(&rowEnv, ex)
+			if err != nil {
+				return nil, err
+			}
+			combined = append(combined, v)
+		}
+	}
+	out := make([]any, len(rp.proj))
+	for j, pe := range rp.proj {
+		if pe.ord < 0 {
+			out[j] = pe.lit
+		} else {
+			out[j] = combined[pe.ord]
+		}
+	}
+	return out, nil
+}
+
 func (d *DB) execInsert(s *Insert) (*Result, error) {
+	res := &Result{}
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
+		}
+		ret, err := d.prepareReturning(tx, s.Table, desc, &s.Returning, res)
+		if err != nil {
+			return err
 		}
 		// With a column list, unnamed columns insert as NULL.
 		var ords []int
@@ -727,8 +788,20 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					return err
 				}
 			}
-			if err := tx.Insert(s.Table, vals...); err != nil {
+			// The engine hands back the row as stored — identity columns
+			// filled, values coerced — which is the only correct input for
+			// RETURNING: the SQL layer never sees a drawn identity value
+			// otherwise.
+			stored, err := tx.InsertReturning(s.Table, vals...)
+			if err != nil {
 				return err
+			}
+			if ret != nil {
+				out, err := ret.row(stored)
+				if err != nil {
+					return err
+				}
+				res.Rows = append(res.Rows, out)
 			}
 		}
 		return nil
@@ -736,15 +809,21 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Result{RowsAffected: len(s.Rows)}, nil
+	res.RowsAffected = len(s.Rows)
+	return res, nil
 }
 
 func (d *DB) execUpdate(s *Update) (*Result, error) {
+	res := &Result{}
 	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
+		}
+		ret, err := d.prepareReturning(tx, s.Table, desc, &s.Returning, res)
+		if err != nil {
+			return err
 		}
 		pl, err := planScan(desc, s.Table, s.Where)
 		if err != nil {
@@ -844,12 +923,23 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 			for i, ord := range desc.PKCols {
 				pk[i] = rv[ord]
 			}
-			ok, err := tx.Update(s.Table, pk, set)
+			// RETURNING reports the engine's post-update row rather than a
+			// SQL-layer reconstruction: the engine applies its own coercion
+			// (e.g. an int assigned to a float column stores as float), and
+			// only its output is guaranteed to match what a later read sees.
+			stored, ok, err := tx.UpdateReturning(s.Table, pk, set)
 			if err != nil {
 				return err
 			}
 			if ok {
 				affected++
+				if ret != nil {
+					out, err := ret.row(stored)
+					if err != nil {
+						return err
+					}
+					res.Rows = append(res.Rows, out)
+				}
 			}
 		}
 		return nil
@@ -857,31 +947,52 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Result{RowsAffected: affected}, nil
+	res.RowsAffected = affected
+	return res, nil
 }
 
 func (d *DB) execDelete(s *Delete) (*Result, error) {
+	res := &Result{}
 	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
+		ret, err := d.prepareReturning(tx, s.Table, desc, &s.Returning, res)
+		if err != nil {
+			return err
+		}
 		pl, err := planScan(desc, s.Table, s.Where)
 		if err != nil {
 			return err
 		}
-		pks, err := collectPKs(tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc))
+		// RETURNING reports each row as it was before its delete, so the
+		// scan keeps the full rows alongside the keys (they are decoded
+		// already; keeping them costs only the reference).
+		var rows [][]any
+		pks, err := collectPKs(tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc), func(vals []any) {
+			if ret != nil {
+				rows = append(rows, vals)
+			}
+		})
 		if err != nil {
 			return err
 		}
-		for _, pk := range pks {
+		for i, pk := range pks {
 			ok, err := tx.Delete(s.Table, pk...)
 			if err != nil {
 				return err
 			}
 			if ok {
 				affected++
+				if ret != nil {
+					out, err := ret.row(rows[i])
+					if err != nil {
+						return err
+					}
+					res.Rows = append(res.Rows, out)
+				}
 			}
 		}
 		return nil
@@ -889,7 +1000,8 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Result{RowsAffected: affected}, nil
+	res.RowsAffected = affected
+	return res, nil
 }
 
 // tableEnv is the evaluation environment for a single-table scan
@@ -902,7 +1014,10 @@ func (d *DB) tableEnv(tx *bytdb.Txn, table string, desc *bytdb.TableDesc) *exEnv
 	return &exEnv{d: d, tx: tx, sc: sc}
 }
 
-func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, env *exEnv) ([][]any, error) {
+// collectPKs materializes the primary keys of every row the plan
+// matches, calling keep with each full row along the way (DELETE ...
+// RETURNING retains them; a plain DELETE's keep is a no-op).
+func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, env *exEnv, keep func([]any)) ([][]any, error) {
 	var pks [][]any
 	err := scanPlan(tx, table, pl, env, func(r bytdb.Row) bool {
 		pk := make([]any, len(desc.PKCols))
@@ -910,6 +1025,7 @@ func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, en
 			pk[i] = r.Vals[ord]
 		}
 		pks = append(pks, pk)
+		keep(r.Vals)
 		return true
 	})
 	return pks, err

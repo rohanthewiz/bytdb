@@ -187,29 +187,49 @@ func (t *Txn) desc(table string) (*TableDesc, error) {
 
 // Insert stores one row within the transaction (see Engine.Insert).
 func (t *Txn) Insert(table string, vals ...any) error {
+	_, err := t.InsertReturning(table, vals...)
+	return err
+}
+
+// InsertReturning is Insert, additionally returning the row as stored:
+// values coerced to their column types and identity columns filled.
+// This is what INSERT ... RETURNING reports — the engine is the only
+// party that knows a drawn identity value, so it must hand the final
+// row back rather than have callers reconstruct it.
+func (t *Txn) InsertReturning(table string, vals ...any) ([]any, error) {
 	desc, err := t.desc(table)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := insertRow(t.tx, desc, vals); err != nil {
-		return serr.Wrap(err, "op", "insert", "table", table)
+	row, err := insertRow(t.tx, desc, vals)
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "insert", "table", table)
 	}
-	return nil
+	return row, nil
 }
 
 // Update modifies a row within the transaction (see Engine.Update).
 // A failed update stages no writes, so the transaction remains
 // committable if the error is handled.
 func (t *Txn) Update(table string, pkVals []any, set map[string]any) (bool, error) {
+	_, updated, err := t.UpdateReturning(table, pkVals, set)
+	return updated, err
+}
+
+// UpdateReturning is Update, additionally returning the row as stored
+// (nil when no row matched). RETURNING reports these values instead of
+// re-applying the SET map itself so it can never drift from the
+// engine's own coercion.
+func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) ([]any, bool, error) {
 	desc, err := t.desc(table)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	updated, err := updateRow(t.tx, desc, pkVals, set)
+	row, updated, err := updateRow(t.tx, desc, pkVals, set)
 	if err != nil {
-		return false, serr.Wrap(err, "op", "update", "table", table)
+		return nil, false, serr.Wrap(err, "op", "update", "table", table)
 	}
-	return updated, nil
+	return row, updated, nil
 }
 
 // Delete removes a row within the transaction (see Engine.Delete).

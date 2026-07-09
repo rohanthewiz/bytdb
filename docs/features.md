@@ -72,6 +72,27 @@ INSERT INTO users (name) VALUES ('edsger');          -- id 11, no collision
   non-nullable with a serial-style `column_default`, which is what
   introspecting ORMs key "omit on insert" off.
 
+## RETURNING
+
+```sql
+INSERT INTO users (name) VALUES ('ada') RETURNING id;         -- the ORM idiom
+INSERT INTO users (name) VALUES ('x'), ('y') RETURNING *;
+UPDATE users SET age = age + 1 WHERE id = 1 RETURNING id, age;
+DELETE FROM users WHERE city = 'nyc' RETURNING id, name AS gone;
+```
+*(verified in `sql/returning_test.go` and `pgwire/returning_test.go`)*
+
+- INSERT and UPDATE report each row **as stored** — a `SERIAL` column's drawn
+  value, coerced values, SET applied — straight from the engine, so the client
+  learns server-generated IDs without a second round trip. DELETE reports the
+  row as it was before removal.
+- The clause is a full select list: expressions, aliases, `*`, `t.*`, and `$n`
+  placeholders. Aggregates and window functions are rejected at parse, as in
+  Postgres — each affected row yields exactly one output row.
+- Works over both wire protocol paths: `Describe` announces the row shape
+  before execution, and the command tag still carries the affected count
+  (`INSERT 0 2` alongside the rows).
+
 ## Indexes
 
 ```sql

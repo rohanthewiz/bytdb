@@ -24,6 +24,7 @@ func numParams(st Statement) int {
 				note(v)
 			}
 		}
+		noteReturningVals(&s.Returning, note)
 	case *Update:
 		for _, v := range s.Set {
 			note(v)
@@ -32,8 +33,10 @@ func numParams(st Statement) int {
 			noteExprVals(ex, note)
 		}
 		notePredVals(s.Where, note)
+		noteReturningVals(&s.Returning, note)
 	case *Delete:
 		notePredVals(s.Where, note)
+		noteReturningVals(&s.Returning, note)
 	case *Select:
 		noteSelectVals(s, note)
 	case *Explain:
@@ -64,6 +67,17 @@ func noteSelectVals(s *Select, note func(any)) {
 	}
 	for _, arm := range s.Union {
 		noteSelectVals(arm.Sel, note)
+	}
+}
+
+// noteReturningVals feeds a RETURNING clause's literals to note —
+// items carry the same shapes as select-list entries.
+func noteReturningVals(r *Returning, note func(any)) {
+	for _, it := range r.RetItems {
+		if it.IsLit {
+			note(it.Lit)
+		}
+		noteExprVals(it.Ex, note)
 	}
 }
 
@@ -142,6 +156,7 @@ func bindParams(st Statement, args []any) (Statement, error) {
 			}
 			c.Rows[i] = r
 		}
+		c.Returning = bindReturning(s.Returning, sub)
 		return &c, nil
 	case *Update:
 		c := *s
@@ -154,10 +169,12 @@ func bindParams(st Statement, args []any) (Statement, error) {
 			c.SetEx[k] = bindExpr(ex, sub)
 		}
 		c.Where = bindBool(s.Where, sub)
+		c.Returning = bindReturning(s.Returning, sub)
 		return &c, nil
 	case *Delete:
 		c := *s
 		c.Where = bindBool(s.Where, sub)
+		c.Returning = bindReturning(s.Returning, sub)
 		return &c, nil
 	case *Select:
 		return bindSelect(s, sub), nil
@@ -169,6 +186,24 @@ func bindParams(st Statement, args []any) (Statement, error) {
 		return &Explain{Stmt: inner}, nil
 	}
 	return st, nil
+}
+
+// bindReturning clones a RETURNING clause with placeholders
+// substituted, mirroring bindSelect's item handling.
+func bindReturning(r Returning, sub func(any) any) Returning {
+	if len(r.RetItems) == 0 {
+		return r
+	}
+	c := r
+	c.RetItems = make([]SelectItem, len(r.RetItems))
+	copy(c.RetItems, r.RetItems)
+	for i := range c.RetItems {
+		if c.RetItems[i].IsLit {
+			c.RetItems[i].Lit = sub(c.RetItems[i].Lit)
+		}
+		c.RetItems[i].Ex = bindExpr(c.RetItems[i].Ex, sub)
+	}
+	return c
 }
 
 // bindSelect clones a SELECT with placeholders substituted, including

@@ -15,11 +15,11 @@
 //	CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 //	DROP INDEX idx [ON t]
 //	EXPLAIN statement
-//	INSERT INTO t [(c, ...)] VALUES (v, ...), ...
+//	INSERT INTO t [(c, ...)] VALUES (v, ...), ... [RETURNING ...]
 //	SELECT * | items FROM tables [WHERE ...] [GROUP BY c, ...] [HAVING ...]
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
-//	UPDATE t SET c = v, ... [WHERE ...]
-//	DELETE FROM t [WHERE ...]
+//	UPDATE t SET c = v, ... [WHERE ...] [RETURNING ...]
+//	DELETE FROM t [WHERE ...] [RETURNING ...]
 //	BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
 //	SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 //
@@ -158,6 +158,17 @@
 // same $n may be used more than once. Arguments are Go values —
 // int64, float64, string, bool, []byte, or nil for NULL, with other
 // integer and float types converted.
+//
+// INSERT, UPDATE, and DELETE take an optional RETURNING clause — a
+// select list (expressions, aliases, *, t.*) evaluated once per
+// affected row and returned like a SELECT's rows, alongside the
+// affected count. INSERT and UPDATE report each row as stored — an
+// identity column's drawn value, coerced values, SET applied — and
+// DELETE reports the row as it was before its removal; rows come back
+// in the statement's processing order (insertion order for INSERT,
+// scan order otherwise). Aggregates and window functions are rejected
+// in the clause, as in Postgres: there is no row set to fold — each
+// affected row yields exactly one output row.
 //
 // Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 // runs in one engine transaction and rolls back entirely on error.
