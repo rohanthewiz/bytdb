@@ -9,9 +9,11 @@ package pgwire_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestReturningOverWire(t *testing.T) {
@@ -77,5 +79,34 @@ func TestReturningOverWire(t *testing.T) {
 	if err := c.QueryRow(ctx, `insert into users (name) values ('barbara') returning id`,
 		pgx.QueryExecModeSimpleProtocol).Scan(&last); err != nil || last != 4 {
 		t.Fatalf("simple-protocol insert: %v id %d, want 4", err, last)
+	}
+}
+
+// TestLastvalOverWire: the post-insert probe some drivers still send
+// instead of RETURNING; 55000 before any draw, per-connection after.
+func TestLastvalOverWire(t *testing.T) {
+	ctx := context.Background()
+	addr := startServer(t)
+	c := connect(t, addr)
+	mustExec(t, c, `create table t (id serial primary key, v text)`)
+
+	var pgErr *pgconn.PgError
+	if err := c.QueryRow(ctx, `select lastval()`).Scan(new(int64)); err == nil {
+		t.Fatal("lastval before draw succeeded")
+	} else if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
+		t.Fatalf("lastval error: %v", err)
+	}
+
+	mustExec(t, c, `insert into t (v) values ('a')`)
+	var last, curr int64
+	if err := c.QueryRow(ctx, `select lastval(), currval('t_id_seq')`).Scan(&last, &curr); err != nil ||
+		last != 1 || curr != 1 {
+		t.Fatalf("after draw: %v %d %d", err, last, curr)
+	}
+
+	// Another connection has its own session state.
+	c2 := connect(t, addr)
+	if err := c2.QueryRow(ctx, `select lastval()`).Scan(new(int64)); err == nil {
+		t.Fatal("lastval crossed connections")
 	}
 }

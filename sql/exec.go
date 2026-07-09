@@ -882,6 +882,15 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 				return err
 			}
 			affected++
+			// A NULL in an identity column meant a draw: record it for
+			// lastval()/currval(). An explicit value is not a draw.
+			for i := range desc.Columns {
+				if c := &desc.Columns[i]; c.Identity && i < len(vals) && vals[i] == nil {
+					if v, ok := stored.Vals[i].(int64); ok {
+						d.seq.record(identitySeqName(desc.Name, c.Name), v)
+					}
+				}
+			}
 			if up != nil {
 				if err := up.markInserted(stored.Vals); err != nil {
 					return err

@@ -806,6 +806,14 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 		return "0 bytes", nil
 	case "pg_encoding_to_char":
 		return "UTF8", nil
+	case "lastval":
+		return env.d.seq.lastval()
+	case "currval":
+		s, ok := argN(0).(string)
+		if !ok {
+			return nil, serr.New("currval requires a sequence name")
+		}
+		return env.d.seq.currval(s)
 	}
 	return nil, serr.New("unknown function", "function", name)
 }
@@ -1240,6 +1248,8 @@ var funcTypes = map[string]bytdb.ColType{
 	"length":                     bytdb.TInt,
 	"char_length":                bytdb.TInt,
 	"character_length":           bytdb.TInt,
+	"lastval":                    bytdb.TInt,
+	"currval":                    bytdb.TInt,
 }
 
 func castColType(typ string) bytdb.ColType {

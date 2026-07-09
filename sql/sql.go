@@ -189,6 +189,13 @@
 // in the clause, as in Postgres: there is no row set to fold — each
 // affected row yields exactly one output row.
 //
+// lastval() and currval('t_col_seq') read back the session's identity
+// draws for drivers that probe instead of using RETURNING, with
+// Postgres's "not yet defined in this session" error (SQLSTATE 55000)
+// before the first draw. The state is per Session (a bare DB is one
+// shared session) and survives a rolled-back block, as in Postgres —
+// sequence state is session-local, not transactional.
+//
 // INSERT takes an optional ON CONFLICT clause with Postgres upsert
 // semantics. The conflict target names the primary key's or a unique
 // index's columns (inferred set-wise, order-insensitive); DO NOTHING
@@ -243,10 +250,14 @@ type DB struct {
 	// tx, when set, is a Session's open transaction: every statement
 	// runs inside it instead of opening its own.
 	tx *bytdb.Txn
+
+	// seq is the sequence-function state lastval()/currval() read.
+	// Sessions each carry their own; a bare DB is one shared session.
+	seq *seqSession
 }
 
 // New wraps an Engine for SQL execution.
-func New(e *bytdb.Engine) *DB { return &DB{e: e} }
+func New(e *bytdb.Engine) *DB { return &DB{e: e, seq: &seqSession{}} }
 
 // read runs fn over the open session transaction, or a fresh
 // read-only snapshot in autocommit.

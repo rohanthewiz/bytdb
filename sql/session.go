@@ -59,8 +59,14 @@ type sesSave struct {
 	sp   *bytdb.Savepoint
 }
 
-// NewSession wraps the DB with per-connection transaction state.
-func (d *DB) NewSession() *Session { return &Session{db: d} }
+// NewSession wraps the DB with per-connection transaction state. The
+// session gets its own sequence-function state: lastval() reports
+// this session's draws, not another connection's.
+func (d *DB) NewSession() *Session {
+	sdb := *d
+	sdb.seq = &seqSession{}
+	return &Session{db: &sdb}
+}
 
 // Status reports the session's transaction state.
 func (s *Session) Status() TxStatus {
@@ -149,7 +155,7 @@ func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 			return nil, err
 		}
 		s.tx, s.readOnly, s.aborted, s.saves = tx, tc.ReadOnly, false, nil
-		s.sdb = &DB{e: s.db.e, tx: tx}
+		s.sdb = &DB{e: s.db.e, tx: tx, seq: s.db.seq}
 		return &Result{}, nil
 	case TxnCommit:
 		if s.tx == nil {

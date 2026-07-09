@@ -54,6 +54,8 @@ func sqlstate(msg string, hasPos bool) string {
 		return "25P01" // no_active_sql_transaction
 	case strings.Contains(msg, "savepoint") && strings.Contains(msg, "does not exist"):
 		return "3B001" // invalid_savepoint_specification
+	case strings.Contains(msg, "not yet defined in this session"):
+		return "55000" // object_not_in_prerequisite_state (lastval/currval)
 	}
 	return "XX000"
 }

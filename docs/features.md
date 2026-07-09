@@ -77,6 +77,11 @@ INSERT INTO users (name) VALUES ('edsger');          -- id 11, no collision
 - Identity implies NOT NULL; `information_schema.columns` reports the column
   non-nullable with a serial-style `column_default`, which is what
   introspecting ORMs key "omit on insert" off.
+- `lastval()` and `currval('t_col_seq')` read back this session's identity
+  draws (the probe some drivers send instead of `RETURNING`), with Postgres's
+  55000 "not yet defined in this session" before the first draw. Draws are
+  session-local and survive a rolled-back block, as in Postgres.
+  *(verified in `sql/seqfuncs_test.go`)*
 
 ## RETURNING
 
