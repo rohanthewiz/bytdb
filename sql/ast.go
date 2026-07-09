@@ -462,10 +462,29 @@ type DropIndex struct{ Name, Table string }
 // [RETURNING ...]. Values are parsed literals: int64, float64, string,
 // bool, or nil.
 type Insert struct {
-	Table string
-	Cols  []string // nil: values in declared column order
-	Rows  [][]any
+	Table    string
+	Cols     []string // nil: values in declared column order
+	Rows     [][]any
+	Conflict *OnConflict // nil: a collision is an error, as ever
 	Returning
+}
+
+// OnConflict is INSERT's ON CONFLICT clause: what to do instead of
+// erroring when a proposed row collides with an existing one on the
+// primary key or a unique index. TargetCols names the conflict target
+// — the column set of the PK or of one unique index (nil: any of
+// them, allowed only with DO NOTHING, as in Postgres). Update false
+// is DO NOTHING: the proposed row is silently dropped. Update true is
+// DO UPDATE: the existing row gets Set/SetEx applied (the same split
+// as Update's), where unqualified column references read the existing
+// row and excluded.col reads the proposed one; Where, when present,
+// limits which conflicting rows update.
+type OnConflict struct {
+	TargetCols []string
+	Update     bool
+	Set        map[string]any
+	SetEx      map[string]Expr
+	Where      BoolExpr
 }
 
 // Returning is the optional RETURNING clause of INSERT, UPDATE, and

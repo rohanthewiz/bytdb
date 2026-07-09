@@ -58,7 +58,8 @@ Parse-time rejections with pointed errors:
 | `REFERENCES` / foreign keys | Enforce in application code |
 | `ALTER TABLE ... ADD PRIMARY KEY / ADD UNIQUE` | Declare PK at create; unique via index |
 | `RIGHT` / `FULL` / `NATURAL` joins | Rewrite as `LEFT`/`INNER` |
-| CTEs (`WITH`), `ON CONFLICT`/upsert, `TRUNCATE`, views | — |
+| CTEs (`WITH`), `TRUNCATE`, views | — |
+| `ON CONFLICT ON CONSTRAINT name`, index predicates in the conflict target | Name the columns: `ON CONFLICT (col, ...)` |
 | Date/time, decimal, uuid, json, array column types | Store as `INT` (epoch), `TEXT`, or `BYTEA` |
 | `$n` placeholders in `LIMIT`/`OFFSET` | Literal counts only |
 | `EXPLAIN ANALYZE` | `EXPLAIN` only — execution is not instrumented |

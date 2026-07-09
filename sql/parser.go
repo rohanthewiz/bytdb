@@ -814,10 +814,124 @@ func (p *parser) insert() (Statement, error) {
 			break
 		}
 	}
+	if ins.Conflict, err = p.onConflictClause(table); err != nil {
+		return nil, err
+	}
 	if err := p.returningClause(&ins.Returning); err != nil {
 		return nil, err
 	}
 	return ins, nil
+}
+
+// onConflictClause parses an optional ON CONFLICT [(col, ...)]
+// DO NOTHING | DO UPDATE SET ... [WHERE cond]; nil when absent.
+// Unqualified column references in the DO UPDATE assignments and
+// WHERE are qualified with the target table here, at parse time: at
+// execution they resolve against a two-table scope (the table plus
+// the excluded pseudo-table, both the same descriptor), where a bare
+// name would otherwise be ambiguous — Postgres reads bare names as
+// the target row and requires excluded to be spelled out.
+func (p *parser) onConflictClause(table string) (*OnConflict, error) {
+	if !p.acceptKw("on") {
+		return nil, nil
+	}
+	if err := p.expectKw("conflict"); err != nil {
+		return nil, err
+	}
+	oc := &OnConflict{}
+	if p.cur().kind == tOp && p.cur().text == "(" {
+		cols, err := p.identList("a column name")
+		if err != nil {
+			return nil, err
+		}
+		oc.TargetCols = cols
+	}
+	if p.acceptKw("on") {
+		return nil, serr.New("ON CONFLICT ON CONSTRAINT is not supported; name the conflict columns instead")
+	}
+	if p.acceptKw("where") {
+		return nil, serr.New("ON CONFLICT with an index predicate is not supported (bytdb has no partial indexes)")
+	}
+	if err := p.expectKw("do"); err != nil {
+		return nil, err
+	}
+	switch {
+	case p.acceptKw("nothing"):
+		return oc, nil
+	case p.acceptKw("update"):
+		if oc.TargetCols == nil {
+			// Postgres's rule and wording: without a target there is no
+			// way to know which existing row to update.
+			return nil, serr.New("ON CONFLICT DO UPDATE requires the conflict target columns")
+		}
+		if err := p.expectKw("set"); err != nil {
+			return nil, err
+		}
+		oc.Update = true
+		var err error
+		if oc.Set, oc.SetEx, err = p.setClause("ON CONFLICT DO UPDATE"); err != nil {
+			return nil, err
+		}
+		if p.acceptKw("where") {
+			if oc.Where, err = p.boolExpr(false); err != nil {
+				return nil, err
+			}
+		}
+		for _, ex := range oc.SetEx {
+			qualifyExprCols(ex, table)
+		}
+		qualifyBoolCols(oc.Where, table)
+		return oc, nil
+	}
+	return nil, p.unexpected("NOTHING or UPDATE after DO")
+}
+
+// qualifyExprCols stamps the table qualifier on every bare column
+// reference in a freshly parsed expression, in place. Subqueries are
+// left alone (walkExpr treats *ExSub as a leaf): their columns must
+// resolve against their own FROM first, and genuinely correlated
+// references still reach the outer scope through the environment
+// chain at evaluation.
+func qualifyExprCols(e Expr, table string) {
+	walkExpr(e, func(sub Expr) bool {
+		if c, ok := sub.(*ExCol); ok && c.Col.Table == "" {
+			c.Col.Table = table
+		}
+		return true
+	})
+}
+
+// qualifyBoolCols is qualifyExprCols over a condition tree: predicate
+// operands and expression leaves alike.
+func qualifyBoolCols(e BoolExpr, table string) {
+	walkPreds(e, func(pr *Pred) error {
+		if pr.Item.Col.Name != "" && pr.Item.Col.Table == "" {
+			pr.Item.Col.Table = table
+		}
+		if pr.RItem != nil && pr.RItem.Col.Name != "" && pr.RItem.Col.Table == "" {
+			pr.RItem.Col.Table = table
+		}
+		return nil
+	})
+	qualifyCondCols(e, table)
+}
+
+// qualifyCondCols descends to the Cond leaves walkPreds skips.
+func qualifyCondCols(e BoolExpr, table string) {
+	switch n := e.(type) {
+	case *Cond:
+		qualifyExprCols(n.Ex, table)
+	case *Not:
+		qualifyCondCols(n.Expr, table)
+	case *And:
+		for _, sub := range n.Exprs {
+			qualifyCondCols(sub, table)
+		}
+	case *Or:
+		for _, sub := range n.Exprs {
+			qualifyCondCols(sub, table)
+		}
+	}
 }
 
 // returningClause parses an optional RETURNING * | item, ... into ret.
@@ -1013,44 +1127,9 @@ func (p *parser) update() (Statement, error) {
 	if err := p.expectKw("set"); err != nil {
 		return nil, err
 	}
-	u := &Update{Table: table, Set: map[string]any{}, SetEx: map[string]Expr{}}
-	for {
-		col, err := p.ident("a column name")
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expectOp("="); err != nil {
-			return nil, err
-		}
-		ex, err := p.expression()
-		if err != nil {
-			return nil, err
-		}
-		// Aggregates and windows have no row set to aggregate over in an
-		// UPDATE; Postgres rejects them here too.
-		if findAgg(ex) != AggNone {
-			return nil, serr.New("aggregate functions are not allowed in UPDATE")
-		}
-		if hasWindowExpr(ex) {
-			return nil, serr.New("window functions are not allowed in UPDATE")
-		}
-		if _, dup := u.Set[col]; dup {
-			return nil, serr.New("duplicate column in SET", "column", col)
-		}
-		if _, dup := u.SetEx[col]; dup {
-			return nil, serr.New("duplicate column in SET", "column", col)
-		}
-		// A bare literal (or $n placeholder) keeps the pre-expression
-		// representation: Set values coerce once per statement and skip
-		// per-row evaluation. Everything else evaluates per row.
-		if lit, ok := ex.(*ExLit); ok {
-			u.Set[col] = lit.Val
-		} else {
-			u.SetEx[col] = ex
-		}
-		if !p.acceptOp(",") {
-			break
-		}
+	u := &Update{Table: table}
+	if u.Set, u.SetEx, err = p.setClause("UPDATE"); err != nil {
+		return nil, err
 	}
 	if p.acceptKw("where") {
 		if u.Where, err = p.boolExpr(false); err != nil {
@@ -1061,6 +1140,52 @@ func (p *parser) update() (Statement, error) {
 		return nil, err
 	}
 	return u, nil
+}
+
+// setClause parses SET col = expr, ... into the literal / expression
+// assignment split Update documents (shared by UPDATE and ON CONFLICT
+// DO UPDATE). stmt names the statement in rejection errors.
+func (p *parser) setClause(stmt string) (map[string]any, map[string]Expr, error) {
+	set := map[string]any{}
+	setEx := map[string]Expr{}
+	for {
+		col, err := p.ident("a column name")
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := p.expectOp("="); err != nil {
+			return nil, nil, err
+		}
+		ex, err := p.expression()
+		if err != nil {
+			return nil, nil, err
+		}
+		// Aggregates and windows have no row set to aggregate over in an
+		// UPDATE; Postgres rejects them here too.
+		if findAgg(ex) != AggNone {
+			return nil, nil, serr.New("aggregate functions are not allowed in " + stmt)
+		}
+		if hasWindowExpr(ex) {
+			return nil, nil, serr.New("window functions are not allowed in " + stmt)
+		}
+		if _, dup := set[col]; dup {
+			return nil, nil, serr.New("duplicate column in SET", "column", col)
+		}
+		if _, dup := setEx[col]; dup {
+			return nil, nil, serr.New("duplicate column in SET", "column", col)
+		}
+		// A bare literal (or $n placeholder) keeps the pre-expression
+		// representation: Set values coerce once per statement and skip
+		// per-row evaluation. Everything else evaluates per row.
+		if lit, ok := ex.(*ExLit); ok {
+			set[col] = lit.Val
+		} else {
+			setEx[col] = ex
+		}
+		if !p.acceptOp(",") {
+			return set, setEx, nil
+		}
+	}
 }
 
 func (p *parser) deleteStmt() (Statement, error) {

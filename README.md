@@ -148,7 +148,9 @@ ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
 ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 CREATE [UNIQUE] INDEX idx ON t (c, ...)
 DROP INDEX idx [ON t]
-INSERT INTO t [(cols)] VALUES (...), (...) [RETURNING items]
+INSERT INTO t [(cols)] VALUES (...), (...)
+       [ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ... [WHERE ...]]
+       [RETURNING items]
 SELECT * | items FROM tables [WHERE ...] [GROUP BY ...] [HAVING ...]
        [ORDER BY item [DESC], ...] [LIMIT n] [OFFSET n]
 UPDATE t SET c = v, ... [WHERE ...] [RETURNING items]

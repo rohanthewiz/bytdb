@@ -743,6 +743,7 @@ func (rp *retProj) row(vals []any) ([]any, error) {
 
 func (d *DB) execInsert(s *Insert) (*Result, error) {
 	res := &Result{}
+	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.Table(s.Table)
 		if desc == nil {
@@ -767,6 +768,10 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		up, err := d.prepareUpsert(tx, s.Table, desc, s.Conflict, checks)
+		if err != nil {
+			return err
+		}
 		var env *exEnv
 		if len(checks) > 0 {
 			env = d.tableEnv(tx, s.Table, desc)
@@ -782,7 +787,35 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					vals[ord] = row[i]
 				}
 			}
-			// Arity mismatches fall through to the engine's error.
+			// Arity mismatches skip the conflict probe too and fall
+			// through to the engine's error.
+			if up != nil && len(vals) == len(desc.Columns) {
+				existing, hit, err := up.conflict(tx, vals)
+				if err != nil {
+					return err
+				}
+				if hit {
+					if !s.Conflict.Update {
+						continue // DO NOTHING: not counted, not returned
+					}
+					stored, updated, err := up.resolve(tx, existing, vals)
+					if err != nil {
+						return err
+					}
+					if !updated { // DO UPDATE ... WHERE filtered the pair out
+						continue
+					}
+					affected++
+					if ret != nil {
+						out, err := ret.row(stored.Vals)
+						if err != nil {
+							return err
+						}
+						res.Rows = append(res.Rows, out)
+					}
+					continue
+				}
+			}
 			if env != nil && len(vals) == len(desc.Columns) {
 				if err := checkRow(env, s.Table, checks, vals); err != nil {
 					return err
@@ -795,6 +828,12 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 			stored, err := tx.InsertReturning(s.Table, vals...)
 			if err != nil {
 				return err
+			}
+			affected++
+			if up != nil {
+				if err := up.markInserted(stored.Vals); err != nil {
+					return err
+				}
 			}
 			if ret != nil {
 				out, err := ret.row(stored.Vals)
@@ -809,7 +848,7 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	res.RowsAffected = len(s.Rows)
+	res.RowsAffected = affected
 	return res, nil
 }
 

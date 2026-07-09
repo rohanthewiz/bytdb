@@ -83,6 +83,32 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 				}
 			}
 		}
+		if oc := st.Conflict; oc != nil && oc.Update {
+			for name, v := range oc.Set {
+				i := desc.ColIndex(name)
+				if i < 0 {
+					return serr.New("no such column", "table", st.Table, "column", name)
+				}
+				note(v, desc.Columns[i].Type)
+			}
+			// As in UPDATE: a placeholder inside a SET expression infers
+			// as the target column's type, best-effort.
+			for name, ex := range oc.SetEx {
+				i := desc.ColIndex(name)
+				if i < 0 {
+					return serr.New("no such column", "table", st.Table, "column", name)
+				}
+				t := desc.Columns[i].Type
+				noteExprVals(ex, func(v any) { note(v, t) })
+			}
+			ocSc := &scope{tables: []scopeTable{
+				{name: st.Table, desc: desc},
+				{name: "excluded", desc: desc, off: len(desc.Columns)},
+			}, width: 2 * len(desc.Columns)}
+			if err := inferPredParams(oc.Where, columnType(ocSc), note); err != nil {
+				return err
+			}
+		}
 		sc, err := buildScope(lk, []FromItem{{Table: st.Table}})
 		if err != nil {
 			return err

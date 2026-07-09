@@ -96,6 +96,33 @@ DELETE FROM users WHERE city = 'nyc' RETURNING id, name AS gone;
   `Txn.InsertReturning` / `Txn.UpdateReturning` return the stored `Row`
   (verified in `returning_test.go`).
 
+## Upsert (ON CONFLICT)
+
+```sql
+-- the counter idiom
+INSERT INTO kv VALUES ('a', 1, 1)
+    ON CONFLICT (k) DO UPDATE SET v = excluded.v, hits = kv.hits + 1
+    RETURNING hits;
+
+INSERT INTO t VALUES (1, 'x') ON CONFLICT DO NOTHING;             -- absorb any collision
+INSERT INTO t VALUES (1, 'x')
+    ON CONFLICT (id) DO UPDATE SET v = excluded.v WHERE t.v < 50; -- conditional update
+```
+*(verified in `sql/upsert_test.go` and, over the wire, `pgwire/upsert_test.go`)*
+
+- The conflict target names the primary key's or a unique index's columns
+  (matched as a set, order-insensitive); `DO NOTHING` may omit it to absorb a
+  collision on **any** uniqueness constraint.
+- In `DO UPDATE`, bare and table-qualified names read the **existing** row,
+  `excluded.col` reads the proposed one — Postgres semantics exactly. The
+  optional `WHERE` skips conflicting pairs that don't satisfy it.
+- Only rows actually inserted or updated count (`INSERT 0 1` after a
+  DO NOTHING skip) and feed `RETURNING`.
+- Postgres's guardrails are kept: a collision on a constraint other than the
+  named target is still an error, NULL keys never conflict, and `DO UPDATE`
+  touching the same row twice in one statement raises
+  "cannot affect row a second time".
+
 ## Indexes
 
 ```sql

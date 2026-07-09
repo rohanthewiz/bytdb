@@ -24,6 +24,15 @@ func numParams(st Statement) int {
 				note(v)
 			}
 		}
+		if oc := s.Conflict; oc != nil {
+			for _, v := range oc.Set {
+				note(v)
+			}
+			for _, ex := range oc.SetEx {
+				noteExprVals(ex, note)
+			}
+			notePredVals(oc.Where, note)
+		}
 		noteReturningVals(&s.Returning, note)
 	case *Update:
 		for _, v := range s.Set {
@@ -155,6 +164,19 @@ func bindParams(st Statement, args []any) (Statement, error) {
 				r[j] = sub(v)
 			}
 			c.Rows[i] = r
+		}
+		if oc := s.Conflict; oc != nil {
+			oc2 := *oc
+			oc2.Set = make(map[string]any, len(oc.Set))
+			for k, v := range oc.Set {
+				oc2.Set[k] = sub(v)
+			}
+			oc2.SetEx = make(map[string]Expr, len(oc.SetEx))
+			for k, ex := range oc.SetEx {
+				oc2.SetEx[k] = bindExpr(ex, sub)
+			}
+			oc2.Where = bindBool(oc.Where, sub)
+			c.Conflict = &oc2
 		}
 		c.Returning = bindReturning(s.Returning, sub)
 		return &c, nil

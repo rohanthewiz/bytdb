@@ -70,6 +70,32 @@ func (d *DB) coerceLiterals(st Statement) (Statement, error) {
 			}
 			c.Rows[i] = r
 		}
+		if oc := s.Conflict; oc != nil && oc.Update {
+			oc2 := *oc
+			oc2.Set = make(map[string]any, len(oc.Set))
+			for name, v := range oc.Set {
+				oc2.Set[name] = v
+				if i := desc.ColIndex(name); i >= 0 {
+					cv, err := coerceLit(v, desc.Columns[i].Type)
+					if err != nil {
+						return nil, err
+					}
+					oc2.Set[name] = cv
+				}
+			}
+			// The WHERE resolves over the target-plus-excluded scope its
+			// executor builds; both tables share the descriptor.
+			sc := &scope{tables: []scopeTable{
+				{name: s.Table, desc: desc},
+				{name: "excluded", desc: desc, off: len(desc.Columns)},
+			}, width: 2 * len(desc.Columns)}
+			where, err := coerceBool(oc.Where, columnType(sc))
+			if err != nil {
+				return nil, err
+			}
+			oc2.Where = where
+			c.Conflict = &oc2
+		}
 		return &c, nil
 	case *Update:
 		desc, _ := lk(s.Table)

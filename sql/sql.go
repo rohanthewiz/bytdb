@@ -15,7 +15,10 @@
 //	CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 //	DROP INDEX idx [ON t]
 //	EXPLAIN statement
-//	INSERT INTO t [(c, ...)] VALUES (v, ...), ... [RETURNING ...]
+//	INSERT INTO t [(c, ...)] VALUES (v, ...), ...
+//	       [ON CONFLICT [(c, ...)] DO NOTHING |
+//	        ON CONFLICT (c, ...) DO UPDATE SET c = expr, ... [WHERE ...]]
+//	       [RETURNING ...]
 //	SELECT * | items FROM tables [WHERE ...] [GROUP BY c, ...] [HAVING ...]
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
 //	UPDATE t SET c = v, ... [WHERE ...] [RETURNING ...]
@@ -151,7 +154,8 @@
 //
 // Statements may use $1-style placeholders wherever a literal may
 // appear: comparison values in WHERE, ON, and HAVING, INSERT values,
-// and UPDATE SET values (LIMIT and OFFSET take literal counts only).
+// UPDATE and ON CONFLICT DO UPDATE SET values, and RETURNING
+// expressions (LIMIT and OFFSET take literal counts only).
 // Exec binds its trailing arguments to them, and Prepare parses a
 // statement once for repeated execution. Parameters are numbered: a
 // statement takes exactly as many values as its highest $n, and the
@@ -169,6 +173,23 @@
 // scan order otherwise). Aggregates and window functions are rejected
 // in the clause, as in Postgres: there is no row set to fold — each
 // affected row yields exactly one output row.
+//
+// INSERT takes an optional ON CONFLICT clause with Postgres upsert
+// semantics. The conflict target names the primary key's or a unique
+// index's columns (inferred set-wise, order-insensitive); DO NOTHING
+// may omit it to absorb a collision on any of them. DO NOTHING drops
+// the conflicting proposal silently. DO UPDATE applies its SET to the
+// existing row instead: unqualified and table-qualified references
+// read that row, excluded.col reads the proposed one, and an optional
+// WHERE limits which conflicting pairs update — a filtered pair is
+// skipped entirely. Only rows actually inserted or updated count in
+// the result (and feed RETURNING). A NULL in a key position never
+// conflicts, matching unique-index semantics; a collision on a
+// constraint other than the named target stays an error; and, as in
+// Postgres, DO UPDATE reaching the same row twice in one statement —
+// including a row the statement itself inserted — is an error rather
+// than a silent double update. ON CONFLICT ON CONSTRAINT and partial-
+// index predicates are not supported (name the columns instead).
 //
 // Each statement is atomic: a multi-row INSERT, an UPDATE, or a DELETE
 // runs in one engine transaction and rolls back entirely on error.
