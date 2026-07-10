@@ -63,17 +63,22 @@ Parse-time rejections with pointed errors:
 | Date/time, decimal, uuid, json, array column types | Store as `INT` (epoch), `TEXT`, or `BYTEA` |
 | `$n` placeholders in `LIMIT`/`OFFSET` | Literal counts only |
 | `EXPLAIN ANALYZE` | `EXPLAIN` only — execution is not instrumented |
-| Window frames (`ROWS BETWEEN ...`), `LAG`/`LEAD`, window + `GROUP BY` | — |
+| Window frames (`ROWS BETWEEN ...`), window + `GROUP BY` | Default frame only; `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE` work |
 | Aggregates, subqueries, or placeholders inside `CHECK` | — |
 | `COPY`, out-of-band query cancellation, SSL on the wire | — |
 
-Two semantic notes that surprise people (both Postgres-faithful):
+Three semantic notes that surprise people (all Postgres-faithful):
 
 - `x NOT IN (...)` with a NULL in the list matches **zero rows** — three-valued
   logic, same as Postgres.
 - Text-vs-number comparison errors with `operator does not exist` rather than
   coercing; a *quoted untyped literal* against a typed column still adapts
   (`'42'` works where `42` does).
+- `LAST_VALUE(v) OVER (ORDER BY k)` returns the current row's last *peer*,
+  not the partition's last row — the default frame ends at the current row's
+  peer group, exactly as in Postgres (where the usual fix is an explicit
+  frame; here, drop the ORDER BY — `OVER (PARTITION BY ...)` alone frames the
+  whole partition). `NTH_VALUE` is frame-limited the same way.
 
 ## Schema-change edges
 

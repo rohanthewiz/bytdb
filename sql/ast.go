@@ -229,6 +229,8 @@ func walkExpr(e Expr, visit func(Expr) bool) {
 		}
 	case *ExWindow:
 		walkExpr(n.Arg, visit)
+		walkExpr(n.Offset, visit)
+		walkExpr(n.Default, visit)
 		for _, sub := range n.Partition {
 			walkExpr(sub, visit)
 		}
@@ -311,7 +313,9 @@ func (f AggFunc) name() string {
 	return ""
 }
 
-// WinFunc identifies a window-only function (the ranking family).
+// WinFunc identifies a window-only function: the ranking family
+// (argument-free row counters) and the value family (functions that
+// surface another row of the partition — LAG/LEAD and friends).
 // Aggregate windows (SUM(x) OVER ...) carry an AggFunc instead.
 type WinFunc int
 
@@ -320,10 +324,33 @@ const (
 	WinRowNumber
 	WinRank
 	WinDenseRank
+	WinLag
+	WinLead
+	WinFirstValue
+	WinLastValue
+	WinNthValue
 )
 
 var winNames = map[string]WinFunc{
 	"row_number": WinRowNumber, "rank": WinRank, "dense_rank": WinDenseRank,
+	"lag": WinLag, "lead": WinLead,
+	"first_value": WinFirstValue, "last_value": WinLastValue, "nth_value": WinNthValue,
+}
+
+// winArity gives a window-only function's argument-count range. The
+// parser validates counts here so the executor can trust the shape:
+// Arg is always set for the value family, and Offset only where it
+// means something (LAG/LEAD's offset, NTH_VALUE's n).
+func winArity(f WinFunc) (lo, hi int) {
+	switch f {
+	case WinLag, WinLead:
+		return 1, 3 // value [, offset [, default]]
+	case WinFirstValue, WinLastValue:
+		return 1, 1
+	case WinNthValue:
+		return 2, 2 // value, n
+	}
+	return 0, 0 // ranking family
 }
 
 func (f WinFunc) name() string {
@@ -336,15 +363,18 @@ func (f WinFunc) name() string {
 }
 
 // ExWindow is a window function call: fn(args) OVER (PARTITION BY ...
-// ORDER BY ...). Exactly one of Win (ranking family) or Agg (an
+// ORDER BY ...). Exactly one of Win (ranking/value family) or Agg (an
 // aggregate evaluated over the frame) is set. Explicit frames are not
 // supported; the frame is the whole partition when there is no ORDER
 // BY, else running (UNBOUNDED PRECEDING .. CURRENT ROW with peers,
-// the Postgres RANGE default).
+// the Postgres RANGE default). LAG/LEAD ignore the frame and address
+// the whole partition, as in Postgres.
 type ExWindow struct {
 	Win       WinFunc
 	Agg       AggFunc // AggNone unless an aggregate window
-	Arg       Expr    // aggregate argument; nil for COUNT(*) and ranking fns
+	Arg       Expr    // aggregate / value-function argument; nil for COUNT(*) and ranking fns
+	Offset    Expr    // LAG/LEAD offset (default 1) or NTH_VALUE's n; nil otherwise
+	Default   Expr    // LAG/LEAD out-of-partition fallback; nil means NULL
 	Star      bool    // COUNT(*) OVER (...)
 	Partition []Expr
 	OrderBy   []OrderItem

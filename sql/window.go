@@ -14,8 +14,12 @@ import (
 // materializes all post-filter rows, partitions them by the
 // order-preserving tuple encoding (the same equivalence GROUP BY uses),
 // sorts each partition by the window ORDER BY, and assigns a per-row
-// value. Ranking functions (ROW_NUMBER/RANK/DENSE_RANK) and unframed
+// value. Ranking functions (ROW_NUMBER/RANK/DENSE_RANK), value
+// functions (LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE), and unframed
 // aggregate windows are supported; explicit ROWS/RANGE frames are not.
+// Frame-sensitive value functions honor the Postgres default frame:
+// with ORDER BY it ends at the current row's last peer, so LAST_VALUE
+// is the last peer (not the partition end) — same surprise as PG.
 
 // hasWindow reports whether the query uses any window function in its
 // select list or ORDER BY.
@@ -38,8 +42,11 @@ func hasWindow(s *Select) bool {
 
 // resultType is the type of a window function's output column.
 func (w *ExWindow) resultType(sc *scope) bytdb.ColType {
-	if w.Win != WinNone {
-		return bytdb.TInt // row_number / rank / dense_rank
+	switch w.Win {
+	case WinRowNumber, WinRank, WinDenseRank:
+		return bytdb.TInt // ranking functions count rows
+	case WinLag, WinLead, WinFirstValue, WinLastValue, WinNthValue:
+		return exprType(sc, w.Arg) // value functions surface another row's Arg
 	}
 	switch w.Agg {
 	case AggCount:
@@ -63,6 +70,12 @@ func windowText(w *ExWindow) string {
 		b.WriteByte('*')
 	case w.Arg != nil:
 		b.WriteString(exprText(w.Arg))
+		if w.Offset != nil {
+			b.WriteString(", " + exprText(w.Offset))
+		}
+		if w.Default != nil {
+			b.WriteString(", " + exprText(w.Default))
+		}
 	}
 	b.WriteString(") OVER (")
 	sep := ""
@@ -343,6 +356,21 @@ func assignWindow(env *exEnv, sc *scope, w *ExWindow, wi int, base [][]any, idxs
 			prev = cur
 		}
 		return nil
+	case WinLag, WinLead:
+		return assignLagLead(env, w, base, idxs, wi, winvals)
+	case WinFirstValue:
+		// The default frame always starts at UNBOUNDED PRECEDING, so
+		// FIRST_VALUE is the partition's first row for every row.
+		v, err := evalOn(env, w.Arg, base[idxs[0]])
+		if err != nil {
+			return err
+		}
+		for _, ri := range idxs {
+			winvals[ri][wi] = v
+		}
+		return nil
+	case WinLastValue, WinNthValue:
+		return assignFrameEnd(env, w, base, idxs, wi, winvals)
 	}
 
 	// Aggregate window.
@@ -396,6 +424,135 @@ func assignWindow(env *exEnv, sc *scope, w *ExWindow, wi int, base [][]any, idxs
 		i = j
 	}
 	return nil
+}
+
+// assignLagLead fills LAG/LEAD values for one sorted partition. Both
+// address the whole partition regardless of frame, as in Postgres:
+// LAG(v, o) reads o rows back, LEAD(v, o) o rows ahead. The offset is
+// evaluated per row (it may be an expression), may be negative (which
+// flips direction, as in PG), and a NULL offset yields NULL. Rows past
+// either partition edge take the Default expression, or NULL.
+func assignLagLead(env *exEnv, w *ExWindow, base [][]any, idxs []int, wi int, winvals [][]any) error {
+	for n, ri := range idxs {
+		off := int64(1) // Postgres default offset
+		if w.Offset != nil {
+			ov, err := evalOn(env, w.Offset, base[ri])
+			if err != nil {
+				return err
+			}
+			if ov == nil {
+				winvals[ri][wi] = nil
+				continue
+			}
+			o, ok := ov.(int64)
+			if !ok {
+				return serr.New("window function offset must be an integer", "function", w.fnName())
+			}
+			off = o
+		}
+		if w.Win == WinLead {
+			off = -off
+		}
+		// Guard the subtraction: |off| bounded by the partition size
+		// keeps int64(n)-off well inside int64, so a huge or MinInt64
+		// offset can't overflow — it is simply out of the partition.
+		t := int64(-1)
+		if off >= -int64(len(idxs)) && off <= int64(len(idxs)) {
+			t = int64(n) - off
+		}
+		if t >= 0 && t < int64(len(idxs)) {
+			v, err := evalOn(env, w.Arg, base[idxs[t]])
+			if err != nil {
+				return err
+			}
+			winvals[ri][wi] = v
+		} else if w.Default != nil {
+			v, err := evalOn(env, w.Default, base[ri])
+			if err != nil {
+				return err
+			}
+			winvals[ri][wi] = v
+		}
+	}
+	return nil
+}
+
+// assignFrameEnd fills LAST_VALUE/NTH_VALUE for one sorted partition.
+// Both are frame-sensitive, and the default frame runs from the
+// partition start to the current row's last ORDER BY peer (Postgres'
+// RANGE default) — with no ORDER BY every row is a peer, making the
+// frame the whole partition. So the walk below visits peer groups:
+// each group [i, j) sees a frame of j rows.
+//
+//	idxs:   r0 r1 | r2 r3 r4 | r5        (| = peer-group boundary)
+//	frame:  [0,2) for r0/r1, [0,5) for r2..r4, [0,6) for r5
+//
+// LAST_VALUE is the frame's final row (idxs[j-1], the famous PG
+// surprise — not the partition end); NTH_VALUE(v, n) is the frame's
+// nth row or NULL when the frame is still shorter than n.
+func assignFrameEnd(env *exEnv, w *ExWindow, base [][]any, idxs []int, wi int, winvals [][]any) error {
+	for i := 0; i < len(idxs); {
+		key0, err := orderVals(env, w.OrderBy, base[idxs[i]])
+		if err != nil {
+			return err
+		}
+		j := i + 1
+		for j < len(idxs) {
+			kj, err := orderVals(env, w.OrderBy, base[idxs[j]])
+			if err != nil {
+				return err
+			}
+			if !equalVals(key0, kj) {
+				break
+			}
+			j++
+		}
+		if w.Win == WinLastValue {
+			v, err := evalOn(env, w.Arg, base[idxs[j-1]])
+			if err != nil {
+				return err
+			}
+			for k := i; k < j; k++ {
+				winvals[idxs[k]][wi] = v
+			}
+		} else { // NTH_VALUE: n evaluates per row, so peers can differ
+			for k := i; k < j; k++ {
+				ri := idxs[k]
+				nv, err := evalOn(env, w.Offset, base[ri])
+				if err != nil {
+					return err
+				}
+				if nv == nil {
+					continue // NULL n -> NULL, as in Postgres
+				}
+				n, ok := nv.(int64)
+				if !ok {
+					return serr.New("nth_value argument must be an integer")
+				}
+				if n < 1 {
+					return serr.New("argument of nth_value must be greater than zero")
+				}
+				if n <= int64(j) { // frame holds j rows
+					v, err := evalOn(env, w.Arg, base[idxs[n-1]])
+					if err != nil {
+						return err
+					}
+					winvals[ri][wi] = v
+				}
+			}
+		}
+		i = j
+	}
+	return nil
+}
+
+// evalOn evaluates a single expression against one base row.
+func evalOn(env *exEnv, e Expr, row []any) (any, error) {
+	vs, err := evalRow(env, []Expr{e}, row)
+	if err != nil {
+		return nil, err
+	}
+	return vs[0], nil
 }
 
 // orderVals evaluates a window ORDER BY's expressions on one row.

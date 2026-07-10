@@ -178,17 +178,28 @@ ORDER BY n DESC, decade LIMIT 3
 
 ### Window functions
 
-`ROW_NUMBER`, `RANK`, `DENSE_RANK`, and aggregate windows over
+`ROW_NUMBER`, `RANK`, `DENSE_RANK`, the value family (`LAG`, `LEAD`,
+`FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`), and aggregate windows over
 `PARTITION BY ... ORDER BY ...`:
 
 ```sql
 SELECT grp, v,
     rank()       OVER (PARTITION BY grp ORDER BY v) AS r,
-    dense_rank() OVER (PARTITION BY grp ORDER BY v) AS dr
+    dense_rank() OVER (PARTITION BY grp ORDER BY v) AS dr,
+    v - lag(v, 1, 0) OVER (PARTITION BY grp ORDER BY v) AS delta
 FROM t
 ```
-*(verified in `sql/expr_test.go:199-201`; running sums like
+*(verified in `sql/expr_test.go:199-201` and
+`sql/window_value_test.go`; running sums like
 `sum(age) OVER (ORDER BY age)` also work)*
+
+`LAG(v [, offset [, default]])` / `LEAD(...)` follow Postgres: the
+offset defaults to 1, is evaluated per row, may be negative (which
+flips direction), and a NULL offset yields NULL; rows past the
+partition edge take `default`, or NULL. `LAST_VALUE` and `NTH_VALUE`
+honor the Postgres default frame — see the semantic notes in
+[Considerations & Gotchas](gotchas.md#sql-that-is-deliberately-not-there)
+before reaching for `LAST_VALUE`.
 
 ### Expressions
 

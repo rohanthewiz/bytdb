@@ -2088,16 +2088,56 @@ func (p *parser) exprPrimary() (Expr, error) {
 		}
 		return agg, nil
 	}
-	// Ranking window functions: row_number()/rank()/dense_rank(), which
-	// take no arguments and require an OVER clause.
+	// Window-only functions: the ranking family (row_number/rank/
+	// dense_rank, no arguments) and the value family (lag/lead/
+	// first_value/last_value/nth_value, which surface another row of
+	// the partition). Both require an OVER clause; winArity validates
+	// argument counts here so the executor can trust the AST shape.
 	if t.kind == tIdent && winNames[t.text] != WinNone && p.peekOp("(") {
 		fn := winNames[t.text]
+		name := t.text
 		p.advance() // name
 		p.advance() // (
-		if err := p.expectOp(")"); err != nil {
-			return nil, err
+		var args []Expr
+		if !p.acceptOp(")") {
+			for {
+				a, err := p.expression()
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, a)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
 		}
-		return p.windowOver(&ExWindow{Win: fn})
+		lo, hi := winArity(fn)
+		if len(args) < lo || len(args) > hi {
+			return nil, serr.New("wrong number of arguments for window function",
+				"function", name, "got", strconv.Itoa(len(args)),
+				"want", strconv.Itoa(lo)+".."+strconv.Itoa(hi))
+		}
+		for _, a := range args {
+			if hasWindowExpr(a) {
+				return nil, serr.New("window function calls cannot be nested")
+			}
+		}
+		w := &ExWindow{Win: fn}
+		// Positional meaning is per-family: LAG/LEAD are (value, offset,
+		// default); NTH_VALUE is (value, n) with n riding in Offset.
+		if len(args) > 0 {
+			w.Arg = args[0]
+		}
+		if len(args) > 1 {
+			w.Offset = args[1]
+		}
+		if len(args) > 2 {
+			w.Default = args[2]
+		}
+		return p.windowOver(w)
 	}
 	if t.kind == tIdent && p.peekOp("(") {
 		name := t.text
@@ -2154,6 +2194,11 @@ func (p *parser) funcCall(name string) (Expr, error) {
 // attaches it to w; cur is the "over" keyword. Explicit frame clauses
 // (ROWS/RANGE) are rejected — the frame is implied by ORDER BY.
 func (p *parser) windowOver(w *ExWindow) (Expr, error) {
+	// The aggregate caller has already seen "over"; the window-only
+	// path has not, and e.g. lag(x) with no OVER must error clearly.
+	if t := p.cur(); !(t.kind == tIdent && t.text == "over") {
+		return nil, serr.New("window function requires an OVER clause", "function", w.fnName())
+	}
 	p.advance() // over
 	if err := p.expectOp("("); err != nil {
 		return nil, err

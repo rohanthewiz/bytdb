@@ -366,6 +366,8 @@ func bindExpr(e Expr, sub func(any) any) Expr {
 	case *ExWindow:
 		c := *n
 		c.Arg = bindExpr(n.Arg, sub)
+		c.Offset = bindExpr(n.Offset, sub)
+		c.Default = bindExpr(n.Default, sub)
 		c.Partition = make([]Expr, len(n.Partition))
 		for i, e := range n.Partition {
 			c.Partition[i] = bindExpr(e, sub)

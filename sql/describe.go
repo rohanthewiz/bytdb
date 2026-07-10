@@ -212,6 +212,31 @@ func describeSelect(lk tableLookup, st *Select, note func(any, bytdb.ColType), r
 	if err := inferPredParams(st.Having, itemType(sc), note); err != nil {
 		return err
 	}
+	// Select-list placeholders are generally untyped (they present as
+	// text on the wire), but a window function's extra arguments are
+	// knowable: LAG/LEAD's offset and NTH_VALUE's n are integers, and
+	// LAG/LEAD's default takes the value argument's type. Inferring
+	// them keeps the lag(v, $1, $2) shape working for wire drivers
+	// that encode bindings by the described type.
+	noteWin := func(e Expr) {
+		walkExpr(e, func(sub Expr) bool {
+			if w, ok := sub.(*ExWindow); ok {
+				if l, ok := w.Offset.(*ExLit); ok {
+					note(l.Val, bytdb.TInt)
+				}
+				if l, ok := w.Default.(*ExLit); ok {
+					note(l.Val, exprType(sc, w.Arg))
+				}
+			}
+			return true
+		})
+	}
+	for _, it := range st.Items {
+		noteWin(it.Ex)
+	}
+	for _, o := range st.OrderBy {
+		noteWin(o.Ex)
+	}
 	if st.isAggregate() {
 		q, err := resolveAgg(sc, st)
 		if err != nil {
