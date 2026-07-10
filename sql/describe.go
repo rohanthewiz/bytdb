@@ -227,6 +227,16 @@ func describeSelect(lk tableLookup, st *Select, note func(any, bytdb.ColType), r
 				if l, ok := w.Default.(*ExLit); ok {
 					note(l.Val, exprType(sc, w.Arg))
 				}
+				// Frame offsets are integers too (only ROWS/GROUPS reach
+				// here; RANGE offsets are rejected at parse).
+				if w.Frame != nil {
+					if l, ok := w.Frame.Start.Offset.(*ExLit); ok {
+						note(l.Val, bytdb.TInt)
+					}
+					if l, ok := w.Frame.End.Offset.(*ExLit); ok {
+						note(l.Val, bytdb.TInt)
+					}
+				}
 			}
 			return true
 		})

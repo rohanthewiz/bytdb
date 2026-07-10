@@ -63,7 +63,7 @@ Parse-time rejections with pointed errors:
 | Date/time, decimal, uuid, json, array column types | Store as `INT` (epoch), `TEXT`, or `BYTEA` |
 | `$n` placeholders in `LIMIT`/`OFFSET` | Literal counts only |
 | `EXPLAIN ANALYZE` | `EXPLAIN` only — execution is not instrumented |
-| Window frames (`ROWS BETWEEN ...`), window + `GROUP BY` | Default frame only; `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE` work |
+| `RANGE <n> PRECEDING/FOLLOWING` frames, frame `EXCLUDE`, window + `GROUP BY` | `ROWS`/`GROUPS` frames (and `RANGE` with `UNBOUNDED`/`CURRENT ROW` bounds) work |
 | Aggregates, subqueries, or placeholders inside `CHECK` | — |
 | `COPY`, out-of-band query cancellation, SSL on the wire | — |
 
@@ -76,9 +76,9 @@ Three semantic notes that surprise people (all Postgres-faithful):
   (`'42'` works where `42` does).
 - `LAST_VALUE(v) OVER (ORDER BY k)` returns the current row's last *peer*,
   not the partition's last row — the default frame ends at the current row's
-  peer group, exactly as in Postgres (where the usual fix is an explicit
-  frame; here, drop the ORDER BY — `OVER (PARTITION BY ...)` alone frames the
-  whole partition). `NTH_VALUE` is frame-limited the same way.
+  peer group, exactly as in Postgres. The fix is Postgres' usual one, an
+  explicit frame: `OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND
+  UNBOUNDED FOLLOWING)`. `NTH_VALUE` is frame-limited the same way.
 
 ## Schema-change edges
 

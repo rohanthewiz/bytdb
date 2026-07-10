@@ -237,6 +237,10 @@ func walkExpr(e Expr, visit func(Expr) bool) {
 		for _, o := range n.OrderBy {
 			walkExpr(o.Ex, visit)
 		}
+		if n.Frame != nil {
+			walkExpr(n.Frame.Start.Offset, visit)
+			walkExpr(n.Frame.End.Offset, visit)
+		}
 	case *ExArith:
 		walkExpr(n.L, visit)
 		walkExpr(n.R, visit)
@@ -362,13 +366,69 @@ func (f WinFunc) name() string {
 	return ""
 }
 
+// FrameMode selects how an explicit window frame measures its bounds:
+// ROWS counts physical rows, GROUPS counts peer groups (rows tying on
+// the window ORDER BY), and RANGE is peer-aware — its CURRENT ROW
+// bound covers the whole peer group. RANGE with offset bounds needs
+// typed arithmetic on the sort key (added in Postgres 11) and is not
+// supported here; the parser rejects it.
+type FrameMode int
+
+const (
+	FrameRange FrameMode = iota // the SQL default mode
+	FrameRows
+	FrameGroups
+)
+
+func (m FrameMode) name() string {
+	switch m {
+	case FrameRows:
+		return "ROWS"
+	case FrameGroups:
+		return "GROUPS"
+	}
+	return "RANGE"
+}
+
+// FrameBoundType is one endpoint kind of a window frame. The order is
+// meaningful: it matches the direction a frame extends, so validity
+// checks read as ordering (a start bound must not sort after its end
+// bound — the parser enforces the specific illegal pairs).
+type FrameBoundType int
+
+const (
+	BoundUnboundedPreceding FrameBoundType = iota
+	BoundOffsetPreceding
+	BoundCurrentRow
+	BoundOffsetFollowing
+	BoundUnboundedFollowing
+)
+
+// FrameBound is one frame endpoint; Offset is set only for the
+// offset-taking bound types, and must be row-independent (the parser
+// rejects column references inside it, so the executor can evaluate
+// it once per window rather than per row, as Postgres does).
+type FrameBound struct {
+	Type   FrameBoundType
+	Offset Expr
+}
+
+// WindowFrame is an explicit frame clause:
+// {ROWS|RANGE|GROUPS} BETWEEN <start> AND <end>. The single-bound
+// form (no BETWEEN) parses with End = CURRENT ROW, its SQL meaning.
+type WindowFrame struct {
+	Mode  FrameMode
+	Start FrameBound
+	End   FrameBound
+}
+
 // ExWindow is a window function call: fn(args) OVER (PARTITION BY ...
-// ORDER BY ...). Exactly one of Win (ranking/value family) or Agg (an
-// aggregate evaluated over the frame) is set. Explicit frames are not
-// supported; the frame is the whole partition when there is no ORDER
-// BY, else running (UNBOUNDED PRECEDING .. CURRENT ROW with peers,
-// the Postgres RANGE default). LAG/LEAD ignore the frame and address
-// the whole partition, as in Postgres.
+// ORDER BY ... [frame]). Exactly one of Win (ranking/value family) or
+// Agg (an aggregate evaluated over the frame) is set. With no explicit
+// Frame the SQL default applies: RANGE UNBOUNDED PRECEDING .. CURRENT
+// ROW — the whole partition when there is no ORDER BY, else running
+// with peer sharing. Ranking functions and LAG/LEAD ignore the frame
+// and address the whole partition, as in Postgres.
 type ExWindow struct {
 	Win       WinFunc
 	Agg       AggFunc // AggNone unless an aggregate window
@@ -378,6 +438,7 @@ type ExWindow struct {
 	Star      bool    // COUNT(*) OVER (...)
 	Partition []Expr
 	OrderBy   []OrderItem
+	Frame     *WindowFrame // nil: the default frame
 }
 
 // fnName is the window function's name, ranking or aggregate.

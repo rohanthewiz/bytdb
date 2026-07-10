@@ -201,6 +201,31 @@ honor the Postgres default frame — see the semantic notes in
 [Considerations & Gotchas](gotchas.md#sql-that-is-deliberately-not-there)
 before reaching for `LAST_VALUE`.
 
+Explicit frames select which partition rows an aggregate window or
+`FIRST/LAST/NTH_VALUE` sees:
+
+```sql
+SELECT id,
+    avg(v)        OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS smoothed,
+    sum(v)        OVER (ORDER BY k  GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS grp_run,
+    last_value(v) OVER (ORDER BY k  RANGE BETWEEN UNBOUNDED PRECEDING
+                                          AND UNBOUNDED FOLLOWING) AS final
+FROM t
+```
+*(verified in `sql/window_frame_test.go`)*
+
+Bounds are `UNBOUNDED PRECEDING/FOLLOWING`, `<n> PRECEDING/FOLLOWING`,
+and `CURRENT ROW`; the single-bound form (`ROWS 2 PRECEDING`) means
+`BETWEEN ... AND CURRENT ROW`. `ROWS` counts rows, `GROUPS` counts
+peer groups (needs `ORDER BY`), and in `RANGE` mode `CURRENT ROW`
+spans the current row's peers. Offsets must be row-independent
+non-negative integers (`$n` binds); empty frames yield NULL (COUNT 0).
+The last line above is the canonical fix for the `LAST_VALUE`
+default-frame surprise. Not supported: `RANGE <n> PRECEDING/FOLLOWING`
+(Postgres 11's typed sort-key arithmetic) and `EXCLUDE` variants other
+than the no-op `EXCLUDE NO OTHERS`. Ranking functions and `LAG`/`LEAD`
+ignore frames, as in Postgres.
+
 ### Expressions
 
 - Comparisons `= != <> < <= > >=`, `IS [NOT] NULL`, regex `~ !~ ~* !~*`

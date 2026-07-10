@@ -377,6 +377,14 @@ func bindExpr(e Expr, sub func(any) any) Expr {
 			o.Ex = bindExpr(o.Ex, sub)
 			c.OrderBy[i] = o
 		}
+		if n.Frame != nil {
+			// Deep-copy the frame: the shallow struct copy above shares
+			// the pointer, and binding must not mutate the cached AST.
+			f := *n.Frame
+			f.Start.Offset = bindExpr(n.Frame.Start.Offset, sub)
+			f.End.Offset = bindExpr(n.Frame.End.Offset, sub)
+			c.Frame = &f
+		}
 		return &c
 	case *ExArith:
 		return &ExArith{Op: n.Op, L: bindExpr(n.L, sub), R: bindExpr(n.R, sub)}

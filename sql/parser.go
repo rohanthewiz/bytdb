@@ -2190,9 +2190,8 @@ func (p *parser) funcCall(name string) (Expr, error) {
 	return f, p.expectOp(")")
 }
 
-// windowOver parses the OVER (PARTITION BY ... ORDER BY ...) clause and
-// attaches it to w; cur is the "over" keyword. Explicit frame clauses
-// (ROWS/RANGE) are rejected — the frame is implied by ORDER BY.
+// windowOver parses the OVER (PARTITION BY ... ORDER BY ... [frame])
+// clause and attaches it to w; cur is the "over" keyword.
 func (p *parser) windowOver(w *ExWindow) (Expr, error) {
 	// The aggregate caller has already seen "over"; the window-only
 	// path has not, and e.g. lag(x) with no OVER must error clearly.
@@ -2240,9 +2239,144 @@ func (p *parser) windowOver(w *ExWindow) (Expr, error) {
 		}
 	}
 	if t := p.cur(); t.kind == tIdent && (t.text == "rows" || t.text == "range" || t.text == "groups") {
-		return nil, serr.New("explicit window frames (ROWS/RANGE/GROUPS) are not supported")
+		f, err := p.windowFrame(len(w.OrderBy) > 0)
+		if err != nil {
+			return nil, err
+		}
+		w.Frame = f
 	}
 	return w, p.expectOp(")")
+}
+
+// windowFrame parses an explicit frame clause; cur is the mode keyword
+// (rows/range/groups). Both forms are accepted — BETWEEN <start> AND
+// <end>, and the single-bound shorthand whose end is CURRENT ROW.
+// Bound-pair validity is checked here with Postgres' wording, so an
+// impossible frame fails at parse rather than producing empty frames
+// everywhere. EXCLUDE NO OTHERS (the default exclusion) is accepted
+// and ignored; the other exclusions change frame membership per row
+// and are not supported.
+func (p *parser) windowFrame(hasOrderBy bool) (*WindowFrame, error) {
+	f := &WindowFrame{}
+	switch {
+	case p.acceptKw("rows"):
+		f.Mode = FrameRows
+	case p.acceptKw("groups"):
+		f.Mode = FrameGroups
+		// GROUPS offsets count peer groups, which only exist under an
+		// ORDER BY; Postgres rejects the mode outright without one.
+		if !hasOrderBy {
+			return nil, serr.New("GROUPS mode requires an ORDER BY clause")
+		}
+	default:
+		p.advance() // range
+		f.Mode = FrameRange
+	}
+	if p.acceptKw("between") {
+		start, err := p.frameBound(f.Mode)
+		if err != nil {
+			return nil, err
+		}
+		if err = p.expectKw("and"); err != nil {
+			return nil, err
+		}
+		end, err := p.frameBound(f.Mode)
+		if err != nil {
+			return nil, err
+		}
+		f.Start, f.End = start, end
+	} else {
+		start, err := p.frameBound(f.Mode)
+		if err != nil {
+			return nil, err
+		}
+		f.Start, f.End = start, FrameBound{Type: BoundCurrentRow}
+	}
+	// A frame's start must not lie after its end; the specific illegal
+	// pairs get Postgres' messages. (Equal-offset cases like BETWEEN 2
+	// FOLLOWING AND 1 FOLLOWING are legal — they yield empty frames.)
+	switch {
+	case f.Start.Type == BoundUnboundedFollowing:
+		return nil, serr.New("frame start cannot be UNBOUNDED FOLLOWING")
+	case f.End.Type == BoundUnboundedPreceding:
+		return nil, serr.New("frame end cannot be UNBOUNDED PRECEDING")
+	case f.Start.Type == BoundCurrentRow && f.End.Type == BoundOffsetPreceding:
+		return nil, serr.New("frame starting from current row cannot have preceding rows")
+	case f.Start.Type == BoundOffsetFollowing && f.End.Type == BoundOffsetPreceding:
+		return nil, serr.New("frame starting from following row cannot have preceding rows")
+	case f.Start.Type == BoundOffsetFollowing && f.End.Type == BoundCurrentRow:
+		return nil, serr.New("frame starting from following row cannot reference current row")
+	}
+	if p.acceptKw("exclude") {
+		if !p.acceptKw("no") {
+			return nil, serr.New("frame exclusion (EXCLUDE CURRENT ROW/GROUP/TIES) is not supported")
+		}
+		if err := p.expectKw("others"); err != nil {
+			return nil, err
+		}
+	}
+	return f, nil
+}
+
+// frameBound parses one frame endpoint: UNBOUNDED PRECEDING/FOLLOWING,
+// CURRENT ROW, or <expr> PRECEDING/FOLLOWING.
+func (p *parser) frameBound(mode FrameMode) (FrameBound, error) {
+	if p.acceptKw("unbounded") {
+		if p.acceptKw("preceding") {
+			return FrameBound{Type: BoundUnboundedPreceding}, nil
+		}
+		if p.acceptKw("following") {
+			return FrameBound{Type: BoundUnboundedFollowing}, nil
+		}
+		return FrameBound{}, p.unexpected("PRECEDING or FOLLOWING")
+	}
+	if p.acceptKw("current") {
+		if err := p.expectKw("row"); err != nil {
+			return FrameBound{}, err
+		}
+		return FrameBound{Type: BoundCurrentRow}, nil
+	}
+	// An offset bound. RANGE offsets would need to add/subtract the
+	// offset on the ORDER BY column's type (Postgres 11+); unsupported.
+	if mode == FrameRange {
+		return FrameBound{}, serr.New("RANGE with offset PRECEDING/FOLLOWING is not supported")
+	}
+	off, err := p.expression()
+	if err != nil {
+		return FrameBound{}, err
+	}
+	if err = checkFrameOffset(off, mode); err != nil {
+		return FrameBound{}, err
+	}
+	b := FrameBound{Offset: off}
+	switch {
+	case p.acceptKw("preceding"):
+		b.Type = BoundOffsetPreceding
+	case p.acceptKw("following"):
+		b.Type = BoundOffsetFollowing
+	default:
+		return FrameBound{}, p.unexpected("PRECEDING or FOLLOWING")
+	}
+	return b, nil
+}
+
+// checkFrameOffset enforces that a frame offset is row-independent.
+// Postgres evaluates frame offsets once per window, not per row, so
+// anything needing row context — columns, aggregates, window calls,
+// subqueries — is rejected at parse; the executor can then evaluate
+// the offset without a current row.
+func checkFrameOffset(e Expr, mode FrameMode) error {
+	var err error
+	walkExpr(e, func(sub Expr) bool {
+		switch sub.(type) {
+		case *ExCol:
+			err = serr.New("argument of " + mode.name() + " must not contain variables")
+		case *ExAgg, *ExWindow, *ExSub:
+			err = serr.New("argument of " + mode.name() + " must be a simple expression")
+		}
+		return err == nil
+	})
+	return err
 }
 
 // caseExpr parses both CASE forms; "case" is consumed.
