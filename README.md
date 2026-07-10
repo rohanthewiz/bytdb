@@ -12,12 +12,13 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–25: a working relational store, queryable in SQL — in
+Milestones 1–26: a working relational store, queryable in SQL — in
 process or over the Postgres wire protocol, with transaction blocks
 and savepoints, NOT NULL and CHECK constraints, SERIAL identity
 columns, constant column DEFAULTs, RETURNING, upsert
 (`INSERT ... ON CONFLICT`), window functions (ranking, value, and
-aggregate, with explicit ROWS/RANGE/GROUPS frames), descending index
+aggregate, with explicit ROWS/RANGE/GROUPS frames including RANGE
+offsets on the sort key), descending index
 columns, EXPLAIN, and
 enough system catalog and expression language that psql's `\dt`,
 `\d`, `\d <table>`, `\di`, `\du`, and `\l` render for real — check
@@ -410,7 +411,8 @@ durability with group commit.
 - [x] **Milestone 23**: write-path ORM enablement — `INSERT ... ON CONFLICT DO NOTHING | DO UPDATE` with arbiter inference over the primary key and unique indexes (probe-based: no new engine machinery), `excluded.*` and Postgres name resolution in SET/WHERE, only real writes counted; constant column `DEFAULT`s (column-list fill, `DEFAULT` keyword in VALUES, `DEFAULT VALUES`; expression defaults rejected, `ADD COLUMN ... DEFAULT` empty-table only); `lastval()`/`currval('t_col_seq')` session readback of identity draws with Postgres's 55000 before the first draw
 - [x] **Milestone 24**: value window functions — `LAG`/`LEAD` (offset defaults to 1, evaluated per row, may be negative to flip direction, NULL offset → NULL; optional default expression for rows past the partition edge) addressing the whole partition as in Postgres, plus frame-sensitive `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE` honoring the Postgres default frame — with ORDER BY the frame ends at the current row's last peer, so `LAST_VALUE` is the last *peer*, the same surprise PG ships; all five are new per-row assignment cases over the milestone-19 partition/sort machinery, with argument counts checked at parse, nested window calls rejected, and `$n` placeholders binding inside offset/default arguments
 - [x] **Milestone 25**: explicit window frames — `{ROWS|RANGE|GROUPS} [BETWEEN <start> AND <end>]` with `UNBOUNDED PRECEDING/FOLLOWING`, `<n> PRECEDING/FOLLOWING`, and `CURRENT ROW` bounds; a row's frame reduces to a half-open position range over the sorted partition (ROWS by position arithmetic, RANGE/GROUPS through peer groups, where CURRENT ROW spans the current row's peers and a GROUPS offset steps whole groups), honored by aggregate windows and `FIRST/LAST/NTH_VALUE` (empty frames → NULL, COUNT 0) and ignored by ranking and `LAG`/`LEAD` as in Postgres; frames anchored at UNBOUNDED PRECEDING accumulate incrementally (the default frame stays O(rows)), moving-start frames recompute per distinct frame with peer memoization; offsets are row-independent (columns rejected at parse, `$n` binds, negative/NULL/non-int error at run); `RANGE <n> PRECEDING` (PG 11+ typed sort-key arithmetic) and `EXCLUDE` other than `NO OTHERS` are rejected; PG-faithful bound-pair validation ("frame starting from following row cannot reference current row", ...)
-- [ ] Later: order-aware path selection among redundant indexes, `RANGE <offset>` frames, frame `EXCLUDE`, standalone `CREATE SEQUENCE`
+- [x] **Milestone 26**: RANGE offset frames — `RANGE <offset> PRECEDING/FOLLOWING` bounds, where the offset is a distance measured on the window ORDER BY key (PG 11's typed sort-key arithmetic) rather than a row or group count: exactly one ORDER BY column (parse-checked, PG wording), numeric key type (int/float; checked at execution — "not supported for column type ..."), fractional offsets legal (`RANGE 0.5 PRECEDING`, over int keys too — mixed numerics compare); since the partition is sorted, each offset bound is a binary search for `key ∓ offset` moved against/with the sort direction (DESC flips the sign), pure-int arithmetic saturates to ±Inf on overflow instead of wrapping, and NaN keys ride the comparator's NaN-sorts-last order (NaN is within any distance of NaN only, as in PG's `in_range`); NULL sort keys follow Postgres — a NULL row's offset frame is exactly its peer group, non-NULL rows never reach NULLs through an offset bound but UNBOUNDED bounds still take them in; offsets must be non-null, numeric, non-negative, non-NaN ("invalid preceding or following size in window function"); `$n` offsets describe with the sort key's type so wire drivers encode fractional offsets as float8, not truncated int8
+- [ ] Later: order-aware path selection among redundant indexes, frame `EXCLUDE`, standalone `CREATE SEQUENCE`
 
 ## Design notes
 

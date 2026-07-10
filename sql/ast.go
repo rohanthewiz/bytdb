@@ -369,9 +369,9 @@ func (f WinFunc) name() string {
 // FrameMode selects how an explicit window frame measures its bounds:
 // ROWS counts physical rows, GROUPS counts peer groups (rows tying on
 // the window ORDER BY), and RANGE is peer-aware — its CURRENT ROW
-// bound covers the whole peer group. RANGE with offset bounds needs
-// typed arithmetic on the sort key (added in Postgres 11) and is not
-// supported here; the parser rejects it.
+// bound covers the whole peer group, and its offset bounds are
+// distances measured on the (single, numeric) ORDER BY key rather
+// than row counts.
 type FrameMode int
 
 const (

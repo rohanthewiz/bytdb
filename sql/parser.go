@@ -2239,7 +2239,7 @@ func (p *parser) windowOver(w *ExWindow) (Expr, error) {
 		}
 	}
 	if t := p.cur(); t.kind == tIdent && (t.text == "rows" || t.text == "range" || t.text == "groups") {
-		f, err := p.windowFrame(len(w.OrderBy) > 0)
+		f, err := p.windowFrame(len(w.OrderBy))
 		if err != nil {
 			return nil, err
 		}
@@ -2256,7 +2256,7 @@ func (p *parser) windowOver(w *ExWindow) (Expr, error) {
 // everywhere. EXCLUDE NO OTHERS (the default exclusion) is accepted
 // and ignored; the other exclusions change frame membership per row
 // and are not supported.
-func (p *parser) windowFrame(hasOrderBy bool) (*WindowFrame, error) {
+func (p *parser) windowFrame(nOrderBy int) (*WindowFrame, error) {
 	f := &WindowFrame{}
 	switch {
 	case p.acceptKw("rows"):
@@ -2265,7 +2265,7 @@ func (p *parser) windowFrame(hasOrderBy bool) (*WindowFrame, error) {
 		f.Mode = FrameGroups
 		// GROUPS offsets count peer groups, which only exist under an
 		// ORDER BY; Postgres rejects the mode outright without one.
-		if !hasOrderBy {
+		if nOrderBy == 0 {
 			return nil, serr.New("GROUPS mode requires an ORDER BY clause")
 		}
 	default:
@@ -2273,20 +2273,20 @@ func (p *parser) windowFrame(hasOrderBy bool) (*WindowFrame, error) {
 		f.Mode = FrameRange
 	}
 	if p.acceptKw("between") {
-		start, err := p.frameBound(f.Mode)
+		start, err := p.frameBound(f.Mode, nOrderBy)
 		if err != nil {
 			return nil, err
 		}
 		if err = p.expectKw("and"); err != nil {
 			return nil, err
 		}
-		end, err := p.frameBound(f.Mode)
+		end, err := p.frameBound(f.Mode, nOrderBy)
 		if err != nil {
 			return nil, err
 		}
 		f.Start, f.End = start, end
 	} else {
-		start, err := p.frameBound(f.Mode)
+		start, err := p.frameBound(f.Mode, nOrderBy)
 		if err != nil {
 			return nil, err
 		}
@@ -2320,7 +2320,7 @@ func (p *parser) windowFrame(hasOrderBy bool) (*WindowFrame, error) {
 
 // frameBound parses one frame endpoint: UNBOUNDED PRECEDING/FOLLOWING,
 // CURRENT ROW, or <expr> PRECEDING/FOLLOWING.
-func (p *parser) frameBound(mode FrameMode) (FrameBound, error) {
+func (p *parser) frameBound(mode FrameMode, nOrderBy int) (FrameBound, error) {
 	if p.acceptKw("unbounded") {
 		if p.acceptKw("preceding") {
 			return FrameBound{Type: BoundUnboundedPreceding}, nil
@@ -2336,10 +2336,12 @@ func (p *parser) frameBound(mode FrameMode) (FrameBound, error) {
 		}
 		return FrameBound{Type: BoundCurrentRow}, nil
 	}
-	// An offset bound. RANGE offsets would need to add/subtract the
-	// offset on the ORDER BY column's type (Postgres 11+); unsupported.
-	if mode == FrameRange {
-		return FrameBound{}, serr.New("RANGE with offset PRECEDING/FOLLOWING is not supported")
+	// An offset bound. A RANGE offset is a distance measured on the
+	// window ORDER BY key (added in Postgres 11), so it only makes
+	// sense against a single sort key; the key's type is checked at
+	// execution, where the scope is known.
+	if mode == FrameRange && nOrderBy != 1 {
+		return FrameBound{}, serr.New("RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
 	}
 	off, err := p.expression()
 	if err != nil {

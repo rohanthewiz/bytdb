@@ -1,7 +1,9 @@
 package sql
 
 import (
+	"math"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -18,8 +20,8 @@ import (
 // functions (LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE), and aggregate
 // windows are supported. Frame-sensitive functions (the aggregates and
 // FIRST/LAST/NTH_VALUE) evaluate over each row's frame: an explicit
-// ROWS/GROUPS clause (RANGE only with UNBOUNDED/CURRENT ROW bounds),
-// or the SQL default — RANGE UNBOUNDED PRECEDING .. CURRENT ROW, which
+// ROWS/RANGE/GROUPS clause (RANGE offsets are distances on the sort
+// key), or the SQL default — RANGE UNBOUNDED PRECEDING .. CURRENT ROW, which
 // with ORDER BY ends at the current row's last peer, so LAST_VALUE is
 // the last peer (not the partition end) — same surprise as PG.
 
@@ -394,16 +396,21 @@ func assignWindow(env *exEnv, sc *scope, w *ExWindow, fs frameSpec, wi int, base
 	}
 
 	// Frame-sensitive: FIRST_VALUE/LAST_VALUE/NTH_VALUE and aggregate
-	// windows. RANGE and GROUPS bounds resolve through peer groups, so
-	// those are built once per partition here.
+	// windows. RANGE and GROUPS bounds resolve through peer groups (and
+	// RANGE offsets through the sort keys), so a framer bundles those
+	// once per partition here.
 	groups, groupOf, err := peerGroups(env, w, base, idxs)
 	if err != nil {
 		return err
 	}
-	if w.Win != WinNone {
-		return assignValueFrame(env, w, fs, base, idxs, wi, winvals, groups, groupOf)
+	fr, err := newFramer(env, w, fs, base, idxs, groups, groupOf)
+	if err != nil {
+		return err
 	}
-	return assignAggFrame(env, sc, w, fs, base, idxs, wi, winvals, groups, groupOf)
+	if w.Win != WinNone {
+		return assignValueFrame(env, w, fr, base, idxs, wi, winvals)
+	}
+	return assignAggFrame(env, sc, w, fr, base, idxs, wi, winvals)
 }
 
 // assignLagLead fills LAG/LEAD values for one sorted partition. Both
@@ -458,23 +465,47 @@ func assignLagLead(env *exEnv, w *ExWindow, base [][]any, idxs []int, wi int, wi
 }
 
 // frameSpec is a window frame ready for per-row use: the bound types
-// plus their offsets already evaluated to integers, so computing a
-// row's frame is pure position arithmetic.
+// plus their offsets already evaluated, so computing a row's frame is
+// position arithmetic (ROWS/GROUPS) or a sort-key search (RANGE).
 type frameSpec struct {
 	mode             FrameMode
 	start, end       FrameBoundType
-	startOff, endOff int64
+	startOff, endOff int64 // ROWS/GROUPS offsets: row / peer-group counts
+	startNum, endNum any   // RANGE offsets: numeric distances on the sort key
+}
+
+// hasRangeOffsets reports whether the frame has RANGE offset bounds,
+// which measure distances on the window ORDER BY key and so need the
+// key values (and their type checked) rather than just positions.
+func (fs frameSpec) hasRangeOffsets() bool {
+	return fs.mode == FrameRange &&
+		(fs.start == BoundOffsetPreceding || fs.start == BoundOffsetFollowing ||
+			fs.end == BoundOffsetPreceding || fs.end == BoundOffsetFollowing)
 }
 
 // resolveFrame turns a window's frame clause into a frameSpec,
 // evaluating the offset expressions. No clause means the SQL default:
-// RANGE UNBOUNDED PRECEDING .. CURRENT ROW.
+// RANGE UNBOUNDED PRECEDING .. CURRENT ROW. RANGE offsets are typed
+// differently from ROWS/GROUPS ones — they are distances on the sort
+// key, so they may be fractional, and the key itself must be numeric
+// for the arithmetic to exist (the parser already guaranteed exactly
+// one ORDER BY column).
 func resolveFrame(env *exEnv, w *ExWindow) (frameSpec, error) {
 	if w.Frame == nil {
 		return frameSpec{mode: FrameRange, start: BoundUnboundedPreceding, end: BoundCurrentRow}, nil
 	}
 	fs := frameSpec{mode: w.Frame.Mode, start: w.Frame.Start.Type, end: w.Frame.End.Type}
 	var err error
+	if fs.hasRangeOffsets() {
+		if t := exprType(env.sc, w.OrderBy[0].Ex); t != bytdb.TInt && t != bytdb.TFloat {
+			return fs, serr.New("RANGE with offset PRECEDING/FOLLOWING is not supported for column type " + string(t))
+		}
+		if fs.startNum, err = rangeOffset(env, w.Frame.Start.Offset, "starting"); err != nil {
+			return fs, err
+		}
+		fs.endNum, err = rangeOffset(env, w.Frame.End.Offset, "ending")
+		return fs, err
+	}
 	if fs.startOff, err = frameOffset(env, w.Frame.Start.Offset, "starting"); err != nil {
 		return fs, err
 	}
@@ -482,7 +513,7 @@ func resolveFrame(env *exEnv, w *ExWindow) (frameSpec, error) {
 	return fs, err
 }
 
-// frameOffset evaluates one frame offset. The parse-time
+// frameOffset evaluates one ROWS/GROUPS frame offset. The parse-time
 // row-independence check makes a nil row safe here; Postgres'
 // runtime rules apply — the offset must be a non-null, non-negative
 // integer.
@@ -505,6 +536,31 @@ func frameOffset(env *exEnv, e Expr, which string) (int64, error) {
 		return 0, serr.New("frame " + which + " offset must not be negative")
 	}
 	return n, nil
+}
+
+// rangeOffset evaluates one RANGE frame offset: a non-null numeric
+// distance on the sort key, which unlike a row count may be
+// fractional. Negative (and NaN — no ordered distance) sizes get
+// Postgres' runtime wording.
+func rangeOffset(env *exEnv, e Expr, which string) (any, error) {
+	if e == nil {
+		return nil, nil
+	}
+	v, err := evalOn(env, e, nil)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, serr.New("frame " + which + " offset must not be null")
+	}
+	f, ok := asFloat(v)
+	if !ok {
+		return nil, serr.New("frame " + which + " offset must be numeric")
+	}
+	if f < 0 || math.IsNaN(f) {
+		return nil, serr.New("invalid preceding or following size in window function")
+	}
+	return v, nil
 }
 
 // peerGroup is one run of ORDER BY peers, as a half-open range of
@@ -546,74 +602,147 @@ func peerGroups(env *exEnv, w *ExWindow, base [][]any, idxs []int) (groups []pee
 	return groups, groupOf, nil
 }
 
-// frameBounds computes the frame of the row at partition position n
-// as a half-open position range [lo, hi) over a partition of size
-// rows. ROWS bounds are plain position arithmetic; RANGE and GROUPS
-// bounds resolve through peer groups — CURRENT ROW means the current
-// row's whole peer group, and a GROUPS offset steps whole groups:
+// framer computes per-row frames for one sorted partition. It bundles
+// the resolved frameSpec with the partition context every bound type
+// needs: peer groups for RANGE/GROUPS CURRENT ROW and GROUPS offsets,
+// and — only when the frame has RANGE offset bounds — the sort-key
+// value of every row, since those offsets are distances on the key.
+type framer struct {
+	fs      frameSpec
+	size    int
+	groups  []peerGroup
+	groupOf []int
+	// RANGE-offset context (nil/zero otherwise): keys[k] is the single
+	// window ORDER BY key at partition position k, desc its direction,
+	// and [nnLo, nnHi) the contiguous run of non-NULL keys (NULLs sort
+	// last ascending, first descending, so one run at one end).
+	keys       []any
+	desc       bool
+	nnLo, nnHi int
+}
+
+// newFramer builds a partition's framer, evaluating the sort keys up
+// front when the frame has RANGE offset bounds.
+func newFramer(env *exEnv, w *ExWindow, fs frameSpec, base [][]any, idxs []int, groups []peerGroup, groupOf []int) (*framer, error) {
+	fr := &framer{fs: fs, size: len(idxs), groups: groups, groupOf: groupOf}
+	if !fs.hasRangeOffsets() {
+		return fr, nil
+	}
+	fr.desc = w.OrderBy[0].Desc
+	fr.keys = make([]any, len(idxs))
+	for k, ri := range idxs {
+		v, err := evalOn(env, w.OrderBy[0].Ex, base[ri])
+		if err != nil {
+			return nil, err
+		}
+		fr.keys[k] = v
+	}
+	// Trim the NULL run off whichever end it sorted to.
+	fr.nnLo, fr.nnHi = 0, len(idxs)
+	for fr.nnHi > fr.nnLo && fr.keys[fr.nnHi-1] == nil {
+		fr.nnHi--
+	}
+	for fr.nnLo < fr.nnHi && fr.keys[fr.nnLo] == nil {
+		fr.nnLo++
+	}
+	return fr, nil
+}
+
+// bounds computes the frame of the row at partition position n as a
+// half-open position range [lo, hi) over a partition of size rows.
+// ROWS bounds are plain position arithmetic; GROUPS bounds (and every
+// mode's CURRENT ROW) resolve through peer groups — CURRENT ROW means
+// the current row's whole peer group, and a GROUPS offset steps whole
+// groups; RANGE offset bounds are searches on the sort key:
 //
 //	positions: 0 1 | 2 3 4 | 5      (| = peer-group boundary)
 //	ROWS   BETWEEN 1 PRECEDING AND 1 FOLLOWING  at n=3 -> [2,5)
 //	GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW  at n=3 -> [0,5)
 //
+//	keys:      1 2 | 4 4 | 7                    (RANGE, ORDER BY key)
+//	RANGE  BETWEEN 2 PRECEDING AND 2 FOLLOWING  at key=4 -> keys in [2,6] -> [1,4)
+//
 // Bounds past a partition edge clamp to it, and a start past the end
 // yields an empty frame (lo == hi) — legal, and NULL/zero-count
 // downstream.
-func frameBounds(fs frameSpec, n, size int, groups []peerGroup, groupOf []int) (lo, hi int) {
-	g := groupOf[n]
+func (fr *framer) bounds(n int) (lo, hi int) {
+	fs, size := fr.fs, fr.size
+	g := fr.groupOf[n]
 	// Clamp offsets to the position/group count first: anything larger
 	// lands past an edge regardless, and clamping keeps the arithmetic
 	// below far from int overflow even for absurd literal offsets.
+	// (RANGE offsets never enter position arithmetic, so they are not
+	// clamped — rangeEdge saturates its key arithmetic instead.)
 	so := int(min(fs.startOff, int64(size)))
 	eo := int(min(fs.endOff, int64(size)))
 	switch fs.start {
 	case BoundUnboundedPreceding:
 		lo = 0
 	case BoundOffsetPreceding:
-		if fs.mode == FrameRows {
+		switch {
+		case fs.mode == FrameRows:
 			lo = n - so
-		} else if pg := g - so; pg < 0 {
-			lo = 0 // group before the partition: frame starts at its head
-		} else {
-			lo = groups[pg].lo
+		case fs.mode == FrameRange:
+			lo = fr.rangeEdge(n, fs.startNum, true, false)
+		default:
+			if pg := g - so; pg < 0 {
+				lo = 0 // group before the partition: frame starts at its head
+			} else {
+				lo = fr.groups[pg].lo
+			}
 		}
 	case BoundCurrentRow:
 		if fs.mode == FrameRows {
 			lo = n
 		} else {
-			lo = groups[g].lo
+			lo = fr.groups[g].lo
 		}
 	case BoundOffsetFollowing:
-		if fs.mode == FrameRows {
+		switch {
+		case fs.mode == FrameRows:
 			lo = n + so
-		} else if pg := g + so; pg >= len(groups) {
-			lo = size // group after the partition: empty frame
-		} else {
-			lo = groups[pg].lo
+		case fs.mode == FrameRange:
+			lo = fr.rangeEdge(n, fs.startNum, false, false)
+		default:
+			if pg := g + so; pg >= len(fr.groups) {
+				lo = size // group after the partition: empty frame
+			} else {
+				lo = fr.groups[pg].lo
+			}
 		}
 	}
 	switch fs.end {
 	case BoundOffsetPreceding:
-		if fs.mode == FrameRows {
+		switch {
+		case fs.mode == FrameRows:
 			hi = n - eo + 1
-		} else if pg := g - eo; pg < 0 {
-			hi = 0 // group before the partition: empty frame
-		} else {
-			hi = groups[pg].hi
+		case fs.mode == FrameRange:
+			hi = fr.rangeEdge(n, fs.endNum, true, true)
+		default:
+			if pg := g - eo; pg < 0 {
+				hi = 0 // group before the partition: empty frame
+			} else {
+				hi = fr.groups[pg].hi
+			}
 		}
 	case BoundCurrentRow:
 		if fs.mode == FrameRows {
 			hi = n + 1
 		} else {
-			hi = groups[g].hi
+			hi = fr.groups[g].hi
 		}
 	case BoundOffsetFollowing:
-		if fs.mode == FrameRows {
+		switch {
+		case fs.mode == FrameRows:
 			hi = n + eo + 1
-		} else if pg := g + eo; pg >= len(groups) {
-			hi = size // group after the partition: frame ends at its tail
-		} else {
-			hi = groups[pg].hi
+		case fs.mode == FrameRange:
+			hi = fr.rangeEdge(n, fs.endNum, false, true)
+		default:
+			if pg := g + eo; pg >= len(fr.groups) {
+				hi = size // group after the partition: frame ends at its tail
+			} else {
+				hi = fr.groups[pg].hi
+			}
 		}
 	case BoundUnboundedFollowing:
 		hi = size
@@ -623,14 +752,88 @@ func frameBounds(fs frameSpec, n, size int, groups []peerGroup, groupOf []int) (
 	return lo, hi
 }
 
+// rangeEdge resolves one RANGE offset bound for the row at partition
+// position n: the boundary position where the sort key crosses
+// key(n) ± off. Since the partition is sorted, that is a binary
+// search over the non-NULL key run — end marks an end bound, whose
+// edge is one past the last in-frame key (first key strictly beyond
+// the threshold) rather than the first in-frame key.
+//
+// Confining the search to [nnLo, nnHi) is what implements Postgres'
+// NULL semantics for a non-NULL current row: NULL keys sort to one
+// end and act as infinitely preceding/following there, so an offset
+// bound never reaches them — yet an UNBOUNDED or over-the-edge bound
+// on the other side still takes them in, because these positions
+// only ever clamp the NULL side of the partition off via nnLo/nnHi.
+// A NULL current row is within any distance of NULL and of nothing
+// else (Postgres' in_range), so its offset bounds are just its peer
+// group's edges.
+func (fr *framer) rangeEdge(n int, off any, preceding, end bool) int {
+	v := fr.keys[n]
+	if v == nil {
+		g := fr.groupOf[n]
+		if end {
+			return fr.groups[g].hi
+		}
+		return fr.groups[g].lo
+	}
+	// PRECEDING moves against the sort direction, so under DESC it
+	// adds; the threshold itself is then compared in sort order.
+	t := rangeThreshold(v, off, preceding != fr.desc)
+	return fr.nnLo + sort.Search(fr.nnHi-fr.nnLo, func(i int) bool {
+		c, _ := compareVals(fr.keys[fr.nnLo+i], t) // both non-NULL numerics
+		if fr.desc {
+			c = -c
+		}
+		if end {
+			return c > 0
+		}
+		return c >= 0
+	})
+}
+
+// rangeThreshold computes the sort-key boundary v ± off for a RANGE
+// offset bound (sub chooses the sign). Pure-int arithmetic stays
+// exact, with a saturation guard: off is validated non-negative, so
+// wraparound is detectable by direction, and an overflowed threshold
+// lies past every representable key — ±Inf compares the same way.
+// Any float operand switches to float math, whose NaN propagation
+// matches the comparator's ordering: a NaN key sorts after +Inf
+// (cmpFloat), so finite thresholds exclude it, while a NaN current
+// row yields NaN thresholds that equal only its fellow NaNs — the
+// same "NaN is within any distance of NaN, and of nothing else" that
+// Postgres' float in_range implements.
+func rangeThreshold(v, off any, sub bool) any {
+	vi, vok := v.(int64)
+	oi, ook := off.(int64)
+	if vok && ook {
+		if sub {
+			if r := vi - oi; r <= vi {
+				return r
+			}
+			return math.Inf(-1)
+		}
+		if r := vi + oi; r >= vi {
+			return r
+		}
+		return math.Inf(1)
+	}
+	vf, _ := asFloat(v)
+	of, _ := asFloat(off)
+	if sub {
+		return vf - of
+	}
+	return vf + of
+}
+
 // assignValueFrame fills FIRST_VALUE/LAST_VALUE/NTH_VALUE for one
 // sorted partition: each row surfaces one row of its own frame. Under
 // the default frame LAST_VALUE lands on the current row's last peer
 // (the famous PG surprise — not the partition end); explicit bounds
 // can make any frame, including an empty one, which yields NULL.
-func assignValueFrame(env *exEnv, w *ExWindow, fs frameSpec, base [][]any, idxs []int, wi int, winvals [][]any, groups []peerGroup, groupOf []int) error {
+func assignValueFrame(env *exEnv, w *ExWindow, fr *framer, base [][]any, idxs []int, wi int, winvals [][]any) error {
 	for n, ri := range idxs {
-		lo, hi := frameBounds(fs, n, len(idxs), groups, groupOf)
+		lo, hi := fr.bounds(n)
 		var t int // frame position to surface
 		switch w.Win {
 		case WinFirstValue:
@@ -675,13 +878,14 @@ func assignValueFrame(env *exEnv, w *ExWindow, fs frameSpec, base [][]any, idxs 
 // assignAggFrame fills an aggregate window for one sorted partition.
 // A frame anchored at the partition start (UNBOUNDED PRECEDING) only
 // ever grows — every end-bound type is nondecreasing in the row
-// position — so one accumulator extends forward and the common
-// default frame stays O(rows). A moving start invalidates that
-// (min/max can't retract), so those frames recompute per distinct
-// [lo, hi), memoizing the last range since consecutive rows often
-// share a frame (always, for RANGE/GROUPS peers); a sliding ROWS
-// frame is O(rows x frame width).
-func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fs frameSpec, base [][]any, idxs []int, wi int, winvals [][]any, groups []peerGroup, groupOf []int) error {
+// position (RANGE offset ends included: sorted keys make the
+// thresholds, and so the searched edges, monotone) — so one
+// accumulator extends forward and the common default frame stays
+// O(rows). A moving start invalidates that (min/max can't retract),
+// so those frames recompute per distinct [lo, hi), memoizing the last
+// range since consecutive rows often share a frame (always, for
+// RANGE/GROUPS peers); a sliding ROWS frame is O(rows x frame width).
+func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fr *framer, base [][]any, idxs []int, wi int, winvals [][]any) error {
 	intSum := w.Arg != nil && exprType(sc, w.Arg) == bytdb.TInt
 	newAcc := func() *accum { return &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum} }
 	add := func(acc *accum, ri int) error {
@@ -689,12 +893,11 @@ func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fs frameSpec, base [][]a
 		re.row = base[ri]
 		return acc.add(&re, base[ri])
 	}
-	size := len(idxs)
-	if fs.start == BoundUnboundedPreceding {
+	if fr.fs.start == BoundUnboundedPreceding {
 		acc := newAcc()
 		done := 0 // rows accumulated so far; hi never decreases
 		for n, ri := range idxs {
-			_, hi := frameBounds(fs, n, size, groups, groupOf)
+			_, hi := fr.bounds(n)
 			for ; done < hi; done++ {
 				if err := add(acc, idxs[done]); err != nil {
 					return err
@@ -707,7 +910,7 @@ func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fs frameSpec, base [][]a
 	lastLo, lastHi := -1, -1
 	var lastV any
 	for n, ri := range idxs {
-		lo, hi := frameBounds(fs, n, size, groups, groupOf)
+		lo, hi := fr.bounds(n)
 		if lo != lastLo || hi != lastHi {
 			acc := newAcc()
 			for k := lo; k < hi; k++ {

@@ -227,14 +227,22 @@ func describeSelect(lk tableLookup, st *Select, note func(any, bytdb.ColType), r
 				if l, ok := w.Default.(*ExLit); ok {
 					note(l.Val, exprType(sc, w.Arg))
 				}
-				// Frame offsets are integers too (only ROWS/GROUPS reach
-				// here; RANGE offsets are rejected at parse).
+				// ROWS/GROUPS frame offsets count rows/groups — integers.
+				// A RANGE offset is a distance on the window ORDER BY key,
+				// so it takes the key's type: int offsets over a float key
+				// still execute (mixed numerics compare), but a driver
+				// encoding by described type needs the float OID to send
+				// fractional offsets.
 				if w.Frame != nil {
+					ft := bytdb.TInt
+					if w.Frame.Mode == FrameRange && len(w.OrderBy) == 1 {
+						ft = exprType(sc, w.OrderBy[0].Ex)
+					}
 					if l, ok := w.Frame.Start.Offset.(*ExLit); ok {
-						note(l.Val, bytdb.TInt)
+						note(l.Val, ft)
 					}
 					if l, ok := w.Frame.End.Offset.(*ExLit); ok {
-						note(l.Val, bytdb.TInt)
+						note(l.Val, ft)
 					}
 				}
 			}

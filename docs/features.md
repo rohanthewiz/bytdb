@@ -208,6 +208,7 @@ Explicit frames select which partition rows an aggregate window or
 SELECT id,
     avg(v)        OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS smoothed,
     sum(v)        OVER (ORDER BY k  GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS grp_run,
+    sum(v)        OVER (ORDER BY ts RANGE BETWEEN 300 PRECEDING AND CURRENT ROW) AS last_5min,
     last_value(v) OVER (ORDER BY k  RANGE BETWEEN UNBOUNDED PRECEDING
                                           AND UNBOUNDED FOLLOWING) AS final
 FROM t
@@ -218,13 +219,20 @@ Bounds are `UNBOUNDED PRECEDING/FOLLOWING`, `<n> PRECEDING/FOLLOWING`,
 and `CURRENT ROW`; the single-bound form (`ROWS 2 PRECEDING`) means
 `BETWEEN ... AND CURRENT ROW`. `ROWS` counts rows, `GROUPS` counts
 peer groups (needs `ORDER BY`), and in `RANGE` mode `CURRENT ROW`
-spans the current row's peers. Offsets must be row-independent
-non-negative integers (`$n` binds); empty frames yield NULL (COUNT 0).
-The last line above is the canonical fix for the `LAST_VALUE`
-default-frame surprise. Not supported: `RANGE <n> PRECEDING/FOLLOWING`
-(Postgres 11's typed sort-key arithmetic) and `EXCLUDE` variants other
-than the no-op `EXCLUDE NO OTHERS`. Ranking functions and `LAG`/`LEAD`
-ignore frames, as in Postgres.
+spans the current row's peers while an offset is a *distance measured
+on the sort key* (Postgres 11 semantics, `last_5min` above): it needs
+exactly one numeric `ORDER BY` column, may be fractional
+(`RANGE 0.5 PRECEDING`, over int keys too), flips direction under
+`DESC`, and treats a NULL sort key as within any distance of NULL
+only — a NULL row's offset frame is its peer group, and non-NULL rows
+never reach the NULLs through an offset bound. Offsets must be
+row-independent and non-negative (`$n` binds; a `RANGE` offset
+describes with the sort key's type, so wire drivers can send `0.5` as
+float8); empty frames yield NULL (COUNT 0). The `last_value` line
+above is the canonical fix for the `LAST_VALUE` default-frame
+surprise. Not supported: `EXCLUDE` variants other than the no-op
+`EXCLUDE NO OTHERS`. Ranking functions and `LAG`/`LEAD` ignore
+frames, as in Postgres.
 
 ### Expressions
 

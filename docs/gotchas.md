@@ -63,7 +63,7 @@ Parse-time rejections with pointed errors:
 | Date/time, decimal, uuid, json, array column types | Store as `INT` (epoch), `TEXT`, or `BYTEA` |
 | `$n` placeholders in `LIMIT`/`OFFSET` | Literal counts only |
 | `EXPLAIN ANALYZE` | `EXPLAIN` only — execution is not instrumented |
-| `RANGE <n> PRECEDING/FOLLOWING` frames, frame `EXCLUDE`, window + `GROUP BY` | `ROWS`/`GROUPS` frames (and `RANGE` with `UNBOUNDED`/`CURRENT ROW` bounds) work |
+| Frame `EXCLUDE` (beyond `NO OTHERS`), window + `GROUP BY` | `ROWS`/`RANGE`/`GROUPS` frames all work, `RANGE <n> PRECEDING/FOLLOWING` included (one numeric `ORDER BY` column) |
 | Aggregates, subqueries, or placeholders inside `CHECK` | — |
 | `COPY`, out-of-band query cancellation, SSL on the wire | — |
 

@@ -118,8 +118,8 @@ func TestWindowErrors(t *testing.T) {
 		// then the evaluator rejects the subscript itself.
 		{`select (array[1,2])[row_number() over ()] from users`, "array subscripts are not supported"},
 		{`select count(distinct age) over () from users`, "DISTINCT is not supported in a window function"},
-		{`select sum(age) over (order by age range 1 preceding) from users`,
-			"RANGE with offset PRECEDING/FOLLOWING is not supported"},
+		{`select sum(age) over (order by age, name range 1 preceding) from users`,
+			"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"},
 		// Errors inside PARTITION BY / ORDER BY evaluation surface.
 		{`select rank() over (partition by age/0 order by age) from users`, "division by zero"},
 		{`select rank() over (order by age/0) from users`, "division by zero"},
