@@ -33,8 +33,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/bytdb"
-	bsql "github.com/rohanthewiz/bytdb/sql"
 	"github.com/rohanthewiz/bytdb/pgwire"
+	bsql "github.com/rohanthewiz/bytdb/sql"
 )
 
 const (
