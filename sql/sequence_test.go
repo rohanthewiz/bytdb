@@ -53,9 +53,8 @@ func TestSequenceBasics(t *testing.T) {
 		t.Fatalf("state relation: %v", res.Rows)
 	}
 
-	// The driver allocation pattern: draw the key, then insert it.
-	// (INSERT VALUES takes literals, so nextval cannot appear there —
-	// see docs/gotchas.)
+	// The draw-then-insert allocation pattern drivers use still works
+	// (nextval directly in VALUES is covered in insert_expr_test.go).
 	exec(t, d, `create table seqt (id int primary key, v text)`)
 	id := exec(t, d, `select nextval('s')`).Rows[0][0].(int64)
 	if _, err := d.Exec(`insert into seqt values ($1, 'a')`, id); err != nil {

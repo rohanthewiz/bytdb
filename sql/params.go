@@ -21,7 +21,13 @@ func numParams(st Statement) int {
 	case *Insert:
 		for _, row := range s.Rows {
 			for _, v := range row {
-				note(v)
+				// An expression value carries its placeholders inside the
+				// tree (as ExLit leaves); a plain value may itself be one.
+				if ex, ok := v.(Expr); ok {
+					noteExprVals(ex, note)
+				} else {
+					note(v)
+				}
 			}
 		}
 		if oc := s.Conflict; oc != nil {
@@ -161,7 +167,13 @@ func bindParams(st Statement, args []any) (Statement, error) {
 		for i, row := range s.Rows {
 			r := make([]any, len(row))
 			for j, v := range row {
-				r[j] = sub(v)
+				// Expression values re-bind as expressions do everywhere
+				// else: a cloned tree with ExLit placeholders substituted.
+				if ex, ok := v.(Expr); ok {
+					r[j] = bindExpr(ex, sub)
+				} else {
+					r[j] = sub(v)
+				}
 			}
 			c.Rows[i] = r
 		}

@@ -64,8 +64,9 @@ Parse-time rejections with pointed errors:
 | `$n` placeholders in `LIMIT`/`OFFSET` | Literal counts only |
 | `EXPLAIN ANALYZE` | `EXPLAIN` only — execution is not instrumented |
 | Aggregates, subqueries, or placeholders inside `CHECK` | — |
-| Expressions in `INSERT ... VALUES` | Literals and `DEFAULT` only — so `VALUES (nextval('s'))` doesn't parse; draw the key first (`SELECT nextval('s')`) and insert it, the pattern drivers use |
-| `nextval(...)` as a column `DEFAULT` | Constant defaults only; use an identity column (`SERIAL`) or draw explicitly |
+| `nextval(...)` as a column `DEFAULT` | Constant defaults only; use an identity column (`SERIAL`) or put `nextval('s')` in the VALUES list |
+| `SELECT DISTINCT ON (...)` | Plain `DISTINCT` works; keep-first-per-group needs application code |
+| `SELECT DISTINCT ... ORDER BY <expression>` | Order by output column names or positions — a sort key the projection dropped would decide which duplicate survives |
 | `DROP SEQUENCE ... CASCADE`, `OWNED BY table.column` | Nothing can depend on a sequence yet; `OWNED BY NONE` parses |
 | `COPY`, out-of-band query cancellation, SSL on the wire | — |
 

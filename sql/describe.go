@@ -78,7 +78,16 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		}
 		for _, row := range st.Rows {
 			for j, v := range row {
-				if j < len(colTypes) { // arity mismatches error at execution
+				if j >= len(colTypes) { // arity mismatches error at execution
+					continue
+				}
+				// As in UPDATE's SET expressions: a placeholder inside an
+				// expression value infers as the target column's type,
+				// best-effort ($1 + 1 in an int column infers int).
+				if ex, ok := v.(Expr); ok {
+					t := colTypes[j]
+					noteExprVals(ex, func(v any) { note(v, t) })
+				} else {
 					note(v, colTypes[j])
 				}
 			}

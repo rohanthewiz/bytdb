@@ -126,14 +126,14 @@ func (x *explainer) selectNode(s *Select) (*planNode, error) {
 		head := *s
 		head.Union, head.OrderBy = nil, nil
 		head.Limit, head.Offset = -1, 0
-		arm, err := x.coreNode(&head)
+		arm, err := x.armNode(&head)
 		if err != nil {
 			return nil, err
 		}
 		app.children = append(app.children, arm)
 		distinct := false
 		for _, u := range s.Union {
-			if arm, err = x.coreNode(u.Sel); err != nil {
+			if arm, err = x.armNode(u.Sel); err != nil {
 				return nil, err
 			}
 			app.children = append(app.children, arm)
@@ -143,7 +143,7 @@ func (x *explainer) selectNode(s *Select) (*planNode, error) {
 		if distinct {
 			n = &planNode{title: "Unique", children: []*planNode{app}}
 		}
-	} else if n, err = x.coreNode(s); err != nil {
+	} else if n, err = x.armNode(s); err != nil {
 		return nil, err
 	}
 	if len(s.OrderBy) > 0 && !x.orderElim {
@@ -161,6 +161,27 @@ func (x *explainer) selectNode(s *Select) (*planNode, error) {
 		n = &planNode{title: "Limit", children: []*planNode{n}}
 	}
 	return n, nil
+}
+
+// armNode explains one SELECT body (a UNION arm or a whole statement's
+// core): the core plan, under a Unique node when it is SELECT
+// DISTINCT. Mirroring execution, a DISTINCT body's core runs with
+// ORDER BY / OFFSET / LIMIT stripped — dedup happens on the projected
+// rows first, then the statement-level Sort and Limit nodes apply
+// above the Unique (so an order-eliminating scan is never claimed:
+// the sort runs after dedup, not in the scan).
+func (x *explainer) armNode(s *Select) (*planNode, error) {
+	if !s.Distinct {
+		return x.coreNode(s)
+	}
+	core := *s
+	core.Distinct = false
+	core.OrderBy, core.Limit, core.Offset = nil, -1, 0
+	n, err := x.coreNode(&core)
+	if err != nil {
+		return nil, err
+	}
+	return &planNode{title: "Unique", children: []*planNode{n}}, nil
 }
 
 // coreNode explains one SELECT core: the FROM tree, wrapped in an

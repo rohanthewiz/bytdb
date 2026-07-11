@@ -885,12 +885,14 @@ func (p *parser) insert() (Statement, error) {
 			var row []any
 			for {
 				// DEFAULT as a value slots the column's default in at
-				// execution (NULL without one), as in Postgres.
+				// execution (NULL without one), as in Postgres. It must be
+				// checked before the expression grammar, which would read
+				// the keyword as a column reference.
 				if t := p.cur(); t.kind == tIdent && t.text == "default" {
 					p.advance()
 					row = append(row, defaultMarker{})
 				} else {
-					v, err := p.literal()
+					v, err := p.insertValue()
 					if err != nil {
 						return nil, err
 					}
@@ -916,6 +918,29 @@ func (p *parser) insert() (Statement, error) {
 		return nil, err
 	}
 	return ins, nil
+}
+
+// insertValue parses one VALUES entry through the expression grammar.
+// A bare literal (or $n placeholder) unwraps to its parsed value —
+// the historical representation, which the binding, describe, and
+// engine-coercion paths key off — while anything richer stays an Expr
+// for per-row evaluation. Aggregates and windows have no row set to
+// compute over in VALUES; Postgres rejects them here too.
+func (p *parser) insertValue() (any, error) {
+	ex, err := p.expression()
+	if err != nil {
+		return nil, err
+	}
+	if findAgg(ex) != AggNone {
+		return nil, serr.New("aggregate functions are not allowed in VALUES")
+	}
+	if hasWindowExpr(ex) {
+		return nil, serr.New("window functions are not allowed in VALUES")
+	}
+	if lit, ok := ex.(*ExLit); ok {
+		return lit.Val, nil
+	}
+	return ex, nil
 }
 
 // onConflictClause parses an optional ON CONFLICT [(col, ...)]
@@ -1122,6 +1147,18 @@ func (p *parser) selectStmt() (Statement, error) {
 // belong to the whole statement.
 func (p *parser) selectCore() (*Select, error) {
 	s := &Select{Limit: -1}
+	// SELECT [ALL | DISTINCT]: ALL is the explicit spelling of the
+	// default. DISTINCT ON (...) — Postgres's keep-first-per-group form
+	// — is a different feature (it needs ORDER BY-driven row choice,
+	// not a dedup) and is rejected outright rather than misread.
+	if p.acceptKw("distinct") {
+		if p.acceptKw("on") {
+			return nil, serr.New("SELECT DISTINCT ON is not supported")
+		}
+		s.Distinct = true
+	} else {
+		p.acceptKw("all")
+	}
 	if p.acceptOp("*") {
 		s.Star = true
 	} else {

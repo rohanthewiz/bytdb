@@ -784,6 +784,33 @@ func resolveDefaultMarkers(vals, defaults []any) []any {
 	return vals
 }
 
+// resolveExprValues evaluates each expression value in an INSERT row
+// (nextval('s'), 1+2, a scalar subquery) down to a plain value the
+// engine can store. VALUES has no input row, so env carries an empty
+// scope: a column reference fails with "no such column", as it should.
+// Like resolveDefaultMarkers, the slice may alias the parsed AST, so
+// it is cloned before the first in-place write — prepared statements
+// re-execute (and re-evaluate volatile calls like nextval) against
+// the original tree.
+func resolveExprValues(env *exEnv, vals []any) ([]any, error) {
+	cloned := false
+	for i, v := range vals {
+		ex, ok := v.(Expr)
+		if !ok {
+			continue
+		}
+		out, err := evalEx(env, ex)
+		if err != nil {
+			return nil, err
+		}
+		if !cloned {
+			vals, cloned = slices.Clone(vals), true
+		}
+		vals[i] = out
+	}
+	return vals, nil
+}
+
 func (d *DB) execInsert(s *Insert) (*Result, error) {
 	res := &Result{}
 	affected := 0
@@ -823,6 +850,10 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		if len(checks) > 0 {
 			env = d.tableEnv(tx, s.Table, desc)
 		}
+		// The environment expression values evaluate in: transaction and
+		// DB for nextval/subqueries, an empty scope so column references
+		// fail. Built once; VALUES expressions never read a row.
+		venv := &exEnv{d: d, tx: tx, sc: &scope{}}
 		for _, row := range s.Rows {
 			vals := row
 			// s.Cols (not ords) is the column-list signal: DEFAULT VALUES
@@ -839,6 +870,9 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 				}
 			}
 			vals = resolveDefaultMarkers(vals, defaults)
+			if vals, err = resolveExprValues(venv, vals); err != nil {
+				return err
+			}
 			// Arity mismatches skip the conflict probe too and fall
 			// through to the engine's error.
 			if up != nil && len(vals) == len(desc.Columns) {
@@ -1133,6 +1167,9 @@ func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, en
 
 // runSelectCore executes one UNION arm (or a whole plain SELECT).
 func (d *DB) runSelectCore(s *Select) (*Result, error) {
+	if s.Distinct {
+		return d.execSelectDistinct(s)
+	}
 	if s.isAggregate() {
 		if hasWindow(s) {
 			return d.execSelectAggWindow(s)
@@ -1173,36 +1210,91 @@ func (d *DB) execUnion(s *Select) (*Result, error) {
 			}
 		}
 	}
+	keys, err := outputSortKeys(s.OrderBy, res.Cols,
+		"ORDER BY on a UNION must name an output column",
+		"ORDER BY on a UNION takes output columns or positions")
+	if err != nil {
+		return nil, err
+	}
+	res.Rows = sortLimitRows(rows, keys, s.Offset, s.Limit)
+	res.RowsAffected = 0
+	return res, nil
+}
+
+// execSelectDistinct runs a SELECT DISTINCT of any shape (plain,
+// aggregate, windowed): the core executes with ORDER BY / OFFSET /
+// LIMIT stripped, the projected rows dedup, and the trimmings apply to
+// the deduped set — the same post-materialization treatment a UNION
+// gets, because both operate on output rows, not table rows.
+//
+//	core rows ──dedup──▶ distinct rows ──sort──▶ OFFSET/LIMIT
+//
+// ORDER BY is therefore restricted to output columns and positions
+// (Postgres's rule, for the same reason: a sort key the projection
+// dropped would decide which duplicate survives, invisibly).
+func (d *DB) execSelectDistinct(s *Select) (*Result, error) {
+	core := *s
+	core.Distinct = false
+	core.OrderBy, core.Limit, core.Offset = nil, -1, 0
+	res, err := d.runSelectCore(&core)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := dedupRows(res.Rows)
+	if err != nil {
+		return nil, err
+	}
+	notInList := "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+	keys, err := outputSortKeys(s.OrderBy, res.Cols, notInList, notInList)
+	if err != nil {
+		return nil, err
+	}
+	res.Rows = sortLimitRows(rows, keys, s.Offset, s.Limit)
+	return res, nil
+}
+
+// outputSortKeys resolves ORDER BY items against a materialized
+// result's output columns: select-list positions (ORDER BY n) or bare
+// output column names. Anything richer — expressions, aggregates,
+// qualified names — has nothing to resolve against once rows are
+// projected, and errors with the caller's wording (errName for an
+// unmatched bare name, errShape for the rest).
+func outputSortKeys(order []OrderItem, cols []string, errName, errShape string) ([]sortKey, error) {
 	var keys []sortKey
-	for _, o := range s.OrderBy {
+	for _, o := range order {
 		switch {
 		case o.IsLit:
 			n, ok := o.Lit.(int64)
 			if !ok {
 				return nil, serr.New("non-integer constant in ORDER BY")
 			}
-			if n < 1 || int(n) > len(res.Cols) {
+			if n < 1 || int(n) > len(cols) {
 				return nil, serr.New("ORDER BY position is not in the select list",
 					"position", fmt.Sprint(n))
 			}
 			keys = append(keys, sortKey{int(n - 1), o.Desc})
 		case o.Ex == nil && o.Agg == AggNone && o.Col.Table == "":
 			found := -1
-			for i, c := range res.Cols {
+			for i, c := range cols {
 				if c == o.Col.Name {
 					found = i
 					break
 				}
 			}
 			if found < 0 {
-				return nil, serr.New("ORDER BY on a UNION must name an output column",
-					"column", o.Col.Name)
+				return nil, serr.New(errName, "column", o.Col.Name)
 			}
 			keys = append(keys, sortKey{found, o.Desc})
 		default:
-			return nil, serr.New("ORDER BY on a UNION takes output columns or positions")
+			return nil, serr.New(errShape)
 		}
 	}
+	return keys, nil
+}
+
+// sortLimitRows finishes a materialized (already projected) result:
+// stable sort by the output-column keys, then OFFSET, then LIMIT.
+func sortLimitRows(rows [][]any, keys []sortKey, offset, limit int64) [][]any {
 	if len(keys) > 0 {
 		slices.SortStableFunc(rows, func(a, b []any) int {
 			for _, k := range keys {
@@ -1217,31 +1309,29 @@ func (d *DB) execUnion(s *Select) (*Result, error) {
 			return 0
 		})
 	}
-	if s.Offset > 0 {
-		if s.Offset >= int64(len(rows)) {
+	if offset > 0 {
+		if offset >= int64(len(rows)) {
 			rows = nil
 		} else {
-			rows = rows[s.Offset:]
+			rows = rows[offset:]
 		}
 	}
-	if s.Limit >= 0 && int64(len(rows)) > s.Limit {
-		rows = rows[:s.Limit]
+	if limit >= 0 && int64(len(rows)) > limit {
+		rows = rows[:limit]
 	}
-	res.Rows = rows
-	res.RowsAffected = 0
-	return res, nil
+	return rows
 }
 
 // dedupRows keeps each distinct row's first occurrence, compared by
 // the order-preserving tuple encoding (NULLs equal NULLs, as UNION
-// requires).
+// and SELECT DISTINCT both require).
 func dedupRows(rows [][]any) ([][]any, error) {
 	seen := make(map[string]bool, len(rows))
 	out := rows[:0]
 	for _, r := range rows {
 		kb, err := tuple.Encode(r...)
 		if err != nil {
-			return nil, serr.Wrap(err, "op", "encode UNION row")
+			return nil, serr.Wrap(err, "op", "encode row for dedup")
 		}
 		if seen[string(kb)] {
 			continue

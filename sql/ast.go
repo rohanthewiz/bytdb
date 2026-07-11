@@ -628,10 +628,15 @@ type AlterSequence struct {
 // at execution to the column's default, or NULL without one.
 type defaultMarker struct{}
 
-// Insert is INSERT INTO t [(cols)] VALUES (lit, ...), ...
-// [RETURNING ...]. Values are parsed literals: int64, float64, string,
-// bool, nil — or a defaultMarker. INSERT ... DEFAULT VALUES parses as
-// an empty column list with one empty row.
+// Insert is INSERT INTO t [(cols)] VALUES (expr, ...), ...
+// [RETURNING ...]. Plain literals stay parsed values — int64, float64,
+// string, bool, nil, a Param, or a defaultMarker — the fast path: they
+// coerce once at the engine and need no evaluation. Anything richer
+// (nextval('s'), 1+2, 'a'||'b', a scalar subquery) is stored as an
+// Expr and evaluated per row at execution, against an empty scope:
+// VALUES has no input row, so column references fail there, as in
+// Postgres. INSERT ... DEFAULT VALUES parses as an empty column list
+// with one empty row.
 type Insert struct {
 	Table    string
 	Cols     []string // nil: values in declared column order
@@ -723,16 +728,22 @@ type FromItem struct {
 // OrderBy, Limit, and Offset then apply to the combined result, and
 // the arms' own OrderBy/Limit/Offset are unset.
 type Select struct {
-	From    []FromItem
-	Star    bool
-	Items   []SelectItem
-	Where   BoolExpr // nil: all rows
-	GroupBy []GroupItem
-	Having  BoolExpr // nil: all groups; leaves may be aggregates
-	OrderBy []OrderItem
-	Limit   int64 // -1: no limit
-	Offset  int64
-	Union   []UnionArm
+	From []FromItem
+	// Distinct is SELECT DISTINCT: the projected rows dedup before
+	// ORDER BY / OFFSET / LIMIT apply, which is why ORDER BY is then
+	// restricted to output columns and positions — sorting by a value
+	// the projection dropped would make "which duplicate survived"
+	// observable, so Postgres forbids it and bytdb follows.
+	Distinct bool
+	Star     bool
+	Items    []SelectItem
+	Where    BoolExpr // nil: all rows
+	GroupBy  []GroupItem
+	Having   BoolExpr // nil: all groups; leaves may be aggregates
+	OrderBy  []OrderItem
+	Limit    int64 // -1: no limit
+	Offset   int64
+	Union    []UnionArm
 }
 
 // UnionArm is one UNION [ALL] continuation, combined left to right:

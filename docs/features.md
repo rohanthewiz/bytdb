@@ -116,10 +116,11 @@ DROP SEQUENCE IF EXISTS order_ids;
   `pg_class` (relkind `'S'`), `pg_catalog.pg_sequence`, and
   `information_schema.sequences`; each also reads as its own one-row state
   relation, so `\ds` and driver probes work.
-- Allocation is transactional — see
+- `nextval` works directly in an INSERT — `VALUES (nextval('order_ids'),
+  ...)` — since VALUES entries are full expressions. Allocation is
+  transactional — see
   [Considerations & Gotchas](gotchas.md#sql-that-is-deliberately-not-there)
-  for the two deliberate divergences from Postgres, and for why
-  `VALUES (nextval('s'))` needs the draw-then-insert pattern.
+  for the two deliberate divergences from Postgres.
 
 ## RETURNING
 
@@ -217,6 +218,24 @@ FROM users WHERE age > 18
 GROUP BY age / 10 HAVING count(*) >= 2
 ORDER BY n DESC, decade LIMIT 3
 ```
+
+### DISTINCT
+
+`SELECT DISTINCT` dedups the projected rows (NULLs compare equal, as in
+Postgres) before `ORDER BY` / `OFFSET` / `LIMIT` apply — which is why
+`ORDER BY` then takes output column names and positions only (Postgres'
+rule: a sort key the projection dropped would silently decide which
+duplicate survives):
+
+```sql
+SELECT DISTINCT dept, sal / 100 AS bucket FROM emp ORDER BY bucket DESC, 1
+```
+
+It composes with aggregates, window functions, UNION arms, and the
+subquery forms (a `DISTINCT` scalar subquery collapses duplicates before
+the one-row rule). `SELECT ALL` parses as the explicit default;
+`DISTINCT ON (...)` is rejected — see [Gotchas](gotchas.md).
+*(verified in `sql/distinct_test.go`)*
 
 ### Window functions
 
@@ -344,6 +363,10 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
   Postgres introspection functions ORMs call (`format_type`,
   `pg_get_indexdef`, `pg_table_is_visible`, ...)
 - `UNION [ALL]`, `SELECT` without `FROM` (`SELECT 1`)
+- Expression values in `INSERT ... VALUES` — evaluated per row, so
+  `VALUES (nextval('s'), 'by'||'tdb', (SELECT max(id) FROM t))` all work;
+  aggregates, window calls, and column references are rejected, as in
+  Postgres *(verified in `sql/insert_expr_test.go`)*
 
 ### Parameters
 

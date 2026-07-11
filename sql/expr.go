@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -488,6 +489,12 @@ func collectSubColumn(env *exEnv, sel *Select) ([]any, error) {
 	}
 	if evalErr != nil {
 		return nil, evalErr
+	}
+	// x = ANY (SELECT DISTINCT y ...) matches exactly what the
+	// non-distinct form matches; dedup here only trims the list the
+	// comparisons walk.
+	if sel.Distinct {
+		return dedupScalars(vals)
 	}
 	return vals, nil
 }
@@ -1056,6 +1063,59 @@ func evalSubquery(env *exEnv, sel *Select) (any, error) {
 	itemEx := itemToExpr(it)
 	sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
 
+	// SELECT DISTINCT collapses duplicates before the one-row rule (and
+	// before OFFSET/LIMIT) apply, so it cannot share the streaming
+	// skip/take below — a thousand rows of the same value are one row.
+	// Collection still stops early: OFFSET+2 distinct values decide the
+	// outcome whatever LIMIT says (LIMIT only shrinks the set further).
+	if sel.Distinct {
+		seen := map[string]bool{}
+		var vals []any
+		var evalErr error
+		err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
+			rowEnv := *sub
+			rowEnv.row = rowVals
+			var v any
+			if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
+				return false
+			}
+			kb, e := tuple.Encode(v)
+			if e != nil {
+				evalErr = serr.Wrap(e, "op", "encode row for dedup")
+				return false
+			}
+			if seen[string(kb)] {
+				return true
+			}
+			seen[string(kb)] = true
+			vals = append(vals, v)
+			return int64(len(vals)) < satAdd(sel.Offset, 2)
+		})
+		if err != nil {
+			return nil, err
+		}
+		if evalErr != nil {
+			return nil, evalErr
+		}
+		if sel.Offset > 0 {
+			if sel.Offset >= int64(len(vals)) {
+				vals = nil
+			} else {
+				vals = vals[sel.Offset:]
+			}
+		}
+		if sel.Limit >= 0 && int64(len(vals)) > sel.Limit {
+			vals = vals[:sel.Limit]
+		}
+		switch len(vals) {
+		case 0:
+			return nil, nil
+		case 1:
+			return vals[0], nil
+		}
+		return nil, serr.New("more than one row returned by a scalar subquery")
+	}
+
 	var out any
 	skip, take := sel.Offset, sel.Limit
 	count := int64(0)
@@ -1085,6 +1145,26 @@ func evalSubquery(env *exEnv, sel *Select) (any, error) {
 	}
 	if count > 1 {
 		return nil, serr.New("more than one row returned by a scalar subquery")
+	}
+	return out, nil
+}
+
+// dedupScalars keeps each distinct value's first occurrence — the
+// single-column analogue of dedupRows, for subquery shapes that
+// materialize one value per row (ANY/ALL lists, ARRAY(SELECT ...)).
+func dedupScalars(vals []any) ([]any, error) {
+	seen := make(map[string]bool, len(vals))
+	out := vals[:0]
+	for _, v := range vals {
+		kb, err := tuple.Encode(v)
+		if err != nil {
+			return nil, serr.Wrap(err, "op", "encode value for dedup")
+		}
+		if seen[string(kb)] {
+			continue
+		}
+		seen[string(kb)] = true
+		out = append(out, v)
 	}
 	return out, nil
 }
@@ -1134,6 +1214,14 @@ func evalArraySub(env *exEnv, sel *Select) (any, error) {
 	}
 	if evalErr != nil {
 		return nil, evalErr
+	}
+	// ARRAY(SELECT DISTINCT ...): dedup before the optional sort — the
+	// surviving set is the same either way, and first-occurrence order
+	// is what an unsorted DISTINCT yields.
+	if sel.Distinct {
+		if vals, err = dedupScalars(vals); err != nil {
+			return nil, err
+		}
 	}
 	if len(sel.OrderBy) > 0 {
 		slices.SortStableFunc(vals, orderCmp)
