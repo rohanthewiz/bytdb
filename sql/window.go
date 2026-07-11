@@ -21,7 +21,8 @@ import (
 // windows are supported. Frame-sensitive functions (the aggregates and
 // FIRST/LAST/NTH_VALUE) evaluate over each row's frame: an explicit
 // ROWS/RANGE/GROUPS clause (RANGE offsets are distances on the sort
-// key), or the SQL default — RANGE UNBOUNDED PRECEDING .. CURRENT ROW, which
+// key) with optional EXCLUDE CURRENT ROW/GROUP/TIES, or the SQL
+// default — RANGE UNBOUNDED PRECEDING .. CURRENT ROW, which
 // with ORDER BY ends at the current row's last peer, so LAST_VALUE is
 // the last peer (not the partition end) — same surprise as PG.
 
@@ -107,6 +108,9 @@ func windowText(w *ExWindow) string {
 		// already normalized to it at parse.
 		b.WriteString(sep + w.Frame.Mode.name() + " BETWEEN " +
 			boundText(w.Frame.Start) + " AND " + boundText(w.Frame.End))
+		if w.Frame.Exclude != ExcludeNoOthers {
+			b.WriteString(" " + w.Frame.Exclude.name())
+		}
 	}
 	b.WriteByte(')')
 	return b.String()
@@ -472,6 +476,7 @@ type frameSpec struct {
 	start, end       FrameBoundType
 	startOff, endOff int64 // ROWS/GROUPS offsets: row / peer-group counts
 	startNum, endNum any   // RANGE offsets: numeric distances on the sort key
+	exclude          FrameExclusion
 }
 
 // hasRangeOffsets reports whether the frame has RANGE offset bounds,
@@ -494,7 +499,7 @@ func resolveFrame(env *exEnv, w *ExWindow) (frameSpec, error) {
 	if w.Frame == nil {
 		return frameSpec{mode: FrameRange, start: BoundUnboundedPreceding, end: BoundCurrentRow}, nil
 	}
-	fs := frameSpec{mode: w.Frame.Mode, start: w.Frame.Start.Type, end: w.Frame.End.Type}
+	fs := frameSpec{mode: w.Frame.Mode, start: w.Frame.Start.Type, end: w.Frame.End.Type, exclude: w.Frame.Exclude}
 	var err error
 	if fs.hasRangeOffsets() {
 		if t := exprType(env.sc, w.OrderBy[0].Ex); t != bytdb.TInt && t != bytdb.TFloat {
@@ -792,6 +797,64 @@ func (fr *framer) rangeEdge(n int, off any, preceding, end bool) int {
 	})
 }
 
+// seg is one contiguous run of frame positions; frame exclusion can
+// split a row's frame into at most three of these.
+type seg struct{ lo, hi int }
+
+// segs computes the frame of the row at partition position n as an
+// ordered list of disjoint, non-empty position segments. Without an
+// EXCLUDE clause that is just bounds(n); with one, the excluded run —
+// the current row, its whole peer group, or the peers minus the row
+// itself (TIES) — is clipped out of [lo, hi):
+//
+//	bounds  [lo...............hi)    peers [pLo ..n.. pHi)
+//	EXCLUDE CURRENT ROW  ->  [lo, n)   ∪ [n+1, hi)
+//	EXCLUDE GROUP        ->  [lo, pLo) ∪ [pHi, hi)
+//	EXCLUDE TIES         ->  [lo, pLo) ∪ [n, n+1) ∪ [pHi, hi)
+//
+// Every piece is intersected with [lo, hi): exclusion only removes
+// rows the bounds selected, so TIES does not re-admit a current row
+// the frame never contained. buf is appended to and returned, letting
+// callers reuse one backing array across rows.
+func (fr *framer) segs(n int, buf []seg) []seg {
+	lo, hi := fr.bounds(n)
+	xLo, xHi := n, n+1 // the excluded run; CURRENT ROW's case
+	switch fr.fs.exclude {
+	case ExcludeNoOthers:
+		if lo < hi {
+			buf = append(buf, seg{lo, hi})
+		}
+		return buf
+	case ExcludeGroup, ExcludeTies:
+		g := fr.groups[fr.groupOf[n]]
+		xLo, xHi = g.lo, g.hi
+	}
+	if l := (seg{lo, min(hi, xLo)}); l.lo < l.hi {
+		buf = append(buf, l)
+	}
+	if fr.fs.exclude == ExcludeTies {
+		if m := (seg{max(lo, n), min(hi, n+1)}); m.lo < m.hi {
+			buf = append(buf, m)
+		}
+	}
+	if r := (seg{max(lo, xHi), hi}); r.lo < r.hi {
+		buf = append(buf, r)
+	}
+	return buf
+}
+
+// segPos maps the k-th frame row (0-based) to its partition position
+// by walking the segments in order.
+func segPos(segs []seg, k int) int {
+	for _, s := range segs {
+		if k < s.hi-s.lo {
+			return s.lo + k
+		}
+		k -= s.hi - s.lo
+	}
+	return -1 // unreachable: callers bound k by the summed length
+}
+
 // rangeThreshold computes the sort-key boundary v ± off for a RANGE
 // offset bound (sub chooses the sign). Pure-int arithmetic stays
 // exact, with a saturation guard: off is validated non-negative, so
@@ -830,22 +893,28 @@ func rangeThreshold(v, off any, sub bool) any {
 // sorted partition: each row surfaces one row of its own frame. Under
 // the default frame LAST_VALUE lands on the current row's last peer
 // (the famous PG surprise — not the partition end); explicit bounds
+// (or an EXCLUDE clause, which can hollow the frame into segments)
 // can make any frame, including an empty one, which yields NULL.
 func assignValueFrame(env *exEnv, w *ExWindow, fr *framer, base [][]any, idxs []int, wi int, winvals [][]any) error {
+	var segbuf []seg
 	for n, ri := range idxs {
-		lo, hi := fr.bounds(n)
+		segbuf = fr.segs(n, segbuf[:0])
+		total := 0
+		for _, s := range segbuf {
+			total += s.hi - s.lo
+		}
 		var t int // frame position to surface
 		switch w.Win {
 		case WinFirstValue:
-			if lo >= hi {
+			if total == 0 {
 				continue // empty frame -> NULL
 			}
-			t = lo
+			t = segbuf[0].lo
 		case WinLastValue:
-			if lo >= hi {
+			if total == 0 {
 				continue
 			}
-			t = hi - 1
+			t = segbuf[len(segbuf)-1].hi - 1
 		default: // NTH_VALUE: n evaluates per row, so peers can differ
 			nv, err := evalOn(env, w.Offset, base[ri])
 			if err != nil {
@@ -861,10 +930,10 @@ func assignValueFrame(env *exEnv, w *ExWindow, fr *framer, base [][]any, idxs []
 			if nth < 1 {
 				return serr.New("argument of nth_value must be greater than zero")
 			}
-			if nth > int64(hi-lo) {
+			if nth > int64(total) {
 				continue // frame shorter than n (or empty) -> NULL
 			}
-			t = lo + int(nth) - 1
+			t = segPos(segbuf, int(nth)-1)
 		}
 		v, err := evalOn(env, w.Arg, base[idxs[t]])
 		if err != nil {
@@ -885,6 +954,11 @@ func assignValueFrame(env *exEnv, w *ExWindow, fr *framer, base [][]any, idxs []
 // so those frames recompute per distinct [lo, hi), memoizing the last
 // range since consecutive rows often share a frame (always, for
 // RANGE/GROUPS peers); a sliding ROWS frame is O(rows x frame width).
+// An EXCLUDE clause hollows a hole that moves with the current row,
+// which defeats the anchored fast path too, so exclusion always takes
+// the recompute-with-memoization road — under EXCLUDE GROUP whole
+// peer groups still share segment lists, so the memo keeps RANGE/
+// GROUPS frames at one aggregation per group.
 func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fr *framer, base [][]any, idxs []int, wi int, winvals [][]any) error {
 	intSum := w.Arg != nil && exprType(sc, w.Arg) == bytdb.TInt
 	newAcc := func() *accum { return &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum} }
@@ -892,6 +966,28 @@ func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fr *framer, base [][]any
 		re := *env
 		re.row = base[ri]
 		return acc.add(&re, base[ri])
+	}
+	if fr.fs.exclude != ExcludeNoOthers {
+		var lastSegs, segbuf []seg
+		var lastV any
+		have := false // guards the first row: empty segs == empty memo otherwise
+		for n, ri := range idxs {
+			segbuf = fr.segs(n, segbuf[:0])
+			if !have || !slices.Equal(segbuf, lastSegs) {
+				acc := newAcc()
+				for _, s := range segbuf {
+					for k := s.lo; k < s.hi; k++ {
+						if err := add(acc, idxs[k]); err != nil {
+							return err
+						}
+					}
+				}
+				lastV, have = acc.value(), true
+				lastSegs = append(lastSegs[:0], segbuf...)
+			}
+			winvals[ri][wi] = lastV
+		}
+		return nil
 	}
 	if fr.fs.start == BoundUnboundedPreceding {
 		acc := newAcc()

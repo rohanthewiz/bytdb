@@ -289,8 +289,96 @@ func TestFrameRangeParams(t *testing.T) {
 	}
 }
 
+// TestFrameExclude covers the EXCLUDE clause on aggregate windows:
+// CURRENT ROW removes just the row, GROUP the whole peer group, TIES
+// the peers but not the row itself — and only ever removes rows the
+// bounds selected (a current row outside the frame is not re-admitted
+// by TIES). Powers-of-two v values make each frame's sum unique.
+func TestFrameExclude(t *testing.T) {
+	d := openDB(t)
+	seedFrames(t, d)
+
+	res := exec(t, d, `select id,
+		sum(v) over (order by k, id rows between 1 preceding and 1 following exclude current row) as xcur,
+		sum(v) over (order by k range between unbounded preceding and current row exclude group) as xgrp,
+		sum(v) over (order by k range between unbounded preceding and current row exclude ties) as xtie,
+		count(*) over (order by k range between unbounded preceding and current row exclude group) as cgrp,
+		sum(v) over (order by k rows between 1 following and 2 following exclude ties) as xout
+		from f order by id`)
+	want := [][]any{
+		// xgrp spells out the default frame, which ends at the last
+		// peer — so excluding the group empties rows 1,2's frames
+		// entirely (SUM NULL, COUNT 0); xtie keeps each row itself, so
+		// ties differ from their peers. xout's row-1 frame is {2,3}:
+		// its peer (row 2)
+		// is excluded, and TIES does not pull row 1 back into a frame
+		// that never contained it (5 would mean it did).
+		{int64(1), int64(2), nil, int64(1), int64(0), int64(4)},
+		{int64(2), int64(5), nil, int64(2), int64(0), int64(12)},
+		{int64(3), int64(10), int64(3), int64(7), int64(2), int64(8)},
+		{int64(4), int64(4), int64(7), int64(15), int64(3), nil},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("exclude aggregates: %v", res.Rows)
+	}
+
+	// Without ORDER BY every row is a peer: EXCLUDE GROUP empties any
+	// frame, EXCLUDE TIES leaves exactly the current row. And EXCLUDE
+	// composes with RANGE offset bounds (distances on k).
+	res = exec(t, d, `select id,
+		sum(v) over (rows between unbounded preceding and unbounded following exclude group) as allgrp,
+		sum(v) over (rows between unbounded preceding and unbounded following exclude ties) as alltie,
+		sum(v) over (order by k range between 1 preceding and 1 following exclude group) as rng
+		from f order by id`)
+	want = [][]any{
+		{int64(1), nil, int64(1), int64(4)},
+		{int64(2), nil, int64(2), int64(4)},
+		{int64(3), nil, int64(4), int64(11)},
+		{int64(4), nil, int64(8), int64(4)},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("exclude no-order/range: %v", res.Rows)
+	}
+}
+
+// TestFrameExcludeValues: exclusion hollows the frame FIRST/LAST/NTH
+// _VALUE walk — NTH_VALUE counts across the hole, a fully excluded
+// frame yields NULL — and EXPLAIN renders the clause.
+func TestFrameExcludeValues(t *testing.T) {
+	d := openDB(t)
+	seedFrames(t, d)
+
+	res := exec(t, d, `select id,
+		first_value(v) over (order by k rows between unbounded preceding and unbounded following exclude group) as fv,
+		last_value(v) over (order by k rows between unbounded preceding and unbounded following exclude group) as lv,
+		nth_value(v, 3) over (order by k rows between unbounded preceding and unbounded following exclude group) as nv,
+		first_value(v) over (order by k, id rows between current row and current row exclude current row) as fempty
+		from f order by id`)
+	want := [][]any{
+		// Rows 1,2 exclude the {v=1,v=2} peer group, leaving {4,8} — too
+		// short for nth 3. Row 3's remainder {1,2,8} straddles the hole,
+		// so its 3rd value (8) crosses a segment boundary.
+		{int64(1), int64(4), int64(8), nil, nil},
+		{int64(2), int64(4), int64(8), nil, nil},
+		{int64(3), int64(1), int64(8), int64(8), nil},
+		{int64(4), int64(1), int64(4), int64(4), nil},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("exclude value functions: %v", res.Rows)
+	}
+
+	res = exec(t, d, `explain select sum(v) over (order by k rows between 1 preceding and current row exclude ties) from f`)
+	txt := ""
+	for _, r := range res.Rows {
+		txt += r[0].(string) + "\n"
+	}
+	if !strings.Contains(txt, "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES") {
+		t.Fatalf("explain exclusion: %s", txt)
+	}
+}
+
 // TestFrameErrors covers the parse- and run-time rejections: illegal
-// bound pairs (Postgres' wording), unsupported modes and exclusions,
+// bound pairs (Postgres' wording), malformed exclusions,
 // row-dependent offsets, and bad offset values.
 func TestFrameErrors(t *testing.T) {
 	d := openDB(t)
@@ -328,8 +416,8 @@ func TestFrameErrors(t *testing.T) {
 			"frame starting offset must be numeric"},
 		{`select sum(v) over (groups between 1 preceding and current row) from f`,
 			"GROUPS mode requires an ORDER BY clause"},
-		{`select sum(v) over (order by k rows between 1 preceding and current row exclude ties) from f`,
-			"frame exclusion"},
+		{`select sum(v) over (order by k rows between 1 preceding and current row exclude nonsense) from f`,
+			"syntax error"},
 		{`select sum(v) over (order by k rows v preceding) from f`,
 			"argument of ROWS must not contain variables"},
 		{`select sum(v) over (order by k groups count(v) preceding) from f`,

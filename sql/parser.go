@@ -2253,9 +2253,9 @@ func (p *parser) windowOver(w *ExWindow) (Expr, error) {
 // <end>, and the single-bound shorthand whose end is CURRENT ROW.
 // Bound-pair validity is checked here with Postgres' wording, so an
 // impossible frame fails at parse rather than producing empty frames
-// everywhere. EXCLUDE NO OTHERS (the default exclusion) is accepted
-// and ignored; the other exclusions change frame membership per row
-// and are not supported.
+// everywhere. An EXCLUDE clause (CURRENT ROW/GROUP/TIES, or the
+// default NO OTHERS) removes rows near the current row after the
+// bounds have chosen the frame.
 func (p *parser) windowFrame(nOrderBy int) (*WindowFrame, error) {
 	f := &WindowFrame{}
 	switch {
@@ -2307,12 +2307,27 @@ func (p *parser) windowFrame(nOrderBy int) (*WindowFrame, error) {
 	case f.Start.Type == BoundOffsetFollowing && f.End.Type == BoundCurrentRow:
 		return nil, serr.New("frame starting from following row cannot reference current row")
 	}
+	// The EXCLUDE clause. GROUP and TIES are defined through ORDER BY
+	// peers but stay legal without one (the whole partition is a single
+	// peer group then), matching Postgres — only GROUPS *mode* demands
+	// an ORDER BY, checked above.
 	if p.acceptKw("exclude") {
-		if !p.acceptKw("no") {
-			return nil, serr.New("frame exclusion (EXCLUDE CURRENT ROW/GROUP/TIES) is not supported")
-		}
-		if err := p.expectKw("others"); err != nil {
-			return nil, err
+		switch {
+		case p.acceptKw("current"):
+			if err := p.expectKw("row"); err != nil {
+				return nil, err
+			}
+			f.Exclude = ExcludeCurrentRow
+		case p.acceptKw("group"):
+			f.Exclude = ExcludeGroup
+		case p.acceptKw("ties"):
+			f.Exclude = ExcludeTies
+		case p.acceptKw("no"):
+			if err := p.expectKw("others"); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, p.unexpected("CURRENT ROW, GROUP, TIES, or NO OTHERS")
 		}
 	}
 	return f, nil

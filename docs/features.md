@@ -230,9 +230,30 @@ row-independent and non-negative (`$n` binds; a `RANGE` offset
 describes with the sort key's type, so wire drivers can send `0.5` as
 float8); empty frames yield NULL (COUNT 0). The `last_value` line
 above is the canonical fix for the `LAST_VALUE` default-frame
-surprise. Not supported: `EXCLUDE` variants other than the no-op
-`EXCLUDE NO OTHERS`. Ranking functions and `LAG`/`LEAD` ignore
-frames, as in Postgres.
+surprise. Ranking functions and `LAG`/`LEAD` ignore frames, as in
+Postgres.
+
+An `EXCLUDE` clause removes rows near the current row *after* the
+bounds have chosen the frame:
+
+```sql
+SELECT id,
+    v - avg(v) OVER (ORDER BY grp ROWS BETWEEN UNBOUNDED PRECEDING
+                     AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS vs_others,
+    sum(v)     OVER (ORDER BY grp RANGE BETWEEN UNBOUNDED PRECEDING
+                     AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS other_grps
+FROM t
+```
+*(verified in `sql/window_frame_test.go`)*
+
+`EXCLUDE CURRENT ROW` drops just the row, `EXCLUDE GROUP` the row and
+its `ORDER BY` peers, `EXCLUDE TIES` the peers but not the row itself;
+`EXCLUDE NO OTHERS` spells the default. Exclusion only removes rows
+the bounds selected — `TIES` never re-admits a current row from
+outside the frame — and `NTH_VALUE` counts across the hole it leaves.
+Without `ORDER BY` the whole partition is one peer group, so `GROUP`
+empties every frame (SUM NULL, COUNT 0) and `TIES` leaves exactly the
+current row.
 
 ### Expressions
 

@@ -404,6 +404,34 @@ const (
 	BoundUnboundedFollowing
 )
 
+// FrameExclusion is a frame's EXCLUDE clause: after the bounds pick a
+// row's frame, exclusion removes rows near the current row from it.
+// The zero value is EXCLUDE NO OTHERS (the default — nothing removed),
+// so an absent clause needs no special casing. GROUP removes the
+// current row and its ORDER BY peers, TIES removes only the peers
+// (the current row stays, if the bounds included it at all), CURRENT
+// ROW removes just the current row.
+type FrameExclusion int
+
+const (
+	ExcludeNoOthers FrameExclusion = iota
+	ExcludeCurrentRow
+	ExcludeGroup
+	ExcludeTies
+)
+
+func (x FrameExclusion) name() string {
+	switch x {
+	case ExcludeCurrentRow:
+		return "EXCLUDE CURRENT ROW"
+	case ExcludeGroup:
+		return "EXCLUDE GROUP"
+	case ExcludeTies:
+		return "EXCLUDE TIES"
+	}
+	return "EXCLUDE NO OTHERS"
+}
+
 // FrameBound is one frame endpoint; Offset is set only for the
 // offset-taking bound types, and must be row-independent (the parser
 // rejects column references inside it, so the executor can evaluate
@@ -414,12 +442,14 @@ type FrameBound struct {
 }
 
 // WindowFrame is an explicit frame clause:
-// {ROWS|RANGE|GROUPS} BETWEEN <start> AND <end>. The single-bound
-// form (no BETWEEN) parses with End = CURRENT ROW, its SQL meaning.
+// {ROWS|RANGE|GROUPS} BETWEEN <start> AND <end> [EXCLUDE ...]. The
+// single-bound form (no BETWEEN) parses with End = CURRENT ROW, its
+// SQL meaning.
 type WindowFrame struct {
-	Mode  FrameMode
-	Start FrameBound
-	End   FrameBound
+	Mode    FrameMode
+	Start   FrameBound
+	End     FrameBound
+	Exclude FrameExclusion
 }
 
 // ExWindow is a window function call: fn(args) OVER (PARTITION BY ...
