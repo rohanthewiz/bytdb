@@ -466,6 +466,7 @@ type ExWindow struct {
 	Offset    Expr    // LAG/LEAD offset (default 1) or NTH_VALUE's n; nil otherwise
 	Default   Expr    // LAG/LEAD out-of-partition fallback; nil means NULL
 	Star      bool    // COUNT(*) OVER (...)
+	Distinct  bool    // aggregate windows only: dedup within each row's frame
 	Partition []Expr
 	OrderBy   []OrderItem
 	Frame     *WindowFrame // nil: the default frame
@@ -583,6 +584,45 @@ type CreateIndex struct {
 // DropIndex is DROP INDEX name [ON t]. With no ON clause the index is
 // resolved by name across tables.
 type DropIndex struct{ Name, Table string }
+
+// SeqOptions is the option list of CREATE or ALTER SEQUENCE. Pointer
+// fields distinguish "not mentioned" (nil — keep the default, or on
+// ALTER the current value) from an explicit setting; NoMin/NoMax are
+// the explicit NO MINVALUE / NO MAXVALUE spellings, which reset the
+// bound to its default.
+type SeqOptions struct {
+	AsType    string // "": bigint; else the declared int type's name
+	Increment *int64
+	Min, Max  *int64
+	NoMin     bool
+	NoMax     bool
+	Start     *int64
+	Cache     *int64
+	Cycle     *bool
+	// ALTER SEQUENCE only: RESTART [WITH n]. Restart without a value
+	// reuses the sequence's START.
+	Restart     bool
+	RestartWith *int64
+}
+
+// CreateSequence is CREATE SEQUENCE [IF NOT EXISTS] name [options].
+type CreateSequence struct {
+	Name        string
+	IfNotExists bool
+	Opts        SeqOptions
+}
+
+// DropSequence is DROP SEQUENCE [IF EXISTS] name [RESTRICT].
+type DropSequence struct {
+	Name     string
+	IfExists bool
+}
+
+// AlterSequence is ALTER SEQUENCE name options.
+type AlterSequence struct {
+	Name string
+	Opts SeqOptions
+}
 
 // defaultMarker is the DEFAULT keyword as an INSERT value: resolved
 // at execution to the column's default, or NULL without one.
@@ -763,6 +803,9 @@ func (*AddConstraint) stmt()  {}
 func (*DropConstraint) stmt() {}
 func (*CreateIndex) stmt()    {}
 func (*DropIndex) stmt()      {}
+func (*CreateSequence) stmt() {}
+func (*DropSequence) stmt()   {}
+func (*AlterSequence) stmt()  {}
 func (*Insert) stmt()         {}
 func (*Select) stmt()         {}
 func (*Update) stmt()         {}

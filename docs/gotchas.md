@@ -63,9 +63,21 @@ Parse-time rejections with pointed errors:
 | Date/time, decimal, uuid, json, array column types | Store as `INT` (epoch), `TEXT`, or `BYTEA` |
 | `$n` placeholders in `LIMIT`/`OFFSET` | Literal counts only |
 | `EXPLAIN ANALYZE` | `EXPLAIN` only — execution is not instrumented |
-| Window + `GROUP BY` in one query | `ROWS`/`RANGE`/`GROUPS` frames all work, `RANGE <n> PRECEDING/FOLLOWING` and `EXCLUDE` included; window over an aggregate needs a subquery |
 | Aggregates, subqueries, or placeholders inside `CHECK` | — |
+| Expressions in `INSERT ... VALUES` | Literals and `DEFAULT` only — so `VALUES (nextval('s'))` doesn't parse; draw the key first (`SELECT nextval('s')`) and insert it, the pattern drivers use |
+| `nextval(...)` as a column `DEFAULT` | Constant defaults only; use an identity column (`SERIAL`) or draw explicitly |
+| `DROP SEQUENCE ... CASCADE`, `OWNED BY table.column` | Nothing can depend on a sequence yet; `OWNED BY NONE` parses |
 | `COPY`, out-of-band query cancellation, SSL on the wire | — |
+
+Two deliberate Postgres *divergences* around sequences and windows:
+
+- `DISTINCT` inside a window aggregate (`COUNT(DISTINCT x) OVER (...)`)
+  **works** here — Postgres rejects it ("DISTINCT is not implemented for
+  window functions"); DuckDB supports it the same way.
+- Sequence allocation is **transactional**: a `nextval` in a rolled-back
+  transaction is not consumed, so the value is handed out again later.
+  Postgres burns it. Code that relies on rolled-back values staying burned
+  (rare, but it exists) will see reuse.
 
 Three semantic notes that surprise people (all Postgres-faithful):
 

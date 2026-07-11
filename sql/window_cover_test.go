@@ -117,7 +117,10 @@ func TestWindowErrors(t *testing.T) {
 		// A window inside an array subscript rewrites (ExIndex container),
 		// then the evaluator rejects the subscript itself.
 		{`select (array[1,2])[row_number() over ()] from users`, "array subscripts are not supported"},
-		{`select count(distinct age) over () from users`, "DISTINCT is not supported in a window function"},
+		// Window calls cannot nest, whether the outer call is a window
+		// function or an aggregate window.
+		{`select lag(rank() over ()) over () from users`, "window function calls cannot be nested"},
+		{`select sum(rank() over ()) over () from users`, "window function calls cannot be nested"},
 		{`select sum(age) over (order by age, name range 1 preceding) from users`,
 			"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"},
 		// Errors inside PARTITION BY / ORDER BY evaluation surface.

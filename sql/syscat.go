@@ -37,6 +37,16 @@ func (d *DB) lookup(base func(string) *bytdb.TableDesc) tableLookup {
 			if desc := base(name); desc != nil {
 				return desc, nil
 			}
+			// A sequence reads as a one-row virtual table, the way
+			// Postgres exposes sequence state relations — drivers and
+			// psql's \d issue SELECT last_value FROM seq.
+			if sd := d.e.Sequence(name); sd != nil {
+				return sysDesc(name,
+						sysCol("last_value", bytdb.TInt),
+						sysCol("log_cnt", bytdb.TInt),
+						sysCol("is_called", bytdb.TBool)),
+					[][]any{{sd.Last, int64(0), sd.Called}}
+			}
 		}
 		if st := sysLookup(name); st != nil {
 			var rows [][]any
@@ -101,6 +111,12 @@ func writeTarget(st Statement) string {
 		return s.Table
 	case *DropIndex:
 		return s.Table
+	case *CreateSequence:
+		return s.Name
+	case *DropSequence:
+		return s.Name
+	case *AlterSequence:
+		return s.Name
 	case *Insert:
 		return s.Table
 	case *Update:
@@ -213,6 +229,21 @@ func indexOID(tableID uint64, indexID uint64) int64 { return int64(tableID*1000 
 // in the table's oid block, above any realistic index ID.
 func checkOID(tableID uint64, i int) int64 { return int64(tableID*1000+900) + int64(i) }
 
+// attrdefOID is the oid of a column default's pg_attrdef row: its own
+// slice of the table's oid block, below the check-constraint slice.
+func attrdefOID(tableID uint64, attnum int) int64 { return int64(tableID*1000+800) + int64(attnum) }
+
+// seqTypeOID maps a sequence's declared type to its pg_type oid.
+func seqTypeOID(t string) int64 {
+	switch t {
+	case "smallint":
+		return 21
+	case "integer":
+		return 23
+	}
+	return 20 // bigint
+}
+
 var sysTables = map[string]*sysTableDef{
 	"pg_catalog.pg_namespace": {
 		desc: sysDesc("pg_namespace", sysCol("oid", bytdb.TInt),
@@ -242,9 +273,12 @@ var sysTables = map[string]*sysTableDef{
 		rows: func(d *DB) [][]any {
 			var rows [][]any
 			rel := func(oid int64, name, kind string, hasIdx bool, nChecks int) {
-				am := amHeap
-				if kind == "i" {
+				am := int64(0) // sequences have no access method
+				switch kind {
+				case "i":
 					am = amBtree
+				case "r":
+					am = amHeap
 				}
 				rows = append(rows, []any{
 					oid, name, oidPublic, kind, int64(10), "p", hasIdx, -1.0, int64(0),
@@ -258,6 +292,9 @@ var sysTables = map[string]*sysTableDef{
 				for _, ix := range desc.Indexes {
 					rel(indexOID(desc.ID, ix.ID), ix.Name, "i", false, 0)
 				}
+			}
+			for _, sd := range d.e.Sequences() {
+				rel(int64(sd.ID), sd.Name, "S", false, 0)
 			}
 			return rows
 		},
@@ -275,10 +312,17 @@ var sysTables = map[string]*sysTableDef{
 		rows: func(d *DB) [][]any {
 			var rows [][]any
 			attr := func(relid int64, num int, c bytdb.Column, notNull bool) {
+				// atthasdef gates psql's pg_attrdef subquery; identity
+				// reports through attidentity ('d': BY DEFAULT), as in
+				// Postgres — not as a default.
+				identity := ""
+				if c.Identity {
+					identity = "d"
+				}
 				rows = append(rows, []any{
 					relid, c.Name, typeOID(c.Type), typeLen(c.Type),
-					int64(num), notNull, false, false,
-					int64(-1), int64(0), "", "",
+					int64(num), notNull, c.Default != "", false,
+					int64(-1), int64(0), identity, "",
 					"p", "", int64(-1),
 				})
 			}
@@ -364,10 +408,10 @@ var sysTables = map[string]*sysTableDef{
 			return rows
 		},
 	},
-	// The tables below exist so psql's probes parse, bind, and return
-	// zero rows (pg_constraint aside, which lists CHECK constraints):
-	// bytdb has no access methods, defaults, collations, inheritance,
-	// policies, extended statistics, or publications.
+	// Most tables below exist so psql's probes parse, bind, and return
+	// zero rows (pg_constraint lists CHECK constraints and pg_attrdef
+	// column defaults): bytdb has no collations, inheritance, policies,
+	// extended statistics, or publications.
 	"pg_catalog.pg_am": {
 		desc: sysDesc("pg_am",
 			sysCol("oid", bytdb.TInt), sysCol("amname", bytdb.TString),
@@ -380,6 +424,42 @@ var sysTables = map[string]*sysTableDef{
 		desc: sysDesc("pg_attrdef",
 			sysCol("oid", bytdb.TInt), sysCol("adrelid", bytdb.TInt),
 			sysCol("adnum", bytdb.TInt), sysCol("adbin", bytdb.TString)),
+		rows: func(d *DB) [][]any {
+			// One row per declared column default. adbin holds the
+			// stored literal text rather than a Postgres expression
+			// tree; pg_get_expr surfaces it as-is, which is exactly
+			// what psql's \d Default column renders. Identity columns
+			// are not defaults — they report via attidentity.
+			var rows [][]any
+			for _, desc := range d.userDescs() {
+				for i, c := range desc.Columns {
+					if c.Default != "" {
+						rows = append(rows, []any{
+							attrdefOID(desc.ID, i+1), int64(desc.ID),
+							int64(i + 1), c.Default,
+						})
+					}
+				}
+			}
+			return rows
+		},
+	},
+	"pg_catalog.pg_sequence": {
+		desc: sysDesc("pg_sequence",
+			sysCol("seqrelid", bytdb.TInt), sysCol("seqtypid", bytdb.TInt),
+			sysCol("seqstart", bytdb.TInt), sysCol("seqincrement", bytdb.TInt),
+			sysCol("seqmax", bytdb.TInt), sysCol("seqmin", bytdb.TInt),
+			sysCol("seqcache", bytdb.TInt), sysCol("seqcycle", bytdb.TBool)),
+		rows: func(d *DB) [][]any {
+			var rows [][]any
+			for _, sd := range d.e.Sequences() {
+				rows = append(rows, []any{
+					int64(sd.ID), seqTypeOID(sd.Type), sd.Start, sd.Increment,
+					sd.Max, sd.Min, sd.Cache, sd.Cycle,
+				})
+			}
+			return rows
+		},
 	},
 	"pg_catalog.pg_collation": {
 		desc: sysDesc("pg_collation",
@@ -487,6 +567,31 @@ var sysTables = map[string]*sysTableDef{
 			var rows [][]any
 			for _, desc := range d.userDescs() {
 				rows = append(rows, []any{sysDatabase, "public", desc.Name, "BASE TABLE"})
+			}
+			return rows
+		},
+	},
+	"information_schema.sequences": {
+		desc: sysDesc("sequences",
+			sysCol("sequence_catalog", bytdb.TString), sysCol("sequence_schema", bytdb.TString),
+			sysCol("sequence_name", bytdb.TString), sysCol("data_type", bytdb.TString),
+			sysCol("start_value", bytdb.TString), sysCol("minimum_value", bytdb.TString),
+			sysCol("maximum_value", bytdb.TString), sysCol("increment", bytdb.TString),
+			sysCol("cycle_option", bytdb.TString)),
+		rows: func(d *DB) [][]any {
+			// The numeric fields are character_data in the standard (and
+			// in Postgres), so they render as text.
+			var rows [][]any
+			for _, sd := range d.e.Sequences() {
+				cycle := "NO"
+				if sd.Cycle {
+					cycle = "YES"
+				}
+				rows = append(rows, []any{
+					sysDatabase, "public", sd.Name, seqTypeName(sd.Type),
+					fmtI(sd.Start), fmtI(sd.Min), fmtI(sd.Max), fmtI(sd.Increment),
+					cycle,
+				})
 			}
 			return rows
 		},

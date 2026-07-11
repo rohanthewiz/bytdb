@@ -172,6 +172,14 @@ type aggQuery struct {
 	outs   []Expr
 	having Expr // nil: all groups
 	sorts  []aggSortKey
+
+	// rowMode makes rewrite emit positional exOrd reads instead of
+	// exGroupRef/exAccRef. The window-over-groups path sets it: groups
+	// materialize as synthetic rows (key values then accumulator
+	// results), so every group-phase expression — window arguments
+	// included — evaluates through env.row like any other row, which
+	// is the shape the window machinery expects.
+	rowMode bool
 }
 
 // exprKey renders an expression canonically for GROUP BY matching:
@@ -260,12 +268,13 @@ func aggItemExpr(it SelectItem) (Expr, error) {
 }
 
 // resolveAgg validates the aggregate query against the FROM scope and
-// rewrites its expressions into group-key and accumulator references.
-func resolveAgg(sc *scope, s *Select) (*aggQuery, error) {
+// rewrites its expressions into group-key and accumulator references
+// (positional row reads instead when rowMode is set — see aggQuery).
+func resolveAgg(sc *scope, s *Select, rowMode bool) (*aggQuery, error) {
 	if s.Star {
 		return nil, serr.New("SELECT * is not allowed in an aggregate query")
 	}
-	q := &aggQuery{sc: sc}
+	q := &aggQuery{sc: sc, rowMode: rowMode}
 	for _, g := range s.GroupBy {
 		var ex Expr
 		switch {
@@ -369,6 +378,9 @@ func (q *aggQuery) rewrite(e Expr) (Expr, error) {
 	if txt, err := exprKey(q.sc, e); err == nil {
 		for i, k := range q.keys {
 			if k.txt == txt {
+				if q.rowMode {
+					return &exOrd{ord: i, typ: k.typ}, nil
+				}
 				return &exGroupRef{idx: i, typ: k.typ}, nil
 			}
 		}
@@ -399,6 +411,12 @@ func (q *aggQuery) rewrite(e Expr) (Expr, error) {
 		i, err := q.accumFor(n)
 		if err != nil {
 			return nil, err
+		}
+		if q.rowMode {
+			// Accumulator results sit after the group keys in the
+			// synthetic row; len(q.keys) is final by the time items
+			// rewrite, so the offset is stable.
+			return &exOrd{ord: len(q.keys) + i, typ: q.accumType(n, i)}, nil
 		}
 		return &exAccRef{idx: i, typ: q.accumType(n, i)}, nil
 	case *ExAnd:
@@ -494,6 +512,11 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 	case n.Arg != nil:
 		if findAgg(n.Arg) != AggNone {
 			return 0, serr.New("aggregate function calls cannot be nested")
+		}
+		// An aggregate's input rows predate window assignment, so a
+		// window result cannot feed one — Postgres' rule and wording.
+		if hasWindowExpr(n.Arg) {
+			return 0, serr.New("aggregate function calls cannot contain window function calls")
 		}
 		txt, err := exprKey(q.sc, n.Arg)
 		if err != nil {
@@ -660,6 +683,69 @@ func (q *aggQuery) newGroup(keyVals []any) *group {
 	return g
 }
 
+// aggScanGroups runs the FROM/WHERE scan and builds the groups,
+// feeding every accumulator along the way. Groups return in key-byte
+// order — ascending group columns, the order the group phase emits
+// before any ORDER BY. Without GROUP BY the whole input is one group,
+// present even over zero rows. env.row is left nil for the group
+// phase that follows.
+func aggScanGroups(tx *bytdb.Txn, fp *fromPlan, q *aggQuery, env *exEnv) ([]*group, error) {
+	groups := map[string]*group{}
+	if len(q.keys) == 0 {
+		groups[""] = q.newGroup(nil)
+	}
+	var scanErr error
+	err := runJoin(tx, fp, env, func(vals []any) bool {
+		env.row = vals
+		keyVals := make([]any, len(q.keys))
+		for i, k := range q.keys {
+			if k.ord >= 0 {
+				keyVals[i] = vals[k.ord]
+				continue
+			}
+			if keyVals[i], scanErr = evalEx(env, k.ex); scanErr != nil {
+				return false
+			}
+		}
+		// The order-preserving tuple encoding makes group values a
+		// map key (NULLs group together) whose byte order is the
+		// groups' semantic order.
+		kb, err := tuple.Encode(keyVals...)
+		if err != nil {
+			scanErr = serr.Wrap(err, "op", "encode group key")
+			return false
+		}
+		g, ok := groups[string(kb)]
+		if !ok {
+			g = q.newGroup(keyVals)
+			groups[string(kb)] = g
+		}
+		for i := range g.accs {
+			if scanErr = g.accs[i].add(env, vals); scanErr != nil {
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	env.row = nil
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	out := make([]*group, 0, len(groups))
+	for _, k := range keys {
+		out = append(out, groups[k])
+	}
+	return out, nil
+}
+
 func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	res := &Result{}
 	err := d.read(func(tx *bytdb.Txn) error {
@@ -667,70 +753,22 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 		if err != nil {
 			return err
 		}
-		q, err := resolveAgg(fp.sc, s)
+		q, err := resolveAgg(fp.sc, s, false)
 		if err != nil {
 			return err
 		}
 		q.resultCols(s, res)
-		groups := map[string]*group{}
-		// Without GROUP BY the whole input is one group, present even
-		// over zero rows.
-		if len(q.keys) == 0 {
-			groups[""] = q.newGroup(nil)
-		}
 		env := &exEnv{d: d, tx: tx, sc: fp.sc}
-		var scanErr error
-		err = runJoin(tx, fp, env, func(vals []any) bool {
-			env.row = vals
-			keyVals := make([]any, len(q.keys))
-			for i, k := range q.keys {
-				if k.ord >= 0 {
-					keyVals[i] = vals[k.ord]
-					continue
-				}
-				if keyVals[i], scanErr = evalEx(env, k.ex); scanErr != nil {
-					return false
-				}
-			}
-			// The order-preserving tuple encoding makes group values a
-			// map key (NULLs group together) whose byte order is the
-			// groups' semantic order.
-			kb, err := tuple.Encode(keyVals...)
-			if err != nil {
-				scanErr = serr.Wrap(err, "op", "encode group key")
-				return false
-			}
-			g, ok := groups[string(kb)]
-			if !ok {
-				g = q.newGroup(keyVals)
-				groups[string(kb)] = g
-			}
-			for i := range g.accs {
-				if scanErr = g.accs[i].add(env, vals); scanErr != nil {
-					return false
-				}
-			}
-			return true
-		})
+		groups, err := aggScanGroups(tx, fp, q, env)
 		if err != nil {
 			return err
 		}
-		if scanErr != nil {
-			return scanErr
-		}
 
 		// Group phase: rewritten expressions read the current group
-		// through env.grp. Emit in key-byte order (ascending group
-		// columns), then apply ORDER BY on top.
-		env.row = nil
-		keys := make([]string, 0, len(groups))
-		for k := range groups {
-			keys = append(keys, k)
-		}
-		slices.Sort(keys)
+		// through env.grp. Groups arrive in key-byte order (ascending
+		// group columns); ORDER BY applies on top.
 		kept := make([]*group, 0, len(groups))
-		for _, k := range keys {
-			g := groups[k]
+		for _, g := range groups {
 			env.grp = g
 			if q.having != nil {
 				t, err := evalTruth(env, q.having)

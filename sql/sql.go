@@ -14,6 +14,11 @@
 //	ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 //	CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 //	DROP INDEX idx [ON t]
+//	CREATE SEQUENCE [IF NOT EXISTS] s [AS type] [INCREMENT [BY] n]
+//	       [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE]
+//	       [START [WITH] n] [CACHE n] [CYCLE | NO CYCLE] [OWNED BY NONE]
+//	ALTER SEQUENCE s options... [RESTART [[WITH] n]]
+//	DROP SEQUENCE [IF EXISTS] s [RESTRICT]
 //	EXPLAIN statement
 //	INSERT INTO t [(c, ...)] VALUES (v, ...), ...
 //	       [ON CONFLICT [(c, ...)] DO NOTHING |
@@ -103,14 +108,16 @@
 // text does not parse as the column's type.
 //
 // For introspection, the virtual system catalog serves
-// pg_catalog.pg_namespace, pg_class, pg_attribute, pg_type, pg_index,
+// pg_catalog.pg_namespace, pg_class (sequences included, relkind 'S'),
+// pg_attribute, pg_attrdef (declared column defaults; identity columns
+// report via attidentity instead), pg_type, pg_index, pg_sequence,
 // pg_am, pg_database, and pg_roles with real rows, a set of
-// always-empty tables psql probes (pg_attrdef, pg_collation,
-// pg_constraint, pg_inherits, pg_policy, pg_statistic_ext, the
-// pg_publication family, pg_auth_members), plus
-// information_schema.tables and columns — all synthesized from the
-// engine catalog and queryable like any tables (read-only; their
-// names are reserved). psql's \dt, \d, \d <table>, \d <index>, \di,
+// always-empty tables psql probes (pg_collation, pg_inherits,
+// pg_policy, pg_statistic_ext, the pg_publication family,
+// pg_auth_members; pg_constraint lists CHECK constraints), plus
+// information_schema.tables, columns, and sequences — all synthesized
+// from the engine catalog and queryable like any tables (read-only;
+// their names are reserved). psql's \dt, \d, \d <table>, \d <index>, \di,
 // \dn, \du, and \l render against it. Table names may be
 // schema-qualified — public.t is t; pg_catalog members also resolve
 // bare, as on Postgres's search path. SELECT works without FROM over
@@ -189,12 +196,29 @@
 // in the clause, as in Postgres: there is no row set to fold — each
 // affected row yields exactly one output row.
 //
-// lastval() and currval('t_col_seq') read back the session's identity
-// draws for drivers that probe instead of using RETURNING, with
-// Postgres's "not yet defined in this session" error (SQLSTATE 55000)
-// before the first draw. The state is per Session (a bare DB is one
-// shared session) and survives a rolled-back block, as in Postgres —
-// sequence state is session-local, not transactional.
+// Standalone sequences are first-class: CREATE SEQUENCE with the
+// Postgres option set (AS smallint|integer|bigint bounds the range;
+// INCREMENT, MINVALUE/MAXVALUE, START, CYCLE, CACHE — cache is stored
+// and reported but allocation behaves as CACHE 1), ALTER SEQUENCE
+// (options plus RESTART [[WITH] n]), and DROP SEQUENCE. nextval('s')
+// and setval('s', v [, is_called]) work wherever expressions evaluate
+// — a SELECT calling them runs in a writable transaction under the
+// covers — and accept 's'::regclass. Sequences appear in pg_class
+// (relkind 'S'), pg_sequence, and information_schema.sequences, and
+// each reads as a one-row state relation (SELECT last_value FROM s).
+// Unlike Postgres, allocation is transactional: a rolled-back
+// nextval's value is handed out again. INSERT VALUES takes literals,
+// so draw the key first (SELECT nextval) and insert it — the pattern
+// drivers use.
+//
+// lastval() and currval('t_col_seq') read back the session's draws —
+// identity-column draws under the implied t_col_seq name, and real
+// sequences under their own (setval repositions currval too) — for
+// drivers that probe instead of using RETURNING, with Postgres's "not
+// yet defined in this session" error (SQLSTATE 55000) before the
+// first draw. The state is per Session (a bare DB is one shared
+// session) and survives a rolled-back block, as in Postgres —
+// the readback state is session-local, not transactional.
 //
 // INSERT takes an optional ON CONFLICT clause with Postgres upsert
 // semantics. The conflict target names the primary key's or a unique
@@ -419,9 +443,38 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		return &Result{}, nil
 	case *DropIndex:
 		return d.execDropIndex(s)
+	case *CreateSequence:
+		return d.execCreateSequence(s)
+	case *DropSequence:
+		return d.execDropSequence(s)
+	case *AlterSequence:
+		return d.execAlterSequence(s)
 	case *Insert:
 		return d.execInsert(s)
 	case *Select:
+		// A SELECT calling nextval/setval writes sequence state, so it
+		// runs in a writable transaction: a copy of this DB carrying
+		// the write txn makes every inner read() land in it. Session
+		// blocks keep their own transaction (READ ONLY ones then fail
+		// the write, as they should).
+		if d.tx == nil && selectWritesSequences(s) {
+			var res *Result
+			err := d.e.WriteTxn(func(tx *bytdb.Txn) error {
+				dw := *d
+				dw.tx = tx
+				var err error
+				if len(s.Union) > 0 {
+					res, err = dw.execUnion(s)
+				} else {
+					res, err = dw.runSelectCore(s)
+				}
+				return err
+			})
+			if err != nil {
+				return nil, err
+			}
+			return res, nil
+		}
 		if len(s.Union) > 0 {
 			return d.execUnion(s)
 		}

@@ -57,9 +57,21 @@ type exWinRef struct {
 	name string // the window function's name, for output column naming
 }
 
+// exOrd reads the environment's current row by ordinal, no scope
+// resolution involved. The window-over-groups path materializes each
+// group as a synthetic row (key values then accumulator results) and
+// rewrites group-phase expressions into these, which lets the window
+// machinery — built around per-row evaluation — run unchanged over
+// grouped data. It never comes from the parser.
+type exOrd struct {
+	ord int
+	typ bytdb.ColType
+}
+
 func (*exGroupRef) expr() {}
 func (*exAccRef) expr()   {}
 func (*exWinRef) expr()   {}
+func (*exOrd) expr()      {}
 
 // lookupVal resolves a column reference against the environment
 // chain, innermost scope first. An ON condition evaluates against a
@@ -225,6 +237,11 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 			return nil, serr.New("window reference outside a window query")
 		}
 		return env.win[n.idx], nil
+	case *exOrd:
+		if n.ord >= len(env.row) {
+			return nil, serr.New("row reference outside its query")
+		}
+		return env.row[n.ord], nil
 	case *ExWindow:
 		return nil, serr.New("window functions are only allowed in the SELECT list and ORDER BY",
 			"function", n.fnName())
@@ -689,6 +706,11 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			if desc := env.d.e.Table(name); desc != nil {
 				return int64(desc.ID), nil
 			}
+			// Sequences share the relation namespace: 'name'::regclass
+			// is how drivers spell nextval's argument.
+			if sd := env.d.e.Sequence(name); sd != nil {
+				return int64(sd.ID), nil
+			}
 			return nil, serr.New("relation does not exist", "relation", x)
 		}
 	case "regtype", "regnamespace", "regproc", "regprocedure", "regoper", "regrole":
@@ -794,7 +816,16 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 			return nil, nil
 		}
 		return constraintdef(env.d, oid), nil
-	case "pg_get_expr", "pg_get_partkeydef",
+	case "pg_get_expr":
+		// bytdb's expression columns (pg_attrdef.adbin) hold rendered
+		// SQL text, not node trees, so "decompiling" is the identity;
+		// NULL in, NULL out covers the probes on empty columns
+		// (indpred, prqual, ...).
+		if s, ok := argN(0).(string); ok {
+			return s, nil
+		}
+		return nil, nil
+	case "pg_get_partkeydef",
 		"pg_get_viewdef", "pg_get_triggerdef", "pg_get_ruledef",
 		"pg_get_statisticsobjdef_columns",
 		"obj_description", "col_description", "shobj_description":
@@ -814,6 +845,40 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 			return nil, serr.New("currval requires a sequence name")
 		}
 		return env.d.seq.currval(s)
+	case "nextval":
+		s, err := seqByArg(env, argN(0))
+		if err != nil {
+			return nil, err
+		}
+		v, err := env.tx.NextVal(s)
+		if err != nil {
+			return nil, err
+		}
+		env.d.seq.record(s, v)
+		return v, nil
+	case "setval":
+		s, err := seqByArg(env, argN(0))
+		if err != nil {
+			return nil, err
+		}
+		v, ok := argN(1).(int64)
+		if !ok {
+			return nil, serr.New("setval requires an integer value")
+		}
+		called := true // 2-arg setval: v counts as already returned
+		if len(args) > 2 {
+			b, ok := argN(2).(bool)
+			if !ok {
+				return nil, serr.New("setval's third argument must be a boolean")
+			}
+			called = b
+		}
+		if err := env.tx.SetVal(s, v, called); err != nil {
+			return nil, err
+		}
+		// As in Postgres, setval also repositions the session's currval.
+		env.d.seq.record(s, v)
+		return v, nil
 	}
 	return nil, serr.New("unknown function", "function", name)
 }
@@ -1201,6 +1266,15 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 		case AggAvg:
 			return bytdb.TFloat
 		}
+		// Mirrors accumType: SUM over anything not statically integer
+		// accumulates as float; MIN/MAX surface the argument's type.
+		if n.Arg != nil {
+			t := exprType(sc, n.Arg)
+			if n.Fn == AggSum && t != bytdb.TInt {
+				return bytdb.TFloat
+			}
+			return t
+		}
 		if !n.Star {
 			if ord, err := sc.resolve(n.Col); err == nil {
 				return sc.column(ord).Type
@@ -1221,6 +1295,8 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 	case *exAccRef:
 		return n.typ
 	case *exWinRef:
+		return n.typ
+	case *exOrd:
 		return n.typ
 	case *ExWindow:
 		return n.resultType(sc)
@@ -1250,6 +1326,8 @@ var funcTypes = map[string]bytdb.ColType{
 	"character_length":           bytdb.TInt,
 	"lastval":                    bytdb.TInt,
 	"currval":                    bytdb.TInt,
+	"nextval":                    bytdb.TInt,
+	"setval":                     bytdb.TInt,
 }
 
 func castColType(typ string) bytdb.ColType {

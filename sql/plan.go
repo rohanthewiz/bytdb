@@ -56,6 +56,16 @@ type stop struct {
 // range column), else a full scan. Only predicates that are top-level
 // AND conjuncts push down; anything under OR or NOT is residual-only.
 func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error) {
+	return planScanOrdered(desc, alias, where, nil)
+}
+
+// planScanOrdered is planScan with an ORDER BY tie-break: when paths
+// tie on predicate score — redundant indexes like (a) and (a, b)
+// under WHERE a = 1 — it prefers the one whose scan order also serves
+// the sort keys, so the sort can be skipped for free. Order never
+// outranks selectivity: a strictly better-scoring path still wins
+// even when it forces a sort.
+func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys []sortKey) (*plan, error) {
 	p := &plan{desc: desc, filter: where, binds: binds{}}
 
 	// Every column referenced anywhere in the tree must exist in this
@@ -126,13 +136,32 @@ func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error
 
 	// Otherwise score the primary index and every secondary index;
 	// equality columns dominate, a bounded range column breaks ties.
-	// The primary index wins ties (no entry -> row indirection).
+	// The primary index wins ties (no entry -> row indirection) —
+	// unless the caller passed sort keys and an equal-scoring path
+	// serves their order while the incumbent does not. Zero-score ties
+	// are left alone: swapping a full scan for an unbounded index walk
+	// is a real cost tradeoff, decided by chooseOrderedPlan's
+	// LIMIT-gated override instead.
+	serves := func(idx *bytdb.IndexDesc, cols []int) bool {
+		if len(keys) == 0 {
+			return false
+		}
+		pinned := map[int]bool{}
+		for i, k := 0, eqPrefix(cols, eq); i < k; i++ {
+			pinned[cols[i]] = true
+		}
+		ok, _ := pathOrder(desc, idx, pinned, keys)
+		return ok
+	}
 	var bestIdx *bytdb.IndexDesc // nil: the primary index
 	bestCols, bestScore := desc.PKCols, pathScore(desc.PKCols, eq, lo, hi)
+	bestServes := serves(nil, desc.PKCols)
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
-		if s := pathScore(idx.Cols, eq, lo, hi); s > bestScore {
+		s := pathScore(idx.Cols, eq, lo, hi)
+		if s > bestScore || (s == bestScore && s > 0 && !bestServes && serves(idx, idx.Cols)) {
 			bestIdx, bestCols, bestScore = idx, idx.Cols, s
+			bestServes = serves(idx, idx.Cols)
 		}
 	}
 	if bestScore == 0 {
@@ -264,7 +293,7 @@ func litFits(v any, t bytdb.ColType) bool {
 // ordered index walk. The second result reports whether the sort can
 // be skipped.
 func chooseOrderedPlan(desc *bytdb.TableDesc, alias string, where BoolExpr, keys []sortKey, limited bool) (*plan, bool, error) {
-	p, err := planScan(desc, alias, where)
+	p, err := planScanOrdered(desc, alias, where, keys)
 	if err != nil {
 		return nil, false, err
 	}
@@ -313,21 +342,30 @@ func (p *plan) orderSatisfied(desc *bytdb.TableDesc, keys []sortKey) (ok, revers
 	if p.get != nil {
 		return false, false
 	}
-	cols := desc.PKCols
-	asc := func(int) bool { return true } // primary-key columns sort ascending
+	var idx *bytdb.IndexDesc
 	if p.index != "" {
-		idx := desc.Index(p.index)
-		if idx == nil {
+		if idx = desc.Index(p.index); idx == nil {
 			return false, false
 		}
-		cols = idx.Cols
-		asc = func(i int) bool { return !idx.DescAt(i) }
 	}
-	eq := map[int]bool{}
+	pinned := map[int]bool{}
 	for _, st := range p.stops {
 		if st.kind == stopNE {
-			eq[st.ord] = true
+			pinned[st.ord] = true
 		}
+	}
+	return pathOrder(desc, idx, pinned, keys)
+}
+
+// pathOrder is orderSatisfied's core over a bare path: the primary
+// index (idx nil) or a secondary index, with pinned naming the
+// columns an equality predicate holds constant.
+func pathOrder(desc *bytdb.TableDesc, idx *bytdb.IndexDesc, pinned map[int]bool, keys []sortKey) (ok, reverse bool) {
+	cols := desc.PKCols
+	asc := func(int) bool { return true } // primary-key columns sort ascending
+	if idx != nil {
+		cols = idx.Cols
+		asc = func(i int) bool { return !idx.DescAt(i) }
 	}
 	nonNull := func(ord int) bool {
 		return slices.Contains(desc.PKCols, ord) || desc.Columns[ord].NotNull
@@ -335,10 +373,10 @@ func (p *plan) orderSatisfied(desc *bytdb.TableDesc, keys []sortKey) (ok, revers
 	try := func(rev bool) bool {
 		ki := 0
 		for _, k := range keys {
-			if eq[k.ord] {
+			if pinned[k.ord] {
 				continue // pinned to a constant: contributes no order
 			}
-			for ki < len(cols) && eq[cols[ki]] {
+			for ki < len(cols) && pinned[cols[ki]] {
 				ki++
 			}
 			if ki >= len(cols) || cols[ki] != k.ord || !nonNull(k.ord) {

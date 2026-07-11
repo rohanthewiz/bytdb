@@ -1135,7 +1135,7 @@ func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, en
 func (d *DB) runSelectCore(s *Select) (*Result, error) {
 	if s.isAggregate() {
 		if hasWindow(s) {
-			return nil, serr.New("window functions with GROUP BY or aggregates are not supported")
+			return d.execSelectAggWindow(s)
 		}
 		return d.execSelectAgg(s)
 	}

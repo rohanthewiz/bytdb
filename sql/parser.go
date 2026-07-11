@@ -153,11 +153,14 @@ func (p *parser) statement() (Statement, error) {
 		if p.acceptKw("table") {
 			return p.createTable()
 		}
+		if p.acceptKw("sequence") {
+			return p.createSequence()
+		}
 		unique := p.acceptKw("unique")
 		if p.acceptKw("index") {
 			return p.createIndex(unique)
 		}
-		return nil, p.unexpected("TABLE or [UNIQUE] INDEX")
+		return nil, p.unexpected("TABLE, SEQUENCE, or [UNIQUE] INDEX")
 	case p.acceptKw("drop"):
 		switch {
 		case p.acceptKw("table"):
@@ -166,11 +169,16 @@ func (p *parser) statement() (Statement, error) {
 				return nil, err
 			}
 			return &DropTable{Table: name}, nil
+		case p.acceptKw("sequence"):
+			return p.dropSequence()
 		case p.acceptKw("index"):
 			return p.dropIndex()
 		}
-		return nil, p.unexpected("TABLE or INDEX")
+		return nil, p.unexpected("TABLE, SEQUENCE, or INDEX")
 	case p.acceptKw("alter"):
+		if p.acceptKw("sequence") {
+			return p.alterSequence()
+		}
 		return p.alterTable()
 	case p.acceptKw("insert"):
 		return p.insert()
@@ -1380,6 +1388,181 @@ var noAlias = map[string]bool{
 // public.t normalizes to t; pg_catalog.t and information_schema.t
 // stay qualified (they name the virtual system catalog); any other
 // schema is an error.
+// createSequence parses CREATE SEQUENCE [IF NOT EXISTS] name
+// [options]; "create sequence" is consumed.
+func (p *parser) createSequence() (Statement, error) {
+	s := &CreateSequence{}
+	if p.acceptKw("if") {
+		if err := p.expectKw("not"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("exists"); err != nil {
+			return nil, err
+		}
+		s.IfNotExists = true
+	}
+	var err error
+	if s.Name, err = p.tableName(); err != nil {
+		return nil, err
+	}
+	s.Opts, err = p.seqOptions(false)
+	return s, err
+}
+
+// dropSequence parses DROP SEQUENCE [IF EXISTS] name [RESTRICT];
+// "drop sequence" is consumed. CASCADE is rejected — nothing can
+// depend on a bytdb sequence yet, so accepting it would be a lie.
+func (p *parser) dropSequence() (Statement, error) {
+	s := &DropSequence{}
+	if p.acceptKw("if") {
+		if err := p.expectKw("exists"); err != nil {
+			return nil, err
+		}
+		s.IfExists = true
+	}
+	var err error
+	if s.Name, err = p.tableName(); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("cascade") {
+		return nil, serr.New("DROP SEQUENCE ... CASCADE is not supported")
+	}
+	p.acceptKw("restrict") // the default
+	return s, nil
+}
+
+// alterSequence parses ALTER SEQUENCE name options; "alter sequence"
+// is consumed. At least one option is required, as in Postgres.
+func (p *parser) alterSequence() (Statement, error) {
+	s := &AlterSequence{}
+	var err error
+	if s.Name, err = p.tableName(); err != nil {
+		return nil, err
+	}
+	if s.Opts, err = p.seqOptions(true); err != nil {
+		return nil, err
+	}
+	empty := SeqOptions{}
+	if s.Opts == empty {
+		return nil, p.unexpected("a sequence option")
+	}
+	return s, nil
+}
+
+// seqOptions parses the CREATE/ALTER SEQUENCE option list. alter
+// additionally admits RESTART [[WITH] n]. Unmentioned options stay
+// nil pointers, so ALTER can tell "keep" from "set".
+func (p *parser) seqOptions(alter bool) (SeqOptions, error) {
+	var o SeqOptions
+	set := func(dst **int64, clause string) error {
+		n, err := p.signedInt(clause)
+		if err != nil {
+			return err
+		}
+		*dst = &n
+		return nil
+	}
+	for {
+		switch {
+		case p.acceptKw("as"):
+			t, err := p.ident("a sequence data type")
+			if err != nil {
+				return o, err
+			}
+			switch t {
+			case "smallint", "int2":
+				o.AsType = "smallint"
+			case "int", "integer", "int4":
+				o.AsType = "integer"
+			case "bigint", "int8":
+				o.AsType = "bigint"
+			default:
+				return o, serr.New("sequence type must be smallint, integer, or bigint",
+					"type", t)
+			}
+		case p.acceptKw("increment"):
+			p.acceptKw("by")
+			if err := set(&o.Increment, "INCREMENT"); err != nil {
+				return o, err
+			}
+		case p.acceptKw("minvalue"):
+			if err := set(&o.Min, "MINVALUE"); err != nil {
+				return o, err
+			}
+		case p.acceptKw("maxvalue"):
+			if err := set(&o.Max, "MAXVALUE"); err != nil {
+				return o, err
+			}
+		case p.acceptKw("start"):
+			p.acceptKw("with")
+			if err := set(&o.Start, "START"); err != nil {
+				return o, err
+			}
+		case p.acceptKw("cache"):
+			if err := set(&o.Cache, "CACHE"); err != nil {
+				return o, err
+			}
+		case p.acceptKw("cycle"):
+			t := true
+			o.Cycle = &t
+		case p.acceptKw("no"):
+			switch {
+			case p.acceptKw("minvalue"):
+				o.NoMin = true
+			case p.acceptKw("maxvalue"):
+				o.NoMax = true
+			case p.acceptKw("cycle"):
+				f := false
+				o.Cycle = &f
+			default:
+				return o, p.unexpected("MINVALUE, MAXVALUE, or CYCLE")
+			}
+		case alter && p.acceptKw("restart"):
+			o.Restart = true
+			// RESTART [[WITH] n]: bare RESTART reuses START.
+			if p.acceptKw("with") {
+				if err := set(&o.RestartWith, "RESTART"); err != nil {
+					return o, err
+				}
+			} else if t := p.cur(); t.kind == tNumber || (t.kind == tOp && t.text == "-") {
+				if err := set(&o.RestartWith, "RESTART"); err != nil {
+					return o, err
+				}
+			}
+		case p.acceptKw("owned"):
+			if err := p.expectKw("by"); err != nil {
+				return o, err
+			}
+			// OWNED BY NONE is the default; column ownership would tie
+			// the sequence's life to a table bytdb doesn't track yet.
+			if !p.acceptKw("none") {
+				return o, serr.New("OWNED BY a column is not supported")
+			}
+		default:
+			return o, nil
+		}
+	}
+}
+
+// signedInt parses an optionally negated integer literal for a
+// sequence option.
+func (p *parser) signedInt(clause string) (int64, error) {
+	neg := p.acceptOp("-")
+	t := p.cur()
+	if t.kind != tNumber {
+		return 0, p.unexpected("an integer after " + clause)
+	}
+	n, err := strconv.ParseInt(t.text, 10, 64)
+	if err != nil {
+		return 0, serr.New(clause+" requires an integer", "got", t.text)
+	}
+	p.advance()
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
 func (p *parser) tableName() (string, error) {
 	first, err := p.ident("a table name")
 	if err != nil {
@@ -2067,9 +2250,6 @@ func (p *parser) exprPrimary() (Expr, error) {
 			if c, ok := e.(*ExCol); ok {
 				agg.Col = c.Col
 			} else {
-				if findAgg(e) != AggNone {
-					return nil, serr.New("aggregate function calls cannot be nested")
-				}
 				agg.Arg = e
 			}
 		}
@@ -2077,14 +2257,24 @@ func (p *parser) exprPrimary() (Expr, error) {
 			return nil, err
 		}
 		if p.cur().kind == tIdent && p.cur().text == "over" {
-			if agg.Distinct {
-				return nil, serr.New("DISTINCT is not supported in a window function")
+			if agg.Arg != nil && hasWindowExpr(agg.Arg) {
+				return nil, serr.New("window function calls cannot be nested")
 			}
-			w := &ExWindow{Agg: agg.Fn, Arg: agg.Arg, Star: agg.Star}
+			// An aggregate directly inside a window aggregate is legal —
+			// SUM(SUM(x)) OVER (...) aggregates the groups' sums — so the
+			// nesting check waits until OVER is ruled out. (Deeper
+			// nesting inside that inner aggregate is caught at resolve.)
+			// DISTINCT in an aggregate window dedups within each row's
+			// frame — a bytdb extension (Postgres does not implement it;
+			// DuckDB does).
+			w := &ExWindow{Agg: agg.Fn, Arg: agg.Arg, Star: agg.Star, Distinct: agg.Distinct}
 			if agg.Arg == nil && !agg.Star {
 				w.Arg = &ExCol{Col: agg.Col}
 			}
 			return p.windowOver(w)
+		}
+		if agg.Arg != nil && findAgg(agg.Arg) != AggNone {
+			return nil, serr.New("aggregate function calls cannot be nested")
 		}
 		return agg, nil
 	}

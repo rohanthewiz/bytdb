@@ -12,17 +12,19 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–27: a working relational store, queryable in SQL — in
+Milestones 1–28: a working relational store, queryable in SQL — in
 process or over the Postgres wire protocol, with transaction blocks
 and savepoints, NOT NULL and CHECK constraints, SERIAL identity
-columns, constant column DEFAULTs, RETURNING, upsert
+columns, standalone sequences (`CREATE SEQUENCE`, `nextval`/`setval`),
+constant column DEFAULTs, RETURNING, upsert
 (`INSERT ... ON CONFLICT`), window functions (ranking, value, and
-aggregate, with explicit ROWS/RANGE/GROUPS frames including RANGE
-offsets on the sort key and frame EXCLUDE), descending index
-columns, EXPLAIN, and
+aggregate — DISTINCT included — with explicit ROWS/RANGE/GROUPS
+frames including RANGE offsets on the sort key and frame EXCLUDE,
+composing with GROUP BY), descending index columns, order-aware index
+selection, EXPLAIN, and
 enough system catalog and expression language that psql's `\dt`,
 `\d`, `\d <table>`, `\di`, `\du`, and `\l` render for real — check
-constraints included.
+constraints, column defaults, and sequences included.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -413,7 +415,8 @@ durability with group commit.
 - [x] **Milestone 25**: explicit window frames — `{ROWS|RANGE|GROUPS} [BETWEEN <start> AND <end>]` with `UNBOUNDED PRECEDING/FOLLOWING`, `<n> PRECEDING/FOLLOWING`, and `CURRENT ROW` bounds; a row's frame reduces to a half-open position range over the sorted partition (ROWS by position arithmetic, RANGE/GROUPS through peer groups, where CURRENT ROW spans the current row's peers and a GROUPS offset steps whole groups), honored by aggregate windows and `FIRST/LAST/NTH_VALUE` (empty frames → NULL, COUNT 0) and ignored by ranking and `LAG`/`LEAD` as in Postgres; frames anchored at UNBOUNDED PRECEDING accumulate incrementally (the default frame stays O(rows)), moving-start frames recompute per distinct frame with peer memoization; offsets are row-independent (columns rejected at parse, `$n` binds, negative/NULL/non-int error at run); `RANGE <n> PRECEDING` (PG 11+ typed sort-key arithmetic) and `EXCLUDE` other than `NO OTHERS` are rejected; PG-faithful bound-pair validation ("frame starting from following row cannot reference current row", ...)
 - [x] **Milestone 26**: RANGE offset frames — `RANGE <offset> PRECEDING/FOLLOWING` bounds, where the offset is a distance measured on the window ORDER BY key (PG 11's typed sort-key arithmetic) rather than a row or group count: exactly one ORDER BY column (parse-checked, PG wording), numeric key type (int/float; checked at execution — "not supported for column type ..."), fractional offsets legal (`RANGE 0.5 PRECEDING`, over int keys too — mixed numerics compare); since the partition is sorted, each offset bound is a binary search for `key ∓ offset` moved against/with the sort direction (DESC flips the sign), pure-int arithmetic saturates to ±Inf on overflow instead of wrapping, and NaN keys ride the comparator's NaN-sorts-last order (NaN is within any distance of NaN only, as in PG's `in_range`); NULL sort keys follow Postgres — a NULL row's offset frame is exactly its peer group, non-NULL rows never reach NULLs through an offset bound but UNBOUNDED bounds still take them in; offsets must be non-null, numeric, non-negative, non-NaN ("invalid preceding or following size in window function"); `$n` offsets describe with the sort key's type so wire drivers encode fractional offsets as float8, not truncated int8
 - [x] **Milestone 27**: frame `EXCLUDE` — `EXCLUDE CURRENT ROW | GROUP | TIES` (and the explicit no-op `NO OTHERS`) on every frame mode, completing the window-frame matrix: after the bounds pick a row's frame, exclusion removes the current row, its whole ORDER BY peer group, or the peers minus the row itself — but only rows the bounds actually selected, so `TIES` never re-admits a current row from outside the frame; a frame stops being one contiguous range and becomes up to three disjoint segments, which `FIRST/LAST/NTH_VALUE` walk in order (`NTH_VALUE` counts across the hole) and aggregates recompute per distinct segment list with last-frame memoization (whole peer groups share segments under `EXCLUDE GROUP`, so RANGE/GROUPS frames still aggregate once per group; the UNBOUNDED PRECEDING fast path is exclusion-free by construction); `GROUP`/`TIES` stay legal without ORDER BY — the whole partition is one peer group, so `GROUP` empties every frame and `TIES` leaves just the current row — and EXPLAIN renders the clause
-- [ ] Later: order-aware path selection among redundant indexes, window + `GROUP BY`, standalone `CREATE SEQUENCE`
+- [x] **Milestone 28**: the outstanding-list sweep — five features closing the window arc and the catalog gaps. *Window + GROUP BY*: windows now evaluate after grouping and HAVING (Postgres' order), so `RANK() OVER (ORDER BY SUM(x) DESC)` ranks whole groups; the bridge is the aggregate resolver's new row mode — each surviving group materializes as a synthetic row (key values then accumulator results), every group-phase expression rewrites to positional reads, and the milestone-19 window machinery runs over those rows unchanged, frames and all (`SUM(SUM(x)) OVER`, EXPLAIN puts WindowAgg above HashAggregate). *DISTINCT in window aggregates* (a bytdb extension — PG doesn't implement it): `COUNT(DISTINCT x) OVER (...)` dedups within each row's frame, riding the existing accumulator dedup. *Standalone sequences*: `CREATE/ALTER/DROP SEQUENCE` with the Postgres option set (AS type bounds, INCREMENT, MIN/MAXVALUE, START, CYCLE, CACHE stored-but-1) over new engine sequence objects — one JSON record holding options and state, IDs from the table-ID counter so pg_class oids stay unique, names sharing the relation namespace; `nextval`/`setval` evaluate anywhere (a SELECT calling them silently runs in a write txn), accept `'s'::regclass`, and feed `lastval`/`currval`; sequences appear in `pg_class` (relkind 'S'), `pg_sequence`, `information_schema.sequences`, and each reads as its one-row state relation. *pg_attrdef*: declared column defaults get real catalog rows (adbin carries the stored literal text, `pg_get_expr` surfaces it, `atthasdef` gates it), identity columns report via `attidentity = 'd'` — psql's `\d` Default column renders. *Order-aware path selection among redundant indexes* (the milestone-20 deferral): when paths tie on predicate score — `(a)` vs `(a, b)` under `WHERE a = 1` — the planner now prefers the one whose scan order also serves ORDER BY, eliding the sort; selectivity still outranks order, and zero-score ties stay with the LIMIT-gated full-scan override
+- [ ] Later: expression values in INSERT (`VALUES (nextval('s'))`), `DISTINCT` in plain SELECT, sequence functions in column DEFAULTs
 
 ## Design notes
 

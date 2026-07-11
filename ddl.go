@@ -82,6 +82,10 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		if tx.Contains(descKey(name)) {
 			return serr.New("table already exists", "table", name)
 		}
+		// Sequences share the relation namespace, as in Postgres.
+		if tx.Contains(sqlSeqKey(name)) {
+			return serr.New(`relation "` + name + `" already exists`)
+		}
 		// Allocate the next table ID from the sequence key.
 		next, err := nextFromCounter(tx, seqKey(), firstUserTableID, "table-id")
 		if err != nil {

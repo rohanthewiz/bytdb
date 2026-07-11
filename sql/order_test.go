@@ -179,6 +179,55 @@ func TestOrderBoundedReverse(t *testing.T) {
 	wantIDs(t, d, `select id from ev where cat = 2 and pri >= 20 and pri <= 40 order by pri desc`, 2, 4, 6) // 40,30,20
 }
 
+// TestOrderRedundantIndexTieBreak: when two indexes tie on predicate
+// score — the redundant pair (a) and (a, b) under WHERE a = ... — the
+// planner prefers the one whose order also serves ORDER BY, dropping
+// the sort. A strictly better score still outranks order.
+func TestOrderRedundantIndexTieBreak(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, a int not null, b int not null, c int not null)`)
+	exec(t, d, `insert into t values
+		(1, 2, 30, 1), (2, 1, 10, 2), (3, 2, 20, 3), (4, 1, 40, 4), (5, 2, 25, 5)`)
+	// by_a is created first, so it wins the tie today on creation
+	// order alone; by_ab must win it on ORDER BY b.
+	exec(t, d, `create index by_a on t (a)`)
+	exec(t, d, `create index by_ab on t (a, b)`)
+
+	// Without an ORDER BY the earlier index keeps the tie.
+	wantPlan(t, d, `explain select id from t where a = 2`,
+		`Index Scan using by_a on t`,
+		`  Index Cond: (a = 2)`)
+
+	// ORDER BY b breaks the tie toward by_ab and elides the sort —
+	// LIMIT or not (both paths visit the same rows).
+	wantPlan(t, d, `explain select id from t where a = 2 order by b`,
+		`Index Scan using by_ab on t`,
+		`  Index Cond: (a = 2)`)
+	wantPlan(t, d, `explain select id from t where a = 2 order by b desc limit 2`,
+		`Limit`,
+		`  ->  Index Scan Backward using by_ab on t`,
+		`        Index Cond: (a = 2)`)
+	wantIDs(t, d, `select id from t where a = 2 order by b`, 3, 5, 1)           // b: 20,25,30
+	wantIDs(t, d, `select id from t where a = 2 order by b desc limit 2`, 1, 5) // b: 30,25
+	wantIDs(t, d, `select id from t where a = 1 order by b desc`, 4, 2)         // b: 40,10
+
+	// A strictly better score still wins: bounding b scores by_ab above
+	// by_a regardless of order, and the order rides along anyway.
+	wantPlan(t, d, `explain select id from t where a = 2 and b > 20 order by b`,
+		`Index Scan using by_ab on t`,
+		`  Index Cond: ((a = 2) AND (b > 20))`)
+	wantIDs(t, d, `select id from t where a = 2 and b > 20 order by b`, 5, 1)
+
+	// An order by_ab cannot serve (c is not in any index) keeps the
+	// creation-order tie and the sort.
+	wantPlan(t, d, `explain select id from t where a = 2 order by c`,
+		`Sort`,
+		`  Sort Key: c`,
+		`  ->  Index Scan using by_a on t`,
+		`        Index Cond: (a = 2)`)
+	wantIDs(t, d, `select id from t where a = 2 order by c`, 1, 3, 5)
+}
+
 // TestOrderNullableNotOptimized: a nullable column's index orders NULLs
 // opposite to ORDER BY's NULLS LAST/FIRST, so it is never used to serve
 // the order — the sort stays and NULLs land correctly.

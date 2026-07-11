@@ -179,7 +179,7 @@ func (x *explainer) coreNode(s *Select) (*planNode, error) {
 		if err != nil {
 			return nil, err
 		}
-		q, err := resolveAgg(fp.sc, s) // validate as execution would
+		q, err := resolveAgg(fp.sc, s, false) // validate as execution would
 		if err != nil {
 			return nil, err
 		}
@@ -194,6 +194,11 @@ func (x *explainer) coreNode(s *Select) (*planNode, error) {
 		}
 		if s.Having != nil {
 			agg.details = append(agg.details, "Filter: "+x.condText(boolParts(s.Having)))
+		}
+		// Windows evaluate after grouping, so the WindowAgg node sits
+		// above the aggregation, as in Postgres.
+		if hasWindow(s) {
+			return windowNode(s, agg), nil
 		}
 		return agg, nil
 	}
@@ -219,22 +224,28 @@ func (x *explainer) coreNode(s *Select) (*planNode, error) {
 		return nil, err
 	}
 	if hasWindow(s) {
-		win := &planNode{title: "WindowAgg", children: []*planNode{n}}
-		visit := func(e Expr) bool {
-			if w, ok := e.(*ExWindow); ok {
-				win.details = append(win.details, "Window: "+windowText(w))
-			}
-			return true
-		}
-		for _, it := range s.Items {
-			walkExpr(it.Ex, visit)
-		}
-		for _, o := range s.OrderBy {
-			walkExpr(o.Ex, visit)
-		}
-		return win, nil
+		return windowNode(s, n), nil
 	}
 	return n, nil
+}
+
+// windowNode wraps a plan node in a WindowAgg listing the query's
+// window calls (from the select list and ORDER BY).
+func windowNode(s *Select, n *planNode) *planNode {
+	win := &planNode{title: "WindowAgg", children: []*planNode{n}}
+	visit := func(e Expr) bool {
+		if w, ok := e.(*ExWindow); ok {
+			win.details = append(win.details, "Window: "+windowText(w))
+		}
+		return true
+	}
+	for _, it := range s.Items {
+		walkExpr(it.Ex, visit)
+	}
+	for _, o := range s.OrderBy {
+		walkExpr(o.Ex, visit)
+	}
+	return win
 }
 
 // fromNode explains a prepared FROM clause as the left-deep chain of

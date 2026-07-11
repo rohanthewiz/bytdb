@@ -70,6 +70,9 @@ func windowText(w *ExWindow) string {
 	var b strings.Builder
 	b.WriteString(w.fnName())
 	b.WriteByte('(')
+	if w.Distinct {
+		b.WriteString("DISTINCT ")
+	}
 	switch {
 	case w.Star:
 		b.WriteByte('*')
@@ -280,6 +283,199 @@ func (d *DB) execSelectWindow(s *Select) (*Result, error) {
 		return nil, err
 	}
 	sortOffsetProject(res, full, keys, proj, s.Offset, s.Limit)
+	return res, nil
+}
+
+// rewriteWindow maps one window call onto the group phase: every
+// row-dependent sub-expression — the argument, LAG/LEAD/NTH offsets
+// and defaults, PARTITION BY, and the window ORDER BY — is rewritten
+// against the group keys and accumulators, so a raw column that is
+// neither grouped nor aggregated gets the classic "must appear in the
+// GROUP BY clause" error, exactly as Postgres reports it for window
+// arguments. Frame offsets stay as parsed: they are row-independent
+// (parse-enforced), so there is nothing to map.
+func (q *aggQuery) rewriteWindow(w *ExWindow) (*ExWindow, error) {
+	c := *w
+	var err error
+	if c.Arg, err = q.rewrite(w.Arg); err != nil {
+		return nil, err
+	}
+	if c.Offset, err = q.rewrite(w.Offset); err != nil {
+		return nil, err
+	}
+	if c.Default, err = q.rewrite(w.Default); err != nil {
+		return nil, err
+	}
+	c.Partition = make([]Expr, len(w.Partition))
+	for i, e := range w.Partition {
+		if c.Partition[i], err = q.rewrite(e); err != nil {
+			return nil, err
+		}
+	}
+	c.OrderBy = make([]OrderItem, len(w.OrderBy))
+	for i, o := range w.OrderBy {
+		if o.Ex, err = q.rewrite(o.Ex); err != nil {
+			return nil, err
+		}
+		c.OrderBy[i] = o
+	}
+	return &c, nil
+}
+
+// execSelectAggWindow executes a SELECT that both aggregates and uses
+// window functions. Windows evaluate after grouping (Postgres' order:
+// WHERE -> GROUP BY/aggregates -> HAVING -> windows -> ORDER BY ->
+// LIMIT), so their inputs are the groups, not the base rows — RANK()
+// OVER (ORDER BY SUM(x) DESC) ranks whole groups by their sums. The
+// bridge is aggQuery's row mode: each HAVING-surviving group
+// materializes as a synthetic row (key values then accumulator
+// results), every group-phase expression rewrites to positional reads
+// into it, and the ordinary window machinery runs over those rows
+// unchanged.
+func (d *DB) execSelectAggWindow(s *Select) (*Result, error) {
+	res := &Result{}
+	err := d.read(func(tx *bytdb.Txn) error {
+		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
+		if err != nil {
+			return err
+		}
+		sc := fp.sc
+		env := &exEnv{d: d, tx: tx, sc: sc}
+
+		// Extract window calls from a shallow copy of the select list
+		// and ORDER BY, as the plain window path does.
+		var wins []*ExWindow
+		s2 := *s
+		s2.Items = make([]SelectItem, len(s.Items))
+		for i, it := range s.Items {
+			if it.Ex != nil {
+				it.Ex = rewriteWindows(it.Ex, sc, &wins)
+			}
+			s2.Items[i] = it
+		}
+		s2.OrderBy = make([]OrderItem, len(s.OrderBy))
+		for i, o := range s.OrderBy {
+			if o.Ex != nil {
+				o.Ex = rewriteWindows(o.Ex, sc, &wins)
+			}
+			s2.OrderBy[i] = o
+		}
+
+		// Resolve the aggregate query in row mode, then map each
+		// window's own expressions onto the group phase. Both must
+		// happen before the scan: they register the accumulators that
+		// newGroup clones per group.
+		q, err := resolveAgg(sc, &s2, true)
+		if err != nil {
+			return err
+		}
+		q.resultCols(&s2, res)
+		wins2 := make([]*ExWindow, len(wins))
+		for i, w := range wins {
+			if wins2[i], err = q.rewriteWindow(w); err != nil {
+				return err
+			}
+		}
+
+		groups, err := aggScanGroups(tx, fp, q, env)
+		if err != nil {
+			return err
+		}
+
+		// Materialize each group as a synthetic row and apply HAVING
+		// (rewritten to positional reads like everything else). Windows
+		// see only the surviving groups, per the evaluation order.
+		base := make([][]any, 0, len(groups))
+		for _, g := range groups {
+			row := make([]any, 0, len(q.keys)+len(g.accs))
+			row = append(row, g.keyVals...)
+			for i := range g.accs {
+				row = append(row, g.accs[i].value())
+			}
+			if q.having != nil {
+				env.row = row
+				t, err := evalTruth(env, q.having)
+				if err != nil {
+					return err
+				}
+				if t != triTrue {
+					continue
+				}
+			}
+			base = append(base, row)
+		}
+		env.row = nil
+
+		// Compute every window's value for every group row.
+		winvals := make([][]any, len(base))
+		for i := range winvals {
+			winvals[i] = make([]any, len(wins2))
+		}
+		for wi, w := range wins2 {
+			if err = computeWindow(env, sc, base, w, wi, winvals); err != nil {
+				return err
+			}
+		}
+
+		// ORDER BY, OFFSET/LIMIT, and projection over the group rows,
+		// with each row's window values visible through env.win. The
+		// stable sort keeps key-byte order as the tiebreak, matching
+		// the aggregate path's emission order.
+		order := make([]int, len(base))
+		for i := range order {
+			order[i] = i
+		}
+		if len(q.sorts) > 0 {
+			sortVals := make([][]any, len(base))
+			for i, row := range base {
+				env.row, env.win = row, winvals[i]
+				vs := make([]any, len(q.sorts))
+				for k, sk := range q.sorts {
+					if vs[k], err = evalEx(env, sk.ex); err != nil {
+						return err
+					}
+				}
+				sortVals[i] = vs
+			}
+			slices.SortStableFunc(order, func(a, b int) int {
+				for k, sk := range q.sorts {
+					c := orderCmp(sortVals[a][k], sortVals[b][k])
+					if sk.desc {
+						c = -c
+					}
+					if c != 0 {
+						return c
+					}
+				}
+				return 0
+			})
+		}
+		if s.Offset > 0 {
+			if s.Offset >= int64(len(order)) {
+				order = nil
+			} else {
+				order = order[s.Offset:]
+			}
+		}
+		if s.Limit >= 0 && int64(len(order)) > s.Limit {
+			order = order[:s.Limit]
+		}
+		res.Rows = make([][]any, len(order))
+		for i, ri := range order {
+			env.row, env.win = base[ri], winvals[ri]
+			out := make([]any, len(q.outs))
+			for j, ex := range q.outs {
+				if out[j], err = evalEx(env, ex); err != nil {
+					return err
+				}
+			}
+			res.Rows[i] = out
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
@@ -961,7 +1157,17 @@ func assignValueFrame(env *exEnv, w *ExWindow, fr *framer, base [][]any, idxs []
 // GROUPS frames at one aggregation per group.
 func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fr *framer, base [][]any, idxs []int, wi int, winvals [][]any) error {
 	intSum := w.Arg != nil && exprType(sc, w.Arg) == bytdb.TInt
-	newAcc := func() *accum { return &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum} }
+	newAcc := func() *accum {
+		a := &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum, distinct: w.Distinct}
+		if a.distinct {
+			// Dedup state is per accumulation: the anchored fast path
+			// reuses one accumulator over a growing frame (its seen set
+			// grows with it), while the recompute paths start fresh per
+			// frame, exactly matching each frame's distinct value set.
+			a.seen = map[string]bool{}
+		}
+		return a
+	}
 	add := func(acc *accum, ri int) error {
 		re := *env
 		re.row = base[ri]

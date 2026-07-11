@@ -256,7 +256,7 @@ func describeSelect(lk tableLookup, st *Select, note func(any, bytdb.ColType), r
 		noteWin(o.Ex)
 	}
 	if st.isAggregate() {
-		q, err := resolveAgg(sc, st)
+		q, err := resolveAgg(sc, st, false)
 		if err != nil {
 			return err
 		}
@@ -287,6 +287,12 @@ func command(st Statement) string {
 		return "CREATE INDEX"
 	case *DropIndex:
 		return "DROP INDEX"
+	case *CreateSequence:
+		return "CREATE SEQUENCE"
+	case *DropSequence:
+		return "DROP SEQUENCE"
+	case *AlterSequence:
+		return "ALTER SEQUENCE"
 	case *Insert:
 		return "INSERT"
 	case *Select:

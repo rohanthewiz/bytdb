@@ -51,6 +51,11 @@ CREATE TABLE items (
   `now()` above all — are rejected with a pointer to epoch integers
   (see [Gotchas](gotchas.md)); `ADD COLUMN ... DEFAULT` needs an empty table
   (no backfill). *(verified in `sql/default_test.go`)*
+- Defaults surface in the catalog — `pg_attrdef` rows (with `pg_get_expr` and
+  `pg_attribute.atthasdef`) and `information_schema.columns.column_default` —
+  so psql's `\d` renders the Default column and ORMs introspect them; identity
+  columns report via `attidentity = 'd'` instead, as in Postgres.
+  *(verified in `sql/attrdef_test.go`)*
 
 ## Auto-increment
 
@@ -82,6 +87,39 @@ INSERT INTO users (name) VALUES ('edsger');          -- id 11, no collision
   55000 "not yet defined in this session" before the first draw. Draws are
   session-local and survive a rolled-back block, as in Postgres.
   *(verified in `sql/seqfuncs_test.go`)*
+
+## Sequences
+
+Standalone sequences with the Postgres option set:
+
+```sql
+CREATE SEQUENCE order_ids START WITH 1000 INCREMENT BY 10;
+SELECT nextval('order_ids');          -- 1000; runs in a write txn under the covers
+SELECT nextval('order_ids'::regclass); -- 1010; the spelling drivers use
+SELECT setval('order_ids', 5000);      -- reposition (5000 counts as returned)
+SELECT currval('order_ids'), lastval();
+ALTER SEQUENCE order_ids RESTART WITH 1;
+SELECT last_value, is_called FROM order_ids;  -- the one-row state relation
+DROP SEQUENCE IF EXISTS order_ids;
+```
+*(verified in `sql/sequence_test.go`)*
+
+- Options: `AS smallint|integer|bigint` (bounds the declarable range),
+  `INCREMENT [BY]` (negative descends), `MINVALUE`/`MAXVALUE`/`NO
+  MINVALUE`/`NO MAXVALUE`, `START [WITH]`, `CYCLE`/`NO CYCLE`, `CACHE n`
+  (stored and reported; allocation behaves as `CACHE 1` — the engine has a
+  single writer, so batching would only manufacture gaps), `IF [NOT]
+  EXISTS` with Postgres' skip notices. Exhaustion, bounds, and option
+  validation carry Postgres' wording (`nextval: reached maximum value of
+  sequence "s" (20)`).
+- Sequences share the relation namespace with tables and appear in
+  `pg_class` (relkind `'S'`), `pg_catalog.pg_sequence`, and
+  `information_schema.sequences`; each also reads as its own one-row state
+  relation, so `\ds` and driver probes work.
+- Allocation is transactional — see
+  [Considerations & Gotchas](gotchas.md#sql-that-is-deliberately-not-there)
+  for the two deliberate divergences from Postgres, and for why
+  `VALUES (nextval('s'))` needs the draw-then-insert pattern.
 
 ## RETURNING
 
@@ -148,6 +186,10 @@ DROP INDEX orders_by_age ON orders;
   not at all.
 - The planner uses indexes for equality and range predicates and can exploit
   index order to satisfy `ORDER BY` without sorting; `EXPLAIN` shows the plan.
+- When two paths tie on predicate score — redundant indexes like `(a)` and
+  `(a, b)` under `WHERE a = 1` — the one whose scan order also serves
+  `ORDER BY` wins the tie, eliding the sort. A strictly better-scoring path
+  still wins even when it forces a sort. *(verified in `sql/order_test.go`)*
 
 ## Queries
 
@@ -254,6 +296,36 @@ outside the frame — and `NTH_VALUE` counts across the hole it leaves.
 Without `ORDER BY` the whole partition is one peer group, so `GROUP`
 empties every frame (SUM NULL, COUNT 0) and `TIES` leaves exactly the
 current row.
+
+Windows compose with `GROUP BY`: they evaluate **after** grouping and
+`HAVING` (Postgres' order), so their inputs are the groups and their
+arguments may be group keys or aggregates:
+
+```sql
+SELECT dept, SUM(sal),
+    RANK() OVER (ORDER BY SUM(sal) DESC) AS payroll_rank,
+    SUM(SUM(sal)) OVER (ORDER BY dept)   AS running_payroll
+FROM emp GROUP BY dept
+HAVING COUNT(*) > 1
+ORDER BY payroll_rank
+```
+*(verified in `sql/window_group_test.go`)*
+
+A column that is neither grouped nor aggregated inside a window's
+expressions gets the classic must-appear-in-GROUP-BY error, and an
+aggregate cannot consume a window result (`SUM(RANK() OVER ())`
+errors), both as in Postgres. Frames, `EXCLUDE`, and the value family
+all work over the grouped rows; `EXPLAIN` shows the `WindowAgg` above
+the `HashAggregate`.
+
+Aggregate windows also take `DISTINCT` — a bytdb extension (Postgres
+rejects it; DuckDB agrees with bytdb) — deduplicating within each
+row's frame:
+
+```sql
+SELECT id, COUNT(DISTINCT city) OVER (ORDER BY id) AS cities_so_far FROM users
+```
+*(verified in `sql/window_group_test.go`)*
 
 ### Expressions
 
