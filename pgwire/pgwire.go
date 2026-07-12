@@ -56,6 +56,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -162,7 +163,32 @@ func (s *Server) idleTxTimeout() time.Duration {
 
 // NewServer wraps a SQL frontend for serving.
 func NewServer(db *sql.DB) *Server {
-	return &Server{db: db, conns: map[net.Conn]struct{}{}, backends: map[int32]*conn{}}
+	s := &Server{db: db, conns: map[net.Conn]struct{}{}, backends: map[int32]*conn{}}
+	// pg_stat_activity reads live backends off this server's registry.
+	// Installed here, before any session copies the DB.
+	db.SetActivityProvider(s.activity)
+	return s
+}
+
+// activity snapshots every live backend for pg_stat_activity, sorted
+// by PID so the view reads stably.
+func (s *Server) activity() []sql.Activity {
+	s.mu.Lock()
+	conns := make([]*conn, 0, len(s.backends))
+	for _, c := range s.backends {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	out := make([]sql.Activity, 0, len(conns))
+	for _, c := range conns {
+		a := c.statSnapshot()
+		if a.PID == 0 {
+			continue // still in startup; not yet a session
+		}
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
+	return out
 }
 
 // ListenAndServe listens on addr (e.g. "127.0.0.1:5432") and serves

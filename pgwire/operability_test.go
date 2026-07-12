@@ -142,3 +142,43 @@ func TestFKWire(t *testing.T) {
 		t.Fatalf("parent violation: %+v", err)
 	}
 }
+
+// TestPgStatActivity: the view lists live backends with identity,
+// state, and current query, fed by the server's registry.
+func TestPgStatActivity(t *testing.T) {
+	addr := startConfiguredServer(t, nil)
+	c1 := connect(t, fmt.Sprintf("postgres://ada@%s/any?sslmode=disable&application_name=app1", addr))
+	c2 := connect(t, fmt.Sprintf("postgres://bob@%s/any?sslmode=disable", addr))
+
+	// c2 sits inside a transaction block; c1 queries the view.
+	mustExec(t, c2, `begin`)
+	rows, err := c1.Query(context.Background(),
+		`select pid, usename, application_name, state, query from pg_stat_activity order by pid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type row struct {
+		pid                 int64
+		user, app, state, q string
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.pid, &r.user, &r.app, &r.state, &r.q); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	if len(got) != 2 {
+		t.Fatalf("backends: %+v", got)
+	}
+	// The querying backend reports itself active on this very query.
+	if got[0].user != "ada" || got[0].app != "app1" || got[0].state != "active" ||
+		!strings.Contains(got[0].q, "pg_stat_activity") {
+		t.Fatalf("self row: %+v", got[0])
+	}
+	if got[1].user != "bob" || got[1].state != "idle in transaction" {
+		t.Fatalf("blocked row: %+v", got[1])
+	}
+	mustExec(t, c2, `rollback`)
+}

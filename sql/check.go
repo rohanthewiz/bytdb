@@ -214,6 +214,13 @@ func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 // checkDropColumn rejects dropping a column a check constraint
 // mentions, as Postgres does without CASCADE.
 func (d *DB) checkDropColumn(table, col string) error {
+	return d.checkColumnUnmentioned(table, col, "drop")
+}
+
+// checkColumnUnmentioned rejects dropping or renaming a column a
+// check constraint mentions: check expressions are stored as text, so
+// either change would silently orphan the constraint.
+func (d *DB) checkColumnUnmentioned(table, col, verb string) error {
 	desc := d.e.Table(table)
 	if desc == nil {
 		return nil // the engine reports the missing table
@@ -232,7 +239,7 @@ func (d *DB) checkDropColumn(table, col string) error {
 			return !used
 		})
 		if used {
-			return serr.New(`cannot drop column "`+col+`" of table "`+table+
+			return serr.New(`cannot `+verb+` column "`+col+`" of table "`+table+
 				`" because other objects depend on it`, "constraint", ck.name)
 		}
 	}

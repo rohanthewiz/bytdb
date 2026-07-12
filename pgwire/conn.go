@@ -58,6 +58,12 @@ type conn struct {
 	cancelMu    sync.Mutex
 	queryCancel context.CancelFunc
 
+	// stat is what pg_stat_activity reports about this connection.
+	// Written by the connection goroutine, read by whichever session
+	// queries the view — hence its own mutex.
+	statMu sync.Mutex
+	stat   sql.Activity
+
 	stmts   map[string]*prepared
 	portals map[string]*portal
 
@@ -335,6 +341,7 @@ func (c *conn) startup() error {
 			key.int32(int(c.pid))
 			key.int32(int(int32(c.secret)))
 			c.send(msgBackendKeyData, key)
+			c.statConnected(params)
 			c.ready()
 			// The session is established; from here the read deadline
 			// belongs to armIdleDeadline (which only manages it inside
@@ -422,6 +429,8 @@ func (c *conn) simpleQuery(q string) {
 	// the batch (the next statement fails on the canceled context).
 	ctx := c.armCancel()
 	defer c.disarmCancel()
+	c.statActive(q)
+	defer c.statIdle()
 	for _, p := range parts {
 		start := time.Now()
 		st, err := c.srv.db.Prepare(p.text)
@@ -595,9 +604,11 @@ func (c *conn) execute(r *rbuf) {
 		return
 	}
 	ctx := c.armCancel()
+	c.statActive(pt.prep.query)
 	start := time.Now()
 	res, err := c.sess.ExecStmtCtx(ctx, pt.prep.stmt, pt.args...)
 	c.logQuery(pt.prep.query, start, err)
+	c.statIdle()
 	c.disarmCancel()
 	if err != nil {
 		c.sendError(err, pt.prep.query, 0)
@@ -610,6 +621,52 @@ func (c *conn) execute(r *rbuf) {
 		return
 	}
 	c.sendCommandComplete(pt.prep.info.Command, res)
+}
+
+// statConnected records the startup identity for pg_stat_activity.
+func (c *conn) statConnected(params map[string]string) {
+	addr := ""
+	if ra := c.nc.RemoteAddr(); ra != nil {
+		addr = ra.String()
+	}
+	c.statMu.Lock()
+	c.stat.PID = c.pid
+	c.stat.User = params["user"]
+	c.stat.AppName = params["application_name"]
+	c.stat.ClientAddr = addr
+	c.stat.State = "idle"
+	c.statMu.Unlock()
+}
+
+// statActive marks the connection as executing q.
+func (c *conn) statActive(q string) {
+	c.statMu.Lock()
+	c.stat.State = "active"
+	c.stat.Query = q
+	c.statMu.Unlock()
+}
+
+// statIdle records the post-statement state — plain idle, or idle
+// inside a (possibly failed) transaction block. The query text stays,
+// as Postgres keeps the last statement visible on idle backends.
+func (c *conn) statIdle() {
+	state := "idle"
+	switch c.sess.Status() { // the connection's own goroutine: safe
+	case sql.TxActive:
+		state = "idle in transaction"
+	case sql.TxFailed:
+		state = "idle in transaction (aborted)"
+	}
+	c.statMu.Lock()
+	c.stat.State = state
+	c.statMu.Unlock()
+}
+
+// statSnapshot reads the connection's row for the provider.
+func (c *conn) statSnapshot() sql.Activity {
+	c.statMu.Lock()
+	defer c.statMu.Unlock()
+	return c.stat
 }
 
 // logQuery reports one executed statement to the server's QueryLog

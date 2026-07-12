@@ -347,6 +347,106 @@ func (e *Engine) DropCheck(table, name string) (bool, error) {
 	return existed, nil
 }
 
+// RenameTable renames a table. Rows never move — the key space is
+// owned by the table ID, and only the descriptor (keyed by name)
+// changes. A table referenced by another table's foreign key cannot
+// be renamed (RefTable is stored by name; drop the constraint first);
+// a self-reference renames along. Views are not tracked: one whose
+// stored text names the old table fails at its next use.
+func (e *Engine) RenameTable(oldName, newName string) error {
+	if newName == "" {
+		return serr.New("new table name is required", "table", oldName)
+	}
+	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
+		desc, err := e.descFromView(tx, oldName)
+		if err != nil {
+			return err
+		}
+		if tx.Contains(descKey(newName)) || tx.Contains(sqlSeqKey(newName)) || tx.Contains(viewKey(newName)) {
+			return serr.New(`relation "` + newName + `" already exists`)
+		}
+		refs, err := e.referencingFKs(tx, oldName, true)
+		if err != nil {
+			return err
+		}
+		if len(refs) > 0 {
+			return serr.New("cannot rename a table referenced by a foreign key",
+				"table", oldName, "constraint", refs[0].FK.Name,
+				"referencing_table", refs[0].Child.Name)
+		}
+		next := desc.clone()
+		next.Name = newName
+		for i := range next.ForeignKeys {
+			if next.ForeignKeys[i].RefTable == oldName { // self-reference follows
+				next.ForeignKeys[i].RefTable = newName
+			}
+		}
+		if _, err := tx.Delete(descKey(oldName)); err != nil {
+			return err
+		}
+		return writeDescIn(tx, newName, next)
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "rename table", "table", oldName, "to", newName)
+	}
+	return nil
+}
+
+// RenameColumn renames a column: descriptor-only, since row values are
+// tagged by column ID. Columns that CHECK constraints mention (their
+// expressions are stored as text) or that a foreign key references
+// from another table (RefCols are names) cannot be renamed while the
+// constraint stands; the caller enforces the check side, which owns
+// the expression language — this guards the FK side.
+func (e *Engine) RenameColumn(table, oldName, newName string) error {
+	if newName == "" {
+		return serr.New("new column name is required", "table", table, "column", oldName)
+	}
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		ord := old.ColIndex(oldName)
+		if ord < 0 {
+			return nil, serr.New("no such column", "table", table, "column", oldName)
+		}
+		if old.ColIndex(newName) >= 0 {
+			return nil, serr.New(`column "` + newName + `" of relation "` + table + `" already exists`)
+		}
+		refs, err := e.referencingFKs(tx, table, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range refs {
+			if slices.Contains(r.FK.RefCols, oldName) {
+				if r.Child.Name == table {
+					// The table's own inbound reference renames along below.
+					continue
+				}
+				return nil, serr.New("cannot rename a column referenced by a foreign key",
+					"table", table, "column", oldName,
+					"constraint", r.FK.Name, "referencing_table", r.Child.Name)
+			}
+		}
+		desc := old.clone()
+		desc.Columns[ord].Name = newName
+		for i := range desc.ForeignKeys {
+			if desc.ForeignKeys[i].RefTable != table {
+				continue
+			}
+			cols := slices.Clone(desc.ForeignKeys[i].RefCols)
+			for j, n := range cols {
+				if n == oldName {
+					cols[j] = newName
+				}
+			}
+			desc.ForeignKeys[i].RefCols = cols
+		}
+		return desc, nil
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "rename column", "table", table, "column", oldName)
+	}
+	return nil
+}
+
 // alterDesc runs one descriptor-rewriting DDL: it resolves the current
 // descriptor inside the transaction, applies mutate, and persists the
 // result — all under the kv writer lock, so concurrent DDL serializes

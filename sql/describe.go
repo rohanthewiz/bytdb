@@ -321,7 +321,8 @@ func command(st Statement) string {
 		return "CREATE VIEW"
 	case *DropView:
 		return "DROP VIEW"
-	case *AddColumn, *DropColumn, *AddConstraint, *AddFK, *DropConstraint:
+	case *AddColumn, *DropColumn, *RenameTable, *RenameColumn,
+		*AddConstraint, *AddFK, *DropConstraint:
 		return "ALTER TABLE"
 	case *CreateIndex:
 		return "CREATE INDEX"

@@ -362,7 +362,29 @@ type DB struct {
 	// the catalog in lookup. Rides the copy-the-DB convention: run
 	// stamps it on a copy, so nothing leaks between statements.
 	vtabs map[string]vtab
+
+	// activity, when set, feeds pg_catalog.pg_stat_activity: a wire
+	// server installs it (SetActivityProvider) so sessions can see the
+	// other backends. Copied along with the DB into every session.
+	activity func() []Activity
 }
+
+// Activity is one backend's pg_stat_activity row, reported by the
+// serving layer (which is the only party that knows connections).
+type Activity struct {
+	PID        int32
+	User       string
+	AppName    string
+	ClientAddr string
+	State      string // active | idle | idle in transaction [(aborted)]
+	Query      string // current statement, or the last one when idle
+}
+
+// SetActivityProvider installs the pg_stat_activity source. Call
+// before sessions are created — they copy the DB, provider included.
+// The provider is called from whatever session queries the table, so
+// it must be safe for concurrent use.
+func (d *DB) SetActivityProvider(f func() []Activity) { d.activity = f }
 
 // vtab is one materialized virtual table: a synthetic descriptor plus
 // its rows, exactly the shape the system catalog serves its tables in.
@@ -575,6 +597,24 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 			return nil, err
 		}
 		if err := d.e.DropColumn(s.Table, s.Col); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
+	case *RenameTable:
+		if err := sysWriteGuard(s.To); err != nil {
+			return nil, err
+		}
+		if err := d.e.RenameTable(s.Table, s.To); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
+	case *RenameColumn:
+		// A CHECK constraint's stored text would silently orphan; the
+		// engine guards the FK side.
+		if err := d.checkColumnUnmentioned(s.Table, s.Col, "rename"); err != nil {
+			return nil, err
+		}
+		if err := d.e.RenameColumn(s.Table, s.Col, s.To); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil

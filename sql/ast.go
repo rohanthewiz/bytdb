@@ -615,6 +615,12 @@ type AddColumn struct {
 // DropColumn is ALTER TABLE t DROP [COLUMN] col.
 type DropColumn struct{ Table, Col string }
 
+// RenameTable is ALTER TABLE t RENAME TO u.
+type RenameTable struct{ Table, To string }
+
+// RenameColumn is ALTER TABLE t RENAME [COLUMN] c TO d.
+type RenameColumn struct{ Table, Col, To string }
+
 // AddConstraint is ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr).
 type AddConstraint struct {
 	Table string
@@ -909,6 +915,8 @@ func (*CreateView) stmt()     {}
 func (*DropView) stmt()       {}
 func (*AddColumn) stmt()      {}
 func (*DropColumn) stmt()     {}
+func (*RenameTable) stmt()    {}
+func (*RenameColumn) stmt()   {}
 func (*AddConstraint) stmt()  {}
 func (*AddFK) stmt()          {}
 func (*DropConstraint) stmt() {}

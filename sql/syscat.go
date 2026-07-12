@@ -112,6 +112,10 @@ func writeTarget(st Statement) string {
 		return s.Table
 	case *AddFK:
 		return s.Table
+	case *RenameTable:
+		return s.Table
+	case *RenameColumn:
+		return s.Table
 	case *DropConstraint:
 		return s.Table
 	case *CreateIndex:
@@ -549,6 +553,32 @@ var sysTables = map[string]*sysTableDef{
 						nil, nil,
 					})
 				}
+			}
+			return rows
+		},
+	},
+	"pg_catalog.pg_stat_activity": {
+		desc: sysDesc("pg_stat_activity",
+			sysCol("datname", bytdb.TString), sysCol("pid", bytdb.TInt),
+			sysCol("usename", bytdb.TString), sysCol("application_name", bytdb.TString),
+			sysCol("client_addr", bytdb.TString), sysCol("state", bytdb.TString),
+			sysCol("query", bytdb.TString)),
+		rows: func(d *DB) [][]any {
+			// Fed by the serving layer's provider; an embedded DB with no
+			// wire server has no backends to report.
+			if d.activity == nil {
+				return nil
+			}
+			var rows [][]any
+			for _, a := range d.activity() {
+				var addr any
+				if a.ClientAddr != "" {
+					addr = a.ClientAddr
+				}
+				rows = append(rows, []any{
+					sysDatabase, int64(a.PID), a.User, a.AppName,
+					addr, a.State, a.Query,
+				})
 			}
 			return rows
 		},

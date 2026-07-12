@@ -1286,6 +1286,28 @@ func (p *parser) alterTable() (Statement, error) {
 				"table", table, "column", col.Name)
 		}
 		return &AddColumn{Table: table, Col: col}, nil
+	case p.acceptKw("rename"):
+		// RENAME TO t | RENAME [COLUMN] c TO d.
+		if p.acceptKw("to") {
+			to, err := p.tableName()
+			if err != nil {
+				return nil, err
+			}
+			return &RenameTable{Table: table, To: to}, nil
+		}
+		p.acceptKw("column")
+		col, err := p.ident("a column name")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("to"); err != nil {
+			return nil, err
+		}
+		to, err := p.ident("the new column name")
+		if err != nil {
+			return nil, err
+		}
+		return &RenameColumn{Table: table, Col: col, To: to}, nil
 	case p.acceptKw("drop"):
 		if p.acceptKw("constraint") {
 			dc := &DropConstraint{Table: table}
@@ -1307,7 +1329,7 @@ func (p *parser) alterTable() (Statement, error) {
 		}
 		return &DropColumn{Table: table, Col: name}, nil
 	}
-	return nil, p.unexpected("ADD or DROP COLUMN or CONSTRAINT")
+	return nil, p.unexpected("ADD, DROP, or RENAME")
 }
 
 // --- DML ---

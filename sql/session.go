@@ -376,6 +376,7 @@ func (s *Session) savepointControl(tc *TxnControl) (*Result, error) {
 func isDDL(st Statement) bool {
 	switch st.(type) {
 	case *CreateTable, *DropTable, *AddColumn, *DropColumn,
+		*RenameTable, *RenameColumn,
 		*AddConstraint, *AddFK, *DropConstraint, *CreateIndex, *DropIndex,
 		*CreateSequence, *DropSequence, *AlterSequence,
 		*CreateView, *DropView:
