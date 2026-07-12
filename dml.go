@@ -190,6 +190,9 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 		if err != nil {
 			return nil, false, serr.Wrap(err, "table", desc.Name, "column", col)
 		}
+		if cv, err = enforceMaxLen(cv, &desc.Columns[ord]); err != nil {
+			return nil, false, serr.Wrap(err, "table", desc.Name, "column", col)
+		}
 		if cv == nil {
 			if desc.isPK(ord) {
 				return nil, false, serr.New("primary key column may not be NULL", "table", desc.Name, "column", col)
@@ -472,6 +475,9 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 		if err != nil {
 			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
 		}
+		if cv, err = enforceMaxLen(cv, &c); err != nil {
+			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
+		}
 		if cv == nil {
 			if desc.isPK(i) {
 				return nil, serr.New("primary key column may not be NULL",
@@ -486,6 +492,38 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 		out[i] = cv
 	}
 	return out, nil
+}
+
+// enforceMaxLen applies a string column's VARCHAR(n) character limit
+// to an already-coerced value, with Postgres semantics: overflow is an
+// error (SQLSTATE 22001's wording), except overflow that is entirely
+// spaces, which truncates silently — the one concession the SQL
+// standard makes, because trailing pad spaces are considered
+// insignificant. The limit counts characters, not bytes, as Postgres
+// does, so multi-byte text is not short-changed.
+func enforceMaxLen(v any, c *Column) (any, error) {
+	if c.MaxLen <= 0 {
+		return v, nil
+	}
+	s, ok := v.(string)
+	if !ok { // NULL, or a non-string headed for a type error elsewhere
+		return v, nil
+	}
+	// Fast path: a byte count within the limit bounds the rune count.
+	if len(s) <= c.MaxLen {
+		return v, nil
+	}
+	runes := []rune(s)
+	if len(runes) <= c.MaxLen {
+		return v, nil
+	}
+	for _, r := range runes[c.MaxLen:] {
+		if r != ' ' {
+			return nil, serr.New(fmt.Sprintf(
+				"value too long for type character varying(%d)", c.MaxLen))
+		}
+	}
+	return string(runes[:c.MaxLen]), nil
 }
 
 // notNullErr is the NOT NULL violation, worded as Postgres words it.

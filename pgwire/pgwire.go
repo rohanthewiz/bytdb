@@ -101,6 +101,22 @@ type Server struct {
 	// before Serve.
 	Auth *Credentials
 
+	// MaxConns caps concurrent client connections (0 = unlimited).
+	// Connections over the cap are accepted just long enough to be
+	// refused properly — FATAL 53300 "sorry, too many clients already",
+	// which drivers understand — rather than left hanging in a TCP
+	// backlog. CancelRequest connections are exempt: they carry one
+	// message and close, and refusing them would make an overloaded
+	// server impossible to relieve. Set before Serve.
+	MaxConns int
+
+	// QueryLog, when non-nil, is called after every executed statement
+	// with its SQL text, wall-clock duration, and error (nil on
+	// success). Called from connection goroutines concurrently, so
+	// implementations must be safe for concurrent use; keep them fast —
+	// the statement's ReadyForQuery waits on the call. Set before Serve.
+	QueryLog func(query string, d time.Duration, err error)
+
 	// bindOnce/bindData cache the RFC 5929 tls-server-end-point
 	// channel-binding value (a hash of the server certificate) that
 	// SCRAM-SHA-256-PLUS signs into the authentication exchange. Derived
@@ -195,6 +211,10 @@ func (s *Server) Serve(ln net.Listener) error {
 			secret:  newCancelSecret(),
 		}
 		s.mu.Lock()
+		// The over-limit decision is made under the same lock that
+		// registers the connection, so racing accepts cannot both squeak
+		// under the cap.
+		c.overLimit = s.MaxConns > 0 && len(s.conns) >= s.MaxConns
 		s.conns[nc] = struct{}{}
 		s.backends[c.pid] = c
 		s.mu.Unlock()

@@ -518,6 +518,11 @@ type ColDef struct {
 	Type     bytdb.ColType
 	NotNull  bool
 	Identity bool
+	// MaxLen is a VARCHAR(n) length limit in characters (0: none).
+	MaxLen int
+	// Unique marks a UNIQUE column constraint — sugar the executor
+	// lowers to a single-column unique index named table_col_key.
+	Unique bool
 	// Default is the column's DEFAULT constant; HasDefault
 	// distinguishes an absent clause (DEFAULT NULL parses as absent —
 	// it declares what a defaultless column already does).
@@ -539,15 +544,35 @@ type CheckDef struct {
 
 // CreateTable is CREATE TABLE t (col type [constraints], ...,
 // [PRIMARY KEY (col, ...)], [[CONSTRAINT name] CHECK (expr)], ...).
+// Uniques collects UNIQUE constraints — column-level and table-level
+// alike — as column lists; the executor lowers each to a unique index
+// (UNIQUE here is sugar over CREATE UNIQUE INDEX, as the pg_constraint
+// synthesis assumes).
 type CreateTable struct {
-	Table  string
-	Cols   []ColDef
-	PK     []string
-	Checks []CheckDef
+	Table   string
+	Cols    []ColDef
+	PK      []string
+	Checks  []CheckDef
+	Uniques [][]string
 }
 
 // DropTable is DROP TABLE t.
 type DropTable struct{ Table string }
+
+// Truncate is TRUNCATE [TABLE] t [, ...] [RESTART|CONTINUE IDENTITY]
+// [RESTRICT]: delete every row (and index entry) of each named table
+// in one statement, schema untouched. It is DML, not DDL — it runs
+// inside transaction blocks, and all tables truncate atomically.
+// CASCADE is rejected (bytdb has no foreign-key cascades to follow).
+type Truncate struct {
+	Tables          []string
+	RestartIdentity bool // RESTART IDENTITY: identity counters draw from 1 again
+}
+
+// ShowVar is SHOW name (or SHOW ALL): report a configuration
+// parameter as a one-row result. A Session answers from its SET state
+// over the built-in defaults; a bare DB reports the defaults.
+type ShowVar struct{ Name string } // "all" for SHOW ALL
 
 // AddColumn is ALTER TABLE t ADD [COLUMN] col type.
 type AddColumn struct {
@@ -823,6 +848,8 @@ type SetVar struct {
 func (*CreateTable) stmt()    {}
 func (*Explain) stmt()        {}
 func (*DropTable) stmt()      {}
+func (*Truncate) stmt()       {}
+func (*ShowVar) stmt()        {}
 func (*AddColumn) stmt()      {}
 func (*DropColumn) stmt()     {}
 func (*AddConstraint) stmt()  {}

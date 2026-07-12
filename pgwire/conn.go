@@ -38,6 +38,12 @@ type conn struct {
 	// refuses a second SSLRequest.
 	tlsOn bool
 
+	// overLimit: the server was at MaxConns when this connection
+	// arrived. The startup handshake still runs far enough to deliver a
+	// proper FATAL 53300 (through TLS if the client asked for it), and
+	// CancelRequests still work — see Server.MaxConns.
+	overLimit bool
+
 	// pid and secret form the connection's BackendKeyData: a client
 	// proves the right to cancel this connection's queries by echoing
 	// both in a CancelRequest. The secret is crypto-random — a
@@ -286,6 +292,16 @@ func (c *conn) startup() error {
 			// cstring pairs. The engine has no databases, so only user
 			// matters, and only when authenticating.
 			params := startupParams(r)
+			if c.overLimit {
+				// Postgres's exact message and SQLSTATE (53300
+				// too_many_connections); pgx and libpq both surface it
+				// verbatim.
+				c.send(msgErrorResponse, fatalBody(
+					"sorry, too many clients already", "53300"))
+				c.w.Flush()
+				return serr.New("connection limit reached",
+					"max", fmt.Sprint(c.srv.MaxConns))
+			}
 			if c.srv.RequireTLS && !c.tlsOn {
 				// What a hostssl-only pg_hba.conf answers, with its
 				// SQLSTATE (28000 invalid_authorization_specification).
@@ -303,7 +319,7 @@ func (c *conn) startup() error {
 			auth.int32(authOK) // AuthenticationOk
 			c.send(msgAuth, auth)
 			for _, kv := range [][2]string{
-				{"server_version", "16.0 (bytdb)"},
+				{"server_version", sql.ServerVersion},
 				{"server_encoding", "UTF8"},
 				{"client_encoding", "UTF8"},
 				{"DateStyle", "ISO, MDY"},
@@ -407,12 +423,15 @@ func (c *conn) simpleQuery(q string) {
 	ctx := c.armCancel()
 	defer c.disarmCancel()
 	for _, p := range parts {
+		start := time.Now()
 		st, err := c.srv.db.Prepare(p.text)
 		if err != nil {
+			c.logQuery(p.text, start, err)
 			c.sendError(err, q, p.off)
 			break
 		}
 		res, err := c.sess.ExecStmtCtx(ctx, st)
+		c.logQuery(p.text, start, err)
 		if err != nil {
 			c.sendError(err, q, p.off)
 			break
@@ -576,7 +595,9 @@ func (c *conn) execute(r *rbuf) {
 		return
 	}
 	ctx := c.armCancel()
+	start := time.Now()
 	res, err := c.sess.ExecStmtCtx(ctx, pt.prep.stmt, pt.args...)
+	c.logQuery(pt.prep.query, start, err)
 	c.disarmCancel()
 	if err != nil {
 		c.sendError(err, pt.prep.query, 0)
@@ -589,6 +610,15 @@ func (c *conn) execute(r *rbuf) {
 		return
 	}
 	c.sendCommandComplete(pt.prep.info.Command, res)
+}
+
+// logQuery reports one executed statement to the server's QueryLog
+// hook, if configured. Execution only: Parse-time failures of the
+// extended protocol never reach an Execute and are not logged.
+func (c *conn) logQuery(query string, start time.Time, err error) {
+	if f := c.srv.QueryLog; f != nil {
+		f(query, time.Since(start), err)
+	}
 }
 
 // closeTarget handles Close for a statement or portal; closing an

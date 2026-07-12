@@ -59,6 +59,9 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 			return nil, serr.New("identity column must be an int column",
 				"table", name, "column", c.Name, "type", string(c.Type))
 		}
+		if err := validMaxLen(c); err != nil {
+			return nil, serr.Wrap(err, "table", name)
+		}
 	}
 	for i := range desc.Columns {
 		desc.Columns[i].ID = uint32(i + 1)
@@ -98,6 +101,23 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		return nil, serr.Wrap(err, "op", "create table", "table", name)
 	}
 	return desc, nil
+}
+
+// validMaxLen checks a column's declared VARCHAR(n) limit: only string
+// columns take one, and n must be positive (a zero-or-negative length
+// admits no value at all — Postgres rejects it at parse too).
+func validMaxLen(c Column) error {
+	if c.MaxLen == 0 {
+		return nil
+	}
+	if c.Type != TString {
+		return serr.New("length limit is only valid on string columns",
+			"column", c.Name, "type", string(c.Type))
+	}
+	if c.MaxLen < 0 {
+		return serr.New("length limit must be positive", "column", c.Name)
+	}
+	return nil
 }
 
 // DropTable removes a table — descriptor, rows, and every index —
@@ -143,6 +163,9 @@ func (e *Engine) AddColumn(table string, col Column) error {
 		// Existing rows would need backfilled values; defer until there
 		// is a story for that.
 		return serr.New("adding an identity column is not supported", "table", table, "column", col.Name)
+	}
+	if err := validMaxLen(col); err != nil {
+		return serr.Wrap(err, "table", table)
 	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		if old.ColIndex(col.Name) >= 0 {

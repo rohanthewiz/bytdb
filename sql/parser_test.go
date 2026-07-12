@@ -47,7 +47,7 @@ func TestParseCreateTable(t *testing.T) {
 	want := &CreateTable{
 		Table: "users",
 		Cols: []ColDef{
-			{Name: "id", Type: bytdb.TInt}, {Name: "name", Type: bytdb.TString}, {Name: "score", Type: bytdb.TFloat},
+			{Name: "id", Type: bytdb.TInt}, {Name: "name", Type: bytdb.TString, MaxLen: 40}, {Name: "score", Type: bytdb.TFloat},
 			{Name: "active", Type: bytdb.TBool}, {Name: "blob", Type: bytdb.TBytes},
 		},
 		PK: []string{"id"},

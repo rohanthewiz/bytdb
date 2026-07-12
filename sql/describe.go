@@ -167,6 +167,16 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		if err := describeReturning(sc, &st.Returning, info); err != nil {
 			return err
 		}
+	case *ShowVar:
+		// The output column is named after the parameter, as Postgres
+		// names it; the shape is knowable without touching the catalog.
+		if st.Name == "all" {
+			info.Cols = []string{"name", "setting", "description"}
+			info.Types = []bytdb.ColType{bytdb.TString, bytdb.TString, bytdb.TString}
+		} else {
+			info.Cols = []string{st.Name}
+			info.Types = []bytdb.ColType{bytdb.TString}
+		}
 	case *Select:
 		res := &Result{}
 		if err := describeSelect(lk, st, note, res); err != nil {
@@ -293,6 +303,10 @@ func command(st Statement) string {
 		return "CREATE TABLE"
 	case *DropTable:
 		return "DROP TABLE"
+	case *Truncate:
+		return "TRUNCATE TABLE"
+	case *ShowVar:
+		return "SHOW"
 	case *AddColumn, *DropColumn, *AddConstraint, *DropConstraint:
 		return "ALTER TABLE"
 	case *CreateIndex:

@@ -77,6 +77,12 @@ type Column struct {
 	// by the SQL layer, which owns the literal syntax — engine-API
 	// inserts take explicit values for every column.
 	Default string `json:"default,omitempty"`
+	// MaxLen is a string column's VARCHAR(n) limit in characters
+	// (0 = unbounded). Enforced on every insert and update with
+	// Postgres semantics: overflow errors, except overflow that is all
+	// spaces, which truncates silently (the SQL standard's one
+	// concession). Only valid on string columns.
+	MaxLen int `json:"max_len,omitempty"`
 }
 
 // CheckDesc is one CHECK constraint: a SQL boolean expression over the
@@ -294,6 +300,15 @@ func curGID() uint64 {
 		id = id*10 + uint64(c-'0')
 	}
 	return id
+}
+
+// WithSyncNever opens the engine with WAL fsyncs left to the operating
+// system: much faster writes, at the cost that a power loss (not a
+// process crash) may lose recently acknowledged transactions. Exposed
+// here so embedders and bytdbd can select the policy without importing
+// btypedb.
+func WithSyncNever() btypedb.Option {
+	return btypedb.WithSyncPolicy(btypedb.SyncNever)
 }
 
 // Open opens (creating if necessary) the database at path and

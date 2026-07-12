@@ -4,6 +4,7 @@ import (
 	"iter"
 
 	"github.com/rohanthewiz/btypedb"
+	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -233,6 +234,34 @@ func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (R
 		return Row{}, false, nil
 	}
 	return Row{Desc: desc, Vals: newVals}, true, nil
+}
+
+// Truncate removes every row of the table — and its entries in every
+// secondary index — as one range delete over the table's key space,
+// leaving the schema untouched. Unlike a row-at-a-time DELETE, it
+// never decodes a row, so it is O(rows) in the kv store's bulk delete
+// rather than in decode+per-index maintenance. restartIdentity
+// additionally deletes the table's identity counters, so the next
+// insert draws from 1 again (TRUNCATE ... RESTART IDENTITY); without
+// it counters keep counting, as Postgres defaults (CONTINUE IDENTITY).
+func (t *Txn) Truncate(table string, restartIdentity bool) error {
+	desc, err := t.desc(table)
+	if err != nil {
+		return err
+	}
+	// One prefix covers primary rows and every index: the key space is
+	// tuple(tableID, indexID, ...), and this deletes all of tableID.
+	prefix := tableSpace(desc.ID)
+	if _, err := t.tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
+		return serr.Wrap(err, "op", "truncate", "table", table)
+	}
+	if restartIdentity {
+		idPrefix := identitySeqTablePrefix(desc.ID)
+		if _, err := t.tx.DeleteRange(string(idPrefix), string(tuple.PrefixEnd(idPrefix))); err != nil {
+			return serr.Wrap(err, "op", "truncate", "table", table)
+		}
+	}
+	return nil
 }
 
 // Delete removes a row within the transaction (see Engine.Delete).

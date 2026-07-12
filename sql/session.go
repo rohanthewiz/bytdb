@@ -161,6 +161,10 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 	if sv, ok := st.(*SetVar); ok {
 		return s.setVar(sv)
 	}
+	if sv, ok := st.(*ShowVar); ok {
+		// SHOW reads the session's SET state over the defaults.
+		return execShow(sv, s.vars, s.timeout)
+	}
 	if s.tx == nil {
 		return s.db.runCtx(ctx, st, args)
 	}
@@ -379,10 +383,12 @@ func isDDL(st Statement) bool {
 	return false
 }
 
-// isWrite reports whether st writes at all (DML or DDL).
+// isWrite reports whether st writes at all (DML or DDL). TRUNCATE is
+// deliberately DML here — like Postgres, it runs inside transaction
+// blocks (and rolls back with them), unlike bytdb DDL.
 func isWrite(st Statement) bool {
 	switch st.(type) {
-	case *Insert, *Update, *Delete:
+	case *Insert, *Update, *Delete, *Truncate:
 		return true
 	}
 	return isDDL(st)

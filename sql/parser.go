@@ -180,6 +180,10 @@ func (p *parser) statement() (Statement, error) {
 			return p.alterSequence()
 		}
 		return p.alterTable()
+	case p.acceptKw("truncate"):
+		return p.truncateStmt()
+	case p.acceptKw("show"):
+		return p.showStmt()
 	case p.acceptKw("insert"):
 		return p.insert()
 	case p.acceptKw("select"):
@@ -385,6 +389,69 @@ func (p *parser) explainOptBool() bool {
 	return true
 }
 
+// truncateStmt parses TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY
+// | CONTINUE IDENTITY] [RESTRICT]; "truncate" is consumed. CASCADE is
+// rejected — there are no foreign-key cascades to follow, and
+// accepting the keyword would promise them.
+func (p *parser) truncateStmt() (Statement, error) {
+	p.acceptKw("table")
+	t := &Truncate{}
+	for {
+		name, err := p.tableName()
+		if err != nil {
+			return nil, err
+		}
+		t.Tables = append(t.Tables, name)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	switch {
+	case p.acceptKw("restart"):
+		if err := p.expectKw("identity"); err != nil {
+			return nil, err
+		}
+		t.RestartIdentity = true
+	case p.acceptKw("continue"): // the default, spelled out
+		if err := p.expectKw("identity"); err != nil {
+			return nil, err
+		}
+	}
+	if p.acceptKw("cascade") {
+		return nil, serr.New("TRUNCATE ... CASCADE is not supported")
+	}
+	p.acceptKw("restrict") // the default
+	return t, nil
+}
+
+// showStmt parses SHOW name | SHOW ALL, plus the two multi-word
+// parameters clients actually send: SHOW TIME ZONE and SHOW
+// TRANSACTION ISOLATION LEVEL (JDBC probes the latter on connect).
+func (p *parser) showStmt() (Statement, error) {
+	switch {
+	case p.acceptKw("all"):
+		return &ShowVar{Name: "all"}, nil
+	case p.acceptKw("time"):
+		if err := p.expectKw("zone"); err != nil {
+			return nil, err
+		}
+		return &ShowVar{Name: "timezone"}, nil
+	case p.acceptKw("transaction"):
+		if err := p.expectKw("isolation"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("level"); err != nil {
+			return nil, err
+		}
+		return &ShowVar{Name: "transaction_isolation"}, nil
+	}
+	name, err := p.ident("a configuration parameter")
+	if err != nil {
+		return nil, err
+	}
+	return &ShowVar{Name: strings.ToLower(name)}, nil
+}
+
 // txnModes parses BEGIN's transaction modes, in any order with
 // optional commas: ISOLATION LEVEL ... (accepted and ignored — every
 // engine transaction is serializable), READ ONLY / READ WRITE, and
@@ -495,6 +562,15 @@ func (p *parser) createTable() (Statement, error) {
 			if ct.PK, err = p.identList("a primary key column"); err != nil {
 				return nil, err
 			}
+		case p.acceptKw("unique"):
+			// UNIQUE (a, b): sugar for a unique index over the columns.
+			// A CONSTRAINT name, like the primary key's, is accepted and
+			// dropped — the index gets the conventional table_cols_key name.
+			cols, err := p.identList("a unique column")
+			if err != nil {
+				return nil, err
+			}
+			ct.Uniques = append(ct.Uniques, cols)
 		case p.acceptKw("check"):
 			ex, text, err := p.checkExpr()
 			if err != nil {
@@ -502,7 +578,7 @@ func (p *parser) createTable() (Statement, error) {
 			}
 			ct.Checks = append(ct.Checks, CheckDef{Name: cname, Ex: ex, Text: text})
 		case named:
-			return nil, p.unexpected("PRIMARY KEY or CHECK after CONSTRAINT name")
+			return nil, p.unexpected("PRIMARY KEY, UNIQUE, or CHECK after CONSTRAINT name")
 		default:
 			col, inlinePK, checks, err := p.colDef()
 			if err != nil {
@@ -513,6 +589,9 @@ func (p *parser) createTable() (Statement, error) {
 					return nil, serr.New("multiple primary keys", "table", name)
 				}
 				ct.PK = []string{col.Name}
+			}
+			if col.Unique {
+				ct.Uniques = append(ct.Uniques, []string{col.Name})
 			}
 			ct.Cols = append(ct.Cols, col)
 			ct.Checks = append(ct.Checks, checks...)
@@ -548,7 +627,7 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 		p.advance()
 		col.Type, col.Identity, col.NotNull = bytdb.TInt, true, true
 	default:
-		if col.Type, err = p.typeName(); err != nil {
+		if col.Type, col.MaxLen, err = p.typeName(); err != nil {
 			return fail(err)
 		}
 	}
@@ -630,8 +709,10 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 				col.Default, col.HasDefault = v, true
 			}
 		case p.acceptKw("unique"):
-			return fail(serr.New("UNIQUE column constraints are not supported; use CREATE UNIQUE INDEX",
-				"column", name))
+			// Sugar for a single-column unique index (a CONSTRAINT name,
+			// as with PRIMARY KEY, is accepted and dropped — the index
+			// gets the conventional table_col_key name).
+			col.Unique = true
 		case p.acceptKw("references"):
 			return fail(serr.New("REFERENCES is not supported", "column", name))
 		case named:
@@ -728,39 +809,69 @@ var serialTypes = map[string]bool{
 }
 
 // typeName parses a column type, accepting common Postgres aliases.
-func (p *parser) typeName() (bytdb.ColType, error) {
+// maxLen is a VARCHAR(n) limit (0: none), enforced on writes; it was
+// formerly parsed and dropped, which silently accepted schemas whose
+// declared limits meant nothing.
+func (p *parser) typeName() (typ bytdb.ColType, maxLen int, err error) {
 	t := p.cur()
 	if t.kind != tIdent {
-		return "", p.unexpected("a column type")
+		return "", 0, p.unexpected("a column type")
 	}
 	p.advance()
 	switch t.text {
 	case "int", "integer", "bigint", "int8", "int4", "int2", "smallint":
-		return bytdb.TInt, nil
+		return bytdb.TInt, 0, nil
 	case "float", "float4", "float8", "real":
-		return bytdb.TFloat, nil
+		return bytdb.TFloat, 0, nil
 	case "double":
 		p.acceptKw("precision")
-		return bytdb.TFloat, nil
+		return bytdb.TFloat, 0, nil
 	case "text", "string":
-		return bytdb.TString, nil
-	case "varchar":
-		if p.acceptOp("(") {
-			if p.cur().kind != tNumber {
-				return "", p.unexpected("a length")
-			}
-			p.advance()
-			if err := p.expectOp(")"); err != nil {
-				return "", err
-			}
+		return bytdb.TString, 0, nil
+	case "character":
+		// CHARACTER VARYING(n) is varchar; blank-padded CHAR(n) is not
+		// supported (padding on read would need its own type).
+		if !p.acceptKw("varying") {
+			return "", 0, serr.New("char(n) is not supported; use varchar(n) or text",
+				"pos", fmt.Sprint(t.pos))
 		}
-		return bytdb.TString, nil
+		fallthrough
+	case "varchar":
+		if maxLen, err = p.typeLength(); err != nil {
+			return "", 0, err
+		}
+		return bytdb.TString, maxLen, nil
+	case "char":
+		return "", 0, serr.New("char(n) is not supported; use varchar(n) or text",
+			"pos", fmt.Sprint(t.pos))
 	case "bool", "boolean":
-		return bytdb.TBool, nil
+		return bytdb.TBool, 0, nil
 	case "bytea", "bytes":
-		return bytdb.TBytes, nil
+		return bytdb.TBytes, 0, nil
 	}
-	return "", serr.New("unknown column type", "type", t.text, "pos", fmt.Sprint(t.pos))
+	return "", 0, serr.New("unknown column type", "type", t.text, "pos", fmt.Sprint(t.pos))
+}
+
+// typeLength parses an optional "(n)" type modifier; n must be a
+// positive integer (varchar(0) admits nothing, as Postgres also
+// rejects). Absent modifier reads as 0: unbounded.
+func (p *parser) typeLength() (int, error) {
+	if !p.acceptOp("(") {
+		return 0, nil
+	}
+	t := p.cur()
+	if t.kind != tNumber {
+		return 0, p.unexpected("a length")
+	}
+	n, err := strconv.Atoi(t.text)
+	if err != nil || n < 1 {
+		return 0, serr.New("length for type varchar must be at least 1", "got", t.text)
+	}
+	p.advance()
+	if err := p.expectOp(")"); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // identList parses "( ident [, ident]* )".

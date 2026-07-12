@@ -602,7 +602,8 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("table_name", bytdb.TString), sysCol("column_name", bytdb.TString),
 			sysCol("ordinal_position", bytdb.TInt), sysCol("column_default", bytdb.TString),
 			sysCol("is_nullable", bytdb.TString), sysCol("data_type", bytdb.TString),
-			sysCol("udt_name", bytdb.TString)),
+			sysCol("udt_name", bytdb.TString),
+			sysCol("character_maximum_length", bytdb.TInt)),
 		rows: func(d *DB) [][]any {
 			var rows [][]any
 			for _, desc := range d.userDescs() {
@@ -624,9 +625,16 @@ var sysTables = map[string]*sysTableDef{
 					} else if c.Default != "" {
 						dflt = c.Default
 					}
+					// A declared VARCHAR(n) limit reports as
+					// character_maximum_length; unbounded types report NULL.
+					var maxLen any
+					if c.MaxLen > 0 {
+						maxLen = int64(c.MaxLen)
+					}
 					rows = append(rows, []any{
 						sysDatabase, "public", desc.Name, c.Name,
 						int64(i + 1), dflt, nullable, sqlTypeName(c.Type), udtName(c.Type),
+						maxLen,
 					})
 				}
 			}
@@ -643,7 +651,7 @@ const sysDatabase = "bytdb"
 // to its constant at parse time (an optional pg_catalog. qualifier is
 // accepted).
 var sysFuncs = map[string]string{
-	"version":          "PostgreSQL 16.0 (bytdb)",
+	"version":          "PostgreSQL " + ServerVersion,
 	"current_database": sysDatabase,
 	"current_schema":   "public",
 	"current_user":     sysDatabase,

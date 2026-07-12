@@ -1365,6 +1365,31 @@ func dedupRows(rows [][]any) ([][]any, error) {
 	return out, nil
 }
 
+// execTruncate deletes every row of each named table — one atomic
+// write transaction for the whole statement, so a failure on the
+// third table leaves the first two intact.
+func (d *DB) execTruncate(s *Truncate) (*Result, error) {
+	for _, t := range s.Tables {
+		// run()'s single-target guard can't cover a table list, so the
+		// system-catalog check runs here, per table.
+		if err := sysWriteGuard(t); err != nil {
+			return nil, err
+		}
+	}
+	err := d.write(func(tx *bytdb.Txn) error {
+		for _, t := range s.Tables {
+			if err := tx.Truncate(t, s.RestartIdentity); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Result{}, nil
+}
+
 func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 	table := s.Table
 	if table == "" {

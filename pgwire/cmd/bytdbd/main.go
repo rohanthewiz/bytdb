@@ -26,7 +26,9 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/pgwire"
 	"github.com/rohanthewiz/bytdb/sql"
@@ -43,6 +45,12 @@ func main() {
 	requireTLS := flag.Bool("require-tls", false, "refuse connections that do not upgrade to TLS")
 	authFile := flag.String("auth-file", "",
 		"SCRAM credentials, one user:password or user:SCRAM-SHA-256$... per line (absent = trust any client)")
+	syncMode := flag.String("sync", "always",
+		"WAL fsync policy: always (durable through power loss) or never (faster; the OS decides when to flush)")
+	maxConns := flag.Int("max-conns", 0,
+		"maximum concurrent client connections (0 = unlimited); excess clients get FATAL 53300")
+	logQueries := flag.Bool("log-queries", false,
+		"log every executed statement with its duration and outcome to stderr")
 	flag.Parse()
 	if *dbPath == "" {
 		log.Fatal("bytdbd: -db is required")
@@ -63,8 +71,16 @@ func main() {
 			log.Fatalf("bytdbd: %s", serr.StringFromErr(err))
 		}
 	}
+	var engineOpts []btypedb.Option
+	switch *syncMode {
+	case "always": // the default policy needs no option
+	case "never":
+		engineOpts = append(engineOpts, bytdb.WithSyncNever())
+	default:
+		log.Fatalf("bytdbd: -sync must be always or never (got %q)", *syncMode)
+	}
 
-	e, err := bytdb.Open(*dbPath)
+	e, err := bytdb.Open(*dbPath, engineOpts...)
 	if err != nil {
 		log.Fatalf("bytdbd: %s", bytdb.ErrText(err))
 	}
@@ -77,6 +93,18 @@ func main() {
 	srv.TLSConfig = tlsConfig
 	srv.RequireTLS = *requireTLS
 	srv.Auth = creds
+	srv.MaxConns = *maxConns
+	if *logQueries {
+		// log (not fmt) so entries interleave atomically across
+		// connection goroutines and carry timestamps.
+		srv.QueryLog = func(q string, d time.Duration, err error) {
+			outcome := "ok"
+			if err != nil {
+				outcome = "error: " + err.Error()
+			}
+			log.Printf("query (%s) %s [%s]", d.Round(time.Microsecond), q, outcome)
+		}
+	}
 
 	// A signal must not kill the process outright: under a relaxed
 	// sync policy the engine buffers acknowledged writes, and only

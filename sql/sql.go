@@ -28,6 +28,9 @@
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
 //	UPDATE t SET c = v, ... [WHERE ...] [RETURNING ...]
 //	DELETE FROM t [WHERE ...] [RETURNING ...]
+//	TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
+//	SET [SESSION|LOCAL] name {=|TO} value | RESET name | RESET ALL
+//	SHOW name | SHOW ALL
 //	BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
 //	SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 //
@@ -101,7 +104,11 @@
 // escapes, "quoted" identifiers, unquoted identifiers folded to
 // lowercase, -- and /* */ comments, and type aliases (int, integer,
 // bigint, int8...; float, float8, real, double precision; text,
-// varchar[(n)], string; bool, boolean; bytea, bytes). As in Postgres,
+// varchar[(n)], character varying[(n)], string; bool, boolean; bytea,
+// bytes). A varchar(n) limit is enforced on every insert and update —
+// overflow errors with Postgres's wording (22001 over the wire), and
+// overflow that is entirely spaces truncates silently, per the SQL
+// standard. As in Postgres,
 // a quoted literal is untyped until context types it: '2' compares,
 // inserts, and assigns as an integer against an int column (and
 // likewise for float, bool, and bytea columns), erroring when the
@@ -144,8 +151,20 @@
 // satisfies it — in the transaction that publishes it, so no write
 // slips in between — and ALTER TABLE DROP CONSTRAINT removes one by
 // name (checks only: the primary key is structural, and unique
-// constraints are indexes here). UNIQUE column constraints and
-// REFERENCES are rejected at parse.
+// constraints are indexes here). A UNIQUE constraint — on a column or
+// table-level over a column list — is sugar for CREATE UNIQUE INDEX,
+// creating an index named t_cols_key that DROP INDEX removes.
+// REFERENCES is rejected at parse.
+//
+// TRUNCATE empties one or more tables (rows and index entries) in a
+// single atomic statement without touching the schema; it is DML —
+// unlike bytdb DDL it runs inside transaction blocks and rolls back
+// with them. RESTART IDENTITY resets the tables' identity counters;
+// CASCADE is rejected. SHOW reads configuration parameters: a
+// Session's SET values overlay built-in defaults (server_version,
+// timezone, transaction_isolation, ...), SHOW ALL lists them, and the
+// multi-word forms clients probe (SHOW TIME ZONE, SHOW TRANSACTION
+// ISOLATION LEVEL) parse.
 //
 // A column may declare DEFAULT <constant> — a literal of the column's
 // type (quoted literals adapt), stored as text in the descriptor. A
@@ -262,6 +281,7 @@ package sql
 
 import (
 	"context"
+	"strings"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
@@ -401,7 +421,8 @@ func (s *Stmt) ExecCtx(ctx context.Context, args ...any) (*Result, error) {
 // adapts, Postgres-style) and rendering it to the literal text the
 // descriptor stores.
 func toEngineColumn(c ColDef) (bytdb.Column, error) {
-	col := bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Identity: c.Identity}
+	col := bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull,
+		Identity: c.Identity, MaxLen: c.MaxLen}
 	if c.HasDefault {
 		cv, err := coerceLit(c.Default, c.Type)
 		if err != nil {
@@ -442,6 +463,21 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		if _, err := d.e.CreateTableWithChecks(s.Table, cols, checks, s.PK...); err != nil {
 			return nil, err
 		}
+		// UNIQUE constraints lower to unique indexes, created right after
+		// the table. Engine DDL is one transaction per change, so a failed
+		// index (a bad column name, a duplicate) un-creates the table to
+		// keep CREATE TABLE all-or-nothing from the caller's view.
+		for _, ucols := range s.Uniques {
+			keys := make([]bytdb.IndexCol, len(ucols))
+			for i, c := range ucols {
+				keys[i] = bytdb.IndexCol{Name: c}
+			}
+			idxName := s.Table + "_" + strings.Join(ucols, "_") + "_key"
+			if _, err := d.e.CreateIndexCols(s.Table, idxName, true, keys); err != nil {
+				d.e.DropTable(s.Table) // best-effort unwind; the create error matters more
+				return nil, err
+			}
+		}
 		return &Result{}, nil
 	case *DropTable:
 		if err := d.e.DropTable(s.Table); err != nil {
@@ -480,6 +516,11 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		return &Result{}, nil
 	case *DropIndex:
 		return d.execDropIndex(s)
+	case *Truncate:
+		return d.execTruncate(s)
+	case *ShowVar:
+		// A bare DB has no SET state; SHOW reports the defaults.
+		return execShow(s, nil, 0)
 	case *CreateSequence:
 		return d.execCreateSequence(s)
 	case *DropSequence:
