@@ -105,7 +105,16 @@
 // lowercase, -- and /* */ comments, and type aliases (int, integer,
 // bigint, int8...; float, float8, real, double precision; text,
 // varchar[(n)], character varying[(n)], string; bool, boolean; bytea,
-// bytes). A varchar(n) limit is enforced on every insert and update —
+// bytes; timestamp[tz] [with|without time zone], date, uuid). The
+// date/time types store UTC instants — timestamps as int64
+// microseconds and dates as days since the Unix epoch (that is what
+// embedded queries return) — parse the ISO text forms as literals,
+// order chronologically in keys and indexes, and present as
+// timestamptz/date over the wire; now(), CURRENT_TIMESTAMP,
+// current_date, and gen_random_uuid() evaluate per call (now() is
+// not transaction-frozen as in Postgres). UUIDs are 16-byte values
+// written as the usual dashed hex. A varchar(n) limit is enforced on
+// every insert and update —
 // overflow errors with Postgres's wording (22001 over the wire), and
 // overflow that is entirely spaces truncates silently, per the SQL
 // standard. As in Postgres,
@@ -172,10 +181,9 @@
 // DEFAULT keyword works as a VALUES entry, and INSERT ... DEFAULT
 // VALUES inserts a whole row of them; an explicit NULL still inserts
 // NULL (DEFAULT NULL declares the absence of a default, as it does in
-// Postgres). Only constants are accepted: bytdb has no date/time
-// types, so now() and CURRENT_TIMESTAMP are rejected with a pointer
-// to epoch integers, and other expressions are rejected because a
-// default is applied, not evaluated. information_schema.columns
+// Postgres). Only constants are accepted: a default is applied, not
+// evaluated, so now() and CURRENT_TIMESTAMP are rejected with a
+// pointer to calling now() in the INSERT. information_schema.columns
 // reports the stored text in column_default. ALTER TABLE ADD COLUMN
 // with a DEFAULT is allowed only while the table is empty — Postgres
 // backfills existing rows; this engine leaves rows untouched, and the

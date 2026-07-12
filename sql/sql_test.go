@@ -223,7 +223,7 @@ func TestSQLCheckValidation(t *testing.T) {
 		{`create table t (a int primary key check ($1 > 0))`,
 			"placeholders are not allowed in check constraints"},
 		{`create table t (a int primary key default now())`,
-			"no date/time types"},
+			"defaults are constants"},
 		{`create table t (a int primary key,
 			constraint c check (a > 0), constraint c check (a < 9))`,
 			"duplicate constraint name"},

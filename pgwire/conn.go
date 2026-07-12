@@ -441,7 +441,7 @@ func (c *conn) simpleQuery(q string) {
 		}
 		if len(res.Cols) > 0 {
 			c.sendRowDescription(res.Cols, res.Types, nil)
-			if !c.sendDataRows(res.Rows, nil) {
+			if !c.sendDataRows(res.Rows, nil, res.Types) {
 				break
 			}
 		}
@@ -606,7 +606,7 @@ func (c *conn) execute(r *rbuf) {
 	if res.Notice != "" {
 		c.sendNotice(res.Notice)
 	}
-	if len(res.Cols) > 0 && !c.sendDataRows(res.Rows, pt.formats) {
+	if len(res.Cols) > 0 && !c.sendDataRows(res.Rows, pt.formats, res.Types) {
 		return
 	}
 	c.sendCommandComplete(pt.prep.info.Command, res)
@@ -690,8 +690,11 @@ func (c *conn) sendRowDescription(cols []string, types []bytdb.ColType, formats 
 }
 
 // sendDataRows sends one DataRow per result row; false on an encoding
-// failure (already reported).
-func (c *conn) sendDataRows(rows [][]any, formats []int) bool {
+// failure (already reported). types are the declared column types —
+// the date/time and uuid types share runtime representations with the
+// integer and byte kinds, so encoding must be driven by declaration,
+// not representation.
+func (c *conn) sendDataRows(rows [][]any, formats []int, types []bytdb.ColType) bool {
 	for _, row := range rows {
 		var b wbuf
 		b.int16(len(row))
@@ -700,7 +703,11 @@ func (c *conn) sendDataRows(rows [][]any, formats []int) bool {
 				b.int32(-1)
 				continue
 			}
-			enc, err := encodeValue(v, formatFor(formats, i))
+			var t bytdb.ColType
+			if i < len(types) {
+				t = types[i]
+			}
+			enc, err := encodeValue(v, formatFor(formats, i), t)
 			if err != nil {
 				c.sendError(err, "", 0)
 				return false

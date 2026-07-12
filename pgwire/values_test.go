@@ -20,7 +20,7 @@ func TestValueRoundTrip(t *testing.T) {
 	}
 	for _, c := range cases {
 		for _, format := range []int{fmtText, fmtBinary} {
-			enc, err := encodeValue(c.v, format)
+			enc, err := encodeValue(c.v, format, "")
 			if err != nil {
 				t.Fatalf("encode(%v, %d): %v", c.v, format, err)
 			}

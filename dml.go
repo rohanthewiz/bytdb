@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 	"slices"
+	"time"
 
 	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/bytdb/tuple"
@@ -579,6 +580,43 @@ func coerce(v any, t ColType) (any, error) {
 	case TBytes:
 		if b, ok := v.([]byte); ok {
 			return b, nil
+		}
+	case TTimestamp:
+		// int64 is the canonical form (micros since the Unix epoch);
+		// time.Time is accepted so embedded Go callers and wire drivers
+		// can bind naturally, and text parses for the SQL literal path.
+		switch x := v.(type) {
+		case int64:
+			return x, nil
+		case time.Time:
+			return x.UnixMicro(), nil
+		case string:
+			return ParseTimestamp(x)
+		}
+	case TDate:
+		switch x := v.(type) {
+		case int64:
+			return x, nil
+		case time.Time:
+			u := x.UTC()
+			// Truncate to the UTC day; floor for pre-1970 instants, where
+			// plain division would round toward the epoch.
+			day := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).Unix() / 86400
+			return day, nil
+		case string:
+			return ParseDate(x)
+		}
+	case TUUID:
+		switch x := v.(type) {
+		case []byte:
+			if len(x) == 16 {
+				return x, nil
+			}
+			return nil, serr.New("uuid value must be 16 bytes", "got", fmt.Sprint(len(x)))
+		case [16]byte:
+			return x[:], nil
+		case string:
+			return ParseUUID(x)
 		}
 	}
 	return nil, serr.New("value does not fit column type",

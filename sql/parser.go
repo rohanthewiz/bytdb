@@ -723,18 +723,19 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 	}
 }
 
-// defaultLiteral parses a column DEFAULT, constants only: bytdb has
-// no date/time types, so the defaults people most want (now(),
-// CURRENT_TIMESTAMP) have nothing to evaluate to, and accepting any
-// expression would imply re-evaluation per insert. Postgres-legal
-// non-constants are named in the rejection so the fix is obvious.
+// defaultLiteral parses a column DEFAULT, constants only: a default
+// is applied, not evaluated, so accepting now() or any expression
+// would imply re-evaluation per insert, which this engine does not
+// do. Postgres-legal non-constants are named in the rejection so the
+// fix (call now() in the INSERT) is obvious.
 func (p *parser) defaultLiteral(col string) (any, error) {
 	if t := p.cur(); t.kind == tIdent {
 		switch t.text {
 		case "now", "current_timestamp", "current_date", "current_time", "localtimestamp":
 			return nil, serr.New(
-				"DEFAULT "+t.text+" is not supported: bytdb has no date/time types; "+
-					"store epoch integers and set them in the application", "column", col)
+				"DEFAULT "+t.text+" is not supported: defaults are constants, applied "+
+					"rather than evaluated; call now() in the INSERT (or use RETURNING)",
+				"column", col)
 		}
 	}
 	if p.cur().kind == tParam {
@@ -848,6 +849,36 @@ func (p *parser) typeName() (typ bytdb.ColType, maxLen int, err error) {
 		return bytdb.TBool, 0, nil
 	case "bytea", "bytes":
 		return bytdb.TBytes, 0, nil
+	case "timestamp", "timestamptz":
+		// An optional (p) precision parses and is ignored — storage is
+		// always microseconds, Postgres's own maximum precision.
+		if p.acceptOp("(") {
+			if p.cur().kind != tNumber {
+				return "", 0, p.unexpected("a precision")
+			}
+			p.advance()
+			if err := p.expectOp(")"); err != nil {
+				return "", 0, err
+			}
+		}
+		// TIMESTAMP [WITH | WITHOUT TIME ZONE]: both store UTC instants
+		// here, so the distinction parses and folds away.
+		if p.acceptKw("with") || p.acceptKw("without") {
+			if err := p.expectKw("time"); err != nil {
+				return "", 0, err
+			}
+			if err := p.expectKw("zone"); err != nil {
+				return "", 0, err
+			}
+		}
+		return bytdb.TTimestamp, 0, nil
+	case "date":
+		return bytdb.TDate, 0, nil
+	case "uuid":
+		return bytdb.TUUID, 0, nil
+	case "time":
+		return "", 0, serr.New("the time-of-day type is not supported; use timestamp",
+			"pos", fmt.Sprint(t.pos))
 	}
 	return "", 0, serr.New("unknown column type", "type", t.text, "pos", fmt.Sprint(t.pos))
 }
@@ -2435,6 +2466,19 @@ func (p *parser) exprPrimary() (Expr, error) {
 	if t.kind == tIdent && t.text == "case" {
 		p.advance()
 		return p.caseExpr()
+	}
+	// The parenthesis-free SQL date/time keywords, lowered to their
+	// function forms (now() and current_date) before the column-ref
+	// fallback would misread them as column names.
+	if t.kind == tIdent && !p.peekOp("(") {
+		switch t.text {
+		case "current_timestamp", "localtimestamp":
+			p.advance()
+			return &ExFunc{Name: "now"}, nil
+		case "current_date":
+			p.advance()
+			return &ExFunc{Name: "current_date"}, nil
+		}
 	}
 	if t.kind == tIdent && t.text == "array" && p.peekOp("[") {
 		p.advance() // array

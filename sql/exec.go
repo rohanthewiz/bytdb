@@ -8,6 +8,7 @@ import (
 	"iter"
 	"math"
 	"slices"
+	"time"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/tuple"
@@ -244,6 +245,15 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 			return triTrue, nil
 		}
 		return triFalse, nil
+	}
+	// A bound time.Time compares as timestamp micros — the dynamic
+	// mirror of coerceLit's conversion, for placeholders that end up in
+	// expression leaves the static pass never types.
+	if tv, ok := lit.(time.Time); ok {
+		lit = tv.UnixMicro()
+	}
+	if tv, ok := v.(time.Time); ok {
+		v = tv.UnixMicro()
 	}
 	if v != nil && lit != nil {
 		if _, ok := compareVals(v, lit); !ok {

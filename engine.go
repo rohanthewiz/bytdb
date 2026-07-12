@@ -53,6 +53,12 @@ const (
 	TFloat  ColType = "float" // float64
 	TString ColType = "string"
 	TBytes  ColType = "bytes"
+	// The date/time and UUID types ride on integer and byte runtime
+	// representations (see types.go), so keys and index entries order
+	// chronologically / bytewise with no new tuple encoding.
+	TTimestamp ColType = "timestamp" // int64: microseconds since the Unix epoch, UTC
+	TDate      ColType = "date"      // int64: days since the Unix epoch
+	TUUID      ColType = "uuid"      // []byte: 16 bytes, RFC 4122 order
 )
 
 // Column describes one table column. ID is assigned by the engine

@@ -10,6 +10,7 @@ package sql
 // bytdb implementing every function they mention.
 
 import (
+	crand "crypto/rand"
 	"fmt"
 	"math"
 	"regexp"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/tuple"
@@ -752,6 +754,35 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 		case string:
 			return coerceLit(x, bytdb.TFloat)
 		}
+	case "timestamp", "timestamptz":
+		switch x := v.(type) {
+		case nil:
+			return nil, nil
+		case int64: // already micros-since-epoch
+			return x, nil
+		case string:
+			return bytdb.ParseTimestamp(x)
+		}
+	case "date":
+		switch x := v.(type) {
+		case nil:
+			return nil, nil
+		case int64: // already days-since-epoch
+			return x, nil
+		case string:
+			return bytdb.ParseDate(x)
+		}
+	case "uuid":
+		switch x := v.(type) {
+		case nil:
+			return nil, nil
+		case []byte:
+			if len(x) == 16 {
+				return x, nil
+			}
+		case string:
+			return bytdb.ParseUUID(x)
+		}
 	}
 	return nil, serr.New("unsupported cast", "type", typ)
 }
@@ -769,6 +800,23 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 		return nil
 	}
 	switch name {
+	case "now", "transaction_timestamp", "statement_timestamp", "clock_timestamp":
+		// All four report the evaluation instant. Postgres freezes now()
+		// per transaction; bytdb evaluates per call — documented, and
+		// close enough for the dominant insert-a-timestamp use.
+		return time.Now().UnixMicro(), nil
+	case "current_date":
+		u := time.Now().UTC()
+		return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).Unix() / 86400, nil
+	case "gen_random_uuid":
+		// A version-4 random UUID, as pgcrypto/Postgres 13+ define it.
+		var b [16]byte
+		if _, err := crand.Read(b[:]); err != nil {
+			return nil, serr.Wrap(err, "op", "gen_random_uuid")
+		}
+		b[6] = (b[6] & 0x0f) | 0x40 // version 4
+		b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+		return b[:], nil
 	case "coalesce":
 		for _, a := range args {
 			if a != nil {
@@ -1416,6 +1464,12 @@ var funcTypes = map[string]bytdb.ColType{
 	"currval":                    bytdb.TInt,
 	"nextval":                    bytdb.TInt,
 	"setval":                     bytdb.TInt,
+	"now":                        bytdb.TTimestamp,
+	"transaction_timestamp":      bytdb.TTimestamp,
+	"statement_timestamp":        bytdb.TTimestamp,
+	"clock_timestamp":            bytdb.TTimestamp,
+	"current_date":               bytdb.TDate,
+	"gen_random_uuid":            bytdb.TUUID,
 }
 
 func castColType(typ string) bytdb.ColType {
@@ -1428,6 +1482,12 @@ func castColType(typ string) bytdb.ColType {
 		return bytdb.TBool
 	case "float4", "float8", "real", "numeric", "decimal":
 		return bytdb.TFloat
+	case "timestamp", "timestamptz":
+		return bytdb.TTimestamp
+	case "date":
+		return bytdb.TDate
+	case "uuid":
+		return bytdb.TUUID
 	}
 	return bytdb.TString
 }

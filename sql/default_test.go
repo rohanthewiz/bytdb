@@ -117,9 +117,9 @@ func TestDefaultRejections(t *testing.T) {
 	d := openDB(t)
 	for _, tc := range []struct{ q, want string }{
 		{`create table t (id int primary key, ts int default now())`,
-			"no date/time types"},
+			"defaults are constants"},
 		{`create table t (id int primary key, ts int default current_timestamp)`,
-			"no date/time types"},
+			"defaults are constants"},
 		{`create table t (id int primary key, n int default 1 + 2)`,
 			""}, // trailing tokens: a parse error is enough
 		{`create table t (id int primary key, n int default upper('x'))`,

@@ -163,6 +163,12 @@ func typeOID(t bytdb.ColType) int64 {
 		return 20
 	case bytdb.TFloat:
 		return 701
+	case bytdb.TTimestamp:
+		return 1184 // timestamptz: stored instants are UTC
+	case bytdb.TDate:
+		return 1082
+	case bytdb.TUUID:
+		return 2950
 	}
 	return 25 // text
 }
@@ -172,8 +178,12 @@ func typeLen(t bytdb.ColType) int64 {
 	switch t {
 	case bytdb.TBool:
 		return 1
-	case bytdb.TInt, bytdb.TFloat:
+	case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp:
 		return 8
+	case bytdb.TDate:
+		return 4
+	case bytdb.TUUID:
+		return 16
 	}
 	return -1
 }
@@ -189,6 +199,12 @@ func sqlTypeName(t bytdb.ColType) string {
 		return "bigint"
 	case bytdb.TFloat:
 		return "double precision"
+	case bytdb.TTimestamp:
+		return "timestamp with time zone"
+	case bytdb.TDate:
+		return "date"
+	case bytdb.TUUID:
+		return "uuid"
 	}
 	return "text"
 }
@@ -205,6 +221,12 @@ func udtName(t bytdb.ColType) string {
 		return "int8"
 	case bytdb.TFloat:
 		return "float8"
+	case bytdb.TTimestamp:
+		return "timestamptz"
+	case bytdb.TDate:
+		return "date"
+	case bytdb.TUUID:
+		return "uuid"
 	}
 	return "text"
 }
@@ -365,6 +387,8 @@ var sysTables = map[string]*sysTableDef{
 				{20, "int8", 8, "N"}, {21, "int2", 2, "N"}, {23, "int4", 4, "N"},
 				{25, "text", -1, "S"}, {26, "oid", 4, "N"}, {700, "float4", 4, "N"},
 				{701, "float8", 8, "N"}, {1043, "varchar", -1, "S"},
+				{1082, "date", 4, "D"}, {1114, "timestamp", 8, "D"},
+				{1184, "timestamptz", 8, "D"}, {2950, "uuid", 16, "U"},
 			} {
 				rows = append(rows, []any{t.oid, t.name, oidPGCatalog, t.len, "b", t.cat, int64(0)})
 			}

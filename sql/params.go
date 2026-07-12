@@ -3,6 +3,7 @@ package sql
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/rohanthewiz/serr"
 )
@@ -408,11 +409,16 @@ func bindExpr(e Expr, sub func(any) any) Expr {
 
 // bindArg normalizes one argument to the value kinds the executor
 // compares and the engine stores: int64, float64, string, bool,
-// []byte, or nil (SQL NULL).
+// []byte, or nil (SQL NULL). A time.Time stays itself — whether it
+// means timestamp micros or date days depends on the column it meets,
+// so the conversion happens where the type is known (coerceLit, the
+// engine's coerce); a [16]byte is a UUID's natural Go shape.
 func bindArg(a any) (any, error) {
 	switch v := a.(type) {
-	case nil, int64, float64, string, bool, []byte:
+	case nil, int64, float64, string, bool, []byte, time.Time:
 		return v, nil
+	case [16]byte:
+		return v[:], nil
 	case int:
 		return int64(v), nil
 	case int8:

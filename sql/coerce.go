@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
@@ -179,7 +180,9 @@ func coerceBool(e BoolExpr, typeOf func(SelectItem) (bytdb.ColType, error)) (Boo
 	case nil:
 		return nil, nil
 	case *Pred:
-		if _, ok := n.Val.(string); !ok {
+		switch n.Val.(type) {
+		case string, time.Time: // the kinds coerceLit adapts by column type
+		default:
 			return n, nil
 		}
 		t, err := typeOf(n.Item)
@@ -231,8 +234,20 @@ func coerceBools(in []BoolExpr, typeOf func(SelectItem) (bytdb.ColType, error)) 
 
 // coerceLit converts a string value to a non-string column type's
 // value kind, per Postgres literal syntax. Non-strings and string
-// columns pass through.
+// columns pass through. A bound time.Time converts here too — only
+// the column type can say whether it means timestamp micros or date
+// days.
 func coerceLit(v any, t bytdb.ColType) (any, error) {
+	if tv, ok := v.(time.Time); ok {
+		switch t {
+		case bytdb.TTimestamp:
+			return tv.UnixMicro(), nil
+		case bytdb.TDate:
+			u := tv.UTC()
+			return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).Unix() / 86400, nil
+		}
+		return v, nil // any other column type: the engine's coercion reports it
+	}
 	s, ok := v.(string)
 	if !ok {
 		return v, nil
@@ -265,6 +280,12 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 			return b, nil
 		}
 		return []byte(s), nil
+	case bytdb.TTimestamp:
+		return bytdb.ParseTimestamp(s)
+	case bytdb.TDate:
+		return bytdb.ParseDate(s)
+	case bytdb.TUUID:
+		return bytdb.ParseUUID(s)
 	}
 	return s, nil
 }
