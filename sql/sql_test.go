@@ -316,7 +316,7 @@ func TestSQLAddDropConstraint(t *testing.T) {
 	for q, want := range map[string]string{
 		`alter table items add primary key (id)`:                    "ADD PRIMARY KEY is not supported",
 		`alter table items add constraint u unique (price)`:         "ADD UNIQUE is not supported",
-		`alter table items add foreign key (id) references o (id)`:  "foreign keys are not supported",
+		`alter table items add foreign key (id) references o (id)`:  "no such table",
 		`alter table nosuch add check (a > 0)`:                      "no such table",
 		`alter table nosuch drop constraint c`:                      "no such table",
 		`alter table items add constraint x check ((select 1) = 1)`: "cannot use subquery in check constraint",

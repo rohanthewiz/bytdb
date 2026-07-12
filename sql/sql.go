@@ -159,11 +159,28 @@
 // a check on an existing table after verifying every existing row
 // satisfies it — in the transaction that publishes it, so no write
 // slips in between — and ALTER TABLE DROP CONSTRAINT removes one by
-// name (checks only: the primary key is structural, and unique
-// constraints are indexes here). A UNIQUE constraint — on a column or
-// table-level over a column list — is sugar for CREATE UNIQUE INDEX,
-// creating an index named t_cols_key that DROP INDEX removes.
-// REFERENCES is rejected at parse.
+// name (checks and foreign keys: the primary key is structural, and
+// unique constraints are indexes here). A UNIQUE constraint — on a
+// column or table-level over a column list — is sugar for CREATE
+// UNIQUE INDEX, creating an index named t_cols_key that DROP INDEX
+// removes.
+//
+// Foreign keys: column-level REFERENCES parent [(col)] and
+// table-level [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent
+// [(cols)], plus ALTER TABLE ADD the same (existing rows validated in
+// the publishing transaction) and DROP CONSTRAINT. The referenced
+// columns must be the parent's primary key (the default when the list
+// is omitted) or a unique index's columns. Semantics are MATCH SIMPLE
+// with NO ACTION/RESTRICT only — CASCADE and SET NULL/DEFAULT are
+// rejected at parse: a child INSERT/UPDATE requires the referenced
+// parent row to exist (any NULL FK column satisfies the constraint),
+// and a parent DELETE/UPDATE is refused while child rows reference
+// the old key — checked after the statement's writes, so deleting a
+// parent together with its children in one statement is legal.
+// Violations carry Postgres's wording and SQLSTATE 23503. The schema
+// side is guarded too: a referenced table cannot be dropped or
+// truncated alone, and columns or unique indexes a constraint depends
+// on cannot be dropped while it stands.
 //
 // TRUNCATE empties one or more tables (rows and index entries) in a
 // single atomic statement without touching the schema; it is DML —
@@ -468,7 +485,8 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, err := d.e.CreateTableWithChecks(s.Table, cols, checks, s.PK...); err != nil {
+		desc, err := d.e.CreateTableWithChecks(s.Table, cols, checks, s.PK...)
+		if err != nil {
 			return nil, err
 		}
 		// UNIQUE constraints lower to unique indexes, created right after
@@ -485,6 +503,21 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 				d.e.DropTable(s.Table) // best-effort unwind; the create error matters more
 				return nil, err
 			}
+		}
+		// Foreign keys go on last: a same-statement UNIQUE column may be
+		// what a sibling table's reference (or a self-reference) needs.
+		// The table is empty, so no row validation is required.
+		for _, def := range s.FKs {
+			fkd, err := resolveFK(desc, def)
+			if err == nil {
+				err = d.e.AddForeignKey(s.Table, fkd, false)
+			}
+			if err != nil {
+				d.e.DropTable(s.Table) // best-effort unwind, as with unique indexes
+				return nil, err
+			}
+			// Keep later name-collision checks accurate within this loop.
+			desc = d.e.Table(s.Table)
 		}
 		return &Result{}, nil
 	case *DropTable:
@@ -511,6 +544,8 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		return &Result{}, nil
 	case *AddConstraint:
 		return d.execAddConstraint(s)
+	case *AddFK:
+		return d.execAddFK(s)
 	case *DropConstraint:
 		return d.execDropConstraint(s)
 	case *CreateIndex:

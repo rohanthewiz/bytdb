@@ -236,6 +236,14 @@ func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (R
 	return Row{Desc: desc, Vals: newVals}, true, nil
 }
 
+// ReferencingFKs returns every foreign key, on any table in the
+// transaction's catalog view, that references the named table —
+// including the table's references to itself. The SQL layer's
+// DELETE/UPDATE/TRUNCATE enforcement is built on it.
+func (t *Txn) ReferencingFKs(table string) ([]FKRef, error) {
+	return t.e.referencingFKs(t.tx, table, false)
+}
+
 // Truncate removes every row of the table — and its entries in every
 // secondary index — as one range delete over the table's key space,
 // leaving the schema untouched. Unlike a row-at-a-time DELETE, it

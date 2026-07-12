@@ -178,9 +178,10 @@ func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
 	return &Result{}, nil
 }
 
-// execDropConstraint handles ALTER TABLE ... DROP CONSTRAINT. Only
-// CHECK constraints can be dropped: the primary key is structural in
-// bytdb, and unique constraints are indexes (DROP INDEX).
+// execDropConstraint handles ALTER TABLE ... DROP CONSTRAINT for
+// CHECK and FOREIGN KEY constraints (they share a namespace, as in
+// Postgres). The primary key is structural in bytdb, and unique
+// constraints are indexes (DROP INDEX).
 func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	desc := d.e.Table(s.Table)
 	if desc == nil {
@@ -189,6 +190,11 @@ func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	existed, err := d.e.DropCheck(s.Table, s.Name)
 	if err != nil {
 		return nil, err
+	}
+	if !existed {
+		if existed, err = d.e.DropForeignKey(s.Table, s.Name); err != nil {
+			return nil, err
+		}
 	}
 	if !existed {
 		if s.Name == s.Table+"_pkey" {

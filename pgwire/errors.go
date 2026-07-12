@@ -37,6 +37,10 @@ func sqlstate(msg string, hasPos bool) string {
 		strings.Contains(msg, "primary key column may not be NULL"),
 		strings.Contains(msg, "contains null values"):
 		return "23502" // not_null_violation
+	case strings.Contains(msg, "violates foreign key constraint"):
+		return "23503" // foreign_key_violation
+	case strings.Contains(msg, "truncate a table referenced in a foreign key"):
+		return "0A000" // feature_not_supported (Postgres's code for it sans CASCADE)
 	case strings.Contains(msg, "violates check constraint"),
 		strings.Contains(msg, "is violated by some row"):
 		return "23514" // check_violation

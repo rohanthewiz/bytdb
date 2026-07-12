@@ -127,6 +127,25 @@ func (e *Engine) DropIndex(table, name string) error {
 		if idx == nil {
 			return nil, serr.New("no such index", "table", table, "index", name)
 		}
+		// A unique index may be the uniqueness a foreign key depends on;
+		// dropping it would leave "the referenced row" undefined. Refuse
+		// unless another unique key still covers the referenced columns.
+		if idx.Unique {
+			refs, err := e.referencingFKs(tx, table, false)
+			if err != nil {
+				return nil, err
+			}
+			trimmed := old.clone() // clone() copies Indexes, so DeleteFunc is safe
+			trimmed.Indexes = slices.DeleteFunc(trimmed.Indexes,
+				func(x IndexDesc) bool { return x.Name == name })
+			for _, r := range refs {
+				if uniqueKeyCovers(old, r.FK.RefCols) && !uniqueKeyCovers(trimmed, r.FK.RefCols) {
+					return nil, serr.New("cannot drop the unique index a foreign key depends on",
+						"table", table, "index", name,
+						"constraint", r.FK.Name, "referencing_table", r.Child.Name)
+				}
+			}
+		}
 		desc := old.clone()
 		desc.Indexes = slices.DeleteFunc(desc.Indexes, func(x IndexDesc) bool { return x.Name == name })
 		prefix := indexPrefix(desc.ID, idx.ID)

@@ -1035,6 +1035,18 @@ func constraintdef(d *DB, oid int64) any {
 				return "CHECK ((" + ck.Expr + "))"
 			}
 		}
+		for i := range desc.ForeignKeys {
+			if oid != fkOID(desc.ID, i) {
+				continue
+			}
+			fk := &desc.ForeignKeys[i]
+			cols := make([]string, len(fk.Cols))
+			for j, ord := range fk.Cols {
+				cols[j] = desc.Columns[ord].Name
+			}
+			return "FOREIGN KEY (" + strings.Join(cols, ", ") + ") REFERENCES " +
+				fk.RefTable + "(" + strings.Join(fk.RefCols, ", ") + ")"
+		}
 	}
 	return nil
 }

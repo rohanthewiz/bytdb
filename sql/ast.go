@@ -523,6 +523,9 @@ type ColDef struct {
 	// Unique marks a UNIQUE column constraint — sugar the executor
 	// lowers to a single-column unique index named table_col_key.
 	Unique bool
+	// Ref is a column-level REFERENCES constraint (Cols filled with
+	// this column by the CREATE TABLE parser); nil when absent.
+	Ref *FKDef
 	// Default is the column's DEFAULT constant; HasDefault
 	// distinguishes an absent clause (DEFAULT NULL parses as absent —
 	// it declares what a defaultless column already does).
@@ -542,18 +545,30 @@ type CheckDef struct {
 	Text string
 }
 
+// FKDef is one FOREIGN KEY constraint as parsed: the child columns
+// and the referenced table/columns (RefCols nil: the parent's primary
+// key). Only NO ACTION/RESTRICT actions parse — there are no cascades.
+type FKDef struct {
+	Name     string // from CONSTRAINT name; "": named table_col_fkey
+	Cols     []string
+	RefTable string
+	RefCols  []string
+}
+
 // CreateTable is CREATE TABLE t (col type [constraints], ...,
 // [PRIMARY KEY (col, ...)], [[CONSTRAINT name] CHECK (expr)], ...).
 // Uniques collects UNIQUE constraints — column-level and table-level
 // alike — as column lists; the executor lowers each to a unique index
 // (UNIQUE here is sugar over CREATE UNIQUE INDEX, as the pg_constraint
-// synthesis assumes).
+// synthesis assumes). FKs collects FOREIGN KEY constraints, column-
+// level REFERENCES included.
 type CreateTable struct {
 	Table   string
 	Cols    []ColDef
 	PK      []string
 	Checks  []CheckDef
 	Uniques [][]string
+	FKs     []FKDef
 }
 
 // DropTable is DROP TABLE t.
@@ -587,6 +602,14 @@ type DropColumn struct{ Table, Col string }
 type AddConstraint struct {
 	Table string
 	Check CheckDef
+}
+
+// AddFK is ALTER TABLE t ADD [CONSTRAINT name] FOREIGN KEY (cols)
+// REFERENCES parent [(cols)]. Existing rows are validated in the
+// transaction that publishes the constraint.
+type AddFK struct {
+	Table string
+	FK    FKDef
 }
 
 // DropConstraint is ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name.
@@ -853,6 +876,7 @@ func (*ShowVar) stmt()        {}
 func (*AddColumn) stmt()      {}
 func (*DropColumn) stmt()     {}
 func (*AddConstraint) stmt()  {}
+func (*AddFK) stmt()          {}
 func (*DropConstraint) stmt() {}
 func (*CreateIndex) stmt()    {}
 func (*DropIndex) stmt()      {}

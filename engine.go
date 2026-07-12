@@ -101,6 +101,22 @@ type CheckDesc struct {
 	Expr string `json:"expr"`
 }
 
+// FKDesc is one foreign-key constraint, stored on the referencing
+// (child) table: the child columns, by ordinal, that must match a row
+// of RefTable on RefCols. RefCols name the parent's primary key or the
+// columns of one of its unique indexes — the uniqueness is what makes
+// "the referenced row" well-defined. Only NO ACTION/RESTRICT semantics
+// exist (no cascades). Like checks, the engine stores and reports FKs
+// and guards the schema side (you cannot drop a referenced table or an
+// involved column), while row-level enforcement belongs to the SQL
+// layer — engine-API writes alone do not check references.
+type FKDesc struct {
+	Name     string   `json:"name"`
+	Cols     []int    `json:"cols"`
+	RefTable string   `json:"ref_table"`
+	RefCols  []string `json:"ref_cols"`
+}
+
 // descFormatVersion is the version stamped into every descriptor this
 // build writes. Bump it when the persisted layout changes in a way an
 // older reader would misinterpret; Open refuses descriptors from the
@@ -120,6 +136,7 @@ type TableDesc struct {
 	PKCols        []int       `json:"pk_cols"`
 	Indexes       []IndexDesc `json:"indexes,omitempty"`
 	Checks        []CheckDesc `json:"checks,omitempty"`
+	ForeignKeys   []FKDesc    `json:"foreign_keys,omitempty"`
 	NextColID     uint32      `json:"next_col_id"`
 }
 
@@ -170,6 +187,7 @@ func (d *TableDesc) clone() *TableDesc {
 	c.PKCols = slices.Clone(d.PKCols)
 	c.Indexes = slices.Clone(d.Indexes)
 	c.Checks = slices.Clone(d.Checks)
+	c.ForeignKeys = slices.Clone(d.ForeignKeys)
 	return &c
 }
 

@@ -924,6 +924,11 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					if !updated { // DO UPDATE ... WHERE filtered the pair out
 						continue
 					}
+					if len(desc.ForeignKeys) > 0 {
+						if err := d.fkVerifyRow(tx, desc, stored.Vals); err != nil {
+							return err
+						}
+					}
 					affected++
 					if ret != nil {
 						out, err := ret.row(stored.Vals)
@@ -947,6 +952,15 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 			stored, err := tx.InsertReturning(s.Table, vals...)
 			if err != nil {
 				return err
+			}
+			// Foreign keys check the row as stored, after the write: the
+			// transaction discards it on error, and checking post-insert is
+			// what lets a self-referencing row (a node that is its own
+			// parent) go in.
+			if len(desc.ForeignKeys) > 0 {
+				if err := d.fkVerifyRow(tx, desc, stored.Vals); err != nil {
+					return err
+				}
 			}
 			affected++
 			// A NULL in an identity column meant a draw: record it for
@@ -1045,6 +1059,15 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		// Inbound foreign keys: if any other table references this one,
+		// old row images whose referenced columns change must be
+		// re-checked once the statement's writes are in (NO ACTION is an
+		// end-of-statement check, so intra-statement key shuffles work).
+		refs, err := tx.ReferencingFKs(s.Table)
+		if err != nil {
+			return err
+		}
+		var refRecheck [][]any
 		for _, rv := range rows {
 			// SET expressions evaluate against the pre-update row (SET age
 			// = age + 1 reads the old age; Postgres semantics), then coerce
@@ -1099,6 +1122,15 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 				return err
 			}
 			if ok {
+				if len(desc.ForeignKeys) > 0 {
+					// Child side: the row's own references must still exist.
+					if err := d.fkVerifyRow(tx, desc, stored.Vals); err != nil {
+						return err
+					}
+				}
+				if len(refs) > 0 && fkRefColsChanged(desc, refs, rv, stored.Vals) {
+					refRecheck = append(refRecheck, rv)
+				}
 				affected++
 				if ret != nil {
 					out, err := ret.row(stored.Vals)
@@ -1107,6 +1139,11 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 					}
 					res.Rows = append(res.Rows, out)
 				}
+			}
+		}
+		for _, old := range refRecheck {
+			if err := d.fkVerifyReferenced(tx, desc, refs, old); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -1134,12 +1171,20 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		refs, err := tx.ReferencingFKs(s.Table)
+		if err != nil {
+			return err
+		}
 		// RETURNING reports each row as it was before its delete, so the
 		// scan keeps the full rows alongside the keys (they are decoded
-		// already; keeping them costs only the reference).
+		// already; keeping them costs only the reference). Inbound
+		// foreign keys need the old images too: the referenced check
+		// runs after all deletes, so deleting a parent together with its
+		// children (or a self-referencing row) in one statement is legal.
+		keepRows := ret != nil || len(refs) > 0
 		var rows [][]any
 		pks, err := collectPKs(d.ctx, tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc), func(vals []any) {
-			if ret != nil {
+			if keepRows {
 				rows = append(rows, vals)
 			}
 		})
@@ -1159,6 +1204,13 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 						return err
 					}
 					res.Rows = append(res.Rows, out)
+				}
+			}
+		}
+		if len(refs) > 0 {
+			for _, old := range rows {
+				if err := d.fkVerifyReferenced(tx, desc, refs, old); err != nil {
+					return err
 				}
 			}
 		}
@@ -1387,6 +1439,27 @@ func (d *DB) execTruncate(s *Truncate) (*Result, error) {
 		}
 	}
 	err := d.write(func(tx *bytdb.Txn) error {
+		inList := map[string]bool{}
+		for _, t := range s.Tables {
+			inList[t] = true
+		}
+		for _, t := range s.Tables {
+			// A referenced table can only truncate together with every
+			// table referencing it — otherwise child rows would dangle.
+			// Postgres's rule and wording (it demands CASCADE or listing
+			// the children; bytdb has no cascades, so: list them).
+			refs, err := tx.ReferencingFKs(t)
+			if err != nil {
+				return err
+			}
+			for _, r := range refs {
+				if !inList[r.Child.Name] {
+					return serr.New(`cannot truncate a table referenced in a foreign key constraint`,
+						"table", t, "referencing_table", r.Child.Name, "constraint", r.FK.Name,
+						"hint", `TRUNCATE `+t+`, `+r.Child.Name)
+				}
+			}
+		}
 		for _, t := range s.Tables {
 			if err := tx.Truncate(t, s.RestartIdentity); err != nil {
 				return err

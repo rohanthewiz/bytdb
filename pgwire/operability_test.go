@@ -121,3 +121,24 @@ func TestShowAndTruncateWire(t *testing.T) {
 		t.Fatalf("after truncate: %v %d", err, n)
 	}
 }
+
+// TestFKWire: a foreign-key violation surfaces as SQLSTATE 23503 with
+// Postgres's message shape.
+func TestFKWire(t *testing.T) {
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table users (id int primary key)`)
+	mustExec(t, c, `create table orders (id int primary key, user_id int references users)`)
+	mustExec(t, c, `insert into users values (1)`)
+	mustExec(t, c, `insert into orders values (10, 1)`)
+
+	var pgErr *pgconn.PgError
+	if _, err := c.Exec(context.Background(),
+		`insert into orders values (11, 99)`); !errors.As(err, &pgErr) ||
+		pgErr.Code != "23503" || !strings.Contains(pgErr.Message, "violates foreign key constraint") {
+		t.Fatalf("child violation: %+v", err)
+	}
+	if _, err := c.Exec(context.Background(),
+		`delete from users where id = 1`); !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Fatalf("parent violation: %+v", err)
+	}
+}

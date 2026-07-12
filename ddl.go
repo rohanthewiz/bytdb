@@ -122,12 +122,23 @@ func validMaxLen(c Column) error {
 }
 
 // DropTable removes a table — descriptor, rows, and every index —
-// atomically.
+// atomically. A table referenced by another table's foreign key
+// cannot be dropped (drop the referencing constraint or table first);
+// its own foreign keys go with it.
 func (e *Engine) DropTable(name string) error {
 	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.descFromView(tx, name)
 		if err != nil {
 			return err
+		}
+		refs, err := e.referencingFKs(tx, name, true)
+		if err != nil {
+			return err
+		}
+		if len(refs) > 0 {
+			return serr.New(`cannot drop table "`+name+`" because other objects depend on it`,
+				"detail", `constraint "`+refs[0].FK.Name+`" on table "`+refs[0].Child.Name+
+					`" depends on table "`+name+`"`)
 		}
 		prefix := tableSpace(desc.ID)
 		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
@@ -232,6 +243,25 @@ func (e *Engine) DropColumn(table, name string) error {
 			if slices.Contains(old.Indexes[i].Cols, ord) {
 				return nil, serr.New("cannot drop an indexed column; drop the index first",
 					"table", table, "column", name, "index", old.Indexes[i].Name)
+			}
+		}
+		// A column on either side of a foreign key cannot be dropped
+		// while the constraint stands (Postgres requires CASCADE).
+		for i := range old.ForeignKeys {
+			if slices.Contains(old.ForeignKeys[i].Cols, ord) {
+				return nil, serr.New("cannot drop a foreign key column; drop the constraint first",
+					"table", table, "column", name, "constraint", old.ForeignKeys[i].Name)
+			}
+		}
+		refs, err := e.referencingFKs(tx, table, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range refs {
+			if slices.Contains(r.FK.RefCols, name) {
+				return nil, serr.New("cannot drop a column referenced by a foreign key",
+					"table", table, "column", name,
+					"constraint", r.FK.Name, "referencing_table", r.Child.Name)
 			}
 		}
 		desc := old.clone()

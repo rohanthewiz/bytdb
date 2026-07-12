@@ -571,6 +571,23 @@ func (p *parser) createTable() (Statement, error) {
 				return nil, err
 			}
 			ct.Uniques = append(ct.Uniques, cols)
+		case p.acceptKw("foreign"):
+			if err := p.expectKw("key"); err != nil {
+				return nil, err
+			}
+			cols, err := p.identList("a foreign key column")
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectKw("references"); err != nil {
+				return nil, err
+			}
+			fk, err := p.referencesClause(cols)
+			if err != nil {
+				return nil, err
+			}
+			fk.Name = cname
+			ct.FKs = append(ct.FKs, fk)
 		case p.acceptKw("check"):
 			ex, text, err := p.checkExpr()
 			if err != nil {
@@ -578,7 +595,7 @@ func (p *parser) createTable() (Statement, error) {
 			}
 			ct.Checks = append(ct.Checks, CheckDef{Name: cname, Ex: ex, Text: text})
 		case named:
-			return nil, p.unexpected("PRIMARY KEY, UNIQUE, or CHECK after CONSTRAINT name")
+			return nil, p.unexpected("PRIMARY KEY, UNIQUE, FOREIGN KEY, or CHECK after CONSTRAINT name")
 		default:
 			col, inlinePK, checks, err := p.colDef()
 			if err != nil {
@@ -592,6 +609,9 @@ func (p *parser) createTable() (Statement, error) {
 			}
 			if col.Unique {
 				ct.Uniques = append(ct.Uniques, []string{col.Name})
+			}
+			if col.Ref != nil {
+				ct.FKs = append(ct.FKs, *col.Ref)
 			}
 			ct.Cols = append(ct.Cols, col)
 			ct.Checks = append(ct.Checks, checks...)
@@ -714,11 +734,72 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 			// gets the conventional table_col_key name).
 			col.Unique = true
 		case p.acceptKw("references"):
-			return fail(serr.New("REFERENCES is not supported", "column", name))
+			// A column-level foreign key; the CONSTRAINT name, if any,
+			// names the constraint, as in Postgres.
+			fk, err := p.referencesClause([]string{name})
+			if err != nil {
+				return fail(err)
+			}
+			fk.Name = cname
+			col.Ref = &fk
 		case named:
 			return fail(p.unexpected("CHECK after CONSTRAINT name"))
 		default:
 			return col, pk, checks, nil
+		}
+	}
+}
+
+// referencesClause parses the tail of a foreign-key declaration after
+// REFERENCES: the parent table, an optional referenced-column list
+// (absent: the parent's primary key), and the MATCH / ON DELETE / ON
+// UPDATE options. Only NO ACTION and RESTRICT actions are accepted —
+// both mean "refuse", which is the only semantics bytdb implements;
+// CASCADE and SET NULL/DEFAULT are rejected rather than silently
+// weakened, and MATCH FULL/PARTIAL likewise (MATCH SIMPLE is the
+// implemented default: any NULL child column satisfies the FK).
+func (p *parser) referencesClause(cols []string) (FKDef, error) {
+	table, err := p.tableName()
+	if err != nil {
+		return FKDef{}, err
+	}
+	fk := FKDef{Cols: cols, RefTable: table}
+	if p.cur().kind == tOp && p.cur().text == "(" {
+		if fk.RefCols, err = p.identList("a referenced column"); err != nil {
+			return FKDef{}, err
+		}
+	}
+	for {
+		switch {
+		case p.acceptKw("match"):
+			if !p.acceptKw("simple") {
+				return FKDef{}, serr.New("only MATCH SIMPLE foreign keys are supported")
+			}
+		case p.acceptKw("on"):
+			action := "DELETE"
+			if !p.acceptKw("delete") {
+				if err := p.expectKw("update"); err != nil {
+					return FKDef{}, err
+				}
+				action = "UPDATE"
+			}
+			switch {
+			case p.acceptKw("no"):
+				if err := p.expectKw("action"); err != nil {
+					return FKDef{}, err
+				}
+			case p.acceptKw("restrict"):
+			case p.acceptKw("cascade"):
+				return FKDef{}, serr.New("ON " + action + " CASCADE is not supported" +
+					"; only NO ACTION/RESTRICT foreign keys exist")
+			case p.acceptKw("set"):
+				return FKDef{}, serr.New("ON " + action + " SET NULL/DEFAULT is not supported" +
+					"; only NO ACTION/RESTRICT foreign keys exist")
+			default:
+				return FKDef{}, p.unexpected("NO ACTION or RESTRICT")
+			}
+		default:
+			return fk, nil
 		}
 	}
 }
@@ -1023,7 +1104,22 @@ func (p *parser) alterTable() (Statement, error) {
 			return nil, serr.New("ADD UNIQUE is not supported; use CREATE UNIQUE INDEX",
 				"table", table)
 		case p.acceptKw("foreign"):
-			return nil, serr.New("foreign keys are not supported", "table", table)
+			if err := p.expectKw("key"); err != nil {
+				return nil, err
+			}
+			cols, err := p.identList("a foreign key column")
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectKw("references"); err != nil {
+				return nil, err
+			}
+			fk, err := p.referencesClause(cols)
+			if err != nil {
+				return nil, err
+			}
+			fk.Name = cname
+			return &AddFK{Table: table, FK: fk}, nil
 		case named:
 			return nil, p.unexpected("CHECK after CONSTRAINT name")
 		}

@@ -307,7 +307,7 @@ func command(st Statement) string {
 		return "TRUNCATE TABLE"
 	case *ShowVar:
 		return "SHOW"
-	case *AddColumn, *DropColumn, *AddConstraint, *DropConstraint:
+	case *AddColumn, *DropColumn, *AddConstraint, *AddFK, *DropConstraint:
 		return "ALTER TABLE"
 	case *CreateIndex:
 		return "CREATE INDEX"

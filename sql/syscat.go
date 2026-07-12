@@ -105,6 +105,8 @@ func writeTarget(st Statement) string {
 		return s.Table
 	case *AddConstraint:
 		return s.Table
+	case *AddFK:
+		return s.Table
 	case *DropConstraint:
 		return s.Table
 	case *CreateIndex:
@@ -250,6 +252,10 @@ func indexOID(tableID uint64, indexID uint64) int64 { return int64(tableID*1000 
 // checkOID is the oid of a table's i-th check constraint, placed high
 // in the table's oid block, above any realistic index ID.
 func checkOID(tableID uint64, i int) int64 { return int64(tableID*1000+900) + int64(i) }
+
+// fkOID is the oid of a table's i-th foreign-key constraint — its own
+// slice of the table's oid block, above the check-constraint slice.
+func fkOID(tableID uint64, i int) int64 { return int64(tableID*1000+950) + int64(i) }
 
 // attrdefOID is the oid of a column default's pg_attrdef row: its own
 // slice of the table's oid block, below the check-constraint slice.
@@ -500,7 +506,8 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("conparentid", bytdb.TInt), sysCol("confrelid", bytdb.TInt),
 			sysCol("conkey", bytdb.TString), sysCol("confkey", bytdb.TString)),
 		rows: func(d *DB) [][]any {
-			// CHECK constraints only; keys surface through pg_index.
+			// CHECK and FOREIGN KEY constraints; keys surface through
+			// pg_index.
 			var rows [][]any
 			for _, desc := range d.userDescs() {
 				for i, ck := range desc.Checks {
@@ -508,6 +515,19 @@ var sysTables = map[string]*sysTableDef{
 						checkOID(desc.ID, i), ck.Name, oidPublic, "c",
 						false, false, true, int64(desc.ID),
 						int64(0), int64(0), int64(0), int64(0),
+						nil, nil,
+					})
+				}
+				for i := range desc.ForeignKeys {
+					fk := &desc.ForeignKeys[i]
+					confrelid := int64(0)
+					if p := d.e.Table(fk.RefTable); p != nil {
+						confrelid = int64(p.ID)
+					}
+					rows = append(rows, []any{
+						fkOID(desc.ID, i), fk.Name, oidPublic, "f",
+						false, false, true, int64(desc.ID),
+						int64(0), int64(0), int64(0), confrelid,
 						nil, nil,
 					})
 				}
