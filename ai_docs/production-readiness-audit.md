@@ -103,3 +103,27 @@ A reader can act on data a power cut then erases.
 
 Replication/HA and larger-than-RAM datasets are architectural rewrites, not
 features — out of scope until the niche changes.
+
+---
+
+## Remediation status (updated 2026-07-12)
+
+Everything in the "suggested order" and "cheap wins" lists is done:
+
+- **Auth/TLS**: SCRAM-SHA-256 + TLS (`f309deb`), SCRAM-SHA-256-PLUS
+  channel binding (`952e49e`).
+- **Operability batch** (`ebd0078`): TRUNCATE, VARCHAR(n) enforcement,
+  UNIQUE constraint sugar, SHOW / honest server_version,
+  bytdbd -sync/-max-conns/-log-queries, pgwire MaxConns + QueryLog.
+- **Types** (`ea8da92`): TIMESTAMP[TZ]/DATE (int64 micros/days, UTC),
+  UUID; text+binary wire formats; now()/current_date/gen_random_uuid.
+- **Foreign keys** (`83a6fc8`): NO ACTION/RESTRICT, MATCH SIMPLE;
+  full schema guards; SQLSTATE 23503.
+- **Derived tables → CTEs → views** (`bc7f719`): all via the
+  virtual-table machinery; IN (SELECT ...) as = ANY.
+- **Hash join** (`284bc47`): unindexed equijoins are linear.
+- **ALTER RENAME + pg_stat_activity** (`0e80c26`).
+
+Still deferred (rewrites, as assessed): MVCC concurrent writers,
+replication/HA, larger-than-RAM, streaming/external sort, cost-based
+optimization, triggers, JSON/arrays, NUMERIC(p,s).
