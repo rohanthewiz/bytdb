@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	crand "crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -27,11 +28,15 @@ import (
 
 type conn struct {
 	srv    *Server
-	nc     net.Conn      // the raw socket, for read deadlines
+	nc     net.Conn      // the raw socket (or its TLS wrapper), for read deadlines
 	idleTx time.Duration // idle-in-transaction timeout; 0 = disabled
 	r      *bufio.Reader
 	w      *bufio.Writer
 	sess   *sql.Session
+
+	// tlsOn: the stream has been upgraded to TLS. Gates RequireTLS and
+	// refuses a second SSLRequest.
+	tlsOn bool
 
 	// pid and secret form the connection's BackendKeyData: a client
 	// proves the right to cancel this connection's queries by echoing
@@ -233,10 +238,18 @@ func (c *conn) idleTxExpired(err error) bool {
 // CancelRequest; run treats it as a clean exit.
 var errCancelHandled = errors.New("cancel request handled")
 
-// startup performs the handshake: refuse SSL and GSS encryption
-// politely, dispatch cancel requests to their target connection, then
-// trust-authenticate any startup message.
+// startupTimeout bounds the whole pre-session phase — startup message,
+// TLS handshake, SCRAM exchange. Postgres enforces the same idea as
+// authentication_timeout: an unauthenticated peer must not pin a
+// socket and goroutine forever by going silent mid-handshake.
+const startupTimeout = 30 * time.Second
+
+// startup performs the handshake: upgrade to TLS when configured
+// (decline politely when not), dispatch cancel requests to their
+// target connection, then authenticate the startup message — SCRAM
+// when the server holds credentials, trust otherwise.
 func (c *conn) startup() error {
+	c.nc.SetReadDeadline(time.Now().Add(startupTimeout))
 	for {
 		body, err := readStartup(c.r)
 		if err != nil {
@@ -244,8 +257,12 @@ func (c *conn) startup() error {
 		}
 		r := &rbuf{b: body}
 		switch code := r.u32(); code {
-		case codeSSLRequest, codeGSSENCRequest:
-			// A bare byte, not a framed message.
+		case codeSSLRequest:
+			if err := c.maybeStartTLS(); err != nil {
+				return err
+			}
+		case codeGSSENCRequest:
+			// Declined with a bare byte, not a framed message.
 			if err := c.w.WriteByte('N'); err != nil {
 				return err
 			}
@@ -254,7 +271,10 @@ func (c *conn) startup() error {
 			// The whole connection exists to carry this one message: PID
 			// and secret follow the code, and the protocol's answer is
 			// silence — the socket just closes, whether or not anything
-			// was canceled.
+			// was canceled. Deliberately reachable without auth: the
+			// crypto-random secret is itself the credential, and the
+			// issuing session may be blocked inside a query, unable to
+			// authenticate a second connection's exchange.
 			pid := int32(r.u32())
 			secret := r.u32()
 			if !r.bad {
@@ -263,10 +283,24 @@ func (c *conn) startup() error {
 			return errCancelHandled
 		case protoVersion3:
 			// Parameters (user, database, ...) follow as key/value
-			// cstring pairs; the engine has no users or databases, so
-			// they are accepted and ignored.
+			// cstring pairs. The engine has no databases, so only user
+			// matters, and only when authenticating.
+			params := startupParams(r)
+			if c.srv.RequireTLS && !c.tlsOn {
+				// What a hostssl-only pg_hba.conf answers, with its
+				// SQLSTATE (28000 invalid_authorization_specification).
+				c.send(msgErrorResponse, fatalBody(
+					"connection requires TLS (send SSLRequest first)", "28000"))
+				c.w.Flush()
+				return serr.New("plaintext connection refused: TLS required")
+			}
+			if c.srv.Auth != nil {
+				if err := c.authSCRAM(params["user"]); err != nil {
+					return err
+				}
+			}
 			var auth wbuf
-			auth.int32(0) // AuthenticationOk
+			auth.int32(authOK) // AuthenticationOk
 			c.send(msgAuth, auth)
 			for _, kv := range [][2]string{
 				{"server_version", "16.0 (bytdb)"},
@@ -286,10 +320,66 @@ func (c *conn) startup() error {
 			key.int32(int(int32(c.secret)))
 			c.send(msgBackendKeyData, key)
 			c.ready()
+			// The session is established; from here the read deadline
+			// belongs to armIdleDeadline (which only manages it inside
+			// transaction blocks), so the startup one must go.
+			c.nc.SetReadDeadline(time.Time{})
 			return c.wErr()
 		default:
 			return serr.New("unsupported protocol version", "version", fmt.Sprint(code))
 		}
+	}
+}
+
+// maybeStartTLS answers one SSLRequest: 'S' and a TLS upgrade when the
+// server has a TLS config, a polite 'N' when it does not (or when the
+// stream is already TLS — a client bug Postgres also refuses).
+func (c *conn) maybeStartTLS() error {
+	if c.srv.TLSConfig == nil || c.tlsOn {
+		if err := c.w.WriteByte('N'); err != nil {
+			return err
+		}
+		return c.w.Flush()
+	}
+	// A compliant client sends nothing more until it sees 'S', so any
+	// bytes already buffered were pipelined in the clear. Honoring them
+	// after the upgrade would let an active attacker splice a plaintext
+	// prefix into the "secure" session — drop the connection instead.
+	if c.r.Buffered() > 0 {
+		return serr.New("protocol data pipelined after SSLRequest")
+	}
+	if err := c.w.WriteByte('S'); err != nil {
+		return err
+	}
+	if err := c.w.Flush(); err != nil {
+		return err
+	}
+	tc := tls.Server(c.nc, c.srv.TLSConfig)
+	// Handshake reads inherit the startup deadline already armed on the
+	// underlying socket.
+	if err := tc.Handshake(); err != nil {
+		return serr.Wrap(err, "TLS handshake")
+	}
+	// Everything from here — including the startup message the client
+	// now retries — flows through the TLS record layer, so the buffered
+	// reader and writer must be rebuilt around it.
+	c.nc = tc
+	c.r = bufio.NewReader(tc)
+	c.w = bufio.NewWriter(tc)
+	c.tlsOn = true
+	return nil
+}
+
+// startupParams collects the startup message's key/value cstring
+// pairs; the list ends at its empty-key terminator.
+func startupParams(r *rbuf) map[string]string {
+	params := map[string]string{}
+	for {
+		k := r.cstr()
+		if k == "" || r.bad {
+			return params
+		}
+		params[k] = r.cstr()
 	}
 }
 

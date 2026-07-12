@@ -7,13 +7,20 @@
 //   - Both the simple ('Q') and extended (Parse/Bind/Describe/
 //     Execute/Sync) query protocols, in text and binary formats for
 //     the five column types (bool, int8, float8, text, bytea).
+//
 //   - Parse maps onto sql.Prepare and Describe onto sql.Stmt.Describe,
 //     so drivers see real parameter types (inferred from the columns
 //     each $n touches) and the result shape before execution.
-//   - Trust authentication: any user and database name is accepted
-//     and ignored. TLS and GSS encryption are declined; clients must
-//     connect with sslmode=disable or tolerate the refusal (the
-//     default sslmode=prefer does).
+//
+//   - Authentication and transport: trust by default (any user and
+//     database name is accepted and ignored). Setting Server.Auth
+//     enables SCRAM-SHA-256 (RFC 7677) — the server stores only
+//     Postgres-format verifiers, never passwords, and unknown users
+//     get a mock exchange so they are indistinguishable from wrong
+//     passwords. Setting Server.TLSConfig makes the server accept
+//     SSLRequest and upgrade the stream to TLS; RequireTLS then
+//     refuses plaintext clients outright. GSS encryption is declined.
+//
 //   - Transaction blocks: each connection is a sql.Session, so BEGIN
 //     ... COMMIT/ROLLBACK behave as in Postgres — ReadyForQuery
 //     reports the real status (idle / in transaction / failed), an
@@ -25,6 +32,7 @@
 //     SAVEPOINT / RELEASE / ROLLBACK TO work too — pgx's nested
 //     transactions ride on them — with ROLLBACK TO recovering a
 //     failed block ('E' back to 'T').
+//
 //   - Errors travel structurally: the SQL layer's serr fields become
 //     ErrorResponse fields — a parse position becomes Position
 //     (1-based character offset), the rest become Detail — with a
@@ -42,6 +50,7 @@ package pgwire
 
 import (
 	"bufio"
+	"crypto/tls"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -69,6 +78,24 @@ type Server struct {
 	// DefaultIdleTxTimeout; negative disables the timeout. Set before
 	// Serve.
 	IdleTxTimeout time.Duration
+
+	// TLSConfig, when non-nil, makes the server accept the protocol's
+	// SSLRequest and upgrade the connection to TLS (it needs at least
+	// one certificate). Nil declines SSLRequest with 'N', as before.
+	// Set before Serve.
+	TLSConfig *tls.Config
+
+	// RequireTLS refuses startup on connections that have not upgraded
+	// to TLS, the way a hostssl-only pg_hba.conf does. Meaningless
+	// without TLSConfig — every client would be refused. Set before
+	// Serve.
+	RequireTLS bool
+
+	// Auth, when non-nil, requires clients to prove a password via
+	// SCRAM-SHA-256 before the session starts; nil keeps trust
+	// authentication. The registry may be updated while serving. Set
+	// before Serve.
+	Auth *Credentials
 
 	nextPID atomic.Int32
 

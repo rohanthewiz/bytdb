@@ -36,6 +36,18 @@ const (
 	msgSync      = 'S'
 	msgFlush     = 'H'
 	msgTerminate = 'X'
+	// 'p' is the frontend's one catch-all credential message; during
+	// SCRAM it carries SASLInitialResponse and SASLResponse.
+	msgSASLResponse = 'p'
+)
+
+// Authentication request codes: the int32 an 'R' (msgAuth) body opens
+// with, telling the client what the server wants next.
+const (
+	authOK           = 0
+	authSASL         = 10 // here are my SASL mechanisms; pick one
+	authSASLContinue = 11 // mid-exchange challenge (server-first-message)
+	authSASLFinal    = 12 // exchange done; server's proof (server-final-message)
 )
 
 // Backend message types.

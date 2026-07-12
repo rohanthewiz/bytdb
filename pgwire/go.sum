@@ -11,10 +11,8 @@ github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo
 github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/rohanthewiz/btypedb v0.4.0 h1:NAjcdyd5p+9lW//gmSYsmgbOo5TPsE9N8sHKSOiVFmA=
-github.com/rohanthewiz/btypedb v0.4.0/go.mod h1:UXMcf5yJYchW4lZYjFPE35wlRGw8Mi2xKn6ft8ktjV0=
-github.com/rohanthewiz/btypedb v0.4.1-0.20260712030452-571af849fb51 h1:L3z7tAFuAqt3PvpHmif/CWciG3lDgBS51NS/mi+2OwI=
-github.com/rohanthewiz/btypedb v0.4.1-0.20260712030452-571af849fb51/go.mod h1:K+7M8clbmaVh33X9QYm1sA5A7DWDKOE1+O9WFQflMI0=
+github.com/rohanthewiz/btypedb v0.5.0 h1:QYXJ9SsmON2A4F6j0PHwJqXa6gkIGzyPuvNWmr18nK4=
+github.com/rohanthewiz/btypedb v0.5.0/go.mod h1:K+7M8clbmaVh33X9QYm1sA5A7DWDKOE1+O9WFQflMI0=
 github.com/rohanthewiz/serr v1.4.0 h1:twQnnRRB3+orPJBrdVBaxaYScNE+Dk9MxSLtEabvoGA=
 github.com/rohanthewiz/serr v1.4.0/go.mod h1:l01AbjXw1zP0kxe5tX5s/sADHiBbl0Rwfo/igde4b88=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
