@@ -178,6 +178,16 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 			info.Types = []bytdb.ColType{bytdb.TString}
 		}
 	case *Select:
+		// CTEs and referenced views register as statically shaped
+		// virtual tables so their names resolve without execution.
+		dd, err := d.staticViews(st)
+		if err != nil {
+			return err
+		}
+		if dd, err = dd.staticWith(st); err != nil {
+			return err
+		}
+		lk = dd.lookup(dd.e.Table)
 		res := &Result{}
 		if err := describeSelect(lk, st, note, res); err != nil {
 			return err
@@ -307,6 +317,10 @@ func command(st Statement) string {
 		return "TRUNCATE TABLE"
 	case *ShowVar:
 		return "SHOW"
+	case *CreateView:
+		return "CREATE VIEW"
+	case *DropView:
+		return "DROP VIEW"
 	case *AddColumn, *DropColumn, *AddConstraint, *AddFK, *DropConstraint:
 		return "ALTER TABLE"
 	case *CreateIndex:

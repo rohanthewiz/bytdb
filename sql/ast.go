@@ -589,6 +589,23 @@ type Truncate struct {
 // over the built-in defaults; a bare DB reports the defaults.
 type ShowVar struct{ Name string } // "all" for SHOW ALL
 
+// CreateView is CREATE [OR REPLACE] VIEW name AS select. The view
+// stores the SELECT's source text; executing a statement that names
+// the view materializes that query at that moment (bytdb views are
+// unmaterialized, like Postgres's).
+type CreateView struct {
+	Name      string
+	Query     string // the SELECT's verbatim source text
+	Sel       *Select
+	OrReplace bool
+}
+
+// DropView is DROP VIEW [IF EXISTS] name.
+type DropView struct {
+	Name     string
+	IfExists bool
+}
+
 // AddColumn is ALTER TABLE t ADD [COLUMN] col type.
 type AddColumn struct {
 	Table string
@@ -770,12 +787,27 @@ type FromItem struct {
 	// errors if the scan is ever built
 }
 
+// CTE is one WITH entry: a named subquery materialized once, before
+// the statement body runs, and visible as a table everywhere in the
+// statement. Derived tables (FROM (SELECT ...) alias) lower to
+// synthetic CTEs at parse — their names contain '*', which no real
+// identifier can, so they can never collide. Cols, when non-empty,
+// renames the output columns (WITH x(a, b) AS ...).
+type CTE struct {
+	Name string
+	Cols []string
+	Sel  *Select
+}
+
 // Select is SELECT over one table or a chain of joins. A query with
 // any aggregate item, a GROUP BY, or a HAVING is an aggregate query.
 // A non-empty Union makes this the first arm of a UNION chain;
 // OrderBy, Limit, and Offset then apply to the combined result, and
-// the arms' own OrderBy/Limit/Offset are unset.
+// the arms' own OrderBy/Limit/Offset are unset. With holds the
+// statement's CTEs — written and synthetic — in dependency order
+// (each may reference the ones before it; recursion is rejected).
 type Select struct {
+	With []CTE
 	From []FromItem
 	// Distinct is SELECT DISTINCT: the projected rows dedup before
 	// ORDER BY / OFFSET / LIMIT apply, which is why ORDER BY is then
@@ -873,6 +905,8 @@ func (*Explain) stmt()        {}
 func (*DropTable) stmt()      {}
 func (*Truncate) stmt()       {}
 func (*ShowVar) stmt()        {}
+func (*CreateView) stmt()     {}
+func (*DropView) stmt()       {}
 func (*AddColumn) stmt()      {}
 func (*DropColumn) stmt()     {}
 func (*AddConstraint) stmt()  {}

@@ -62,8 +62,11 @@ func numParams(st Statement) int {
 }
 
 // noteSelectVals feeds every literal in a SELECT — predicates,
-// expression items, subqueries, union arms — to note.
+// expression items, subqueries, union arms, WITH bodies — to note.
 func noteSelectVals(s *Select, note func(any)) {
+	for _, c := range s.With {
+		noteSelectVals(c.Sel, note)
+	}
 	for _, f := range s.From {
 		notePredVals(f.On, note)
 	}
@@ -245,6 +248,13 @@ func bindReturning(r Returning, sub func(any) any) Returning {
 // expression items, subqueries, and union arms.
 func bindSelect(s *Select, sub func(any) any) *Select {
 	c := *s
+	if len(s.With) > 0 {
+		c.With = make([]CTE, len(s.With))
+		copy(c.With, s.With)
+		for i := range c.With {
+			c.With[i].Sel = bindSelect(c.With[i].Sel, sub)
+		}
+	}
 	c.From = make([]FromItem, len(s.From))
 	copy(c.From, s.From)
 	for i := range c.From {

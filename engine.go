@@ -32,6 +32,7 @@ const (
 	sysIDSeqTableID  = 0 // single key: next table ID to allocate
 	sysDescTableID   = 1 // (name) -> JSON TableDesc
 	sysSeqTableID    = 2 // (name) -> big-endian uint64: sequence's next value
+	sysViewTableID   = 3 // (name) -> JSON ViewDesc
 	firstUserTableID = 100
 
 	primaryIndexID = 1

@@ -880,8 +880,17 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 			return s, nil
 		}
 		return nil, nil
+	case "pg_get_viewdef":
+		if oid, ok := argN(0).(int64); ok {
+			for i, vd := range env.d.e.Views() {
+				if viewOID(i) == oid {
+					return vd.Query, nil
+				}
+			}
+		}
+		return nil, nil
 	case "pg_get_partkeydef",
-		"pg_get_viewdef", "pg_get_triggerdef", "pg_get_ruledef",
+		"pg_get_triggerdef", "pg_get_ruledef",
 		"pg_get_statisticsobjdef_columns",
 		"obj_description", "col_description", "shobj_description":
 		return nil, nil

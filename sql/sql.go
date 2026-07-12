@@ -24,8 +24,10 @@
 //	       [ON CONFLICT [(c, ...)] DO NOTHING |
 //	        ON CONFLICT (c, ...) DO UPDATE SET c = expr, ... [WHERE ...]]
 //	       [RETURNING ...]
+//	[WITH name [(cols)] AS (SELECT ...), ...]
 //	SELECT * | items FROM tables [WHERE ...] [GROUP BY c, ...] [HAVING ...]
 //	       [ORDER BY item [ASC|DESC], ...] [LIMIT n] [OFFSET n]
+//	CREATE [OR REPLACE] VIEW v AS SELECT ... | DROP VIEW [IF EXISTS] v
 //	UPDATE t SET c = v, ... [WHERE ...] [RETURNING ...]
 //	DELETE FROM t [WHERE ...] [RETURNING ...]
 //	TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
@@ -38,6 +40,22 @@
 //
 //	FROM a [AS] x [INNER] JOIN b ON x.id = b.a_id
 //	       LEFT [OUTER] JOIN c ON ... CROSS JOIN d
+//
+// A FROM item may also be a derived table — (SELECT ...) alias, the
+// alias mandatory — which materializes once and joins like any table.
+// WITH (non-recursive) names such subqueries: each CTE materializes
+// once, before the body, may use the CTEs before it, shadows a real
+// table of its name, and is visible everywhere in the statement,
+// scalar subqueries and union arms included; WITH x(a, b) renames its
+// output columns. IN (SELECT ...) works, lowered to = ANY. Views are
+// the persistent flavor: CREATE [OR REPLACE] VIEW stores the SELECT's
+// text (validated by running it once), any statement naming the view
+// materializes it at that moment, views may reference other views
+// (cycles are caught), and the relation namespace is shared with
+// tables and sequences. Views list in pg_class as relkind 'v' with
+// pg_get_viewdef; derived tables, CTEs, and views all join through
+// the virtual-table machinery, so ON/WHERE filter them but index
+// pushdown does not apply inside a materialized result.
 //
 // A comma-separated table is a cross join; RIGHT and FULL joins are
 // not supported. Columns may be qualified (t.c, using the alias when
@@ -333,6 +351,19 @@ type DB struct {
 	// point stamps it on a copy, so a DB value is never mutated while
 	// another statement runs.
 	ctx context.Context
+
+	// vtabs are the statement's materialized virtual tables — CTEs,
+	// derived tables, and views the statement references — layered over
+	// the catalog in lookup. Rides the copy-the-DB convention: run
+	// stamps it on a copy, so nothing leaks between statements.
+	vtabs map[string]vtab
+}
+
+// vtab is one materialized virtual table: a synthetic descriptor plus
+// its rows, exactly the shape the system catalog serves its tables in.
+type vtab struct {
+	desc *bytdb.TableDesc
+	rows [][]any
 }
 
 // New wraps an Engine for SQL execution.
@@ -571,24 +602,39 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 	case *AlterSequence:
 		return d.execAlterSequence(s)
 	case *Insert:
-		return d.execInsert(s)
+		dv, err := d.withViews(s)
+		if err != nil {
+			return nil, err
+		}
+		return dv.execInsert(s)
 	case *Select:
+		// runIt materializes referenced views, then the statement's
+		// CTEs, then runs the body.
+		runIt := func(dd *DB) (*Result, error) {
+			dv, err := dd.withViews(s)
+			if err != nil {
+				return nil, err
+			}
+			return dv.execSelectWith(s)
+		}
 		// A SELECT calling nextval/setval writes sequence state, so it
 		// runs in a writable transaction: a copy of this DB carrying
 		// the write txn makes every inner read() land in it. Session
 		// blocks keep their own transaction (READ ONLY ones then fail
-		// the write, as they should).
-		if d.tx == nil && selectWritesSequences(s) {
+		// the write, as they should). CTEs and views get a wrapping
+		// read transaction for the same reason — their materializations
+		// and the body must share one snapshot.
+		if d.tx == nil && (selectWritesSequences(s) || len(s.With) > 0 || d.usesViews(s)) {
 			var res *Result
-			err := d.e.WriteTxn(func(tx *bytdb.Txn) error {
+			txnRun := d.e.ReadTxn
+			if selectWritesSequences(s) {
+				txnRun = d.e.WriteTxn
+			}
+			err := txnRun(func(tx *bytdb.Txn) error {
 				dw := *d
 				dw.tx = tx
 				var err error
-				if len(s.Union) > 0 {
-					res, err = dw.execUnion(s)
-				} else {
-					res, err = dw.runSelectCore(s)
-				}
+				res, err = runIt(&dw)
 				return err
 			})
 			if err != nil {
@@ -596,16 +642,36 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 			}
 			return res, nil
 		}
-		if len(s.Union) > 0 {
-			return d.execUnion(s)
-		}
-		return d.runSelectCore(s)
+		return runIt(d)
 	case *Update:
-		return d.execUpdate(s)
+		dv, err := d.withViews(s)
+		if err != nil {
+			return nil, err
+		}
+		return dv.execUpdate(s)
 	case *Delete:
-		return d.execDelete(s)
+		dv, err := d.withViews(s)
+		if err != nil {
+			return nil, err
+		}
+		return dv.execDelete(s)
 	case *Explain:
-		return d.execExplain(s)
+		// EXPLAIN must not execute, so CTEs and views register as
+		// empty-row virtual tables with statically derived shapes.
+		dd, err := d.staticViews(s.Stmt)
+		if err != nil {
+			return nil, err
+		}
+		if sel, ok := s.Stmt.(*Select); ok {
+			if dd, err = dd.staticWith(sel); err != nil {
+				return nil, err
+			}
+		}
+		return dd.execExplain(s)
+	case *CreateView:
+		return d.execCreateView(s)
+	case *DropView:
+		return d.execDropView(s)
 	case *TxnControl:
 		// Sessions intercept these before run; a bare DB has no
 		// transaction state to control.

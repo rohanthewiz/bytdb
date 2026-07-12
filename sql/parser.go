@@ -24,7 +24,35 @@ func Parse(src string) (Statement, error) {
 	if p.cur().kind != tEOF {
 		return nil, p.unexpected("end of statement")
 	}
+	if err := attachCTEs(st, p.ctes); err != nil {
+		return nil, err
+	}
 	return st, nil
+}
+
+// attachCTEs hangs the statement's accumulated WITH entries (written
+// and derived-table synthetics alike) on its top-level SELECT, where
+// the executor materializes them. Statements without a SELECT to hang
+// them on cannot host them.
+func attachCTEs(st Statement, ctes []CTE) error {
+	if len(ctes) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, c := range ctes {
+		if seen[c.Name] {
+			return serr.New(`WITH query name "` + c.Name + `" specified more than once`)
+		}
+		seen[c.Name] = true
+	}
+	switch s := st.(type) {
+	case *Select:
+		s.With = ctes
+		return nil
+	case *Explain:
+		return attachCTEs(s.Stmt, ctes)
+	}
+	return serr.New("WITH and derived tables are only supported in SELECT statements")
 }
 
 // parseCheckExpr parses a stored CHECK constraint expression.
@@ -67,6 +95,14 @@ type parser struct {
 
 	// depth is the current expression-nesting depth; see enter.
 	depth int
+
+	// ctes accumulates the statement's WITH entries — written ones and
+	// the synthetic ones derived tables lower to — in completion order,
+	// which is dependency order (an inner query finishes parsing before
+	// whatever contains it). Parse attaches them to the top-level
+	// SELECT; nDerived numbers the synthetic names.
+	ctes     []CTE
+	nDerived int
 }
 
 // enter counts one level of expression nesting, rejecting input past
@@ -156,11 +192,23 @@ func (p *parser) statement() (Statement, error) {
 		if p.acceptKw("sequence") {
 			return p.createSequence()
 		}
+		if p.acceptKw("or") {
+			if err := p.expectKw("replace"); err != nil {
+				return nil, err
+			}
+			if err := p.expectKw("view"); err != nil {
+				return nil, err
+			}
+			return p.createView(true)
+		}
+		if p.acceptKw("view") {
+			return p.createView(false)
+		}
 		unique := p.acceptKw("unique")
 		if p.acceptKw("index") {
 			return p.createIndex(unique)
 		}
-		return nil, p.unexpected("TABLE, SEQUENCE, or [UNIQUE] INDEX")
+		return nil, p.unexpected("TABLE, VIEW, SEQUENCE, or [UNIQUE] INDEX")
 	case p.acceptKw("drop"):
 		switch {
 		case p.acceptKw("table"):
@@ -169,12 +217,25 @@ func (p *parser) statement() (Statement, error) {
 				return nil, err
 			}
 			return &DropTable{Table: name}, nil
+		case p.acceptKw("view"):
+			dv := &DropView{}
+			if p.acceptKw("if") {
+				if err := p.expectKw("exists"); err != nil {
+					return nil, err
+				}
+				dv.IfExists = true
+			}
+			var err error
+			if dv.Name, err = p.tableName(); err != nil {
+				return nil, err
+			}
+			return dv, nil
 		case p.acceptKw("sequence"):
 			return p.dropSequence()
 		case p.acceptKw("index"):
 			return p.dropIndex()
 		}
-		return nil, p.unexpected("TABLE, SEQUENCE, or INDEX")
+		return nil, p.unexpected("TABLE, VIEW, SEQUENCE, or INDEX")
 	case p.acceptKw("alter"):
 		if p.acceptKw("sequence") {
 			return p.alterSequence()
@@ -186,6 +247,8 @@ func (p *parser) statement() (Statement, error) {
 		return p.showStmt()
 	case p.acceptKw("insert"):
 		return p.insert()
+	case p.acceptKw("with"):
+		return p.withStmt()
 	case p.acceptKw("select"):
 		return p.selectStmt()
 	case p.acceptKw("update"):
@@ -387,6 +450,93 @@ func (p *parser) explainOptBool() bool {
 		return t.text == "1"
 	}
 	return true
+}
+
+// withStmt parses WITH name [(cols)] AS (select), ... SELECT ...;
+// "with" is consumed. Entries land in p.ctes (dependency order — each
+// may use the ones before it), and Parse attaches them to the SELECT.
+// RECURSIVE is rejected: there is no iteration machinery behind it.
+func (p *parser) withStmt() (Statement, error) {
+	if p.acceptKw("recursive") {
+		return nil, serr.New("WITH RECURSIVE is not supported")
+	}
+	for {
+		name, err := p.ident("a WITH query name")
+		if err != nil {
+			return nil, err
+		}
+		var cols []string
+		if p.cur().kind == tOp && p.cur().text == "(" {
+			if cols, err = p.identList("an output column name"); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKw("as"); err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("select"); err != nil {
+			return nil, err
+		}
+		st, err := p.selectStmt()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		p.ctes = append(p.ctes, CTE{Name: name, Cols: cols, Sel: st.(*Select)})
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	if err := p.expectKw("select"); err != nil {
+		return nil, err
+	}
+	return p.selectStmt()
+}
+
+// createView parses CREATE [OR REPLACE] VIEW name AS select; the
+// leading keywords are consumed. The view stores the SELECT's source
+// text, re-parsed at each use — so the body's derived-table synthetics
+// are trimmed from p.ctes here (they re-hoist when the text is parsed
+// again) rather than attached to this statement.
+func (p *parser) createView(orReplace bool) (Statement, error) {
+	name, err := p.tableName()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().kind == tOp && p.cur().text == "(" {
+		return nil, serr.New("CREATE VIEW with a column list is not supported; alias the select items")
+	}
+	if err := p.expectKw("as"); err != nil {
+		return nil, err
+	}
+	start := p.cur().pos
+	preCTE := len(p.ctes)
+	var body Statement
+	switch {
+	case p.acceptKw("with"):
+		body, err = p.withStmt()
+	case p.acceptKw("select"):
+		body, err = p.selectStmt()
+	default:
+		return nil, p.unexpected("SELECT")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := body.(*Select); !ok {
+		return nil, p.unexpected("SELECT")
+	}
+	p.ctes = p.ctes[:preCTE]
+	return &CreateView{
+		Name:      name,
+		Query:     strings.TrimSpace(p.src[start:p.cur().pos]),
+		OrReplace: orReplace,
+	}, nil
 }
 
 // truncateStmt parses TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY
@@ -1970,10 +2120,43 @@ func (p *parser) sysFuncCall() (val, name string, ok bool, err error) {
 	return v, name, true, nil
 }
 
-// tableRef parses "t", "t alias", or "t AS alias". A function call in
-// FROM (generate_series(...) s) parses too — psql writes them inside
-// subqueries that never run — but errors if its scan is ever built.
+// tableRef parses "t", "t alias", "t AS alias", or a derived table
+// "(SELECT ...) [AS] alias" — which lowers to a synthetic CTE (see
+// parser.ctes): the subquery materializes once and joins like any
+// virtual table. A function call in FROM (generate_series(...) s)
+// parses too — psql writes them inside subqueries that never run —
+// but errors if its scan is ever built.
 func (p *parser) tableRef() (FromItem, error) {
+	if t := p.cur(); t.kind == tOp && t.text == "(" {
+		p.advance()
+		if err := p.expectKw("select"); err != nil {
+			return FromItem{}, err
+		}
+		st, err := p.selectStmt()
+		if err != nil {
+			return FromItem{}, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return FromItem{}, err
+		}
+		it := FromItem{}
+		if p.acceptKw("as") {
+			if it.Alias, err = p.ident("an alias"); err != nil {
+				return FromItem{}, err
+			}
+		} else if t := p.cur(); t.kind == tQIdent || (t.kind == tIdent && !noAlias[t.text]) {
+			it.Alias, _ = p.ident("an alias")
+		}
+		if it.Alias == "" {
+			// Postgres's rule and wording: without a name there is no way
+			// to reference the derived columns.
+			return FromItem{}, serr.New("subquery in FROM must have an alias")
+		}
+		p.nDerived++
+		it.Table = fmt.Sprintf("*derived*%d", p.nDerived) // '*' cannot appear in identifiers
+		p.ctes = append(p.ctes, CTE{Name: it.Table, Sel: st.(*Select)})
+		return it, nil
+	}
 	name, err := p.tableName()
 	if err != nil {
 		return FromItem{}, err
@@ -2340,20 +2523,20 @@ func (p *parser) exprCmp() (Expr, error) {
 			e = &ExIsNull{E: e, Not: not}
 		case p.cur().kind == tIdent && p.cur().text == "in":
 			p.advance()
-			list, err := p.exprList()
+			r, err := p.inTail(e, false)
 			if err != nil {
 				return nil, err
 			}
-			e = &ExIn{E: e, List: list}
+			e = r
 		case p.cur().kind == tIdent && p.cur().text == "not" &&
 			p.tokAt(1).kind == tIdent && p.tokAt(1).text == "in":
 			p.advance()
 			p.advance()
-			list, err := p.exprList()
+			r, err := p.inTail(e, true)
 			if err != nil {
 				return nil, err
 			}
-			e = &ExIn{E: e, List: list, Not: true}
+			e = r
 		default:
 			op, ok, err := p.cmpOp()
 			if err != nil {
@@ -2393,6 +2576,34 @@ func (p *parser) exprCmp() (Expr, error) {
 			e = &ExCmp{Op: op, L: e, R: r}
 		}
 	}
+}
+
+// inTail parses what follows [NOT] IN: a value list, or a subquery —
+// which lowers to the ANY machinery (e IN (SELECT ...) is exactly
+// e = ANY (SELECT ...), and NOT IN is its three-valued negation).
+func (p *parser) inTail(e Expr, not bool) (Expr, error) {
+	if p.cur().kind == tOp && p.cur().text == "(" &&
+		p.tokAt(1).kind == tIdent && p.tokAt(1).text == "select" {
+		p.advance() // (
+		p.advance() // select
+		st, err := p.selectStmt()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		var out Expr = &ExAny{Op: OpEQ, L: e, R: &ExSub{Sel: st.(*Select)}}
+		if not {
+			out = &ExNot{E: out}
+		}
+		return out, nil
+	}
+	list, err := p.exprList()
+	if err != nil {
+		return nil, err
+	}
+	return &ExIn{E: e, List: list, Not: not}, nil
 }
 
 // exprList parses "( expr [, expr]* )".

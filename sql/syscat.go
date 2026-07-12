@@ -33,6 +33,11 @@ type tableLookup func(name string) (desc *bytdb.TableDesc, rows [][]any)
 // names, resolve to synthesized tables.
 func (d *DB) lookup(base func(string) *bytdb.TableDesc) tableLookup {
 	return func(name string) (*bytdb.TableDesc, [][]any) {
+		// The statement's materialized CTEs, derived tables, and views
+		// come first: a WITH name shadows a real table, as in Postgres.
+		if v, ok := d.vtabs[name]; ok {
+			return v.desc, v.rows
+		}
 		if !strings.Contains(name, ".") {
 			if desc := base(name); desc != nil {
 				return desc, nil
@@ -116,6 +121,10 @@ func writeTarget(st Statement) string {
 	case *CreateSequence:
 		return s.Name
 	case *DropSequence:
+		return s.Name
+	case *CreateView:
+		return s.Name
+	case *DropView:
 		return s.Name
 	case *AlterSequence:
 		return s.Name
@@ -257,6 +266,10 @@ func checkOID(tableID uint64, i int) int64 { return int64(tableID*1000+900) + in
 // slice of the table's oid block, above the check-constraint slice.
 func fkOID(tableID uint64, i int) int64 { return int64(tableID*1000+950) + int64(i) }
 
+// viewOID is the i-th view's synthetic pg_class oid (views store no
+// ID; Views() is name-sorted, so the numbering is stable between DDL).
+func viewOID(i int) int64 { return int64(3_000_000_000) + int64(i) }
+
 // attrdefOID is the oid of a column default's pg_attrdef row: its own
 // slice of the table's oid block, below the check-constraint slice.
 func attrdefOID(tableID uint64, attnum int) int64 { return int64(tableID*1000+800) + int64(attnum) }
@@ -323,6 +336,11 @@ var sysTables = map[string]*sysTableDef{
 			}
 			for _, sd := range d.e.Sequences() {
 				rel(int64(sd.ID), sd.Name, "S", false, 0)
+			}
+			// Views get synthetic oids well above the table-ID range;
+			// they have no stored ID of their own (see viewOID).
+			for i, vd := range d.e.Views() {
+				rel(viewOID(i), vd.Name, "v", false, 0)
 			}
 			return rows
 		},
