@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"context"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -256,6 +257,9 @@ func prepareFrom(lk tableLookup, items []FromItem, where BoolExpr) (*fromPlan, e
 // whole join.
 func runJoin(tx *bytdb.Txn, fp *fromPlan, env *exEnv, yield func([]any) bool) error {
 	j := &joinRun{tx: tx, fp: fp, env: env, yield: yield}
+	if env != nil && env.d != nil {
+		j.ctx = env.d.ctx // the statement's cancellation scope, polled by each step's scan
+	}
 	j.rec(0, nil)
 	return j.err
 }
@@ -264,6 +268,7 @@ type joinRun struct {
 	tx    *bytdb.Txn
 	fp    *fromPlan
 	env   *exEnv
+	ctx   context.Context
 	yield func([]any) bool
 	stop  bool
 	err   error
@@ -344,7 +349,7 @@ func (j *joinRun) rec(k int, partial []any) {
 			}
 			// The pushed conjuncts are all plain Preds, so no
 			// environment is needed for this scan's residual filter.
-			err := scanPlan(j.tx, step.it.Table, pl, nil, func(r bytdb.Row) bool {
+			err := scanPlan(j.ctx, j.tx, step.it.Table, pl, nil, func(r bytdb.Row) bool {
 				return next(r.Vals)
 			})
 			if err != nil && j.err == nil {

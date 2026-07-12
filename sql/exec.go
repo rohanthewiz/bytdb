@@ -3,6 +3,7 @@ package sql
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"fmt"
 	"iter"
 	"math"
@@ -13,12 +14,28 @@ import (
 	"github.com/rohanthewiz/serr"
 )
 
+// cancelEvery is how many scanned rows pass between cancellation
+// polls. Polling costs a mutex under the hood, so per-row would tax
+// the in-memory scan rate for nothing; at this stride even a
+// million-row-per-second scan notices a cancel within a millisecond.
+const cancelEvery = 256
+
 // scanPlan yields the rows a plan matches, in the chosen path's key
 // order, within tx's snapshot. env supplies the evaluation
 // environment for any Cond leaves in the residual filter (nil when
 // the filter is known to hold none). yield returning false stops the
 // scan.
-func scanPlan(tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb.Row) bool) error {
+//
+// ctx (nil for uncancellable execution) is the statement's
+// cancellation scope: it is polled at scan start — which alone bounds
+// correlated-subquery and inner-join-loop storms, since those re-enter
+// here per outer row — and every cancelEvery rows within one scan.
+func scanPlan(ctx context.Context, tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb.Row) bool) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return serr.Wrap(err, "state", "statement canceled")
+		}
+	}
 	if p.get != nil {
 		row, ok, err := tx.Get(table, p.get...)
 		if err != nil {
@@ -53,9 +70,15 @@ func scanPlan(tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb
 	default:
 		seq = tx.ScanIndex(table, p.index, p.from, nil)
 	}
+	n := 0
 	for row, err := range seq {
 		if err != nil {
 			return err
+		}
+		if n++; ctx != nil && n%cancelEvery == 0 {
+			if err := ctx.Err(); err != nil {
+				return serr.Wrap(err, "state", "statement canceled")
+			}
 		}
 		if !p.reverse && stopped(p.stops, row) {
 			return nil
@@ -1005,7 +1028,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		// and index entries under a live scan.
 		env := d.tableEnv(tx, s.Table, desc)
 		var rows [][]any
-		err = scanPlan(tx, s.Table, pl, env, func(r bytdb.Row) bool {
+		err = scanPlan(d.ctx, tx, s.Table, pl, env, func(r bytdb.Row) bool {
 			rows = append(rows, r.Vals)
 			return true
 		})
@@ -1105,7 +1128,7 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		// scan keeps the full rows alongside the keys (they are decoded
 		// already; keeping them costs only the reference).
 		var rows [][]any
-		pks, err := collectPKs(tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc), func(vals []any) {
+		pks, err := collectPKs(d.ctx, tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc), func(vals []any) {
 			if ret != nil {
 				rows = append(rows, vals)
 			}
@@ -1151,9 +1174,9 @@ func (d *DB) tableEnv(tx *bytdb.Txn, table string, desc *bytdb.TableDesc) *exEnv
 // collectPKs materializes the primary keys of every row the plan
 // matches, calling keep with each full row along the way (DELETE ...
 // RETURNING retains them; a plain DELETE's keep is a no-op).
-func collectPKs(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, env *exEnv, keep func([]any)) ([][]any, error) {
+func collectPKs(ctx context.Context, tx *bytdb.Txn, table string, desc *bytdb.TableDesc, pl *plan, env *exEnv, keep func([]any)) ([][]any, error) {
 	var pks [][]any
-	err := scanPlan(tx, table, pl, env, func(r bytdb.Row) bool {
+	err := scanPlan(ctx, tx, table, pl, env, func(r bytdb.Row) bool {
 		pk := make([]any, len(desc.PKCols))
 		for i, ord := range desc.PKCols {
 			pk[i] = r.Vals[ord]

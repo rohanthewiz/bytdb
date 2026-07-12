@@ -17,6 +17,11 @@ package sql
 // along with everything after the mark.
 
 import (
+	"context"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
@@ -50,6 +55,16 @@ type Session struct {
 	readOnly bool
 	aborted  bool
 	saves    []sesSave // savepoint stack, oldest first
+
+	// timeout is the session's statement_timeout: when positive, every
+	// statement runs under a deadline that far away, and expiry aborts
+	// it (SQLSTATE 57014 over the wire). Set with SET statement_timeout.
+	timeout time.Duration
+
+	// vars remembers other SET parameters verbatim. None change bytdb
+	// behavior; remembering them (rather than erroring) is what lets
+	// drivers' connect-time housekeeping SETs succeed.
+	vars map[string]string
 }
 
 // sesSave is one named savepoint in the open block. Names may repeat;
@@ -100,14 +115,42 @@ func (s *Session) Exec(query string, args ...any) (*Result, error) {
 	return s.run(st, args)
 }
 
+// ExecCtx is Exec bounded by ctx: cancellation aborts the statement
+// mid-execution (see DB.ExecCtx). The session's statement_timeout, if
+// set, applies on top as a deadline.
+func (s *Session) ExecCtx(ctx context.Context, query string, args ...any) (*Result, error) {
+	st, err := Parse(query)
+	if err != nil {
+		return nil, err
+	}
+	return s.runCtx(ctx, st, args)
+}
+
 // ExecStmt executes a prepared statement in the session. The Stmt
 // must come from the session's DB.
 func (s *Session) ExecStmt(stmt *Stmt, args ...any) (*Result, error) {
 	return s.run(stmt.st, args)
 }
 
-// run dispatches one statement against the session's state.
+// ExecStmtCtx is ExecStmt bounded by ctx; see ExecCtx.
+func (s *Session) ExecStmtCtx(ctx context.Context, stmt *Stmt, args ...any) (*Result, error) {
+	return s.runCtx(ctx, stmt.st, args)
+}
+
+// run dispatches one statement with no caller cancellation scope; the
+// statement_timeout still applies.
 func (s *Session) run(st Statement, args []any) (*Result, error) {
+	return s.runCtx(context.Background(), st, args)
+}
+
+// runCtx dispatches one statement against the session's state, under
+// ctx narrowed by the session's statement_timeout.
+func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result, error) {
+	if s.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
 	if tc, ok := st.(*TxnControl); ok {
 		return s.txnControl(tc)
 	}
@@ -115,8 +158,11 @@ func (s *Session) run(st Statement, args []any) (*Result, error) {
 		return nil, serr.New("current transaction is aborted, " +
 			"commands ignored until end of transaction block")
 	}
+	if sv, ok := st.(*SetVar); ok {
+		return s.setVar(sv)
+	}
 	if s.tx == nil {
-		return s.db.run(st, args)
+		return s.db.runCtx(ctx, st, args)
 	}
 	// Inside a block. DDL would deadlock behind the block's own
 	// writer lock (each engine schema change is its own transaction),
@@ -132,11 +178,91 @@ func (s *Session) run(st Statement, args []any) (*Result, error) {
 		return nil, serr.New("cannot execute " + command(st) +
 			" in a read-only transaction")
 	}
-	res, err := s.sdb.run(st, args)
+	res, err := s.sdb.runCtx(ctx, st, args)
 	if err != nil {
 		s.aborted = true
 	}
 	return res, err
+}
+
+// setVar applies a SET or RESET. statement_timeout is the one
+// parameter with bytdb semantics; the rest are remembered and
+// otherwise ignored. Postgres scopes SET to the transaction only for
+// SET LOCAL, which the parser already folded to session scope, and an
+// erroring SET fails an open block via runCtx's normal path — but a
+// successful one here deliberately does not join the block: with no
+// transactional parameters, unwinding on ROLLBACK has nothing to
+// restore.
+func (s *Session) setVar(sv *SetVar) (*Result, error) {
+	if sv.Name == "statement_timeout" {
+		d, err := parseTimeout(sv)
+		if err != nil {
+			if s.tx != nil {
+				s.aborted = true
+			}
+			return nil, err
+		}
+		s.timeout = d
+		return &Result{Tag: sv.Tag}, nil
+	}
+	if sv.Name == "all" && sv.IsDefault { // RESET ALL
+		s.timeout = 0
+		s.vars = nil
+		return &Result{Tag: sv.Tag}, nil
+	}
+	if sv.IsDefault {
+		delete(s.vars, sv.Name)
+		return &Result{Tag: sv.Tag}, nil
+	}
+	if s.vars == nil {
+		s.vars = map[string]string{}
+	}
+	s.vars[sv.Name] = sv.Value
+	return &Result{Tag: sv.Tag}, nil
+}
+
+// parseTimeout reads a statement_timeout value the way Postgres does:
+// a bare integer is milliseconds; a string may carry one of the time
+// units us, ms, s, min, h, or d. Zero (or DEFAULT/RESET) disables the
+// timeout; negative values are invalid.
+func parseTimeout(sv *SetVar) (time.Duration, error) {
+	if sv.IsDefault {
+		return 0, nil
+	}
+	text := strings.TrimSpace(sv.Value)
+	num, unit := text, ""
+	for i, r := range text {
+		if (r < '0' || r > '9') && r != '-' && r != '.' {
+			num, unit = strings.TrimSpace(text[:i]), strings.TrimSpace(text[i:])
+			break
+		}
+	}
+	n, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0, serr.New(`invalid value for parameter "statement_timeout"`, "value", sv.Value)
+	}
+	scale := time.Millisecond
+	switch unit {
+	case "", "ms":
+	case "us":
+		scale = time.Microsecond
+	case "s":
+		scale = time.Second
+	case "min":
+		scale = time.Minute
+	case "h":
+		scale = time.Hour
+	case "d":
+		scale = 24 * time.Hour
+	default:
+		return 0, serr.New(`invalid value for parameter "statement_timeout"`,
+			"value", sv.Value, "hint", "valid units are us, ms, s, min, h, and d")
+	}
+	if n < 0 {
+		return 0, serr.New(`invalid value for parameter "statement_timeout"`,
+			"value", sv.Value, "hint", "the timeout must be zero (disabled) or positive")
+	}
+	return time.Duration(n * float64(scale)), nil
 }
 
 // txnControl handles BEGIN, COMMIT, ROLLBACK, and the savepoint

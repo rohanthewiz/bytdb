@@ -8,6 +8,8 @@ package pgwire
 // string.
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -60,6 +62,23 @@ func sqlstate(msg string, hasPos bool) string {
 	return "XX000"
 }
 
+// cancelBody builds the ErrorResponse for a canceled statement:
+// SQLSTATE 57014 (query_canceled) at ordinary ERROR severity — the
+// connection survives; only the statement died.
+func cancelBody(msg string) wbuf {
+	var b wbuf
+	b.byte('S')
+	b.cstr("ERROR")
+	b.byte('V')
+	b.cstr("ERROR")
+	b.byte('C')
+	b.cstr("57014")
+	b.byte('M')
+	b.cstr(msg)
+	b.byte(0)
+	return b
+}
+
 // fatalBody builds an ErrorResponse body at FATAL severity — the
 // severity Postgres uses when the server, not the statement, is about
 // to end the connection (e.g. the idle-in-transaction timeout).
@@ -105,6 +124,15 @@ func noticeBody(msg string) wbuf {
 // position should index into and base the byte offset of the failing
 // statement within it (0 when they are the same string).
 func errorBody(err error, query string, base int) wbuf {
+	// A canceled or timed-out statement gets Postgres's exact 57014
+	// wording rather than the internal error chain: clients and
+	// connection pools pattern-match both the code and the message.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return cancelBody("canceling statement due to statement timeout")
+	}
+	if errors.Is(err, context.Canceled) {
+		return cancelBody("canceling statement due to user request")
+	}
 	msg := err.Error()
 	flds := serr.SErrFromErr(err).UserFields()
 	pos := -1

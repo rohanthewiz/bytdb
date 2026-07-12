@@ -190,6 +190,18 @@ func (p *parser) statement() (Statement, error) {
 		return p.deleteStmt()
 	case p.acceptKw("explain"):
 		return p.explainStmt()
+	case p.acceptKw("set"):
+		return p.setStmt()
+	case p.acceptKw("reset"):
+		// RESET name (or RESET ALL) is SET name TO DEFAULT.
+		if p.acceptKw("all") {
+			return &SetVar{Name: "all", IsDefault: true, Tag: "RESET"}, nil
+		}
+		name, err := p.ident("configuration parameter")
+		if err != nil {
+			return nil, err
+		}
+		return &SetVar{Name: name, IsDefault: true, Tag: "RESET"}, nil
 	case p.acceptKw("begin"):
 		if !p.acceptKw("work") {
 			p.acceptKw("transaction")
@@ -226,6 +238,73 @@ func (p *parser) statement() (Statement, error) {
 // does not instrument execution, and pretending to would lie about
 // what ran; the other Postgres options parse and are ignored except
 // FORMAT, which must be TEXT.
+// setStmt parses SET [SESSION|LOCAL] name {=|TO} value[, ...] after
+// the SET keyword. SESSION and LOCAL both scope to the session: bytdb
+// has no transaction-scoped parameters, so LOCAL degrades to SESSION.
+// SET TIME ZONE, the one grammar special case drivers actually send,
+// parses as the timezone parameter.
+func (p *parser) setStmt() (Statement, error) {
+	if !p.acceptKw("session") {
+		p.acceptKw("local")
+	}
+	if p.acceptKw("time") {
+		if err := p.expectKw("zone"); err != nil {
+			return nil, err
+		}
+		v, err := p.setValue()
+		if err != nil {
+			return nil, err
+		}
+		return &SetVar{Name: "timezone", Value: v, Tag: "SET"}, nil
+	}
+	name, err := p.ident("a configuration parameter")
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptOp("=") {
+		if err := p.expectKw("to"); err != nil {
+			return nil, err
+		}
+	}
+	if p.acceptKw("default") {
+		return &SetVar{Name: name, IsDefault: true, Tag: "SET"}, nil
+	}
+	var vals []string
+	for {
+		v, err := p.setValue()
+		if err != nil {
+			return nil, err
+		}
+		vals = append(vals, v)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return &SetVar{Name: name, Value: strings.Join(vals, ", "), Tag: "SET"}, nil
+}
+
+// setValue consumes one SET value: a literal, an identifier (on, off,
+// public, "$user"), or a signed number — value text only, since SET
+// applies parameters rather than evaluating expressions.
+func (p *parser) setValue() (string, error) {
+	t := p.cur()
+	switch t.kind {
+	case tString, tNumber, tIdent, tQIdent:
+		p.advance()
+		return t.text, nil
+	case tOp:
+		if t.text == "-" {
+			p.advance()
+			if n := p.cur(); n.kind == tNumber {
+				p.advance()
+				return "-" + n.text, nil
+			}
+			return "", p.unexpected("a number")
+		}
+	}
+	return "", p.unexpected("a parameter value")
+}
+
 func (p *parser) explainStmt() (Statement, error) {
 	analyze := false
 	if p.cur().kind == tOp && p.cur().text == "(" {

@@ -285,6 +285,9 @@ func command(st Statement) string {
 	if tc, ok := st.(*TxnControl); ok {
 		return tc.Tag
 	}
+	if sv, ok := st.(*SetVar); ok {
+		return sv.Tag
+	}
 	switch st.(type) {
 	case *CreateTable:
 		return "CREATE TABLE"

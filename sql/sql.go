@@ -261,6 +261,8 @@
 package sql
 
 import (
+	"context"
+
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
@@ -278,6 +280,14 @@ type DB struct {
 	// seq is the sequence-function state lastval()/currval() read.
 	// Sessions each carry their own; a bare DB is one shared session.
 	seq *seqSession
+
+	// ctx, when set, is the running statement's cancellation scope
+	// (ExecCtx, a Session statement timeout, a wire CancelRequest).
+	// Row pumps poll it and abort the statement with its error. It
+	// rides the same copy-the-DB convention as tx: each ...Ctx entry
+	// point stamps it on a copy, so a DB value is never mutated while
+	// another statement runs.
+	ctx context.Context
 }
 
 // New wraps an Engine for SQL execution.
@@ -332,6 +342,27 @@ func (d *DB) Exec(query string, args ...any) (*Result, error) {
 	return d.run(st, args)
 }
 
+// ExecCtx is Exec bounded by ctx: cancellation or deadline expiry
+// aborts the statement mid-execution with ctx's error (row pumps poll
+// it, so a full scan, join, or long write stops within a few hundred
+// rows). A statement aborted inside a transaction block fails the
+// block like any other error.
+func (d *DB) ExecCtx(ctx context.Context, query string, args ...any) (*Result, error) {
+	st, err := Parse(query)
+	if err != nil {
+		return nil, err
+	}
+	return d.runCtx(ctx, st, args)
+}
+
+// runCtx runs st with ctx as its cancellation scope, on a copy so the
+// shared DB value never carries one statement's context into another.
+func (d *DB) runCtx(ctx context.Context, st Statement, args []any) (*Result, error) {
+	dw := *d
+	dw.ctx = ctx
+	return dw.run(st, args)
+}
+
 // Prepare parses a statement once for repeated execution with
 // per-call parameter values.
 func (d *DB) Prepare(query string) (*Stmt, error) {
@@ -358,6 +389,12 @@ func (s *Stmt) NumParams() int { return s.n }
 // Exec executes the prepared statement with args bound to its
 // placeholders.
 func (s *Stmt) Exec(args ...any) (*Result, error) { return s.db.run(s.st, args) }
+
+// ExecCtx executes the prepared statement bounded by ctx; see
+// DB.ExecCtx for the cancellation semantics.
+func (s *Stmt) ExecCtx(ctx context.Context, args ...any) (*Result, error) {
+	return s.db.runCtx(ctx, s.st, args)
+}
 
 // toEngineColumn maps a parsed column definition onto the engine's,
 // validating a DEFAULT against the column type (a quoted literal
@@ -490,6 +527,16 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		// transaction state to control.
 		return nil, serr.New("transaction control statements require a Session",
 			"statement", s.Tag)
+	case *SetVar:
+		// Sessions intercept SET to give statement_timeout meaning; a
+		// bare DB has no session state, so honoring the timeout is
+		// impossible — refuse rather than silently not time out.
+		// Everything else is accepted and ignored, exactly as the
+		// Session does for parameters without bytdb semantics.
+		if s.Name == "statement_timeout" {
+			return nil, serr.New("SET statement_timeout requires a Session")
+		}
+		return &Result{Tag: s.Tag}, nil
 	}
 	return nil, serr.New("unhandled statement type")
 }

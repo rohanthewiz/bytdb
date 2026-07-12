@@ -314,6 +314,19 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 // Close closes the underlying store.
 func (e *Engine) Close() error { return e.kv.Close() }
 
+// Backup writes a consistent point-in-time copy of the database to
+// destPath without blocking readers or writers: every transaction
+// committed before the call is in the copy, whole — catalog and rows
+// alike, since both live in the one kv keyspace. The copy lands
+// atomically (temp file + fsync + rename), and restoring is just Open
+// on the backup file.
+func (e *Engine) Backup(destPath string) error {
+	if err := e.kv.Backup(destPath); err != nil {
+		return serr.Wrap(err, "op", "engine backup")
+	}
+	return nil
+}
+
 // loadCatalog validates every table descriptor at open, warming the
 // parse cache. Unreadable or too-new descriptors fail the open —
 // silently skipping one would hide the table's rows and let a

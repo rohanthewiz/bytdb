@@ -30,8 +30,14 @@
 //     (1-based character offset), the rest become Detail — with a
 //     SQLSTATE mapped from the error's kind.
 //
-// Cancellation keys, portal suspension (Execute row limits), COPY,
-// NOTIFY, and the pg_catalog schema are not implemented.
+//   - Out-of-band query cancellation: BackendKeyData carries a
+//     crypto-random secret, CancelRequest (verified by PID + secret)
+//     aborts the target connection's running statement with SQLSTATE
+//     57014, and SET statement_timeout bounds every statement the
+//     session runs. Only the statement dies; the connection lives on.
+//
+// Portal suspension (Execute row limits), COPY, and NOTIFY are not
+// implemented.
 package pgwire
 
 import (
@@ -66,10 +72,25 @@ type Server struct {
 
 	nextPID atomic.Int32
 
-	mu     sync.Mutex
-	ln     net.Listener
-	conns  map[net.Conn]struct{}
-	closed bool
+	mu       sync.Mutex
+	ln       net.Listener
+	conns    map[net.Conn]struct{}
+	backends map[int32]*conn // BackendKeyData PID → live connection, for CancelRequest
+	closed   bool
+}
+
+// cancelBackend handles an out-of-band CancelRequest: find the target
+// connection by PID, verify the shared secret, and cancel whatever
+// statement it is running. A miss is silent — the protocol sends no
+// response either way, precisely so cancellation cannot be used to
+// probe for live PIDs.
+func (s *Server) cancelBackend(pid int32, secret uint32) {
+	s.mu.Lock()
+	c := s.backends[pid]
+	s.mu.Unlock()
+	if c != nil && c.secret == secret {
+		c.cancelQuery()
+	}
 }
 
 // idleTxTimeout resolves the configured timeout to an effective one.
@@ -85,7 +106,7 @@ func (s *Server) idleTxTimeout() time.Duration {
 
 // NewServer wraps a SQL frontend for serving.
 func NewServer(db *sql.DB) *Server {
-	return &Server{db: db, conns: map[net.Conn]struct{}{}}
+	return &Server{db: db, conns: map[net.Conn]struct{}{}, backends: map[int32]*conn{}}
 }
 
 // ListenAndServe listens on addr (e.g. "127.0.0.1:5432") and serves
@@ -121,26 +142,30 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
+		c := &conn{
+			srv:     s,
+			nc:      nc,
+			idleTx:  s.idleTxTimeout(),
+			r:       bufio.NewReader(nc),
+			w:       bufio.NewWriter(nc),
+			sess:    s.db.NewSession(),
+			stmts:   map[string]*prepared{},
+			portals: map[string]*portal{},
+			pid:     s.nextPID.Add(1),
+			secret:  newCancelSecret(),
+		}
 		s.mu.Lock()
 		s.conns[nc] = struct{}{}
+		s.backends[c.pid] = c
 		s.mu.Unlock()
 		go func() {
 			defer func() {
 				nc.Close()
 				s.mu.Lock()
 				delete(s.conns, nc)
+				delete(s.backends, c.pid)
 				s.mu.Unlock()
 			}()
-			c := &conn{
-				srv:     s,
-				nc:      nc,
-				idleTx:  s.idleTxTimeout(),
-				r:       bufio.NewReader(nc),
-				w:       bufio.NewWriter(nc),
-				sess:    s.db.NewSession(),
-				stmts:   map[string]*prepared{},
-				portals: map[string]*portal{},
-			}
 			defer c.sess.Close() // a dropped connection rolls back
 			c.run()
 		}()

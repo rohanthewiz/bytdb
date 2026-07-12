@@ -805,6 +805,21 @@ type TxnControl struct {
 // are ignored.
 type Explain struct{ Stmt Statement }
 
+// SetVar is SET [SESSION|LOCAL] name {=|TO} value, or RESET name.
+// bytdb gives semantics to statement_timeout (a Session honors it on
+// every following statement); any other parameter is accepted and
+// remembered but changes nothing, so the housekeeping SETs drivers
+// and ORMs send on connect succeed. Value holds the rendered value
+// text, comma-joined for list parameters like search_path; IsDefault
+// marks SET ... TO DEFAULT and RESET, which restore the parameter's
+// default (for statement_timeout: no timeout).
+type SetVar struct {
+	Name      string
+	Value     string
+	IsDefault bool
+	Tag       string // command tag: SET or RESET
+}
+
 func (*CreateTable) stmt()    {}
 func (*Explain) stmt()        {}
 func (*DropTable) stmt()      {}
@@ -822,3 +837,4 @@ func (*Select) stmt()         {}
 func (*Update) stmt()         {}
 func (*Delete) stmt()         {}
 func (*TxnControl) stmt()     {}
+func (*SetVar) stmt()         {}

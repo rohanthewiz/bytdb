@@ -68,7 +68,13 @@ Parse-time rejections with pointed errors:
 | `SELECT DISTINCT ON (...)` | Plain `DISTINCT` works; keep-first-per-group needs application code |
 | `SELECT DISTINCT ... ORDER BY <expression>` | Order by output column names or positions — a sort key the projection dropped would decide which duplicate survives |
 | `DROP SEQUENCE ... CASCADE`, `OWNED BY table.column` | Nothing can depend on a sequence yet; `OWNED BY NONE` parses |
-| `COPY`, out-of-band query cancellation, SSL on the wire | — |
+| `COPY`, SSL on the wire | — |
+
+Out-of-band query cancellation **works**: the server issues real
+BackendKeyData secrets, honors `CancelRequest` (SQLSTATE 57014), and
+`SET statement_timeout` bounds every statement — a runaway query no
+longer wedges the global writer lock. `SET`/`RESET` parse; parameters
+other than `statement_timeout` are accepted and ignored.
 
 Two deliberate Postgres *divergences* around sequences and windows:
 
@@ -131,6 +137,19 @@ Easy to confuse:
   means a slow open.
 - **One process per file.** There is no file locking for multi-process access;
   the wire server is the intended way to share a database.
+- **Online backup**: `Engine.Backup(destPath)` writes a consistent
+  point-in-time copy without blocking readers or writers (temp file +
+  fsync + atomic rename); restoring is just `Open` on the copy. Never
+  copy the live file by hand while the process runs — a raw copy can
+  catch a torn tail mid-append.
+- **The log refuses to open past mid-file corruption.** A torn tail
+  (crash mid-append) is repaired silently, as always; but if an intact
+  record survives *after* a corrupt one (bitrot), `Open` fails with
+  `ErrCorrupt` instead of silently discarding everything past the
+  damage. `WithTruncateAtCorruption()` is the explicit salvage
+  override. The file now begins with a magic + format-version header;
+  pre-header files still open and are upgraded on their next
+  compaction.
 - **`server_version` is advertised as `16.0 (bytdb)`** — version-sniffing
   clients will believe they talk to Postgres 16. Features they then assume may
   not exist (see the table above).

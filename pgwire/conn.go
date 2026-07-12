@@ -7,6 +7,8 @@ package pgwire
 
 import (
 	"bufio"
+	"context"
+	crand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,12 +33,71 @@ type conn struct {
 	w      *bufio.Writer
 	sess   *sql.Session
 
+	// pid and secret form the connection's BackendKeyData: a client
+	// proves the right to cancel this connection's queries by echoing
+	// both in a CancelRequest. The secret is crypto-random — a
+	// guessable one would let any peer who can reach the port kill
+	// other sessions' statements.
+	pid    int32
+	secret uint32
+
+	// queryCancel aborts the statement currently executing, nil between
+	// statements. The connection goroutine arms and disarms it; a
+	// CancelRequest arrives on a different goroutine, hence the mutex.
+	cancelMu    sync.Mutex
+	queryCancel context.CancelFunc
+
 	stmts   map[string]*prepared
 	portals map[string]*portal
 
 	// inErr: an extended-protocol message failed; per the protocol,
 	// discard everything until the client's Sync.
 	inErr bool
+}
+
+// newCancelSecret draws the BackendKeyData secret. Failure of the
+// system randomness source is unrecoverable enough that Go's own
+// crypto/rand panics on it; a zero fallback here would silently issue
+// forgeable cancel keys instead.
+func newCancelSecret() uint32 {
+	var b [4]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		panic("pgwire: reading random cancel secret: " + err.Error())
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
+
+// armCancel installs a fresh cancellation scope for one statement (or
+// one simple-query batch) and returns its context. disarmCancel must
+// follow when the work ends.
+func (c *conn) armCancel() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancelMu.Lock()
+	c.queryCancel = cancel
+	c.cancelMu.Unlock()
+	return ctx
+}
+
+// disarmCancel retires the current statement's cancellation scope; a
+// CancelRequest arriving from here on is a no-op, as in Postgres (the
+// protocol makes cancellation advisory and racy by design).
+func (c *conn) disarmCancel() {
+	c.cancelMu.Lock()
+	if c.queryCancel != nil {
+		c.queryCancel() // release the context's resources; the query is done
+		c.queryCancel = nil
+	}
+	c.cancelMu.Unlock()
+}
+
+// cancelQuery aborts whatever statement the connection is running.
+// Called from a CancelRequest connection's goroutine via the server.
+func (c *conn) cancelQuery() {
+	c.cancelMu.Lock()
+	if c.queryCancel != nil {
+		c.queryCancel()
+	}
+	c.cancelMu.Unlock()
 }
 
 // prepared is one named (or unnamed) statement from Parse. A nil stmt
@@ -85,6 +147,9 @@ func (c *conn) run() (err error) {
 		}
 	}()
 	if err := c.startup(); err != nil {
+		if errors.Is(err, errCancelHandled) {
+			return nil
+		}
 		return err
 	}
 	for {
@@ -164,9 +229,13 @@ func (c *conn) idleTxExpired(err error) bool {
 		errors.As(err, &ne) && ne.Timeout()
 }
 
+// errCancelHandled reports a connection that existed only to deliver a
+// CancelRequest; run treats it as a clean exit.
+var errCancelHandled = errors.New("cancel request handled")
+
 // startup performs the handshake: refuse SSL and GSS encryption
-// politely, ignore cancel requests (out-of-band cancellation is not
-// supported), then trust-authenticate any startup message.
+// politely, dispatch cancel requests to their target connection, then
+// trust-authenticate any startup message.
 func (c *conn) startup() error {
 	for {
 		body, err := readStartup(c.r)
@@ -182,7 +251,16 @@ func (c *conn) startup() error {
 			}
 			c.w.Flush()
 		case codeCancelRequest:
-			return serr.New("cancel request")
+			// The whole connection exists to carry this one message: PID
+			// and secret follow the code, and the protocol's answer is
+			// silence — the socket just closes, whether or not anything
+			// was canceled.
+			pid := int32(r.u32())
+			secret := r.u32()
+			if !r.bad {
+				c.srv.cancelBackend(pid, secret)
+			}
+			return errCancelHandled
 		case protoVersion3:
 			// Parameters (user, database, ...) follow as key/value
 			// cstring pairs; the engine has no users or databases, so
@@ -204,8 +282,8 @@ func (c *conn) startup() error {
 				c.send(msgParameterStatus, b)
 			}
 			var key wbuf
-			key.int32(int(c.srv.nextPID.Add(1)))
-			key.int32(0)
+			key.int32(int(c.pid))
+			key.int32(int(int32(c.secret)))
 			c.send(msgBackendKeyData, key)
 			c.ready()
 			return c.wErr()
@@ -233,13 +311,18 @@ func (c *conn) simpleQuery(q string) {
 		c.ready()
 		return
 	}
+	// One cancellation scope spans the whole query buffer, so a
+	// CancelRequest arriving between two of its statements still stops
+	// the batch (the next statement fails on the canceled context).
+	ctx := c.armCancel()
+	defer c.disarmCancel()
 	for _, p := range parts {
 		st, err := c.srv.db.Prepare(p.text)
 		if err != nil {
 			c.sendError(err, q, p.off)
 			break
 		}
-		res, err := c.sess.ExecStmt(st)
+		res, err := c.sess.ExecStmtCtx(ctx, st)
 		if err != nil {
 			c.sendError(err, q, p.off)
 			break
@@ -402,7 +485,9 @@ func (c *conn) execute(r *rbuf) {
 		c.send(msgEmptyQuery, nil)
 		return
 	}
-	res, err := c.sess.ExecStmt(pt.prep.stmt, pt.args...)
+	ctx := c.armCancel()
+	res, err := c.sess.ExecStmtCtx(ctx, pt.prep.stmt, pt.args...)
+	c.disarmCancel()
 	if err != nil {
 		c.sendError(err, pt.prep.query, 0)
 		return
