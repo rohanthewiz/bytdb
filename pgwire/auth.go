@@ -25,9 +25,12 @@ import (
 	"crypto/pbkdf2"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/subtle"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"hash"
 	"strconv"
 	"strings"
 	"sync"
@@ -223,6 +226,57 @@ func hmacSHA256(key []byte, msg string) []byte {
 	return m.Sum(nil)
 }
 
+// --- channel binding (SCRAM-SHA-256-PLUS, RFC 5929) ---
+
+// channelBinding returns the tls-server-end-point binding data — a
+// hash of the server's DER certificate — or nil when the PLUS
+// mechanism cannot be offered. Binding data must equal what the client
+// computes from the certificate it received, so it is only derivable
+// when the served certificate is unambiguous: exactly one static
+// certificate and no dynamic selection callbacks (with those, which
+// certificate a handshake served depends on SNI and is not observable
+// after the fact from the server side).
+func (s *Server) channelBinding() []byte {
+	s.bindOnce.Do(func() {
+		cfg := s.TLSConfig
+		if cfg == nil || cfg.GetCertificate != nil || cfg.GetConfigForClient != nil ||
+			len(cfg.Certificates) != 1 || len(cfg.Certificates[0].Certificate) == 0 {
+			return
+		}
+		leaf, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0])
+		if err != nil {
+			return
+		}
+		h := bindingHash(leaf.SignatureAlgorithm)
+		if h == nil {
+			return
+		}
+		h.Write(leaf.Raw)
+		s.bindData = h.Sum(nil)
+	})
+	return s.bindData
+}
+
+// bindingHash picks the certificate hash per RFC 5929 §4.1: the hash
+// of the certificate's signature algorithm, except MD5 and SHA-1
+// (too weak) are replaced by SHA-256. The mapping mirrors pgx's
+// client-side getTLSCertificateHash exactly — both ends must hash the
+// same way or the proof never verifies. Unlisted algorithms (Ed25519,
+// DSA) get nil: the binding is undefined for them, so PLUS is simply
+// not advertised and clients fall back to plain SCRAM-SHA-256.
+func bindingHash(alg x509.SignatureAlgorithm) hash.Hash {
+	switch alg {
+	case x509.MD5WithRSA, x509.SHA1WithRSA, x509.ECDSAWithSHA1,
+		x509.SHA256WithRSA, x509.SHA256WithRSAPSS, x509.ECDSAWithSHA256:
+		return sha256.New()
+	case x509.SHA384WithRSA, x509.SHA384WithRSAPSS, x509.ECDSAWithSHA384:
+		return sha512.New384()
+	case x509.SHA512WithRSA, x509.SHA512WithRSAPSS, x509.ECDSAWithSHA512:
+		return sha512.New()
+	}
+	return nil
+}
+
 // --- the exchange itself ---
 
 // scramConv holds one connection's SCRAM conversation between the two
@@ -231,6 +285,13 @@ func hmacSHA256(key []byte, msg string) []byte {
 type scramConv struct {
 	verifier scramVerifier
 	mocked   bool
+
+	// binding is the tls-server-end-point data when the client chose
+	// SCRAM-SHA-256-PLUS (nil for plain SCRAM-SHA-256); plusOffered
+	// records whether PLUS was advertised, because a "y" gs2 flag from
+	// a client that was offered binding is a downgrade in progress.
+	binding     []byte
+	plusOffered bool
 
 	gs2Header       string // e.g. "n,," — echoed back base64 in client-final's c=
 	clientFirstBare string
@@ -241,18 +302,42 @@ type scramConv struct {
 // clientFirst parses the client-first-message and builds the
 // server-first-message.
 func (sc *scramConv) clientFirst(msg string) (string, error) {
-	// GS2 header: channel-binding flag, optional authzid, comma. Only
-	// "SCRAM-SHA-256" is advertised, so a client on TLS says "y" (I
-	// could bind but you did not offer it) and one on plaintext says
-	// "n"; "p=" would claim a binding this server never offered.
-	rest, ok := strings.CutPrefix(msg, "n,")
-	if !ok {
-		if rest, ok = strings.CutPrefix(msg, "y,"); !ok {
-			if strings.HasPrefix(msg, "p=") {
-				return "", serr.New("channel binding is not supported")
-			}
-			return "", serr.New("malformed SCRAM client-first message")
+	// GS2 header: channel-binding flag, optional authzid, comma. The
+	// flag must agree with the mechanism the client selected — "p=" if
+	// and only if it chose SCRAM-SHA-256-PLUS — and RFC 5802 §6 makes
+	// "y" a tripwire: it means "I can bind but you did not offer it",
+	// so if PLUS *was* advertised, someone between us stripped it from
+	// the mechanism list and authentication must fail.
+	var rest string
+	switch {
+	case strings.HasPrefix(msg, "n,"):
+		if sc.binding != nil {
+			return "", serr.New("SCRAM-SHA-256-PLUS requires the p= gs2 flag")
 		}
+		rest = msg[2:]
+	case strings.HasPrefix(msg, "y,"):
+		if sc.binding != nil {
+			return "", serr.New("SCRAM-SHA-256-PLUS requires the p= gs2 flag")
+		}
+		if sc.plusOffered {
+			return "", serr.New("channel binding downgrade detected")
+		}
+		rest = msg[2:]
+	case strings.HasPrefix(msg, "p="):
+		cbName, r, ok := strings.Cut(msg[2:], ",")
+		if !ok {
+			return "", serr.New("malformed SCRAM gs2 header")
+		}
+		if sc.binding == nil {
+			// p= under plain SCRAM-SHA-256 (or PLUS never advertised).
+			return "", serr.New("channel binding not offered")
+		}
+		if cbName != "tls-server-end-point" {
+			return "", serr.New("unsupported channel binding type", "type", cbName)
+		}
+		rest = r
+	default:
+		return "", serr.New("malformed SCRAM client-first message")
 	}
 	authzid, bare, ok := strings.Cut(rest, ",")
 	if !ok || (authzid != "" && !strings.HasPrefix(authzid, "a=")) {
@@ -305,9 +390,14 @@ func (sc *scramConv) clientFinal(msg string) (string, error) {
 	if len(attrs) < 2 || !strings.HasPrefix(attrs[0], "c=") || !strings.HasPrefix(attrs[1], "r=") {
 		return "", serr.New("malformed SCRAM client-final message")
 	}
-	// c= must echo the gs2 header from client-first: it is covered by
-	// the proof, so a MITM downgrading the binding flag breaks it.
-	if attrs[0][2:] != base64.StdEncoding.EncodeToString([]byte(sc.gs2Header)) {
+	// c= must echo the gs2 header from client-first — plus, under
+	// SCRAM-SHA-256-PLUS, the channel-binding data itself (the server
+	// certificate's hash). Both are covered by the proof, so a MITM
+	// downgrading the binding flag breaks the exchange, and under PLUS
+	// even a relayed handshake fails: the attacker's own certificate
+	// hash is what the client signed, not ours.
+	cbindInput := append([]byte(sc.gs2Header), sc.binding...)
+	if attrs[0][2:] != base64.StdEncoding.EncodeToString(cbindInput) {
 		return "", serr.New("SCRAM channel-binding mismatch")
 	}
 	if attrs[1][2:] != sc.nonce {
@@ -370,8 +460,19 @@ func (c *conn) authSCRAM(user string) error {
 		return serr.Wrap(err, "scram authentication failed", "user", user)
 	}
 
+	// On TLS, offer SCRAM-SHA-256-PLUS (channel binding) ahead of the
+	// base mechanism when the certificate's binding data is derivable;
+	// clients with channel_binding=require refuse servers that don't.
+	// Postgres advertises the same pair in the same order.
+	var binding []byte
+	if c.tlsOn {
+		binding = c.srv.channelBinding()
+	}
 	var adv wbuf
 	adv.int32(authSASL)
+	if binding != nil {
+		adv.cstr("SCRAM-SHA-256-PLUS")
+	}
 	adv.cstr("SCRAM-SHA-256")
 	adv.byte(0) // end of mechanism list
 	c.send(msgAuth, adv)
@@ -394,12 +495,21 @@ func (c *conn) authSCRAM(user string) error {
 	if r.bad || !ok {
 		return fail(serr.New("malformed SASLInitialResponse"))
 	}
-	if mech != "SCRAM-SHA-256" {
+	switch mech {
+	case "SCRAM-SHA-256":
+	case "SCRAM-SHA-256-PLUS":
+		if binding == nil {
+			return fail(serr.New("SCRAM-SHA-256-PLUS was not offered"))
+		}
+	default:
 		return fail(serr.New("unsupported SASL mechanism", "mechanism", mech))
 	}
 
 	verifier, mocked := c.srv.Auth.lookup(user)
-	conv := &scramConv{verifier: verifier, mocked: mocked}
+	conv := &scramConv{verifier: verifier, mocked: mocked, plusOffered: binding != nil}
+	if mech == "SCRAM-SHA-256-PLUS" {
+		conv.binding = binding
+	}
 	serverFirst, err := conv.clientFirst(string(first))
 	if err != nil {
 		return fail(err)

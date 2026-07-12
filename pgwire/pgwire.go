@@ -19,7 +19,11 @@
 //     get a mock exchange so they are indistinguishable from wrong
 //     passwords. Setting Server.TLSConfig makes the server accept
 //     SSLRequest and upgrade the stream to TLS; RequireTLS then
-//     refuses plaintext clients outright. GSS encryption is declined.
+//     refuses plaintext clients outright. On TLS with a single static
+//     certificate the server also offers SCRAM-SHA-256-PLUS
+//     (tls-server-end-point channel binding, RFC 5929), so
+//     channel_binding=require clients are satisfied and binding
+//     downgrades fail the exchange. GSS encryption is declined.
 //
 //   - Transaction blocks: each connection is a sql.Session, so BEGIN
 //     ... COMMIT/ROLLBACK behave as in Postgres — ReadyForQuery
@@ -96,6 +100,15 @@ type Server struct {
 	// authentication. The registry may be updated while serving. Set
 	// before Serve.
 	Auth *Credentials
+
+	// bindOnce/bindData cache the RFC 5929 tls-server-end-point
+	// channel-binding value (a hash of the server certificate) that
+	// SCRAM-SHA-256-PLUS signs into the authentication exchange. Derived
+	// lazily from TLSConfig on the first TLS+SCRAM login; nil means the
+	// PLUS mechanism is not advertised (no TLS, ambiguous certificate
+	// selection, or a signature algorithm RFC 5929 leaves undefined).
+	bindOnce sync.Once
+	bindData []byte
 
 	nextPID atomic.Int32
 

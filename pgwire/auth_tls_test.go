@@ -12,11 +12,14 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,6 +177,120 @@ func TestSCRAMOverTLS(t *testing.T) {
 		fmt.Sprintf("postgres://ada:wrong@%s/any?sslmode=require", addr)); !errors.As(err, &pgErr) || pgErr.Code != "28P01" {
 		t.Fatalf("wrong password over TLS: %+v", err)
 	}
+}
+
+// TestChannelBinding: over TLS the server advertises
+// SCRAM-SHA-256-PLUS, so a channel_binding=require client — which
+// refuses servers without it — authenticates, and the proof now signs
+// the server certificate's hash.
+func TestChannelBinding(t *testing.T) {
+	creds := pgwire.NewCredentials()
+	creds.SetPassword("ada", "s3cret")
+	addr := startConfiguredServer(t, func(s *pgwire.Server) {
+		s.TLSConfig = testTLSConfig(t)
+		s.Auth = creds
+	})
+
+	roundTrip(t, connect(t, fmt.Sprintf(
+		"postgres://ada:s3cret@%s/any?sslmode=require&channel_binding=require", addr)))
+
+	// A wrong password under PLUS still fails with the uniform 28P01.
+	var pgErr *pgconn.PgError
+	if _, err := pgx.Connect(context.Background(), fmt.Sprintf(
+		"postgres://ada:wrong@%s/any?sslmode=require&channel_binding=require", addr)); !errors.As(err, &pgErr) || pgErr.Code != "28P01" {
+		t.Fatalf("wrong password under channel binding: %+v", err)
+	}
+
+	// Plaintext offers no binding to require: pgx refuses client-side.
+	if _, err := pgx.Connect(context.Background(), fmt.Sprintf(
+		"postgres://ada:s3cret@%s/any?sslmode=disable&channel_binding=require", addr)); err == nil {
+		t.Fatal("channel_binding=require succeeded without TLS")
+	}
+}
+
+// TestChannelBindingDowngrade hand-rolls the one client shape pgx will
+// never send: a "y" gs2 flag on a connection whose server advertised
+// SCRAM-SHA-256-PLUS. RFC 5802 makes that flag mean "you did not offer
+// binding" — seeing it when binding *was* offered means a MITM
+// stripped the PLUS mechanism, and the server must fail the exchange.
+func TestChannelBindingDowngrade(t *testing.T) {
+	creds := pgwire.NewCredentials()
+	creds.SetPassword("ada", "s3cret")
+	addr := startConfiguredServer(t, func(s *pgwire.Server) {
+		s.TLSConfig = testTLSConfig(t)
+		s.Auth = creds
+	})
+
+	nc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	// SSLRequest, then upgrade.
+	if _, err := nc.Write([]byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}); err != nil {
+		t.Fatal(err)
+	}
+	one := make([]byte, 1)
+	if _, err := io.ReadFull(nc, one); err != nil || one[0] != 'S' {
+		t.Fatalf("SSLRequest answer: %v %q", err, one)
+	}
+	tc := tls.Client(nc, &tls.Config{InsecureSkipVerify: true})
+	if err := tc.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+
+	// StartupMessage with user=ada.
+	var startup []byte
+	startup = append(startup, 0, 3, 0, 0) // protocol 3.0
+	startup = append(startup, "user\x00ada\x00\x00"...)
+	frame := make([]byte, 4+len(startup))
+	binary.BigEndian.PutUint32(frame, uint32(len(frame)))
+	copy(frame[4:], startup)
+	if _, err := tc.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+
+	// AuthenticationSASL must list PLUS first.
+	typ, body := readBackendMessage(t, tc)
+	if typ != 'R' || binary.BigEndian.Uint32(body) != 10 {
+		t.Fatalf("expected AuthenticationSASL, got %c %v", typ, body)
+	}
+	if mechs := string(body[4:]); !strings.HasPrefix(mechs, "SCRAM-SHA-256-PLUS\x00SCRAM-SHA-256\x00") {
+		t.Fatalf("advertised mechanisms: %q", mechs)
+	}
+
+	// SASLInitialResponse: plain SCRAM-SHA-256 with the downgrade "y".
+	first := "y,,n=,r=0123456789abcdefgh"
+	var resp []byte
+	resp = append(resp, "SCRAM-SHA-256\x00"...)
+	resp = binary.BigEndian.AppendUint32(resp, uint32(len(first)))
+	resp = append(resp, first...)
+	msg := append([]byte{'p'}, make([]byte, 4)...)
+	binary.BigEndian.PutUint32(msg[1:], uint32(4+len(resp)))
+	msg = append(msg, resp...)
+	if _, err := tc.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+
+	typ, body = readBackendMessage(t, tc)
+	if typ != 'E' || !strings.Contains(string(body), "28P01") {
+		t.Fatalf("downgrade not refused: %c %q", typ, body)
+	}
+}
+
+// readBackendMessage reads one framed backend message off a raw test
+// connection.
+func readBackendMessage(t *testing.T, r io.Reader) (byte, []byte) {
+	t.Helper()
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, binary.BigEndian.Uint32(hdr[1:])-4)
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatal(err)
+	}
+	return hdr[0], body
 }
 
 // TestVerifierAndSASLprep covers the no-plaintext path (MakeVerifier →
