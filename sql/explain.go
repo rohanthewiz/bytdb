@@ -292,7 +292,28 @@ func (x *explainer) fromNode(fp *fromPlan) (*planNode, error) {
 		if step.it.Join == JoinLeft {
 			title = "Nested Loop Left Join"
 		}
+		var hashCond string
+		if len(step.hashEq) > 0 {
+			title = "Hash Join"
+			if step.it.Join == JoinLeft {
+				title = "Hash Left Join"
+			}
+			var conds []string
+			for _, tp := range step.tmpls {
+				if tp.op != OpEQ {
+					continue
+				}
+				src := fp.sc.tableOf(tp.srcOrd)
+				st := fp.sc.tables[src]
+				conds = append(conds, "("+tp.item.Col.String()+" = "+
+					st.name+"."+st.desc.Columns[tp.srcOrd-st.off].Name+")")
+			}
+			hashCond = strings.Join(conds, " AND ")
+		}
 		loop := &planNode{title: title, children: []*planNode{n, scan}}
+		if hashCond != "" {
+			loop.details = append(loop.details, "Hash Cond: "+hashCond)
+		}
 		if parts := unclaimed(boolParts(step.it.On), claimed); len(parts) > 0 {
 			loop.details = append(loop.details, "Join Filter: "+x.condText(parts))
 		}
@@ -324,6 +345,15 @@ func (x *explainer) stepScan(fp *fromPlan, step *joinStep, claimed map[BoolExpr]
 		claimed[e] = true
 	}
 	for _, tp := range step.tmpls {
+		// A hash step consumes its equality templates as the hash
+		// condition (rendered on the join node), not as per-row scan
+		// predicates; its other templates fall through to Join Filter.
+		if len(step.hashEq) > 0 {
+			if tp.op == OpEQ {
+				claimed[tp.pr] = true
+			}
+			continue
+		}
 		src := fp.sc.tableOf(tp.srcOrd)
 		st := fp.sc.tables[src]
 		srcName := st.name + "." + st.desc.Columns[tp.srcOrd-st.off].Name

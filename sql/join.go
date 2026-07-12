@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -188,7 +189,23 @@ type joinStep struct {
 	static []BoolExpr
 	tmpls  []predTmpl
 	plan   *plan // precomputed access path (order-aware single-table scan); nil: plan per outer row
+
+	// hashEq, when non-empty, switches this step from the nested loop
+	// to a hash join: the inner table (filtered by the static
+	// conjuncts) is scanned once into a hash table keyed by these
+	// equality columns, and each outer row probes instead of scanning.
+	// Chosen only when no index could serve the equalities — the case
+	// where the nested loop degrades to a full inner scan per outer
+	// row. The templates it replaces are still re-verified through the
+	// full ON/WHERE evaluation, so the bucket only has to be a
+	// superset of the true matches.
+	hashEq []hashEqKey
 }
+
+// hashEqKey is one hash-join key column: the inner table's own
+// ordinal (build side) and the outer combined-row ordinal (probe
+// side) of an equality conjunct.
+type hashEqKey struct{ innerOrd, srcOrd int }
 
 // predTmpl is "this table's column op the value at srcOrd of the
 // outer row". pr is the conjunct it was made from (EXPLAIN needs the
@@ -245,9 +262,103 @@ func prepareFrom(lk tableLookup, items []FromItem, where BoolExpr) (*fromPlan, e
 				step.tmpls = append(step.tmpls, predTmpl{item: *pr.RItem, op: flip(pr.Op), srcOrd: bd.l, pr: pr})
 			}
 		}
+		if k > 0 {
+			step.hashEq = chooseHashJoin(sc, &step)
+		}
 		fp.steps = append(fp.steps, step)
 	}
 	return fp, nil
+}
+
+// chooseHashJoin decides whether a join step should build and probe a
+// hash table instead of re-scanning per outer row. The conditions:
+// the step has equality templates whose two sides hash compatibly,
+// and no index or primary key could serve any of them (when one
+// could, the nested loop's per-row point get or bounded scan is the
+// better plan — it reads only the matching region and builds
+// nothing). Virtual tables (CTEs, derived tables, views, catalog
+// tables) have no indexes at all, so any equality qualifies them.
+func chooseHashJoin(sc *scope, step *joinStep) []hashEqKey {
+	var keys []hashEqKey
+	for _, tp := range step.tmpls {
+		if tp.op != OpEQ {
+			continue
+		}
+		innerOrd := step.st.desc.ColIndex(tp.item.Col.Name)
+		if innerOrd < 0 {
+			return nil // resolution failed; leave it to the nested loop's error
+		}
+		if !hashCompatible(step.st.desc.Columns[innerOrd].Type, sc.column(tp.srcOrd).Type) {
+			// Sides that only compare through dynamic coercion cannot
+			// share a hash key; the nested loop keeps exact semantics.
+			return nil
+		}
+		if step.st.rows == nil && indexServes(step.st.desc, innerOrd) {
+			return nil
+		}
+		keys = append(keys, hashEqKey{innerOrd: innerOrd, srcOrd: tp.srcOrd})
+	}
+	return keys
+}
+
+// indexServes reports whether an equality on the column could push
+// into the primary key or an index (it is some access path's first
+// key column).
+func indexServes(d *bytdb.TableDesc, ord int) bool {
+	if len(d.PKCols) > 0 && d.PKCols[0] == ord {
+		return true
+	}
+	for i := range d.Indexes {
+		if len(d.Indexes[i].Cols) > 0 && d.Indexes[i].Cols[0] == ord {
+			return true
+		}
+	}
+	return false
+}
+
+// hashCompatible reports whether equal values of the two column types
+// always encode to the same hash key. Identical types do; the numeric
+// class (ints, floats, and the int64-backed date/time types) does via
+// the float64 normalization in hashJoinKey. Everything else — notably
+// text against a non-text — compares through coercion the key cannot
+// reproduce.
+func hashCompatible(a, b bytdb.ColType) bool {
+	if a == b {
+		return true
+	}
+	num := func(t bytdb.ColType) bool {
+		switch t {
+		case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp, bytdb.TDate:
+			return true
+		}
+		return false
+	}
+	return num(a) && num(b)
+}
+
+// hashJoinKey encodes one side's key values; ok is false when any
+// value is NULL (a NULL never equals anything, so it never joins) or
+// unencodable. Integers normalize to float64 so cross-numeric
+// equality (1 = 1.0) lands in the same bucket; the loss above 2^53
+// only ever merges buckets, and every bucket row is re-verified by
+// the full ON/WHERE evaluation.
+func hashJoinKey(vals []any, ord func(hashEqKey) int, keys []hashEqKey) (string, bool) {
+	ks := make([]any, len(keys))
+	for i, k := range keys {
+		v := vals[ord(k)]
+		if v == nil {
+			return "", false
+		}
+		if n, isInt := v.(int64); isInt {
+			v = float64(n)
+		}
+		ks[i] = v
+	}
+	kb, err := tuple.Encode(ks...)
+	if err != nil {
+		return "", false
+	}
+	return string(kb), true
 }
 
 // runJoin nested-loops the FROM clause within tx's snapshot, yielding
@@ -272,6 +383,10 @@ type joinRun struct {
 	yield func([]any) bool
 	stop  bool
 	err   error
+
+	// hashes are the hash-join steps' build tables, keyed by
+	// hashJoinKey, built lazily the first time each step runs.
+	hashes []map[string][][]any
 }
 
 func (j *joinRun) rec(k int, partial []any) {
@@ -287,6 +402,10 @@ func (j *joinRun) rec(k int, partial []any) {
 		return
 	}
 	step := &j.fp.steps[k]
+	if len(step.hashEq) > 0 {
+		j.hashStep(k, partial)
+		return
+	}
 
 	// Fill the templates from the outer row. A NULL source value can
 	// never satisfy its conjunct, so the scan is skipped outright (a
@@ -306,22 +425,7 @@ func (j *joinRun) rec(k int, partial []any) {
 	matched := false
 	if !skip {
 		next := func(rowVals []any) bool {
-			vals := make([]any, len(partial)+len(rowVals))
-			copy(vals, partial)
-			copy(vals[len(partial):], rowVals)
-			if step.it.On != nil {
-				t, err := evalPreds(step.it.On, j.fp.b, j.env, vals)
-				if err != nil {
-					j.err = err
-					return false
-				}
-				if t != triTrue {
-					return true
-				}
-			}
-			matched = true
-			j.rec(k+1, vals)
-			return !j.stop && j.err == nil
+			return j.stepNext(k, partial, rowVals, &matched)
 		}
 		if step.st.rows != nil {
 			// A virtual system table: no pushdown, just its
@@ -359,6 +463,89 @@ func (j *joinRun) rec(k int, partial []any) {
 		if j.stop || j.err != nil {
 			return
 		}
+	}
+	if step.it.Join == JoinLeft && !matched {
+		vals := make([]any, len(partial)+len(step.st.desc.Columns))
+		copy(vals, partial)
+		j.rec(k+1, vals)
+	}
+}
+
+// stepNext extends the outer row with one candidate inner row,
+// applies the step's ON, and recurses to the next step. Returns false
+// to stop the current step's row source.
+func (j *joinRun) stepNext(k int, partial, rowVals []any, matched *bool) bool {
+	step := &j.fp.steps[k]
+	vals := make([]any, len(partial)+len(rowVals))
+	copy(vals, partial)
+	copy(vals[len(partial):], rowVals)
+	if step.it.On != nil {
+		t, err := evalPreds(step.it.On, j.fp.b, j.env, vals)
+		if err != nil {
+			j.err = err
+			return false
+		}
+		if t != triTrue {
+			return true
+		}
+	}
+	*matched = true
+	j.rec(k+1, vals)
+	return !j.stop && j.err == nil
+}
+
+// hashStep runs one hash-join step: build the inner hash table once
+// (statics pushed into the build scan), then probe with the outer
+// row's key. Rows in a bucket still pass through the full ON (and
+// later the WHERE), so bucket collisions and dropped non-equality
+// templates cost work, never correctness.
+func (j *joinRun) hashStep(k int, partial []any) {
+	step := &j.fp.steps[k]
+	if j.hashes == nil {
+		j.hashes = make([]map[string][][]any, len(j.fp.steps))
+	}
+	ht := j.hashes[k]
+	if ht == nil {
+		ht = map[string][][]any{}
+		add := func(rowVals []any) {
+			if key, ok := hashJoinKey(rowVals, func(h hashEqKey) int { return h.innerOrd }, step.hashEq); ok {
+				ht[key] = append(ht[key], rowVals)
+			}
+		}
+		if step.st.rows != nil {
+			for _, rv := range step.st.rows {
+				add(rv)
+			}
+		} else {
+			pl, err := planScan(step.st.desc, step.st.name, combineStatic(step.static))
+			if err != nil {
+				j.err = err
+				return
+			}
+			// Static conjuncts are plain Preds (conjuncts() only yields
+			// those), so the residual filter needs no environment.
+			err = scanPlan(j.ctx, j.tx, step.it.Table, pl, nil, func(r bytdb.Row) bool {
+				add(r.Vals)
+				return true
+			})
+			if err != nil {
+				j.err = err
+				return
+			}
+		}
+		j.hashes[k] = ht
+	}
+
+	matched := false
+	if key, ok := hashJoinKey(partial, func(h hashEqKey) int { return h.srcOrd }, step.hashEq); ok {
+		for _, rowVals := range ht[key] {
+			if !j.stepNext(k, partial, rowVals, &matched) {
+				break
+			}
+		}
+	}
+	if j.stop || j.err != nil {
+		return
 	}
 	if step.it.Join == JoinLeft && !matched {
 		vals := make([]any, len(partial)+len(step.st.desc.Columns))

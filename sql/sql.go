@@ -63,7 +63,12 @@
 // FROM tables. Select lists also accept t.* . Joins execute as nested
 // loops, but ON and WHERE equality conjuncts re-bind per outer row,
 // so an inner table joined on its primary key or an indexed column is
-// a point get or bounded scan per row, not a full scan. A LEFT JOIN
+// a point get or bounded scan per row, not a full scan. When no index
+// can serve an equijoin — including every join against a CTE, derived
+// table, or view — the step becomes a hash join instead: the inner
+// side is scanned once into a hash table and each outer row probes it,
+// so unindexed equijoins are linear, not quadratic (EXPLAIN shows Hash
+// Join with its Hash Cond). A LEFT JOIN
 // extends unmatched left rows with NULLs; WHERE predicates on its
 // right table apply after that extension (so o.id IS NULL is the
 // anti-join).
