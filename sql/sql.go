@@ -12,6 +12,7 @@
 //	ALTER TABLE t DROP [COLUMN] c
 //	ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
 //	ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
+//	ALTER TABLE t OWNER TO role       (accepted and ignored; no roles)
 //	CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 //	DROP INDEX idx [ON t]
 //	CREATE SEQUENCE [IF NOT EXISTS] s [AS type] [INCREMENT [BY] n]
@@ -645,6 +646,12 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 		return d.execAddFK(s)
 	case *DropConstraint:
 		return d.execDropConstraint(s)
+	case *AlterOwner:
+		// No roles in bytdb; the statement exists only so Postgres DDL
+		// (pg_dump output, goose migrations) runs unmodified. Succeed
+		// without touching the catalog — even table existence is not
+		// checked, matching the "ignore" half of parse-and-ignore.
+		return &Result{}, nil
 	case *CreateIndex:
 		keys := make([]bytdb.IndexCol, len(s.Cols))
 		for i, c := range s.Cols {

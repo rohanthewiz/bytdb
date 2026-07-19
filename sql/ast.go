@@ -680,6 +680,14 @@ type DropConstraint struct {
 	IfExists bool
 }
 
+// AlterOwner is ALTER TABLE t OWNER TO role. bytdb has no roles or
+// ownership, but pg_dump output and migration tools (goose, etc.) emit
+// these routinely, so the statement is parsed and executed as a no-op
+// rather than forcing every consumer to strip it from otherwise-valid
+// Postgres DDL. The fields are retained so EXPLAIN/describe can still
+// show what was requested.
+type AlterOwner struct{ Table, Owner string }
+
 // CreateIndex is CREATE [UNIQUE] INDEX name ON t (col [ASC|DESC], ...).
 // Desc is parallel to Cols (nil: all ascending).
 type CreateIndex struct {
@@ -958,6 +966,7 @@ func (*RenameColumn) stmt()   {}
 func (*AddConstraint) stmt()  {}
 func (*AddFK) stmt()          {}
 func (*DropConstraint) stmt() {}
+func (*AlterOwner) stmt()     {}
 func (*CreateIndex) stmt()    {}
 func (*DropIndex) stmt()      {}
 func (*CreateSequence) stmt() {}

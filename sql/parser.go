@@ -1384,8 +1384,21 @@ func (p *parser) alterTable() (Statement, error) {
 			return nil, err
 		}
 		return &DropColumn{Table: table, Col: name}, nil
+	case p.acceptKw("owner"):
+		// OWNER TO role — accepted for pg_dump/migration compatibility
+		// and executed as a no-op (bytdb has no roles). The role is any
+		// identifier, which also covers Postgres's CURRENT_USER /
+		// SESSION_USER pseudo-roles since those lex as plain idents.
+		if err := p.expectKw("to"); err != nil {
+			return nil, err
+		}
+		owner, err := p.ident("a role name")
+		if err != nil {
+			return nil, err
+		}
+		return &AlterOwner{Table: table, Owner: owner}, nil
 	}
-	return nil, p.unexpected("ADD, DROP, or RENAME")
+	return nil, p.unexpected("ADD, DROP, RENAME, or OWNER")
 }
 
 // --- DML ---
