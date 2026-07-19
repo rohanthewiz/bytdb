@@ -257,6 +257,28 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 			return triTrue, nil
 		}
 		return triFalse, nil
+	case OpContains, OpContainedBy, OpKeyExists, OpKeyExistsAny, OpKeyExistsAll:
+		if v == nil || lit == nil {
+			return triUnknown, nil
+		}
+		// Both sides are text at runtime: the left a jsonb document's
+		// canonical form, the right a jsonb document (@> <@), a key (?),
+		// or a '{...}' key list (?| ?&). jsonbPredicate parses and
+		// reports malformed operands in Postgres's words.
+		doc, okD := v.(string)
+		arg, okA := lit.(string)
+		if !okD || !okA {
+			return triUnknown, serr.New("jsonb operator requires text operands",
+				"op", opText(op))
+		}
+		hit, err := jsonbPredicate(op, doc, arg)
+		if err != nil {
+			return triUnknown, err
+		}
+		if hit {
+			return triTrue, nil
+		}
+		return triFalse, nil
 	}
 	// A bound time.Time compares as timestamp micros — the dynamic
 	// mirror of coerceLit's conversion, for placeholders that end up in

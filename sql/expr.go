@@ -217,6 +217,24 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if r == nil {
+			return nil, nil
+		}
+		switch n.Op {
+		case "->", "->>", "#>", "#>>":
+			// These spellings exist only for jsonb; no dispatch needed.
+			return jsonbArith(n.Op, l, r)
+		case "||", "-":
+			// || and - are shared spellings (text concat, arithmetic).
+			// Runtime values cannot say which was meant — a jsonb value
+			// and a text value are both Go strings — so the *static* type
+			// of an operand decides, the row-level analogue of operator
+			// resolution. Two untyped literals stay text/numeric, exactly
+			// as an unknown-vs-unknown operator resolves in Postgres.
+			if staticJSONB(env, n.L) || staticJSONB(env, n.R) {
+				return jsonbArith(n.Op, l, r)
+			}
+		}
 		return arith(n.Op, l, r)
 	case *ExAgg:
 		return nil, serr.New("aggregate calls are not supported inside expressions",
@@ -674,6 +692,46 @@ func arith(op string, l, r any) (any, error) {
 		return math.Mod(lf, rf), nil
 	}
 	return nil, serr.New("unhandled arithmetic operator", "op", op)
+}
+
+// staticJSONB reports whether an expression is jsonb-typed by shape:
+// a jsonb column (resolved through the environment chain, so a
+// correlated outer column counts), a ::jsonb cast, a jsonb-producing
+// accessor, or a || / - chain over one. It decides which semantics the
+// shared || and - spellings get in evalEx; a shape it cannot see
+// through (CASE, coalesce, ...) reads as not-jsonb and falls back to
+// the text/numeric operator, mirroring how Postgres resolves operators
+// on unknown-typed operands.
+func staticJSONB(env *exEnv, e Expr) bool {
+	switch n := e.(type) {
+	case *ExCol:
+		for ev := env; ev != nil; ev = ev.outer {
+			if ev.sc == nil {
+				continue
+			}
+			if ord, err := ev.sc.resolve(n.Col); err == nil {
+				return ev.sc.column(ord).Type == bytdb.TJSONB
+			}
+		}
+	case *ExCast:
+		return n.Type == "json" || n.Type == "jsonb"
+	case *ExArith:
+		switch n.Op {
+		case "->", "#>": // ->> and #>> produce text, not jsonb
+			return true
+		case "||", "-":
+			return staticJSONB(env, n.L) || staticJSONB(env, n.R)
+		}
+	case *exGroupRef:
+		return n.typ == bytdb.TJSONB
+	case *exAccRef:
+		return n.typ == bytdb.TJSONB
+	case *exWinRef:
+		return n.typ == bytdb.TJSONB
+	case *exOrd:
+		return n.typ == bytdb.TJSONB
+	}
+	return false
 }
 
 func asFloat(v any) (float64, bool) {
@@ -1600,8 +1658,20 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 	case *ExWindow:
 		return n.resultType(sc)
 	case *ExArith:
-		if n.Op == "||" {
+		switch n.Op {
+		case "->", "#>":
+			return bytdb.TJSONB
+		case "->>", "#>>":
 			return bytdb.TString
+		case "||":
+			if exprType(sc, n.L) == bytdb.TJSONB || exprType(sc, n.R) == bytdb.TJSONB {
+				return bytdb.TJSONB
+			}
+			return bytdb.TString
+		case "-":
+			if exprType(sc, n.L) == bytdb.TJSONB || exprType(sc, n.R) == bytdb.TJSONB {
+				return bytdb.TJSONB
+			}
 		}
 		if exprType(sc, n.L) == bytdb.TFloat || exprType(sc, n.R) == bytdb.TFloat {
 			return bytdb.TFloat
@@ -1651,6 +1721,8 @@ func castColType(typ string) bytdb.ColType {
 		return bytdb.TDate
 	case "uuid":
 		return bytdb.TUUID
+	case "json", "jsonb":
+		return bytdb.TJSONB
 	}
 	return bytdb.TString
 }

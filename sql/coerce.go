@@ -187,6 +187,13 @@ func coerceBool(e BoolExpr, typeOf func(SelectItem) (bytdb.ColType, error)) (Boo
 		case OpRegex, OpNotRegex, OpRegexI, OpNotRegexI,
 			OpLike, OpNotLike, OpILike, OpNotILike:
 			return n, nil
+		// The key-existence operands are a text key (?) or key list
+		// (?| ?&), never the jsonb column's own type — coercing 'a'
+		// through CanonJSONB would reject every valid key. Containment
+		// (@> <@) is left to coerce: its operand IS jsonb, so the
+		// column-type coercion validates and canonicalizes it early.
+		case OpKeyExists, OpKeyExistsAny, OpKeyExistsAll:
+			return n, nil
 		}
 		switch n.Val.(type) {
 		case string, time.Time: // the kinds coerceLit adapts by column type

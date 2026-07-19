@@ -25,10 +25,20 @@ const (
 	// pattern (%: any run, _: any one character, backslash escapes)
 	// compiles to an anchored regex in checkPred. Postgres's operator
 	// spellings (~~, ~~*) appear in EXPLAIN output.
-	OpLike      // LIKE
-	OpNotLike   // NOT LIKE
-	OpILike     // ILIKE (case-insensitive)
-	OpNotILike  // NOT ILIKE
+	OpLike     // LIKE
+	OpNotLike  // NOT LIKE
+	OpILike    // ILIKE (case-insensitive)
+	OpNotILike // NOT ILIKE
+	// The jsonb boolean operators ride the Pred machinery like the
+	// pattern family: never pushed into scans, evaluated by checkPred
+	// (see jsonb_ops.go). The value-producing operators (-> ->> #> #>>
+	// || -) are ExArith ops instead — they yield jsonb/text, not
+	// booleans, so they live in expressions.
+	OpContains     // @>  left document contains right
+	OpContainedBy  // <@  left document is contained in right
+	OpKeyExists    // ?   text key/element exists
+	OpKeyExistsAny // ?|  any of a text[] of keys exists
+	OpKeyExistsAll // ?&  all of a text[] of keys exist
 )
 
 // Param is a $n placeholder (1-based), parsed wherever a literal may
@@ -170,8 +180,10 @@ type ExCast struct {
 // ExIndex is E[Idx]; parses, does not evaluate (no arrays).
 type ExIndex struct{ E, Idx Expr }
 
-// ExArith is arithmetic or string concatenation: + - * / % ||.
-// A unary minus parses as 0 - E.
+// ExArith is arithmetic, string concatenation, or a jsonb value
+// operator: + - * / % || and -> ->> #> #>>. A unary minus parses as
+// 0 - E. The shared spellings (|| and -) pick jsonb semantics at
+// evaluation when an operand is statically jsonb (see staticJSONB).
 type ExArith struct {
 	Op   string
 	L, R Expr

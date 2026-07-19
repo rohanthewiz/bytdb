@@ -571,6 +571,16 @@ func opText(op PredOp) string {
 		return "~~*"
 	case OpNotILike:
 		return "!~~*"
+	case OpContains:
+		return "@>"
+	case OpContainedBy:
+		return "<@"
+	case OpKeyExists:
+		return "?"
+	case OpKeyExistsAny:
+		return "?|"
+	case OpKeyExistsAll:
+		return "?&"
 	}
 	return "?"
 }

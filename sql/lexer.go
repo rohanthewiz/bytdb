@@ -192,18 +192,22 @@ func scanNumber(src string, i int) int {
 // scanOp recognizes the operator starting at src[i], longest first, or
 // returns "".
 func scanOp(src string, i int) string {
-	if i+2 < len(src) && src[i:i+3] == "!~*" {
-		return "!~*"
+	if i+2 < len(src) {
+		switch three := src[i : i+3]; three {
+		case "!~*", "->>", "#>>":
+			return three
+		}
 	}
 	if i+1 < len(src) {
 		switch two := src[i : i+2]; two {
-		case "!=", "<>", "<=", ">=", "!~", "~*", "::", "||":
+		case "!=", "<>", "<=", ">=", "!~", "~*", "::", "||",
+			"->", "#>", "@>", "<@", "?|", "?&":
 			return two
 		}
 	}
 	switch src[i] {
 	case '=', '<', '>', '(', ')', ',', ';', '*', '.', '+', '-',
-		'~', '[', ']', '/', '%':
+		'~', '[', ']', '/', '%', '?':
 		return string(src[i])
 	}
 	return ""

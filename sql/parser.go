@@ -2751,6 +2751,10 @@ func (p *parser) exprList() ([]Expr, error) {
 	return out, p.expectOp(")")
 }
 
+// exprAdd parses the additive level, which also hosts || and the
+// jsonb accessors (-> ->> #> #>>) — Postgres puts every "other"
+// operator between + - and the comparisons, and one shared level keeps
+// chains like j->'a'->>'b' and j->'a' || j->'b' left-associative.
 func (p *parser) exprAdd() (Expr, error) {
 	e, err := p.exprMul()
 	if err != nil {
@@ -2758,7 +2762,12 @@ func (p *parser) exprAdd() (Expr, error) {
 	}
 	for {
 		t := p.cur()
-		if t.kind != tOp || (t.text != "+" && t.text != "-" && t.text != "||") {
+		if t.kind != tOp {
+			return e, nil
+		}
+		switch t.text {
+		case "+", "-", "||", "->", "->>", "#>", "#>>":
+		default:
 			return e, nil
 		}
 		p.advance()
@@ -3385,6 +3394,16 @@ func predOpFor(t token) (PredOp, bool) {
 		return OpRegexI, true
 	case "!~*":
 		return OpNotRegexI, true
+	case "@>":
+		return OpContains, true
+	case "<@":
+		return OpContainedBy, true
+	case "?":
+		return OpKeyExists, true
+	case "?|":
+		return OpKeyExistsAny, true
+	case "?&":
+		return OpKeyExistsAll, true
 	}
 	return 0, false
 }
