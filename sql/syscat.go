@@ -184,6 +184,8 @@ func typeOID(t bytdb.ColType) int64 {
 		return 1082
 	case bytdb.TUUID:
 		return 2950
+	case bytdb.TTextArray:
+		return 1009 // _text
 	}
 	return 25 // text
 }
@@ -220,6 +222,8 @@ func sqlTypeName(t bytdb.ColType) string {
 		return "date"
 	case bytdb.TUUID:
 		return "uuid"
+	case bytdb.TTextArray:
+		return "ARRAY" // information_schema spells every array type this way
 	}
 	return "text"
 }
@@ -242,6 +246,8 @@ func udtName(t bytdb.ColType) string {
 		return "date"
 	case bytdb.TUUID:
 		return "uuid"
+	case bytdb.TTextArray:
+		return "_text" // pg_type's array-of-text name
 	}
 	return "text"
 }
@@ -415,6 +421,7 @@ var sysTables = map[string]*sysTableDef{
 				{20, "int8", 8, "N"}, {21, "int2", 2, "N"}, {23, "int4", 4, "N"},
 				{25, "text", -1, "S"}, {26, "oid", 4, "N"}, {700, "float4", 4, "N"},
 				{701, "float8", 8, "N"}, {1043, "varchar", -1, "S"},
+				{1009, "_text", -1, "A"},
 				{1082, "date", 4, "D"}, {1114, "timestamp", 8, "D"},
 				{1184, "timestamptz", 8, "D"}, {2950, "uuid", 16, "U"},
 			} {

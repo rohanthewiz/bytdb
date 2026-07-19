@@ -60,6 +60,11 @@ const (
 	TTimestamp ColType = "timestamp" // int64: microseconds since the Unix epoch, UTC
 	TDate      ColType = "date"      // int64: days since the Unix epoch
 	TUUID      ColType = "uuid"      // []byte: 16 bytes, RFC 4122 order
+	// TTextArray rides on a string runtime representation: the
+	// canonical Postgres array literal ('{a,"b c"}', see types.go).
+	// One dimension, text elements only — enough for the tag/category
+	// columns arrays are used for, without a new tuple encoding.
+	TTextArray ColType = "text_array"
 )
 
 // Column describes one table column. ID is assigned by the engine

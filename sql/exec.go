@@ -224,21 +224,33 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 			return triTrue, nil
 		}
 		return triFalse, nil
-	case OpRegex, OpNotRegex, OpRegexI, OpNotRegexI:
+	case OpRegex, OpNotRegex, OpRegexI, OpNotRegexI,
+		OpLike, OpNotLike, OpILike, OpNotILike:
 		if v == nil || lit == nil {
 			return triUnknown, nil
 		}
 		s, okS := v.(string)
 		pat, okP := lit.(string)
 		if !okS || !okP {
-			return triUnknown, serr.New("regex match requires text operands")
+			return triUnknown, serr.New("pattern match requires text operands")
 		}
-		re, err := compileRegex(pat, op == OpRegexI || op == OpNotRegexI)
+		// LIKE patterns become regexes first; both families then share
+		// one compile cache and match path. Case-insensitivity is a
+		// compile flag, not a pattern rewrite.
+		if op == OpLike || op == OpNotLike || op == OpILike || op == OpNotILike {
+			var err error
+			if pat, err = likeRegex(pat); err != nil {
+				return triUnknown, err
+			}
+		}
+		insensitive := op == OpRegexI || op == OpNotRegexI || op == OpILike || op == OpNotILike
+		re, err := compileRegex(pat, insensitive)
 		if err != nil {
 			return triUnknown, err
 		}
 		hit := re.MatchString(s)
-		if op == OpNotRegex || op == OpNotRegexI {
+		switch op {
+		case OpNotRegex, OpNotRegexI, OpNotLike, OpNotILike:
 			hit = !hit
 		}
 		if hit {

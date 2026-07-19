@@ -201,11 +201,7 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		parts := make([]string, len(vals))
-		for i, v := range vals {
-			parts[i] = valText(v)
-		}
-		return "{" + strings.Join(parts, ",") + "}", nil
+		return textArrayValue(vals), nil
 	case *ExArith:
 		// Every arithmetic/concat operator is NULL-strict, so a NULL
 		// left operand decides the result without evaluating the right
@@ -557,6 +553,41 @@ func compileRegex(pat string, insensitive bool) (*regexp.Regexp, error) {
 	return re, nil
 }
 
+// likeRegex translates a LIKE pattern to the anchored regex that
+// implements it: % is any run of characters, _ any single character,
+// backslash makes the next character literal, and everything else
+// quotes. (?s) lets % and _ cross newlines, as LIKE does. The result
+// feeds compileRegex, so each distinct pattern compiles once and the
+// per-row cost is the translation plus a cache hit.
+//
+// Iteration is by rune: _ must consume one character, not one byte,
+// and a multi-byte rune must quote as a unit.
+func likeRegex(pat string) (string, error) {
+	var b strings.Builder
+	b.WriteString(`(?s)^`)
+	runes := []rune(pat)
+	for i := 0; i < len(runes); i++ {
+		switch runes[i] {
+		case '\\':
+			if i+1 >= len(runes) {
+				// Postgres's exact wording; a trailing escape has no
+				// character to escape.
+				return "", serr.New("LIKE pattern must not end with escape character")
+			}
+			i++
+			b.WriteString(regexp.QuoteMeta(string(runes[i])))
+		case '%':
+			b.WriteString(`.*`)
+		case '_':
+			b.WriteString(`.`)
+		default:
+			b.WriteString(regexp.QuoteMeta(string(runes[i])))
+		}
+	}
+	b.WriteString(`$`)
+	return b.String(), nil
+}
+
 // --- arithmetic and concatenation ---
 
 // errIntRange matches Postgres's message (SQLSTATE 22003) for integer
@@ -683,6 +714,23 @@ func valText(v any) string {
 // numeric (a name string resolves through the catalog for regclass).
 func castVal(env *exEnv, v any, typ string) (any, error) {
 	if strings.HasSuffix(typ, "[]") {
+		switch typ {
+		case "text[]", "varchar[]", "character varying[]":
+			// '{a,b}'::text[] validates and canonicalizes the literal —
+			// the array-typed value IS its canonical text (see
+			// bytdb.TTextArray), so the cast is a parse+re-render.
+			switch x := v.(type) {
+			case nil:
+				return nil, nil
+			case string:
+				canon, err := bytdb.CanonTextArray(x)
+				if err != nil {
+					return nil, err
+				}
+				return canon, nil
+			}
+			return nil, serr.New("cannot cast to text[]", "from", fmt.Sprintf("%T", v))
+		}
 		return nil, serr.New("array casts are not supported", "type", typ)
 	}
 	switch typ {
@@ -863,8 +911,65 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 		}
 		colNo, _ := argN(1).(int64)
 		return indexdef(env.d, oid, colNo), nil
-	case "array_to_string", "array_length": // no arrays exist: NULL in, NULL out
-		return nil, nil
+	case "array_to_string":
+		// array_to_string(array, delim [, nullStr]): joins the elements.
+		// Postgres semantics: NULL array or delimiter yields NULL; NULL
+		// elements are skipped in the 2-arg form and rendered as
+		// nullStr in the 3-arg form.
+		if len(args) < 2 || len(args) > 3 {
+			return nil, serr.New("array_to_string requires 2 or 3 arguments")
+		}
+		if args[0] == nil || args[1] == nil {
+			return nil, nil
+		}
+		arr, okA := args[0].(string)
+		delim, okD := args[1].(string)
+		if !okA || !okD {
+			return nil, serr.New("array_to_string requires a text array and a text delimiter")
+		}
+		elems, err := bytdb.ParseTextArray(arr)
+		if err != nil {
+			return nil, err
+		}
+		nullStr, haveNullStr := "", false
+		if len(args) == 3 && args[2] != nil {
+			if nullStr, haveNullStr = args[2].(string); !haveNullStr {
+				return nil, serr.New("array_to_string null-string must be text")
+			}
+		}
+		parts := make([]string, 0, len(elems))
+		for _, e := range elems {
+			if e == nil {
+				if haveNullStr {
+					parts = append(parts, nullStr)
+				}
+				continue
+			}
+			parts = append(parts, e.(string))
+		}
+		return strings.Join(parts, delim), nil
+	case "array_length":
+		// array_length(array, dim): only dimension 1 exists, and — as
+		// in Postgres — the length of an empty array is NULL, not 0.
+		if len(args) != 2 {
+			return nil, serr.New("array_length requires 2 arguments")
+		}
+		if args[0] == nil || args[1] == nil {
+			return nil, nil
+		}
+		arr, okA := args[0].(string)
+		dim, okD := args[1].(int64)
+		if !okA || !okD {
+			return nil, serr.New("array_length requires a text array and an integer dimension")
+		}
+		elems, err := bytdb.ParseTextArray(arr)
+		if err != nil {
+			return nil, err
+		}
+		if dim != 1 || len(elems) == 0 {
+			return nil, nil
+		}
+		return int64(len(elems)), nil
 	case "pg_get_constraintdef":
 		oid, ok := argN(0).(int64)
 		if !ok {
@@ -980,6 +1085,16 @@ func formatType(typid, typmod any) any {
 		if m, ok := typmod.(int64); ok && m >= 4 {
 			return fmt.Sprintf("character varying(%d)", m-4)
 		}
+	case 1009:
+		name = "text[]"
+	case 1082:
+		name = "date"
+	case 1114:
+		name = "timestamp without time zone"
+	case 1184:
+		name = "timestamp with time zone"
+	case 2950:
+		name = "uuid"
 	default:
 		return "???"
 	}
@@ -1295,11 +1410,26 @@ func evalArraySub(env *exEnv, sel *Select) (any, error) {
 	if len(sel.OrderBy) > 0 {
 		slices.SortStableFunc(vals, orderCmp)
 	}
-	parts := make([]string, len(vals))
+	return textArrayValue(vals), nil
+}
+
+// textArrayValue renders evaluated elements as the canonical array
+// literal — the runtime form of every array-typed value. Non-string
+// elements (ints from ARRAY[1,2], say) render through valText first:
+// one dimension of text elements is the only array that exists here.
+func textArrayValue(vals []any) string {
+	elems := make([]any, len(vals))
 	for i, v := range vals {
-		parts[i] = valText(v)
+		if v == nil {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			elems[i] = s
+		} else {
+			elems[i] = valText(v)
+		}
 	}
-	return "{" + strings.Join(parts, ",") + "}", nil
+	return bytdb.FormatTextArray(elems)
 }
 
 // evalExistsSub runs EXISTS (SELECT ...): whether the (possibly

@@ -180,6 +180,14 @@ func coerceBool(e BoolExpr, typeOf func(SelectItem) (bytdb.ColType, error)) (Boo
 	case nil:
 		return nil, nil
 	case *Pred:
+		// A pattern operand is text no matter what type the column is —
+		// coercing '%2024%' to a timestamp because the column is one
+		// would reject every valid pattern. checkPred type-checks these.
+		switch n.Op {
+		case OpRegex, OpNotRegex, OpRegexI, OpNotRegexI,
+			OpLike, OpNotLike, OpILike, OpNotILike:
+			return n, nil
+		}
 		switch n.Val.(type) {
 		case string, time.Time: // the kinds coerceLit adapts by column type
 		default:
@@ -286,6 +294,10 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 		return bytdb.ParseDate(s)
 	case bytdb.TUUID:
 		return bytdb.ParseUUID(s)
+	case bytdb.TTextArray:
+		// Canonicalize here as well as in the engine so comparisons in
+		// WHERE ('{a, b}' = categories) match the stored spelling.
+		return bytdb.CanonTextArray(s)
 	}
 	return s, nil
 }

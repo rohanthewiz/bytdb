@@ -1040,11 +1040,38 @@ var serialTypes = map[string]bool{
 	"serial2": true, "serial4": true, "serial8": true,
 }
 
-// typeName parses a column type, accepting common Postgres aliases.
-// maxLen is a VARCHAR(n) limit (0: none), enforced on writes; it was
-// formerly parsed and dropped, which silently accepted schemas whose
-// declared limits meant nothing.
+// typeName parses a column type, accepting common Postgres aliases,
+// then an optional [] array suffix. Only text arrays exist (they ride
+// on a string representation; see bytdb.TTextArray), so the suffix is
+// legal on the text/varchar family alone and rejected elsewhere rather
+// than parsing into a type the engine would refuse later.
 func (p *parser) typeName() (typ bytdb.ColType, maxLen int, err error) {
+	if typ, maxLen, err = p.typeNameBase(); err != nil {
+		return "", 0, err
+	}
+	if !p.acceptOp("[") {
+		return typ, maxLen, nil
+	}
+	if err = p.expectOp("]"); err != nil {
+		return "", 0, err
+	}
+	if typ != bytdb.TString {
+		return "", 0, serr.New("only text[] arrays are supported",
+			"type", string(typ)+"[]")
+	}
+	if maxLen != 0 {
+		// A per-element length limit would need enforcement inside the
+		// stored literal; refuse rather than silently drop the limit.
+		return "", 0, serr.New("varchar(n)[] is not supported; use text[]")
+	}
+	return bytdb.TTextArray, 0, nil
+}
+
+// typeNameBase parses the scalar type name itself. maxLen is a
+// VARCHAR(n) limit (0: none), enforced on writes; it was formerly
+// parsed and dropped, which silently accepted schemas whose declared
+// limits meant nothing.
+func (p *parser) typeNameBase() (typ bytdb.ColType, maxLen int, err error) {
 	t := p.cur()
 	if t.kind != tIdent {
 		return "", 0, p.unexpected("a column type")
@@ -2559,6 +2586,24 @@ func (p *parser) exprCmp() (Expr, error) {
 				return nil, err
 			}
 			e = r
+		case p.cur().kind == tIdent && (p.cur().text == "like" || p.cur().text == "ilike"):
+			ilike := p.cur().text == "ilike"
+			p.advance()
+			r, err := p.likeTail(e, ilike, false)
+			if err != nil {
+				return nil, err
+			}
+			e = r
+		case p.cur().kind == tIdent && p.cur().text == "not" &&
+			p.tokAt(1).kind == tIdent && (p.tokAt(1).text == "like" || p.tokAt(1).text == "ilike"):
+			ilike := p.tokAt(1).text == "ilike"
+			p.advance()
+			p.advance()
+			r, err := p.likeTail(e, ilike, true)
+			if err != nil {
+				return nil, err
+			}
+			e = r
 		default:
 			op, ok, err := p.cmpOp()
 			if err != nil {
@@ -2626,6 +2671,39 @@ func (p *parser) inTail(e Expr, not bool) (Expr, error) {
 		return nil, err
 	}
 	return &ExIn{E: e, List: list, Not: not}, nil
+}
+
+// likeTail parses what follows [NOT] LIKE / [NOT] ILIKE: the pattern
+// (an additive expression, so `col LIKE '%' || $1 || '%'` composes)
+// and an optional ESCAPE clause. Only the default backslash escape is
+// implemented; a different character is rejected rather than silently
+// matching with the wrong escape semantics.
+func (p *parser) likeTail(e Expr, ilike, not bool) (Expr, error) {
+	r, err := p.exprAdd()
+	if err != nil {
+		return nil, err
+	}
+	if p.acceptKw("escape") {
+		t := p.cur()
+		if t.kind != tString {
+			return nil, p.unexpected("a quoted escape character")
+		}
+		p.advance()
+		if t.text != `\` {
+			return nil, serr.New("only the default backslash ESCAPE character is supported",
+				"escape", t.text)
+		}
+	}
+	op := OpLike
+	switch {
+	case ilike && not:
+		op = OpNotILike
+	case ilike:
+		op = OpILike
+	case not:
+		op = OpNotLike
+	}
+	return &ExCmp{Op: op, L: e, R: r}, nil
 }
 
 // exprList parses "( expr [, expr]* )".

@@ -561,6 +561,16 @@ func opText(op PredOp) string {
 		return "~*"
 	case OpNotRegexI:
 		return "!~*"
+	// Postgres prints LIKE through its operator names (~~ family) in
+	// plan output; matching that keeps EXPLAIN diff-able against it.
+	case OpLike:
+		return "~~"
+	case OpNotLike:
+		return "!~~"
+	case OpILike:
+		return "~~*"
+	case OpNotILike:
+		return "!~~*"
 	}
 	return "?"
 }

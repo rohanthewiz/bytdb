@@ -21,6 +21,14 @@ const (
 	OpNotRegex  // !~
 	OpRegexI    // ~*  case-insensitive
 	OpNotRegexI // !~*
+	// The LIKE family shares the regex ops' execution path: the
+	// pattern (%: any run, _: any one character, backslash escapes)
+	// compiles to an anchored regex in checkPred. Postgres's operator
+	// spellings (~~, ~~*) appear in EXPLAIN output.
+	OpLike      // LIKE
+	OpNotLike   // NOT LIKE
+	OpILike     // ILIKE (case-insensitive)
+	OpNotILike  // NOT ILIKE
 )
 
 // Param is a $n placeholder (1-based), parsed wherever a literal may

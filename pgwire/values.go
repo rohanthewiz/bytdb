@@ -29,6 +29,7 @@ const (
 	oidTimestamp   = 1114
 	oidTimestamptz = 1184
 	oidUUID        = 2950
+	oidTextArray   = 1009 // _text: one-dimensional text[]
 )
 
 // Postgres's date/time binary formats count from 2000-01-01 rather
@@ -63,6 +64,8 @@ func oidForType(t bytdb.ColType) uint32 {
 		return oidDate
 	case bytdb.TUUID:
 		return oidUUID
+	case bytdb.TTextArray:
+		return oidTextArray
 	}
 	return oidText
 }
@@ -126,6 +129,16 @@ func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
 				return []byte(bytdb.FormatUUID(x)), nil
 			}
 			return x, nil
+		}
+	case bytdb.TTextArray:
+		// The stored value IS the text wire form (the canonical array
+		// literal), so text format passes through; binary re-encodes as
+		// Postgres's array format, which pgx requests for text[].
+		if x, ok := v.(string); ok {
+			if format == fmtText {
+				return []byte(x), nil
+			}
+			return encodeTextArrayBinary(x)
 		}
 	}
 	if format == fmtText {
@@ -262,6 +275,103 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			return nil, serr.New("bad binary uuid parameter")
 		}
 		return raw, nil
+	case oidTextArray:
+		return decodeTextArrayBinary(raw)
 	}
 	return nil, serr.New("unsupported binary parameter type", "oid", fmt.Sprint(oid))
+}
+
+// --- text[] binary wire format ---
+//
+// Postgres's array binary format is a header — dimension count, a
+// has-nulls flag, the element type OID, then (length, lower bound) per
+// dimension — followed by each element as an int32 byte length (-1 for
+// NULL) and its bytes. bytdb speaks only one-dimensional text arrays,
+// so encoding is a straight walk over the parsed literal and decoding
+// re-renders the canonical literal string the engine stores.
+
+func encodeTextArrayBinary(literal string) ([]byte, error) {
+	elems, err := bytdb.ParseTextArray(literal)
+	if err != nil {
+		return nil, err
+	}
+	i32 := func(buf []byte, n int32) []byte {
+		return binary.BigEndian.AppendUint32(buf, uint32(n))
+	}
+	hasNull := int32(0)
+	for _, e := range elems {
+		if e == nil {
+			hasNull = 1
+		}
+	}
+	// Postgres encodes an empty array with zero dimensions (no dim
+	// header at all), and clients expect exactly that.
+	if len(elems) == 0 {
+		buf := i32(nil, 0)
+		buf = i32(buf, 0)
+		return i32(buf, oidText), nil
+	}
+	buf := i32(nil, 1) // ndim
+	buf = i32(buf, hasNull)
+	buf = i32(buf, oidText)
+	buf = i32(buf, int32(len(elems))) // dimension length
+	buf = i32(buf, 1)                 // lower bound: Postgres arrays are 1-based
+	for _, e := range elems {
+		if e == nil {
+			buf = i32(buf, -1)
+			continue
+		}
+		s := e.(string)
+		buf = i32(buf, int32(len(s)))
+		buf = append(buf, s...)
+	}
+	return buf, nil
+}
+
+func decodeTextArrayBinary(raw []byte) (string, error) {
+	bad := func() (string, error) { return "", serr.New("bad binary array parameter") }
+	if len(raw) < 12 {
+		return bad()
+	}
+	ndim := int32(binary.BigEndian.Uint32(raw[0:4]))
+	// raw[4:8] is the has-nulls flag; the element lengths already say
+	// which elements are NULL, so it needs no checking.
+	elemOID := binary.BigEndian.Uint32(raw[8:12])
+	if ndim == 0 {
+		return "{}", nil
+	}
+	if ndim != 1 {
+		return "", serr.New("multidimensional arrays are not supported")
+	}
+	// varchar (1043) elements are text on the wire too; anything else
+	// (int arrays, say) has no bytdb type to land in.
+	if elemOID != oidText && elemOID != 1043 {
+		return "", serr.New("unsupported array element type", "oid", fmt.Sprint(elemOID))
+	}
+	if len(raw) < 20 {
+		return bad()
+	}
+	n := int32(binary.BigEndian.Uint32(raw[12:16]))
+	if n < 0 {
+		return bad()
+	}
+	elems := make([]any, 0, n)
+	p := 20 // past the dimension's (length, lower bound)
+	for range n {
+		if p+4 > len(raw) {
+			return bad()
+		}
+		l := int32(binary.BigEndian.Uint32(raw[p : p+4]))
+		p += 4
+		if l == -1 {
+			elems = append(elems, nil)
+			continue
+		}
+		if l < 0 || p+int(l) > len(raw) {
+			return bad()
+		}
+		elems = append(elems, string(raw[p:p+int(l)]))
+		p += int(l)
+	}
+	return bytdb.FormatTextArray(elems), nil
 }

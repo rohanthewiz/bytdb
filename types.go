@@ -110,3 +110,158 @@ func FormatUUID(b []byte) string {
 	}
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
+
+// --- text arrays ---
+//
+// TTextArray rides on a string runtime representation: the canonical
+// Postgres one-dimensional array literal ('{a,"b c",NULL}'), which is
+// also the exact text lib/pq and pgx exchange for text[]. Storing the
+// wire text itself means the pgwire layer round-trips arrays for free,
+// and the tuple encoding needs no new element kind. The cost is that
+// value equality is text equality — which is why every write path
+// canonicalizes through CanonTextArray, so '{a, b}' and '{a,b}' store
+// (and therefore compare) identically.
+//
+// Elements are string or nil (a SQL NULL element). Only one dimension
+// exists; '{{a},{b}}' is rejected rather than silently flattened.
+
+// ParseTextArray reads a Postgres one-dimensional array literal into
+// its elements. Quoted elements ("a \"b\"") unescape backslash
+// sequences; unquoted elements trim surrounding whitespace, may not be
+// empty, and read as NULL when they spell null (any case), exactly the
+// rules Postgres's array_in applies.
+func ParseTextArray(s string) ([]any, error) {
+	malformed := func() error {
+		return serr.New(`malformed array literal: "` + s + `"`)
+	}
+	t := strings.TrimSpace(s)
+	if len(t) < 2 || t[0] != '{' || t[len(t)-1] != '}' {
+		return nil, malformed()
+	}
+	body := t[1 : len(t)-1]
+	if strings.TrimSpace(body) == "" {
+		return []any{}, nil
+	}
+	var elems []any
+	i := 0
+	for {
+		// Each loop iteration consumes one element and the comma after
+		// it. Whitespace around elements is decoration, not content.
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		if i < len(body) && body[i] == '{' {
+			return nil, serr.New("multidimensional arrays are not supported", "value", s)
+		}
+		if i < len(body) && body[i] == '"' {
+			// Quoted element: content runs to the closing quote, with
+			// backslash escaping the next byte (covers \" and \\).
+			var b strings.Builder
+			i++
+			closed := false
+			for i < len(body) {
+				c := body[i]
+				if c == '\\' && i+1 < len(body) {
+					b.WriteByte(body[i+1])
+					i += 2
+					continue
+				}
+				if c == '"' {
+					closed = true
+					i++
+					break
+				}
+				b.WriteByte(c)
+				i++
+			}
+			if !closed {
+				return nil, malformed()
+			}
+			elems = append(elems, b.String())
+		} else {
+			// Unquoted element: runs to the next comma. Braces and
+			// quotes inside are structural characters gone wrong.
+			start := i
+			for i < len(body) && body[i] != ',' {
+				if body[i] == '{' || body[i] == '}' || body[i] == '"' {
+					return nil, malformed()
+				}
+				i++
+			}
+			tok := strings.TrimSpace(body[start:i])
+			if tok == "" {
+				return nil, malformed()
+			}
+			if strings.EqualFold(tok, "null") {
+				elems = append(elems, nil)
+			} else {
+				elems = append(elems, tok)
+			}
+		}
+		// After an element: optional whitespace, then a comma (another
+		// element follows) or the end of the body.
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		if i >= len(body) {
+			return elems, nil
+		}
+		if body[i] != ',' {
+			return nil, malformed()
+		}
+		i++
+	}
+}
+
+// FormatTextArray renders elements (string or nil) as the canonical
+// array literal. Quoting matches Postgres's array_out: an element is
+// quoted when leaving it bare would be ambiguous — it is empty, spells
+// NULL, or contains a structural character ({ } , " \) or whitespace —
+// and inside quotes, backslash escapes itself and the double quote.
+func FormatTextArray(elems []any) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if e == nil {
+			b.WriteString("NULL")
+			continue
+		}
+		s := fmt.Sprint(e) // string in practice; Sprint keeps corrupt values visible
+		if !textArrayNeedsQuotes(s) {
+			b.WriteString(s)
+			continue
+		}
+		b.WriteByte('"')
+		for j := 0; j < len(s); j++ {
+			if s[j] == '"' || s[j] == '\\' {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(s[j])
+		}
+		b.WriteByte('"')
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+func textArrayNeedsQuotes(s string) bool {
+	if s == "" || strings.EqualFold(s, "null") {
+		return true
+	}
+	return strings.ContainsAny(s, "{},\"\\ \t\n\r")
+}
+
+// CanonTextArray parses and re-renders an array literal, producing the
+// one spelling every write path stores. Canonical text is what lets
+// '=' on text[] columns behave as element-wise equality despite the
+// underlying comparison being plain string comparison.
+func CanonTextArray(s string) (string, error) {
+	elems, err := ParseTextArray(s)
+	if err != nil {
+		return "", err
+	}
+	return FormatTextArray(elems), nil
+}

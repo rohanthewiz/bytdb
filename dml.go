@@ -618,6 +618,21 @@ func coerce(v any, t ColType) (any, error) {
 		case string:
 			return ParseUUID(x)
 		}
+	case TTextArray:
+		// Canonicalizing on every write is what makes '=' meaningful on
+		// array columns: the stored text is the one spelling of the
+		// value (see types.go). []string is the natural shape for
+		// embedded Go callers; a string is the SQL/wire literal.
+		switch x := v.(type) {
+		case string:
+			return CanonTextArray(x)
+		case []string:
+			elems := make([]any, len(x))
+			for i, s := range x {
+				elems[i] = s
+			}
+			return FormatTextArray(elems), nil
+		}
 	}
 	return nil, serr.New("value does not fit column type",
 		"type", string(t), "value_type", fmt.Sprintf("%T", v))
