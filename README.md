@@ -488,7 +488,58 @@ Beyond the milestones (production-readiness sweep and app-migration work):
 - [x] **Constraints**: `VARCHAR(n)` enforcement (22001); UNIQUE constraint sugar over unique indexes; foreign keys — MATCH SIMPLE, NO ACTION/RESTRICT, end-of-statement checks, SQLSTATE 23503, schema-side guards — and `ON DELETE CASCADE` with transitive cascades that never bypass a NO ACTION constraint downstream
 - [x] **Statements**: TRUNCATE (transactional, RESTART IDENTITY); SET/RESET/SHOW; ALTER TABLE RENAME (table and column); `LIKE`/`ILIKE`; DEFAULT `now()`/`current_date` clock markers evaluated per statement
 - [x] **Query shapes**: derived tables, non-recursive WITH CTEs, persistent views (all via one virtual-table mechanism), `IN (SELECT ...)`, and hash joins for unindexed equijoins
+- [x] **Replication**: the `replicate` nested package — litestream-style asynchronous shipping of the storage log to any S3-compatible object store (dependency-free SigV4 client included), generation rollover on compaction/restart, retention pruning, point-in-time `Restore`; plus streaming `Engine.BackupTo(io.Writer)` for direct-to-bucket snapshots
 - [ ] Later: sequence functions in column DEFAULTs, `SELECT DISTINCT` ordered by select-list *expressions* (output names and positions only today), `DISTINCT ON`, `jsonb_set`/`jsonb_build_*`, jsonb indexing
+
+## Replication
+
+The storage log is append-only between compactions, which makes
+incremental replication byte-range shipping — no page shadowing, no
+checkpoint racing. The `replicate` package polls the engine's log
+cursor (`Engine.LogState` / `Engine.ReadLogRange`, new in btypedb
+v0.6) and uploads whatever appended since its watermark as immutable
+chunk objects:
+
+```
+<prefix>/gen/<generation-id>/<start>-<end>.wlog
+```
+
+A compaction rewrites the file, so it (and each process start) rolls a
+new *generation* shipped from offset zero; older generations are
+pruned once enough newer ones exist. Because every record is
+CRC-framed with batch atomicity, `replicate.Restore` just concatenates
+the newest complete generation's chunks and the result opens exactly
+like a crash-recovered local file — a torn or missing tail chunk costs
+seconds of data, never validity.
+
+```go
+e, _ := bytdb.Open("site.db")
+
+store, _ := s3.New(s3.Config{
+    Endpoint:  "https://us-east-1.linodeobjects.com",
+    Region:    "us-east-1",
+    Bucket:    "db-replicas",
+    AccessKey: os.Getenv("S3_ACCESS_KEY"),
+    SecretKey: os.Getenv("S3_SECRET_KEY"),
+})
+
+r := replicate.New(e, store, replicate.Options{
+    Interval: 5 * time.Second, // the data-loss window
+    Prefix:   "sites/stjohns",
+})
+r.Start()
+defer r.Close() // final flush; close before e.Close()
+
+// Disaster recovery, elsewhere:
+info, _ := replicate.Restore(ctx, store, "sites/stjohns", "site.db")
+```
+
+This is recovery, not high availability: a restored node comes up from
+object-store state; it does not fail over live. `Replicator.ShipNow`
+forces a synchronous ship (after a critical transaction, say), and
+`Status()` feeds health endpoints. The `Storage` interface is four
+methods, so any store with atomic PUT and ordered listing can stand in
+for S3.
 
 ## Design notes
 

@@ -16,6 +16,7 @@ package bytdb
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"iter"
 	"runtime"
 	"slices"
@@ -393,6 +394,35 @@ func (e *Engine) Backup(destPath string) error {
 		return serr.Wrap(err, "op", "engine backup")
 	}
 	return nil
+}
+
+// BackupTo streams a consistent point-in-time copy of the database to
+// w with the same guarantees as Backup, but no local temp file — the
+// natural fit for piping straight into an object-store upload. The
+// caller owns atomicity at the destination (upload to a temp key, or
+// rely on the store's atomic PUT).
+func (e *Engine) BackupTo(w io.Writer) (int64, error) {
+	n, err := e.kv.BackupTo(w)
+	if err != nil {
+		return n, serr.Wrap(err, "op", "engine backup stream")
+	}
+	return n, nil
+}
+
+// LogState exposes the storage log's replication cursor: the current
+// file epoch and byte size. Together with ReadLogRange it is the whole
+// surface the replicate package needs to ship the database
+// incrementally; see btypedb's replication docs for the epoch contract.
+func (e *Engine) LogState() (epoch uint64, size int64, err error) {
+	return e.kv.LogState()
+}
+
+// ReadLogRange copies up to max bytes of the storage log starting at
+// offset from, for the given epoch, into w. It returns
+// btypedb.ErrEpochChanged if a compaction replaced the file since epoch
+// was captured — the signal to restart shipping from offset zero.
+func (e *Engine) ReadLogRange(epoch uint64, from, max int64, w io.Writer) (int64, error) {
+	return e.kv.ReadLogRange(epoch, from, max, w)
 }
 
 // loadCatalog validates every table descriptor at open, warming the
