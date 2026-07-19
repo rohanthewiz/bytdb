@@ -92,6 +92,44 @@ downstream). Errors carry Postgres wording and SQLSTATEs.
 per INSERT statement). `serial` draws from a durable per-column
 counter; read generated keys back with `RETURNING id`.
 
+## Backup and replication
+
+`e.Backup(path)` writes a consistent point-in-time copy without
+blocking anyone (restore = open the copy); `e.BackupTo(w)` streams the
+same thing to any `io.Writer` — pipe it straight into an object-store
+upload for snapshot backups.
+
+For continuous recovery, the `replicate` package ships the storage log
+to any S3-compatible object store (Linode Object Storage, IDrive e2,
+MinIO, AWS) litestream-style, with a stdlib-only S3 client included:
+
+```go
+import (
+    "github.com/rohanthewiz/bytdb/replicate"
+    "github.com/rohanthewiz/bytdb/replicate/s3"
+)
+
+store, err := s3.New(s3.Config{
+    Endpoint: "https://us-east-1.linodeobjects.com", Region: "us-east-1",
+    Bucket: "db-replicas", AccessKey: key, SecretKey: secret,
+})
+r := replicate.New(e, store, replicate.Options{
+    Interval: 5 * time.Second, // the data-loss window
+    Prefix:   "sites/mysite",  // many databases can share one bucket
+})
+r.Start()
+defer r.Close() // final flush — close before e.Close()
+
+// Cold start / disaster recovery, before bytdb.Open:
+info, err := replicate.Restore(ctx, store, "sites/mysite", "app.db")
+```
+
+`r.ShipNow(ctx)` forces a synchronous ship after a critical write;
+`r.Status()` feeds health endpoints. This is recovery, not live
+failover: a restored node comes up from object-store state with at
+most one Interval of loss. The `Storage` interface is four methods
+(Put/Get/List/Delete), so a fake or another store slots in easily.
+
 ## Gotchas
 
 - **One writer at a time** (serializable by construction): a writable
@@ -112,7 +150,8 @@ counter; read generated keys back with `RETURNING id`.
   text with `bytdb.ErrText(err)`.
 - Not implemented: MVCC concurrent writers, RIGHT/FULL joins,
   triggers, NUMERIC(p,s), arrays beyond `text[]`, jsonb indexing,
-  COPY, replication. Datasets must fit in RAM.
+  COPY, live HA/failover (replication is async recovery, see above).
+  Datasets must fit in RAM.
 
 ## Verifying changes
 
