@@ -221,9 +221,13 @@
 // DEFAULT keyword works as a VALUES entry, and INSERT ... DEFAULT
 // VALUES inserts a whole row of them; an explicit NULL still inserts
 // NULL (DEFAULT NULL declares the absence of a default, as it does in
-// Postgres). Only constants are accepted: a default is applied, not
-// evaluated, so now() and CURRENT_TIMESTAMP are rejected with a
-// pointer to calling now() in the INSERT. information_schema.columns
+// Postgres). Beyond constants, exactly the clock functions are
+// accepted — DEFAULT now() (and its CURRENT_TIMESTAMP-family
+// spellings, all normalized to now()) and DEFAULT current_date, on
+// timestamp/date columns — evaluated once per INSERT statement, so a
+// multi-row insert stamps every row with the same instant. General
+// expressions stay rejected: a default is a stored constant or a
+// clock marker, never an expression tree. information_schema.columns
 // reports the stored text in column_default. ALTER TABLE ADD COLUMN
 // with a DEFAULT is allowed only while the table is empty — Postgres
 // backfills existing rows; this engine leaves rows untouched, and the
@@ -502,11 +506,25 @@ func (s *Stmt) ExecCtx(ctx context.Context, args ...any) (*Result, error) {
 // toEngineColumn maps a parsed column definition onto the engine's,
 // validating a DEFAULT against the column type (a quoted literal
 // adapts, Postgres-style) and rendering it to the literal text the
-// descriptor stores.
+// descriptor stores. An ExprDefault marker stores its own text
+// unquoted — distinguishable from every constant, whose string form
+// renderLit always quotes — after checking the column can hold what
+// the clock function yields (both markers evaluate through the
+// time.Time arm of coerceLit, which fills timestamp or date columns
+// and nothing else).
 func toEngineColumn(c ColDef) (bytdb.Column, error) {
 	col := bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull,
 		Identity: c.Identity, MaxLen: c.MaxLen}
 	if c.HasDefault {
+		if ed, ok := c.Default.(ExprDefault); ok {
+			if c.Type != bytdb.TTimestamp && c.Type != bytdb.TDate {
+				return bytdb.Column{}, serr.New(
+					"DEFAULT "+string(ed)+" requires a timestamp or date column",
+					"column", c.Name)
+			}
+			col.Default = string(ed)
+			return col, nil
+		}
 		cv, err := coerceLit(c.Default, c.Type)
 		if err != nil {
 			return bytdb.Column{}, serr.Wrap(err, "clause", "DEFAULT", "column", c.Name)

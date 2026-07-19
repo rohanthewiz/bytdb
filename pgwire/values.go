@@ -30,6 +30,8 @@ const (
 	oidTimestamptz = 1184
 	oidUUID        = 2950
 	oidTextArray   = 1009 // _text: one-dimensional text[]
+	oidJSON        = 114  // accepted on input; columns present as jsonb
+	oidJSONB       = 3802
 )
 
 // Postgres's date/time binary formats count from 2000-01-01 rather
@@ -66,6 +68,8 @@ func oidForType(t bytdb.ColType) uint32 {
 		return oidUUID
 	case bytdb.TTextArray:
 		return oidTextArray
+	case bytdb.TJSONB:
+		return oidJSONB
 	}
 	return oidText
 }
@@ -139,6 +143,15 @@ func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
 				return []byte(x), nil
 			}
 			return encodeTextArrayBinary(x)
+		}
+	case bytdb.TJSONB:
+		// The stored value IS the JSON text; jsonb's binary format is
+		// just a 1-byte version prefix (always 1) ahead of that text.
+		if x, ok := v.(string); ok {
+			if format == fmtText {
+				return []byte(x), nil
+			}
+			return append([]byte{1}, x...), nil
 		}
 	}
 	if format == fmtText {
@@ -219,6 +232,11 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			return bytdb.ParseDate(s)
 		case oidUUID:
 			return bytdb.ParseUUID(s)
+		case oidJSON, oidJSONB:
+			// Pass the text through; the engine canonicalizes on write
+			// and coerceLit canonicalizes comparisons, so the wire text
+			// need not be canonical here.
+			return s, nil
 		}
 		return s, nil
 	}
@@ -277,6 +295,15 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 		return raw, nil
 	case oidTextArray:
 		return decodeTextArrayBinary(raw)
+	case oidJSON:
+		// json has no binary framing: the bytes are the text.
+		return string(raw), nil
+	case oidJSONB:
+		// jsonb binary is a version byte (1) ahead of the text.
+		if len(raw) < 1 || raw[0] != 1 {
+			return nil, serr.New("bad binary jsonb parameter")
+		}
+		return string(raw[1:]), nil
 	}
 	return nil, serr.New("unsupported binary parameter type", "oid", fmt.Sprint(oid))
 }

@@ -298,6 +298,10 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 		// Canonicalize here as well as in the engine so comparisons in
 		// WHERE ('{a, b}' = categories) match the stored spelling.
 		return bytdb.CanonTextArray(s)
+	case bytdb.TJSONB:
+		// Same as TTextArray: WHERE '{"a": 1}' = doc must compare in
+		// canonical spelling, not the query's.
+		return bytdb.CanonJSONB(s)
 	}
 	return s, nil
 }

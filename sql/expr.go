@@ -831,6 +831,16 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 		case string:
 			return bytdb.ParseUUID(x)
 		}
+	case "json", "jsonb":
+		// '{"a":1}'::jsonb validates and canonicalizes — the jsonb
+		// value IS its canonical text (see bytdb.TJSONB), so the cast
+		// is a parse+re-render, exactly like ::text[].
+		switch x := v.(type) {
+		case nil:
+			return nil, nil
+		case string:
+			return bytdb.CanonJSONB(x)
+		}
 	}
 	return nil, serr.New("unsupported cast", "type", typ)
 }
@@ -1095,6 +1105,8 @@ func formatType(typid, typmod any) any {
 		name = "timestamp with time zone"
 	case 2950:
 		name = "uuid"
+	case 3802:
+		name = "jsonb"
 	default:
 		return "???"
 	}

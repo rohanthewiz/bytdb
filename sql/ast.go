@@ -536,10 +536,26 @@ type ColDef struct {
 	Ref *FKDef
 	// Default is the column's DEFAULT constant; HasDefault
 	// distinguishes an absent clause (DEFAULT NULL parses as absent —
-	// it declares what a defaultless column already does).
+	// it declares what a defaultless column already does). An
+	// ExprDefault value marks the evaluated (non-constant) defaults.
 	Default    any
 	HasDefault bool
 }
+
+// ExprDefault is a DEFAULT that is evaluated at insert time rather
+// than stored as a constant — the closed set of clock functions,
+// normalized to one canonical spelling each (CURRENT_TIMESTAMP parses
+// to DefaultNow, exactly as Postgres normalizes it to now()). It is a
+// distinct type, not a bare string, so a string DEFAULT whose value
+// happens to spell "now()" can never be mistaken for the marker; the
+// descriptor stores the marker text unquoted, which renderLit can
+// never produce for a string constant.
+type ExprDefault string
+
+const (
+	DefaultNow         ExprDefault = "now()"
+	DefaultCurrentDate ExprDefault = "current_date"
+)
 
 // CheckDef is one CHECK constraint of a CREATE TABLE: the parsed
 // expression plus its source text (which is what the descriptor

@@ -265,7 +265,7 @@ func TestCreateTableValidation(t *testing.T) {
 		{"t", cols, []string{"nope"}, "unknown pk column"},
 		{"t", cols, []string{"id", "id"}, "duplicate pk column"},
 		{"t", []Column{{Name: "a", Type: TInt}, {Name: "a", Type: TInt}}, []string{"a"}, "duplicate column"},
-		{"t", []Column{{Name: "a", Type: "jsonb"}}, []string{"a"}, "unknown type"},
+		{"t", []Column{{Name: "a", Type: "hstore"}}, []string{"a"}, "unknown type"},
 	} {
 		if _, err := e.CreateTable(c.name, c.cols, c.pk...); err == nil {
 			t.Fatalf("CreateTable accepted %s", c.descr)

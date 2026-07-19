@@ -15,7 +15,9 @@ package bytdb
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -264,4 +266,48 @@ func CanonTextArray(s string) (string, error) {
 		return "", err
 	}
 	return FormatTextArray(elems), nil
+}
+
+// --- jsonb ---
+//
+// TJSONB follows the TTextArray playbook: the runtime value is a
+// string, the canonical rendering of the JSON document, and every
+// write path canonicalizes through CanonJSONB so plain string
+// comparison implements jsonb document equality — whitespace and
+// object key order vanish, the last duplicate key wins.
+//
+// Canonical form is Go's encoding/json compact rendering with object
+// keys sorted lexically. Postgres renders jsonb with spaces and sorts
+// keys length-first, so the two systems' texts differ cosmetically —
+// which no JSON-parsing client can observe; what matters is that this
+// engine has exactly one spelling per document.
+
+// CanonJSONB validates JSON text and re-renders it canonically.
+// Numbers pass through as their source text (json.Number), not
+// float64 — 20-digit integers and deliberate decimals survive
+// untouched, the closest text-representation analog of jsonb's
+// arbitrary-precision numerics.
+func CanonJSONB(s string) (string, error) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return "", serr.New("invalid input syntax for type json", "value", s)
+	}
+	// One document only: anything after it (beyond whitespace, which
+	// Token skips) is malformed, same as Postgres's jsonb_in.
+	if _, err := dec.Token(); err != io.EOF {
+		return "", serr.New("invalid input syntax for type json", "value", s)
+	}
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	// Postgres does not HTML-escape <, > and & inside jsonb text, and
+	// neither should we — the stored form is data, not markup.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", serr.Wrap(err, "op", "canonicalize jsonb")
+	}
+	// Encode terminates the stream with a newline; the canonical value
+	// must not carry it (it would leak into '=' comparisons).
+	return strings.TrimSuffix(buf.String(), "\n"), nil
 }

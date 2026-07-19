@@ -788,17 +788,33 @@ func (rp *retProj) row(vals []any) ([]any, error) {
 
 // columnDefaults parses each column's stored DEFAULT into its
 // insert-ready value, coerced to the column type; nil entries mean
-// no default (insert NULL).
+// no default (insert NULL). ExprDefault markers evaluate here, which
+// is once per INSERT statement — every row of a multi-row insert
+// (and every now() column) shares the one instant, the statement-
+// granular cousin of Postgres freezing now() per transaction. The
+// stored marker text is unquoted, so it can never collide with a
+// constant string default (renderLit quotes those).
 func columnDefaults(desc *bytdb.TableDesc) ([]any, error) {
 	out := make([]any, len(desc.Columns))
+	now := time.Now().UTC()
 	for i := range desc.Columns {
 		c := &desc.Columns[i]
 		if c.Default == "" {
 			continue
 		}
-		v, err := parseStoredLiteral(c.Default)
-		if err != nil {
-			return nil, serr.Wrap(err, "op", "parse column default", "column", c.Name)
+		var v any
+		var err error
+		switch c.Default {
+		case string(DefaultNow):
+			v = now
+		case string(DefaultCurrentDate):
+			// Truncate before coercing: on a timestamp column the date
+			// must land as midnight UTC, not the current instant.
+			v = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		default:
+			if v, err = parseStoredLiteral(c.Default); err != nil {
+				return nil, serr.Wrap(err, "op", "parse column default", "column", c.Name)
+			}
 		}
 		if out[i], err = coerceLit(v, c.Type); err != nil {
 			return nil, serr.Wrap(err, "op", "parse column default", "column", c.Name)

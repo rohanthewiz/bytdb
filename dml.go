@@ -633,6 +633,16 @@ func coerce(v any, t ColType) (any, error) {
 			}
 			return FormatTextArray(elems), nil
 		}
+	case TJSONB:
+		// Same canonicalize-on-write contract as TTextArray. []byte is
+		// json.RawMessage's underlying type, the natural shape for
+		// embedded Go callers holding marshaled JSON.
+		switch x := v.(type) {
+		case string:
+			return CanonJSONB(x)
+		case []byte:
+			return CanonJSONB(string(x))
+		}
 	}
 	return nil, serr.New("value does not fit column type",
 		"type", string(t), "value_type", fmt.Sprintf("%T", v))

@@ -954,19 +954,38 @@ func (p *parser) referencesClause(cols []string) (FKDef, error) {
 	}
 }
 
-// defaultLiteral parses a column DEFAULT, constants only: a default
-// is applied, not evaluated, so accepting now() or any expression
-// would imply re-evaluation per insert, which this engine does not
-// do. Postgres-legal non-constants are named in the rejection so the
-// fix (call now() in the INSERT) is obvious.
+// defaultLiteral parses a column DEFAULT: a constant, or one of the
+// clock functions (now(), CURRENT_TIMESTAMP, CURRENT_DATE, ...),
+// which parse to ExprDefault markers the insert path evaluates per
+// statement. The clock functions are the only evaluated defaults —
+// general expressions stay rejected, so a default is still either a
+// stored constant or a marker, never an expression tree.
 func (p *parser) defaultLiteral(col string) (any, error) {
 	if t := p.cur(); t.kind == tIdent {
+		// All timestamp-valued spellings normalize to one marker, the
+		// way Postgres normalizes CURRENT_TIMESTAMP to now(). The
+		// keyword forms take no parens; the function forms require
+		// them (a bare `now` is a column reference in Postgres too).
 		switch t.text {
-		case "now", "current_timestamp", "current_date", "current_time", "localtimestamp":
+		case "now", "transaction_timestamp", "statement_timestamp", "clock_timestamp":
+			p.advance()
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			return DefaultNow, nil
+		case "current_timestamp", "localtimestamp":
+			p.advance()
+			return DefaultNow, nil
+		case "current_date":
+			p.advance()
+			return DefaultCurrentDate, nil
+		case "current_time", "localtime":
 			return nil, serr.New(
-				"DEFAULT "+t.text+" is not supported: defaults are constants, applied "+
-					"rather than evaluated; call now() in the INSERT (or use RETURNING)",
-				"column", col)
+				"DEFAULT "+t.text+" is not supported: no time-of-day type exists"+
+					"; use a timestamp column with DEFAULT now()", "column", col)
 		}
 	}
 	if p.cur().kind == tParam {
@@ -1134,6 +1153,13 @@ func (p *parser) typeNameBase() (typ bytdb.ColType, maxLen int, err error) {
 		return bytdb.TDate, 0, nil
 	case "uuid":
 		return bytdb.TUUID, 0, nil
+	case "json", "jsonb":
+		// Both names land on TJSONB, with jsonb semantics: documents
+		// canonicalize on write (key order and whitespace vanish).
+		// Postgres's json type preserves the source text verbatim —
+		// a distinction not worth a second type here, and jsonb is
+		// what schemas mean when they reach for either.
+		return bytdb.TJSONB, 0, nil
 	case "time":
 		return "", 0, serr.New("the time-of-day type is not supported; use timestamp",
 			"pos", fmt.Sprint(t.pos))

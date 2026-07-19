@@ -1,14 +1,16 @@
 package sql
 
-// default_test.go: constant DEFAULT column values — declaration,
+// default_test.go: DEFAULT column values — constant declaration,
 // application on column-list inserts, the DEFAULT keyword in VALUES,
-// DEFAULT VALUES, catalog reporting, and the constant-only rejections.
+// DEFAULT VALUES, the evaluated clock defaults (now(), current_date),
+// catalog reporting, and the expression rejections.
 
 import (
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rohanthewiz/bytdb"
 )
@@ -117,9 +119,13 @@ func TestDefaultRejections(t *testing.T) {
 	d := openDB(t)
 	for _, tc := range []struct{ q, want string }{
 		{`create table t (id int primary key, ts int default now())`,
-			"defaults are constants"},
-		{`create table t (id int primary key, ts int default current_timestamp)`,
-			"defaults are constants"},
+			"requires a timestamp or date column"},
+		{`create table t (id int primary key, s text default current_timestamp)`,
+			"requires a timestamp or date column"},
+		{`create table t (id int primary key, ts timestamp default current_time)`,
+			"no time-of-day type"},
+		{`create table t (id int primary key, ts timestamp default now)`,
+			""}, // now without parens is a column reference: parse error
 		{`create table t (id int primary key, n int default 1 + 2)`,
 			""}, // trailing tokens: a parse error is enough
 		{`create table t (id int primary key, n int default upper('x'))`,
@@ -144,6 +150,70 @@ func TestDefaultRejections(t *testing.T) {
 		where table_name = 'ok' and column_name = 'v'`)
 	if !reflect.DeepEqual(res.Rows, [][]any{{nil}}) {
 		t.Fatalf("DEFAULT NULL: %v", res.Rows)
+	}
+}
+
+func TestDefaultNow(t *testing.T) {
+	d := openDB(t)
+	// Every timestamp spelling normalizes to now(); current_date is
+	// its own marker. Both work on timestamp and date columns.
+	exec(t, d, `create table t (
+		id int primary key,
+		created timestamptz default now(),
+		stamped timestamp default current_timestamp,
+		local timestamp default localtimestamp,
+		txts timestamp default transaction_timestamp(),
+		d date default current_date,
+		dts timestamp default current_date,
+		dnow date default now())`)
+
+	before := time.Now().Add(-time.Minute).UnixMicro()
+	res := exec(t, d, `insert into t (id) values (1), (2)
+		returning created, stamped, local, txts, d, dts, dnow`)
+	after := time.Now().Add(time.Minute).UnixMicro()
+
+	for i, row := range res.Rows {
+		for j := range 4 { // the four timestamp-instant columns
+			ts, ok := row[j].(int64)
+			if !ok || ts < before || ts > after {
+				t.Fatalf("row %d col %d: %v not a current timestamp", i, j, row[j])
+			}
+		}
+		today := time.Now().UTC().Unix() / 86400
+		if days := row[4].(int64); days < today-1 || days > today+1 {
+			t.Fatalf("current_date: %v, today is day %d", row[4], today)
+		}
+		// current_date on a timestamp column lands as midnight UTC.
+		if micros := row[5].(int64); micros%(86400*1e6) != 0 {
+			t.Fatalf("current_date on timestamp not midnight: %v", row[5])
+		}
+		// now() on a date column truncates to days.
+		if days := row[6].(int64); days < today-1 || days > today+1 {
+			t.Fatalf("now() on date: %v", row[6])
+		}
+	}
+
+	// One statement, one instant: both rows share every clock value.
+	if !reflect.DeepEqual(res.Rows[0], res.Rows[1]) {
+		t.Fatalf("rows of one INSERT differ: %v vs %v", res.Rows[0], res.Rows[1])
+	}
+
+	// The catalog reports the normalized marker text, unquoted.
+	res = exec(t, d, `select column_name, column_default from information_schema.columns
+		where table_name = 't' and column_name in ('created', 'stamped', 'd')
+		order by column_name`)
+	want := [][]any{{"created", "now()"}, {"d", "current_date"}, {"stamped", "now()"}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("column_default: %v", res.Rows)
+	}
+
+	// A string default that spells now() stays a constant — the quoted
+	// descriptor text never collides with the marker.
+	exec(t, d, `create table s (id int primary key, v text default 'now()')`)
+	exec(t, d, `insert into s (id) values (1)`)
+	res = exec(t, d, `select v from s`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"now()"}}) {
+		t.Fatalf("literal 'now()': %v", res.Rows)
 	}
 }
 

@@ -73,7 +73,7 @@ func TestAddColumnValidation(t *testing.T) {
 	if err := e.AddColumn("people", Column{Name: "age", Type: TInt}); err == nil {
 		t.Fatal("duplicate column accepted")
 	}
-	if err := e.AddColumn("people", Column{Name: "c", Type: "jsonb"}); err == nil {
+	if err := e.AddColumn("people", Column{Name: "c", Type: "hstore"}); err == nil {
 		t.Fatal("unknown type accepted")
 	}
 }

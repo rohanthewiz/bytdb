@@ -65,6 +65,15 @@ const (
 	// One dimension, text elements only — enough for the tag/category
 	// columns arrays are used for, without a new tuple encoding.
 	TTextArray ColType = "text_array"
+	// TJSONB also rides on a string runtime representation: the
+	// canonical re-rendering of the JSON document (see CanonJSONB in
+	// types.go). Every write path canonicalizes, so '=' is document
+	// equality the way jsonb defines it (whitespace and key order
+	// don't matter, last duplicate key wins) — again with no new
+	// tuple encoding. Ordering (ORDER BY, index keys) is bytewise on
+	// the canonical text, not Postgres's jsonb type ordering; jsonb
+	// columns are for storage and equality, not range scans.
+	TJSONB ColType = "jsonb"
 )
 
 // Column describes one table column. ID is assigned by the engine
