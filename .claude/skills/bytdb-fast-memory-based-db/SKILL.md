@@ -70,7 +70,10 @@ or standalone: `go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd
 
 Postgres-flavored and deliberately small. Full DDL (tables, ASC/DESC
 indexes, sequences, views, ALTER ... ADD/DROP COLUMN / RENAME /
-constraints), INSERT with `ON CONFLICT` upsert and RETURNING,
+constraints; `ALTER TABLE ... OWNER TO` is accepted as a no-op — bytdb
+has no roles, so pg_dump/goose migration DDL runs unmodified, even
+inside transaction blocks), INSERT with `ON CONFLICT` upsert and
+RETURNING,
 SELECT/UPDATE/DELETE with a planner that pushes WHERE conjuncts to
 point gets and bounded index scans, joins (nested-loop with index
 rebinding; hash join when no index serves an equijoin), aggregates +
