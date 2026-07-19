@@ -120,17 +120,31 @@ type CheckDesc struct {
 // (child) table: the child columns, by ordinal, that must match a row
 // of RefTable on RefCols. RefCols name the parent's primary key or the
 // columns of one of its unique indexes — the uniqueness is what makes
-// "the referenced row" well-defined. Only NO ACTION/RESTRICT semantics
-// exist (no cascades). Like checks, the engine stores and reports FKs
-// and guards the schema side (you cannot drop a referenced table or an
-// involved column), while row-level enforcement belongs to the SQL
-// layer — engine-API writes alone do not check references.
+// "the referenced row" well-defined. Like checks, the engine stores
+// and reports FKs and guards the schema side (you cannot drop a
+// referenced table or an involved column), while row-level enforcement
+// belongs to the SQL layer — engine-API writes alone do not check
+// references.
 type FKDesc struct {
 	Name     string   `json:"name"`
 	Cols     []int    `json:"cols"`
 	RefTable string   `json:"ref_table"`
 	RefCols  []string `json:"ref_cols"`
+	// OnDelete is the referential action when a referenced parent row
+	// is deleted: "" (NO ACTION/RESTRICT — refuse the delete) or
+	// FKCascade. The zero value carries the pre-action meaning, so
+	// descriptors written before actions existed read unchanged, and a
+	// build predating the field enforces the stricter refuse semantics
+	// rather than cascading wrongly — which is why this addition does
+	// not bump descFormatVersion. There is no ON UPDATE action: parent
+	// key updates always refuse while referenced.
+	OnDelete string `json:"on_delete,omitempty"`
 }
+
+// FKCascade is the FKDesc.OnDelete marker for ON DELETE CASCADE:
+// deleting a parent row deletes, transitively, every row referencing
+// it through this constraint.
+const FKCascade = "cascade"
 
 // descFormatVersion is the version stamped into every descriptor this
 // build writes. Bump it when the persisted layout changes in a way an

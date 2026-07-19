@@ -20,14 +20,14 @@ func TestJSONBCanon(t *testing.T) {
 		{`null`, `null`},
 		{`true`, `true`},
 		{`"s"`, `"s"`},
-		{`  {"a": 1}  `, `{"a":1}`},                     // whitespace vanishes
-		{`{"b":2,"a":1}`, `{"a":1,"b":2}`},              // keys sort
-		{`{"a":1,"a":2}`, `{"a":2}`},                    // last duplicate key wins
-		{`{"a":{"c":3,"b":2}}`, `{"a":{"b":2,"c":3}}`},  // nested objects sort too
-		{`[1, 2, 3]`, `[1,2,3]`},                        // array order is data, kept
+		{`  {"a": 1}  `, `{"a":1}`},                      // whitespace vanishes
+		{`{"b":2,"a":1}`, `{"a":1,"b":2}`},               // keys sort
+		{`{"a":1,"a":2}`, `{"a":2}`},                     // last duplicate key wins
+		{`{"a":{"c":3,"b":2}}`, `{"a":{"b":2,"c":3}}`},   // nested objects sort too
+		{`[1, 2, 3]`, `[1,2,3]`},                         // array order is data, kept
 		{`12345678901234567890`, `12345678901234567890`}, // big ints survive as text
-		{`1.50`, `1.50`},                                // deliberate decimals survive
-		{`"a<b>&c"`, `"a<b>&c"`},                        // no HTML escaping
+		{`1.50`, `1.50`},                                 // deliberate decimals survive
+		{`"a<b>&c"`, `"a<b>&c"`},                         // no HTML escaping
 		{`{"k":[{"z":1,"a":null}]}`, `{"k":[{"a":null,"z":1}]}`},
 	}
 	for _, c := range cases {

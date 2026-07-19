@@ -29,6 +29,11 @@ func (e *Engine) AddForeignKey(table string, fk FKDesc, validateRows bool) error
 	if len(fk.Cols) == 0 {
 		return serr.New("foreign key needs at least one column", "table", table)
 	}
+	if fk.OnDelete != "" && fk.OnDelete != FKCascade {
+		// The descriptor is persisted; an unknown action stored today
+		// would read as a silent NO ACTION later, so refuse it here.
+		return serr.New("unsupported ON DELETE action", "table", table, "action", fk.OnDelete)
+	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		for _, c := range old.Checks {
 			if c.Name == fk.Name {

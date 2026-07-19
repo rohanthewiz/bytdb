@@ -6,14 +6,17 @@ package sql
 // own transaction:
 //
 //	child INSERT/UPDATE  -> the referenced parent row must exist
-//	parent DELETE/UPDATE -> no child row may still reference the old key
+//	parent DELETE        -> ON DELETE CASCADE children are deleted too;
+//	                        for the rest, no child row may still
+//	                        reference the old key
+//	parent UPDATE        -> no child row may still reference the old key
 //	TRUNCATE             -> a referenced table needs its children in the list
 //
 // Semantics are MATCH SIMPLE with NO ACTION checked at end of
 // statement: a NULL in any child FK column satisfies the constraint,
-// and parent-side checks run after the statement's writes, so a
-// statement that deletes both a row and everything referencing it is
-// legal, as in Postgres.
+// and parent-side checks run after the statement's writes — cascaded
+// deletes included — so a statement that deletes both a row and
+// everything referencing it is legal, as in Postgres.
 
 import (
 	"fmt"
@@ -60,23 +63,11 @@ func (d *DB) fkVerifyRow(tx *bytdb.Txn, desc *bytdb.TableDesc, vals []any) error
 // the parent row as it was before the statement's write.
 func (d *DB) fkVerifyReferenced(tx *bytdb.Txn, desc *bytdb.TableDesc, refs []bytdb.FKRef, oldVals []any) error {
 	for _, r := range refs {
-		refVals := make([]any, len(r.FK.RefCols))
-		null := false
-		for i, name := range r.FK.RefCols {
-			ord := desc.ColIndex(name)
-			if ord < 0 || oldVals[ord] == nil {
-				null = true // a NULL key tuple can never be referenced
-				break
-			}
-			refVals[i] = oldVals[ord]
+		refVals, ok := fkRefTuple(desc, r.FK.RefCols, oldVals)
+		if !ok {
+			continue // a NULL key tuple can never be referenced
 		}
-		if null {
-			continue
-		}
-		childCols := make([]string, len(r.FK.Cols))
-		for i, ord := range r.FK.Cols {
-			childCols[i] = r.Child.Columns[ord].Name
-		}
+		childCols := fkChildCols(&r)
 		found, err := d.fkRowExists(tx, r.Child.Name, childCols, refVals)
 		if err != nil {
 			return err
@@ -88,6 +79,146 @@ func (d *DB) fkVerifyReferenced(tx *bytdb.Txn, desc *bytdb.TableDesc, refs []byt
 		}
 	}
 	return nil
+}
+
+// fkRefTuple extracts a parent row's referenced-key tuple by column
+// name. ok is false when any component is NULL (or the column is
+// somehow gone): a NULL key tuple can never be referenced, so callers
+// skip the row.
+func fkRefTuple(desc *bytdb.TableDesc, refCols []string, vals []any) (refVals []any, ok bool) {
+	refVals = make([]any, len(refCols))
+	for i, name := range refCols {
+		ord := desc.ColIndex(name)
+		if ord < 0 || vals[ord] == nil {
+			return nil, false
+		}
+		refVals[i] = vals[ord]
+	}
+	return refVals, true
+}
+
+// fkChildCols names the referencing columns of one inbound FK (they
+// are stored as ordinals on the child descriptor).
+func fkChildCols(r *bytdb.FKRef) []string {
+	cols := make([]string, len(r.FK.Cols))
+	for i, ord := range r.FK.Cols {
+		cols[i] = r.Child.Columns[ord].Name
+	}
+	return cols
+}
+
+// fkAfterDelete is the parent side of DELETE, run after the
+// statement's own deletes: first every ON DELETE CASCADE constraint
+// is honored by deleting the referencing rows — transitively, since a
+// cascaded row may itself be a parent — and then the remaining
+// (NO ACTION/RESTRICT) inbound constraints are verified against every
+// row the statement removed, cascaded rows included. Doing the checks
+// last preserves the end-of-statement semantics: a NO ACTION
+// grandchild whose parent was cascade-deleted blocks the whole
+// statement, while a statement that deletes a row and everything
+// referencing it stays legal.
+//
+// The worklist terminates even through FK cycles and self-references:
+// a table is re-queued only when rows were actually deleted from it,
+// rows are finite, and a revisited scan runs against the transaction's
+// own view, so already-deleted rows are simply not found.
+//
+// Cascaded rows do not count toward the statement's RowsAffected and
+// do not appear in RETURNING, matching Postgres.
+func (d *DB) fkAfterDelete(tx *bytdb.Txn, desc *bytdb.TableDesc, refs []bytdb.FKRef, rows [][]any) error {
+	type deleted struct {
+		desc *bytdb.TableDesc
+		refs []bytdb.FKRef // all inbound FKs of desc
+		rows [][]any       // old images of rows this statement removed
+	}
+	pending := []deleted{{desc: desc, refs: refs, rows: rows}}
+	var done []deleted
+	for len(pending) > 0 {
+		cur := pending[0]
+		pending = pending[1:]
+		done = append(done, cur)
+		for _, r := range cur.refs {
+			if r.FK.OnDelete != bytdb.FKCascade {
+				continue
+			}
+			childCols := fkChildCols(&r)
+			var childRows [][]any
+			for _, old := range cur.rows {
+				refVals, ok := fkRefTuple(cur.desc, r.FK.RefCols, old)
+				if !ok {
+					continue
+				}
+				got, err := d.fkDeleteMatching(tx, r.Child, childCols, refVals)
+				if err != nil {
+					return err
+				}
+				childRows = append(childRows, got...)
+			}
+			if len(childRows) == 0 {
+				continue
+			}
+			childRefs, err := tx.ReferencingFKs(r.Child.Name)
+			if err != nil {
+				return err
+			}
+			pending = append(pending, deleted{desc: r.Child, refs: childRefs, rows: childRows})
+		}
+	}
+	// End-of-statement verification of the non-cascade constraints.
+	// Cascade constraints need none: their referencing rows were just
+	// deleted, which is the enforcement.
+	for _, ds := range done {
+		var restrict []bytdb.FKRef
+		for _, r := range ds.refs {
+			if r.FK.OnDelete != bytdb.FKCascade {
+				restrict = append(restrict, r)
+			}
+		}
+		if len(restrict) == 0 {
+			continue
+		}
+		for _, old := range ds.rows {
+			if err := d.fkVerifyReferenced(tx, ds.desc, restrict, old); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// fkDeleteMatching deletes every row of desc whose cols equal vals and
+// returns the old images of the rows actually removed. The lookup goes
+// through the ordinary planner, so an index on the child FK columns
+// makes each cascade probe a point get or bounded scan; without one it
+// is a full scan per deleted parent key, the same cost the verify path
+// already pays.
+func (d *DB) fkDeleteMatching(tx *bytdb.Txn, desc *bytdb.TableDesc, cols []string, vals []any) ([][]any, error) {
+	preds := make([]BoolExpr, len(cols))
+	for i, name := range cols {
+		preds[i] = &Pred{Item: SelectItem{Col: ColRef{Name: name}}, Op: OpEQ, Val: vals[i]}
+	}
+	pl, err := planScan(desc, desc.Name, &And{Exprs: preds})
+	if err != nil {
+		return nil, err
+	}
+	var rows [][]any
+	pks, err := collectPKs(d.ctx, tx, desc.Name, desc, pl, d.tableEnv(tx, desc.Name, desc), func(rowVals []any) {
+		rows = append(rows, rowVals)
+	})
+	if err != nil {
+		return nil, err
+	}
+	removed := make([][]any, 0, len(rows))
+	for i, pk := range pks {
+		ok, err := tx.Delete(desc.Name, pk...)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			removed = append(removed, rows[i])
+		}
+	}
+	return removed, nil
 }
 
 // fkRowExists reports whether table holds a row with cols = vals,
@@ -150,7 +281,7 @@ func fkRefColsChanged(desc *bytdb.TableDesc, refs []bytdb.FKRef, oldVals, newVal
 // onto the engine's descriptor form, naming unnamed constraints
 // table_col_fkey (numeric suffix on collision) per Postgres.
 func resolveFK(desc *bytdb.TableDesc, def FKDef) (bytdb.FKDesc, error) {
-	fkd := bytdb.FKDesc{Name: def.Name, RefTable: def.RefTable, RefCols: def.RefCols}
+	fkd := bytdb.FKDesc{Name: def.Name, RefTable: def.RefTable, RefCols: def.RefCols, OnDelete: def.OnDelete}
 	for _, name := range def.Cols {
 		ord := desc.ColIndex(name)
 		if ord < 0 {

@@ -540,6 +540,7 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("convalidated", bytdb.TBool), sysCol("conrelid", bytdb.TInt),
 			sysCol("contypid", bytdb.TInt), sysCol("conindid", bytdb.TInt),
 			sysCol("conparentid", bytdb.TInt), sysCol("confrelid", bytdb.TInt),
+			sysCol("confupdtype", bytdb.TString), sysCol("confdeltype", bytdb.TString),
 			sysCol("conkey", bytdb.TString), sysCol("confkey", bytdb.TString)),
 		rows: func(d *DB) [][]any {
 			// CHECK and FOREIGN KEY constraints; keys surface through
@@ -551,6 +552,7 @@ var sysTables = map[string]*sysTableDef{
 						checkOID(desc.ID, i), ck.Name, oidPublic, "c",
 						false, false, true, int64(desc.ID),
 						int64(0), int64(0), int64(0), int64(0),
+						" ", " ", // action chars are ' ' on non-FK rows, as in Postgres
 						nil, nil,
 					})
 				}
@@ -560,10 +562,15 @@ var sysTables = map[string]*sysTableDef{
 					if p := d.e.Table(fk.RefTable); p != nil {
 						confrelid = int64(p.ID)
 					}
+					deltype := "a" // NO ACTION
+					if fk.OnDelete == bytdb.FKCascade {
+						deltype = "c"
+					}
 					rows = append(rows, []any{
 						fkOID(desc.ID, i), fk.Name, oidPublic, "f",
 						false, false, true, int64(desc.ID),
 						int64(0), int64(0), int64(0), confrelid,
+						"a", deltype,
 						nil, nil,
 					})
 				}

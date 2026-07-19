@@ -193,13 +193,16 @@
 // [(cols)], plus ALTER TABLE ADD the same (existing rows validated in
 // the publishing transaction) and DROP CONSTRAINT. The referenced
 // columns must be the parent's primary key (the default when the list
-// is omitted) or a unique index's columns. Semantics are MATCH SIMPLE
-// with NO ACTION/RESTRICT only — CASCADE and SET NULL/DEFAULT are
-// rejected at parse: a child INSERT/UPDATE requires the referenced
-// parent row to exist (any NULL FK column satisfies the constraint),
-// and a parent DELETE/UPDATE is refused while child rows reference
-// the old key — checked after the statement's writes, so deleting a
-// parent together with its children in one statement is legal.
+// is omitted) or a unique index's columns. Semantics are MATCH SIMPLE:
+// a child INSERT/UPDATE requires the referenced parent row to exist
+// (any NULL FK column satisfies the constraint), and a parent
+// DELETE/UPDATE is refused while child rows reference the old key —
+// checked after the statement's writes, so deleting a parent together
+// with its children in one statement is legal. ON DELETE CASCADE is
+// the one supported referential action: the parent DELETE removes
+// referencing rows transitively instead of refusing (cascaded rows do
+// not count toward RowsAffected or RETURNING). ON UPDATE CASCADE and
+// SET NULL/DEFAULT stay rejected at parse.
 // Violations carry Postgres's wording and SQLSTATE 23503. The schema
 // side is guarded too: a referenced table cannot be dropped or
 // truncated alone, and columns or unique indexes a constraint depends

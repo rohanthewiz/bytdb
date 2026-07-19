@@ -12,19 +12,27 @@ niche, not the CockroachDB niche.
 
 ## Status
 
-Milestones 1–28: a working relational store, queryable in SQL — in
-process or over the Postgres wire protocol, with transaction blocks
-and savepoints, NOT NULL and CHECK constraints, SERIAL identity
-columns, standalone sequences (`CREATE SEQUENCE`, `nextval`/`setval`),
-constant column DEFAULTs, RETURNING, upsert
+Milestones 1–29 plus a production-readiness sweep beyond them: a
+working relational store, queryable in SQL — in process or over the
+Postgres wire protocol, with transaction blocks and savepoints, NOT
+NULL / CHECK / UNIQUE constraints, foreign keys (MATCH SIMPLE, NO
+ACTION/RESTRICT or ON DELETE CASCADE, SQLSTATE 23503), SERIAL
+identity columns, standalone sequences (`CREATE SEQUENCE`,
+`nextval`/`setval`), column DEFAULTs (constants plus the `now()` /
+`current_date` clock markers), RETURNING, upsert
 (`INSERT ... ON CONFLICT`), window functions (ranking, value, and
 aggregate — DISTINCT included — with explicit ROWS/RANGE/GROUPS
 frames including RANGE offsets on the sort key and frame EXCLUDE,
-composing with GROUP BY), descending index columns, order-aware index
-selection, EXPLAIN, and
-enough system catalog and expression language that psql's `\dt`,
-`\d`, `\d <table>`, `\di`, `\du`, and `\l` render for real — check
-constraints, column defaults, and sequences included.
+composing with GROUP BY), WITH CTEs, derived tables, and persistent
+views, hash joins for unindexed equijoins, `LIKE`/`ILIKE`,
+timestamp/timestamptz/date/uuid/jsonb/text[] column types — jsonb
+with the everyday operator family (`->` `->>` `#>` `#>>` `@>` `<@`
+`?` `?|` `?&` `||` `-`) — TRUNCATE, SET/SHOW, ALTER TABLE RENAME,
+descending index columns, order-aware index selection, EXPLAIN,
+SCRAM-SHA-256(-PLUS) auth on the wire, and enough system catalog and
+expression language that psql's `\dt`, `\d`, `\d <table>`, `\di`,
+`\du`, and `\l` render for real — check and foreign-key constraints,
+column defaults, and sequences included.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -142,7 +150,19 @@ The dialect is deliberately small and Postgres-flavored — `'string'`
 literals, `"quoted"` identifiers (unquoted ones fold to lowercase),
 `--` and `/* */` comments, and Postgres type names as aliases
 (`bigint`/`int8` → int, `double precision`/`real` → float, `text`/
-`varchar(n)` → string, `boolean` → bool, `bytea` → bytes). As in
+`varchar(n)` → string, `boolean` → bool, `bytea` → bytes). Beyond
+those, `timestamp[tz]`, `date`, and `uuid` store UTC instants (int64
+micros / days) and 16-byte values that order chronologically in keys
+and indexes and present natively over the wire; `text[]` is a
+one-dimensional string array riding on canonical Postgres
+array-literal text (OID 1009 both wire formats, with real
+`array_to_string`/`array_length` and `= ANY(col)`); and `jsonb`
+(`json` is an alias) stores documents in a canonical rendering —
+compact, keys sorted, one spelling per document — so plain `=` is
+document equality, with the operator family `->` `->>` `#>` `#>>`
+`@>` `<@` `?` `?|` `?&` `||` `-` and `::jsonb` casts (OID 3802,
+binary format included). A `varchar(n)` limit is enforced on every
+write with Postgres's wording (22001). As in
 Postgres, a quoted literal is untyped until context types it:
 `WHERE id = '2'` against an int column compares as the integer 2 (and
 errors if the text doesn't parse as one), which is what quote-happy
@@ -152,20 +172,30 @@ Supported statements:
 
 ```sql
 CREATE TABLE t (id serial PRIMARY KEY,            -- or PRIMARY KEY (a, b)
-                c type [NOT NULL] [DEFAULT lit], ...)
+                c type [NOT NULL] [UNIQUE] [DEFAULT lit]
+                       [REFERENCES p [(col)] [ON DELETE CASCADE]], ...,
+                [UNIQUE (cols)] [[CONSTRAINT name] CHECK (expr)]
+                [[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES p [(cols)]])
 DROP TABLE t
 ALTER TABLE t ADD COLUMN c type | DROP COLUMN c
-ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
+ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr) | FOREIGN KEY ...
 ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
-CREATE [UNIQUE] INDEX idx ON t (c, ...)
+ALTER TABLE t RENAME TO t2 | RENAME [COLUMN] c TO c2
+CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 DROP INDEX idx [ON t]
+CREATE SEQUENCE [IF NOT EXISTS] s [options] | ALTER SEQUENCE | DROP SEQUENCE
+CREATE [OR REPLACE] VIEW v AS SELECT ... | DROP VIEW [IF EXISTS] v
 INSERT INTO t [(cols)] VALUES (...), (...) | DEFAULT VALUES
        [ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ... [WHERE ...]]
        [RETURNING items]
+[WITH name [(cols)] AS (SELECT ...), ...]
 SELECT * | items FROM tables [WHERE ...] [GROUP BY ...] [HAVING ...]
        [ORDER BY item [DESC], ...] [LIMIT n] [OFFSET n]
 UPDATE t SET c = v, ... [WHERE ...] [RETURNING items]
 DELETE FROM t [WHERE ...] [RETURNING items]
+TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
+SET [SESSION|LOCAL] name {=|TO} value | RESET name | SHOW name | SHOW ALL
+EXPLAIN statement
 BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
 SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 ```
@@ -179,10 +209,15 @@ collide (MySQL's semantics, deliberately: it removes Postgres's
 duplicate-key-after-restore footgun). `lastval()` and
 `currval('t_col_seq')` read back the session's draws, though
 `RETURNING id` is the one-round-trip way to learn a generated key.
-Column `DEFAULT`s are constant literals, applied when a column list
-omits the column, by the `DEFAULT` keyword in VALUES, and by
-`DEFAULT VALUES`; expression defaults (`now()` above all) are
-rejected with a pointer at epoch integers. `ON CONFLICT` follows
+Column `DEFAULT`s are constant literals — plus exactly the clock
+functions: `DEFAULT now()` (all `CURRENT_TIMESTAMP`-family spellings
+normalize to it) and `DEFAULT current_date` on timestamp/date
+columns, evaluated once per INSERT statement so a multi-row insert
+stamps every row with the same instant. Defaults apply when a column
+list omits the column, by the `DEFAULT` keyword in VALUES, and by
+`DEFAULT VALUES`; general expression defaults stay rejected — a
+default is a stored constant or a clock marker, never an expression
+tree. `ON CONFLICT` follows
 Postgres exactly: the conflict target names the primary key's or a
 unique index's columns (`DO NOTHING` may omit it to absorb any
 uniqueness collision), and in `DO UPDATE SET` bare or table-qualified
@@ -192,9 +227,32 @@ one, with an optional `WHERE` to leave non-matching pairs alone.
 `FROM` names one table or a left-deep chain of joins — `a [AS] x
 [INNER] JOIN b ON x.id = b.a_id`, `LEFT [OUTER] JOIN`, `CROSS JOIN`
 (a comma is a cross join) — with qualified column references and
-`t.*`. Joins run as nested loops, but equality conjuncts re-bind per
-outer row, so an inner table joined on its primary key or an indexed
-column is a point get or bounded scan per row, not a full scan.
+`t.*`. A FROM item may also be a derived table (`(SELECT ...) alias`),
+a `WITH` CTE (non-recursive; materialized once, visible everywhere in
+the statement), or a persistent view (`CREATE [OR REPLACE] VIEW`
+stores the SELECT's text and any statement naming it materializes it
+at that moment). Joins run as nested loops, but equality conjuncts
+re-bind per outer row, so an inner table joined on its primary key or
+an indexed column is a point get or bounded scan per row, not a full
+scan; when no index can serve an equijoin — including every join
+against a CTE, derived table, or view — the step becomes a hash join
+instead, so unindexed equijoins are linear, not quadratic.
+
+Foreign keys are declared column-level (`REFERENCES parent [(col)]`)
+or table-level (`FOREIGN KEY (cols) REFERENCES parent [(cols)]`), and
+may be added later by `ALTER TABLE ADD` (existing rows validated in
+the transaction that publishes the constraint). The referenced
+columns must be the parent's primary key or a unique index's columns.
+Semantics are MATCH SIMPLE: a child INSERT/UPDATE requires the
+referenced parent row to exist (any NULL FK column satisfies the
+constraint), and a parent DELETE/UPDATE is refused while child rows
+reference the old key — checked at end of statement, so deleting a
+parent together with its children in one statement is legal. `ON
+DELETE CASCADE` is the one supported referential action: the parent
+DELETE removes referencing rows transitively instead of refusing
+(cascaded rows do not count toward RowsAffected or RETURNING, and a
+NO ACTION constraint further down still blocks the whole statement).
+Violations carry Postgres's wording and SQLSTATE 23503.
 
 Aggregates are `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `AVG(x)`, `MIN(x)`,
 `MAX(x)` — over a column, any per-row expression (`SUM(a * b)`), or
@@ -242,13 +300,15 @@ _, err = st.Exec(3, "alan", 41, "london") // re-executable; safe for concurrent 
 ```
 
 For introspection there is a virtual system catalog:
-`pg_catalog.pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
-`pg_index`, `pg_am`, `pg_database`, and `pg_roles` with real rows, a
-set of always-empty tables psql probes (`pg_constraint`, `pg_policy`,
-the `pg_publication` family, ...), plus `information_schema.tables`
-and `columns`, all synthesized from the engine catalog on the fly and
-queryable like any tables — WHERE, joins, and aggregates included —
-but read-only. Table names may be schema-qualified (`public.t` is
+`pg_catalog.pg_namespace`, `pg_class` (sequences and views included),
+`pg_attribute`, `pg_attrdef`, `pg_type`, `pg_index`, `pg_sequence`,
+`pg_constraint` (checks and foreign keys, `confdeltype` included),
+`pg_am`, `pg_database`, `pg_roles`, and `pg_stat_activity` with real
+rows, a set of always-empty tables psql probes (`pg_policy`, the
+`pg_publication` family, ...), plus `information_schema.tables`,
+`columns`, and `sequences`, all synthesized from the engine catalog
+on the fly and queryable like any tables — WHERE, joins, and
+aggregates included — but read-only. Table names may be schema-qualified (`public.t` is
 `t`; bare `pg_class` resolves because pg_catalog is on the search
 path). `SELECT` works without FROM (`SELECT 1`), a small whitelist of
 zero-argument functions folds to constants (`version()`,
@@ -335,8 +395,11 @@ error Position (psql's `LINE 1: ... ^` caret), structured attributes
 become DETAIL, and stable message texts map to SQLSTATE codes
 (syntax_error, undefined_table, unique_violation, ...).
 
-Trust auth (user/database accepted and ignored), TLS declined
-politely. Transaction blocks work as in Postgres: each connection is
+Auth is trust by default (user/database accepted and ignored); with a
+credentials registry set, SCRAM-SHA-256 runs for real — RFC 5802 with
+channel binding (SCRAM-SHA-256-PLUS) over TLS. `bytdbd` adds
+`-max-conns` (a connection cap), `-sync always|never` (WAL fsync
+policy), and query logging. Transaction blocks work as in Postgres: each connection is
 a `sql.Session`, `ReadyForQuery` reports the real status (idle / in
 transaction / failed), redundant `BEGIN`/`COMMIT` raise
 `NoticeResponse` warnings, and a dropped connection rolls back its
@@ -418,7 +481,14 @@ durability with group commit.
 - [x] **Milestone 27**: frame `EXCLUDE` — `EXCLUDE CURRENT ROW | GROUP | TIES` (and the explicit no-op `NO OTHERS`) on every frame mode, completing the window-frame matrix: after the bounds pick a row's frame, exclusion removes the current row, its whole ORDER BY peer group, or the peers minus the row itself — but only rows the bounds actually selected, so `TIES` never re-admits a current row from outside the frame; a frame stops being one contiguous range and becomes up to three disjoint segments, which `FIRST/LAST/NTH_VALUE` walk in order (`NTH_VALUE` counts across the hole) and aggregates recompute per distinct segment list with last-frame memoization (whole peer groups share segments under `EXCLUDE GROUP`, so RANGE/GROUPS frames still aggregate once per group; the UNBOUNDED PRECEDING fast path is exclusion-free by construction); `GROUP`/`TIES` stay legal without ORDER BY — the whole partition is one peer group, so `GROUP` empties every frame and `TIES` leaves just the current row — and EXPLAIN renders the clause
 - [x] **Milestone 28**: the outstanding-list sweep — five features closing the window arc and the catalog gaps. *Window + GROUP BY*: windows now evaluate after grouping and HAVING (Postgres' order), so `RANK() OVER (ORDER BY SUM(x) DESC)` ranks whole groups; the bridge is the aggregate resolver's new row mode — each surviving group materializes as a synthetic row (key values then accumulator results), every group-phase expression rewrites to positional reads, and the milestone-19 window machinery runs over those rows unchanged, frames and all (`SUM(SUM(x)) OVER`, EXPLAIN puts WindowAgg above HashAggregate). *DISTINCT in window aggregates* (a bytdb extension — PG doesn't implement it): `COUNT(DISTINCT x) OVER (...)` dedups within each row's frame, riding the existing accumulator dedup. *Standalone sequences*: `CREATE/ALTER/DROP SEQUENCE` with the Postgres option set (AS type bounds, INCREMENT, MIN/MAXVALUE, START, CYCLE, CACHE stored-but-1) over new engine sequence objects — one JSON record holding options and state, IDs from the table-ID counter so pg_class oids stay unique, names sharing the relation namespace; `nextval`/`setval` evaluate anywhere (a SELECT calling them silently runs in a write txn), accept `'s'::regclass`, and feed `lastval`/`currval`; sequences appear in `pg_class` (relkind 'S'), `pg_sequence`, `information_schema.sequences`, and each reads as its one-row state relation. *pg_attrdef*: declared column defaults get real catalog rows (adbin carries the stored literal text, `pg_get_expr` surfaces it, `atthasdef` gates it), identity columns report via `attidentity = 'd'` — psql's `\d` Default column renders. *Order-aware path selection among redundant indexes* (the milestone-20 deferral): when paths tie on predicate score — `(a)` vs `(a, b)` under `WHERE a = 1` — the planner now prefers the one whose scan order also serves ORDER BY, eliding the sort; selectivity still outranks order, and zero-score ties stay with the LIMIT-gated full-scan override
 - [x] **Milestone 29**: expression values in INSERT and `SELECT DISTINCT`. *INSERT expressions*: `VALUES` entries parse through the full expression grammar — arithmetic, `||`, casts, `CASE`, function calls, scalar subqueries, and the driving case, `VALUES (nextval('s'), ...)` — evaluated per row at execution against an empty scope (column references fail with "no such column"; aggregates and windows are rejected at parse with Postgres' wording); bare literals keep the historical fast path (parse-time values, no evaluation), `$n` placeholders bind inside expressions and describe as the target column's type, and each execution re-evaluates — a prepared insert draws fresh sequence values every run, and the evaluated value is what the ON CONFLICT probe, CHECKs, and RETURNING see. *SELECT DISTINCT*: the projected rows dedup (by the order-preserving tuple encoding — NULLs equal NULLs) before ORDER BY/OFFSET/LIMIT apply, so ORDER BY is restricted to output columns and positions with Postgres' message (a sort key the projection dropped would decide which duplicate survives); one wrapper over every select shape — plain, aggregate, windowed, and UNION arms — plus the inline subquery evaluators: a DISTINCT scalar subquery collapses duplicates before the one-row rule, ANY/ALL and `ARRAY(SELECT ...)` dedup their value lists; `SELECT ALL` parses as the default's explicit spelling, `DISTINCT ON (...)` is rejected outright rather than misread, and EXPLAIN shows the Unique node between the Sort and the scan
-- [ ] Later: sequence functions in column DEFAULTs, `SELECT DISTINCT` ordered by select-list *expressions* (output names and positions only today), `DISTINCT ON`
+Beyond the milestones (production-readiness sweep and app-migration work):
+
+- [x] **Auth & serving**: SCRAM-SHA-256 with channel binding (SCRAM-SHA-256-PLUS) over TLS; server connection cap; `bytdbd -sync` fsync policy; query logging; `pg_stat_activity`
+- [x] **Types**: TIMESTAMP / TIMESTAMPTZ / DATE (int64 micros/days, chronological key order) and UUID (16-byte); one-dimensional `text[]` on canonical array-literal text (OID 1009, both wire formats, `array_to_string`/`array_length`, `= ANY(col)`); `jsonb` on canonical document text (OID 3802, binary format, `::jsonb`), with the operator family `->` `->>` `#>` `#>>` `@>` `<@` `?` `?|` `?&` `||` `-`
+- [x] **Constraints**: `VARCHAR(n)` enforcement (22001); UNIQUE constraint sugar over unique indexes; foreign keys — MATCH SIMPLE, NO ACTION/RESTRICT, end-of-statement checks, SQLSTATE 23503, schema-side guards — and `ON DELETE CASCADE` with transitive cascades that never bypass a NO ACTION constraint downstream
+- [x] **Statements**: TRUNCATE (transactional, RESTART IDENTITY); SET/RESET/SHOW; ALTER TABLE RENAME (table and column); `LIKE`/`ILIKE`; DEFAULT `now()`/`current_date` clock markers evaluated per statement
+- [x] **Query shapes**: derived tables, non-recursive WITH CTEs, persistent views (all via one virtual-table mechanism), `IN (SELECT ...)`, and hash joins for unindexed equijoins
+- [ ] Later: sequence functions in column DEFAULTs, `SELECT DISTINCT` ordered by select-list *expressions* (output names and positions only today), `DISTINCT ON`, `jsonb_set`/`jsonb_build_*`, jsonb indexing
 
 ## Design notes
 

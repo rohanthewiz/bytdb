@@ -14,17 +14,17 @@ func TestTextArrayRoundTrip(t *testing.T) {
 		{`{}`, `{}`},
 		{`{a}`, `{a}`},
 		{`{a,b,c}`, `{a,b,c}`},
-		{`{ a , b }`, `{a,b}`},                          // spacing is decoration
-		{`{"a b",c}`, `{"a b",c}`},                      // spaces force quotes
-		{`{"he said \"hi\""}`, `{"he said \"hi\""}`},    // escaped quotes survive
-		{`{"back\\slash"}`, `{"back\\slash"}`},          // escaped backslash survives
-		{`{"a,b"}`, `{"a,b"}`},                          // comma forces quotes
-		{`{NULL,a}`, `{NULL,a}`},                        // NULL element
-		{`{null}`, `{NULL}`},                            // any case, canonical upper
-		{`{"null"}`, `{"null"}`},                        // quoted "null" is the word
-		{`{""}`, `{""}`},                                // empty string element
-		{`{"{brace}"}`, `{"{brace}"}`},                  // braces force quotes
-		{`  {a,b}  `, `{a,b}`},                          // outer whitespace trims
+		{`{ a , b }`, `{a,b}`},                       // spacing is decoration
+		{`{"a b",c}`, `{"a b",c}`},                   // spaces force quotes
+		{`{"he said \"hi\""}`, `{"he said \"hi\""}`}, // escaped quotes survive
+		{`{"back\\slash"}`, `{"back\\slash"}`},       // escaped backslash survives
+		{`{"a,b"}`, `{"a,b"}`},                       // comma forces quotes
+		{`{NULL,a}`, `{NULL,a}`},                     // NULL element
+		{`{null}`, `{NULL}`},                         // any case, canonical upper
+		{`{"null"}`, `{"null"}`},                     // quoted "null" is the word
+		{`{""}`, `{""}`},                             // empty string element
+		{`{"{brace}"}`, `{"{brace}"}`},               // braces force quotes
+		{`  {a,b}  `, `{a,b}`},                       // outer whitespace trims
 	}
 	for _, c := range cases {
 		got, err := CanonTextArray(c.in)

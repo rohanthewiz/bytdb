@@ -903,11 +903,12 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 // referencesClause parses the tail of a foreign-key declaration after
 // REFERENCES: the parent table, an optional referenced-column list
 // (absent: the parent's primary key), and the MATCH / ON DELETE / ON
-// UPDATE options. Only NO ACTION and RESTRICT actions are accepted —
-// both mean "refuse", which is the only semantics bytdb implements;
-// CASCADE and SET NULL/DEFAULT are rejected rather than silently
-// weakened, and MATCH FULL/PARTIAL likewise (MATCH SIMPLE is the
-// implemented default: any NULL child column satisfies the FK).
+// UPDATE options. ON DELETE accepts NO ACTION, RESTRICT (both mean
+// "refuse") and CASCADE; ON UPDATE accepts NO ACTION and RESTRICT
+// only. SET NULL/DEFAULT and ON UPDATE CASCADE are rejected rather
+// than silently weakened, and MATCH FULL/PARTIAL likewise (MATCH
+// SIMPLE is the implemented default: any NULL child column satisfies
+// the FK).
 func (p *parser) referencesClause(cols []string) (FKDef, error) {
 	table, err := p.tableName()
 	if err != nil {
@@ -940,13 +941,15 @@ func (p *parser) referencesClause(cols []string) (FKDef, error) {
 				}
 			case p.acceptKw("restrict"):
 			case p.acceptKw("cascade"):
-				return FKDef{}, serr.New("ON " + action + " CASCADE is not supported" +
-					"; only NO ACTION/RESTRICT foreign keys exist")
+				if action == "UPDATE" {
+					return FKDef{}, serr.New("ON UPDATE CASCADE is not supported" +
+						"; only NO ACTION/RESTRICT ON UPDATE foreign keys exist")
+				}
+				fk.OnDelete = bytdb.FKCascade
 			case p.acceptKw("set"):
-				return FKDef{}, serr.New("ON " + action + " SET NULL/DEFAULT is not supported" +
-					"; only NO ACTION/RESTRICT foreign keys exist")
+				return FKDef{}, serr.New("ON " + action + " SET NULL/DEFAULT is not supported")
 			default:
-				return FKDef{}, p.unexpected("NO ACTION or RESTRICT")
+				return FKDef{}, p.unexpected("NO ACTION, RESTRICT or CASCADE")
 			}
 		default:
 			return fk, nil

@@ -583,12 +583,14 @@ type CheckDef struct {
 
 // FKDef is one FOREIGN KEY constraint as parsed: the child columns
 // and the referenced table/columns (RefCols nil: the parent's primary
-// key). Only NO ACTION/RESTRICT actions parse — there are no cascades.
+// key). OnDelete is "" (NO ACTION/RESTRICT) or bytdb.FKCascade; ON
+// UPDATE parses NO ACTION/RESTRICT only.
 type FKDef struct {
 	Name     string // from CONSTRAINT name; "": named table_col_fkey
 	Cols     []string
 	RefTable string
 	RefCols  []string
+	OnDelete string
 }
 
 // CreateTable is CREATE TABLE t (col type [constraints], ...,

@@ -1228,9 +1228,10 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		// RETURNING reports each row as it was before its delete, so the
 		// scan keeps the full rows alongside the keys (they are decoded
 		// already; keeping them costs only the reference). Inbound
-		// foreign keys need the old images too: the referenced check
-		// runs after all deletes, so deleting a parent together with its
-		// children (or a self-referencing row) in one statement is legal.
+		// foreign keys need the old images too: cascades and the
+		// referenced check both run after all deletes (fkAfterDelete),
+		// so deleting a parent together with its children (or a
+		// self-referencing row) in one statement is legal.
 		keepRows := ret != nil || len(refs) > 0
 		var rows [][]any
 		pks, err := collectPKs(d.ctx, tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc), func(vals []any) {
@@ -1258,10 +1259,8 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 			}
 		}
 		if len(refs) > 0 {
-			for _, old := range rows {
-				if err := d.fkVerifyReferenced(tx, desc, refs, old); err != nil {
-					return err
-				}
+			if err := d.fkAfterDelete(tx, desc, refs, rows); err != nil {
+				return err
 			}
 		}
 		return nil

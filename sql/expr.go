@@ -1238,8 +1238,12 @@ func constraintdef(d *DB, oid int64) any {
 			for j, ord := range fk.Cols {
 				cols[j] = desc.Columns[ord].Name
 			}
-			return "FOREIGN KEY (" + strings.Join(cols, ", ") + ") REFERENCES " +
+			def := "FOREIGN KEY (" + strings.Join(cols, ", ") + ") REFERENCES " +
 				fk.RefTable + "(" + strings.Join(fk.RefCols, ", ") + ")"
+			if fk.OnDelete == bytdb.FKCascade {
+				def += " ON DELETE CASCADE"
+			}
+			return def
 		}
 	}
 	return nil
