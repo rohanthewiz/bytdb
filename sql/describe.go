@@ -224,6 +224,15 @@ func describeReturning(sc *scope, r *Returning, info *StmtInfo) error {
 // describeSelect infers one SELECT core's parameter types and output
 // shape without executing it.
 func describeSelect(lk tableLookup, st *Select, note func(any, bytdb.ColType), res *Result) error {
+	// LIMIT/OFFSET counts are integers by definition; declaring the
+	// type here lets wire drivers that encode bindings by the described
+	// OID send them as int8 rather than text.
+	if st.LimitParam != 0 {
+		note(st.LimitParam, bytdb.TInt)
+	}
+	if st.OffsetParam != 0 {
+		note(st.OffsetParam, bytdb.TInt)
+	}
 	sc, err := buildScope(lk, st.From)
 	if err != nil {
 		return err

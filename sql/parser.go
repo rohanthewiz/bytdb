@@ -1687,11 +1687,11 @@ func (p *parser) selectStmt() (Statement, error) {
 	for {
 		switch {
 		case p.acceptKw("limit"):
-			if s.Limit, err = p.nonNegInt("LIMIT"); err != nil {
+			if s.Limit, s.LimitParam, err = p.nonNegInt("LIMIT"); err != nil {
 				return nil, err
 			}
 		case p.acceptKw("offset"):
-			if s.Offset, err = p.nonNegInt("OFFSET"); err != nil {
+			if s.Offset, s.OffsetParam, err = p.nonNegInt("OFFSET"); err != nil {
 				return nil, err
 			}
 		default:
@@ -1793,20 +1793,36 @@ func (p *parser) groupItem() (GroupItem, error) {
 	return GroupItem{Ex: e}, nil
 }
 
-func (p *parser) nonNegInt(clause string) (int64, error) {
+// nonNegInt parses a LIMIT/OFFSET count: a non-negative integer
+// literal, or a $n placeholder to be resolved at bind time. A
+// placeholder returns the clause's no-op default as the int (LIMIT -1
+// means "no limit", OFFSET 0 means "skip nothing") so the AST reads
+// safely even before binding fills the real value in.
+func (p *parser) nonNegInt(clause string) (int64, Param, error) {
 	t := p.cur()
 	if t.kind == tParam {
-		return 0, serr.New("placeholders are not supported in "+clause, "param", t.text)
+		// literal owns the $n grammar (numbering from 1, the wire
+		// protocol's 65535 cap); it cannot yield anything but a Param
+		// for a tParam token.
+		v, err := p.literal()
+		if err != nil {
+			return 0, 0, err
+		}
+		def := int64(0)
+		if clause == "LIMIT" {
+			def = -1
+		}
+		return def, v.(Param), nil
 	}
 	if t.kind != tNumber {
-		return 0, p.unexpected("a count after " + clause)
+		return 0, 0, p.unexpected("a count after " + clause)
 	}
 	n, err := strconv.ParseInt(t.text, 10, 64)
 	if err != nil || n < 0 {
-		return 0, serr.New(clause+" requires a non-negative integer", "got", t.text)
+		return 0, 0, serr.New(clause+" requires a non-negative integer", "got", t.text)
 	}
 	p.advance()
-	return n, nil
+	return n, 0, nil
 }
 
 func (p *parser) update() (Statement, error) {
@@ -2646,6 +2662,22 @@ func (p *parser) exprCmp() (Expr, error) {
 				return nil, err
 			}
 			e = r
+		case p.cur().kind == tIdent && p.cur().text == "between":
+			p.advance()
+			r, err := p.betweenTail(e, false)
+			if err != nil {
+				return nil, err
+			}
+			e = r
+		case p.cur().kind == tIdent && p.cur().text == "not" &&
+			p.tokAt(1).kind == tIdent && p.tokAt(1).text == "between":
+			p.advance()
+			p.advance()
+			r, err := p.betweenTail(e, true)
+			if err != nil {
+				return nil, err
+			}
+			e = r
 		default:
 			op, ok, err := p.cmpOp()
 			if err != nil {
@@ -2746,6 +2778,65 @@ func (p *parser) likeTail(e Expr, ilike, not bool) (Expr, error) {
 		op = OpNotLike
 	}
 	return &ExCmp{Op: op, L: e, R: r}, nil
+}
+
+// betweenTail parses what follows [NOT] BETWEEN [SYMMETRIC]: the two
+// bounds separated by AND. There is no BETWEEN node in the AST — the
+// form desugars to the comparisons it is defined as, so evaluation,
+// parameter binding, and CHECK-constraint validation all see plain
+// ExAnd/ExOr/ExCmp trees they already handle:
+//
+//	x BETWEEN a AND b      ->  x >= a AND x <= b
+//	x NOT BETWEEN a AND b  ->  x < a OR x > b
+//	SYMMETRIC              ->  in-range against (a,b) OR (b,a)
+//
+// Both bounds parse at the additive level (like likeTail's pattern):
+// the separating AND must stay the boolean AND, exactly Postgres's
+// b_expr restriction. The operand expression x is shared by both
+// comparison nodes — safe because expressions here are pure, and
+// binding clones each reference independently.
+func (p *parser) betweenTail(e Expr, not bool) (Expr, error) {
+	sym := p.acceptKw("symmetric")
+	if !sym {
+		p.acceptKw("asymmetric") // the explicit spelling of the default
+	}
+	lo, err := p.exprAdd()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("and"); err != nil {
+		return nil, err
+	}
+	hi, err := p.exprAdd()
+	if err != nil {
+		return nil, err
+	}
+	// inRange is the ordered form: e >= lo AND e <= hi.
+	inRange := func(lo, hi Expr) Expr {
+		return &ExAnd{Exprs: []Expr{
+			&ExCmp{Op: OpGE, L: e, R: lo},
+			&ExCmp{Op: OpLE, L: e, R: hi},
+		}}
+	}
+	if sym {
+		// SYMMETRIC tries both bound orders. Its negation wraps ExNot
+		// rather than distributing De Morgan by hand — three-valued NOT
+		// gives the same NULL behavior either way.
+		var out Expr = &ExOr{Exprs: []Expr{inRange(lo, hi), inRange(hi, lo)}}
+		if not {
+			out = &ExNot{E: out}
+		}
+		return out, nil
+	}
+	if not {
+		// Spelled as the definition (x < lo OR x > hi) rather than
+		// NOT(AND): identical semantics, one less node to evaluate.
+		return &ExOr{Exprs: []Expr{
+			&ExCmp{Op: OpLT, L: e, R: lo},
+			&ExCmp{Op: OpGT, L: e, R: hi},
+		}}, nil
+	}
+	return inRange(lo, hi), nil
 }
 
 // exprList parses "( expr [, expr]* )".

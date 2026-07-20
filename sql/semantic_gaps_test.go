@@ -151,9 +151,10 @@ func TestBulkDMLViaIndexRange(t *testing.T) {
 	}
 }
 
-// TestLimitOffsetCorners pins LIMIT 0, OFFSET past the end, and the
-// dialect's stance on parameterized LIMIT/OFFSET (unsupported: the AST
-// holds plain integers — a clear parse error, not a silent misread).
+// TestLimitOffsetCorners pins LIMIT 0, OFFSET past the end, and that a
+// parameterized LIMIT/OFFSET counts toward the statement's parameters
+// (executing without the value is the usual arity error, not a parse
+// error — the placeholder story lives in limit_param_test.go).
 func TestLimitOffsetCorners(t *testing.T) {
 	d := openDB(t)
 	exec(t, d, `create table t (id int primary key)`)
@@ -173,8 +174,8 @@ func TestLimitOffsetCorners(t *testing.T) {
 		`select id from t offset $1`,
 	} {
 		if _, err := d.Exec(q); err == nil ||
-			!strings.Contains(err.Error(), "placeholders are not supported") {
-			t.Fatalf("Exec(%q): err %v; want placeholder rejection", q, err)
+			!strings.Contains(err.Error(), "wrong number of parameters") {
+			t.Fatalf("Exec(%q): err %v; want arity error", q, err)
 		}
 	}
 }

@@ -80,7 +80,9 @@
 // unknown, and only definitely-true rows match. Comparisons are =,
 // !=, <>, <, <=, >, >= and the regex operators ~, !~, ~*, !~* (Go
 // regexp syntax), in either operand order, plus IS [NOT] NULL, [NOT]
-// IN (list), and EXISTS (SELECT ...); in HAVING an operand may be an
+// IN (list), [NOT] BETWEEN [SYMMETRIC] — sugar for the comparisons it
+// is defined as, usable anywhere they are, CHECK constraints included
+// — and EXISTS (SELECT ...); in HAVING an operand may be an
 // aggregate call. The planner turns equality and range predicates
 // that are top-level AND conjuncts on a prefix of the primary key or
 // of a secondary index into point gets or bounded ordered scans
@@ -251,8 +253,9 @@
 //
 // Statements may use $1-style placeholders wherever a literal may
 // appear: comparison values in WHERE, ON, and HAVING, INSERT values,
-// UPDATE and ON CONFLICT DO UPDATE SET values, and RETURNING
-// expressions (LIMIT and OFFSET take literal counts only).
+// UPDATE and ON CONFLICT DO UPDATE SET values, RETURNING
+// expressions, and LIMIT/OFFSET counts (bound as a non-negative
+// integer; NULL means no limit / zero offset, as in Postgres).
 // Exec binds its trailing arguments to them, and Prepare parses a
 // statement once for repeated execution. Parameters are numbered: a
 // statement takes exactly as many values as its highest $n, and the

@@ -875,7 +875,17 @@ type Select struct {
 	OrderBy  []OrderItem
 	Limit    int64 // -1: no limit
 	Offset   int64
-	Union    []UnionArm
+	// LimitParam / OffsetParam are set (nonzero) when the clause's
+	// count is a $n placeholder rather than a literal. The executor
+	// only ever reads the int64 fields; binding resolves each
+	// placeholder into its int64 twin (and zeroes the Param) on the
+	// per-execution copy, so every consumer downstream of bindParams
+	// keeps seeing plain integers. Until then Limit/Offset hold their
+	// defaults (-1 / 0), which is also the safe reading — "no limit" —
+	// should an unbound copy ever reach execution.
+	LimitParam  Param
+	OffsetParam Param
+	Union       []UnionArm
 }
 
 // UnionArm is one UNION [ALL] continuation, combined left to right:

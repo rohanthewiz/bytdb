@@ -50,6 +50,12 @@ func sqlstate(msg string, hasPos bool) string {
 		return "42704" // undefined_object
 	case strings.Contains(msg, "wrong number of parameters"):
 		return "08P01" // protocol_violation
+	// A negative bound count surfaces at execution (a negative literal
+	// is caught at parse and reports 42601 like any syntax error).
+	case strings.Contains(msg, "LIMIT must not be negative"):
+		return "2201W" // invalid_row_count_in_limit_clause
+	case strings.Contains(msg, "OFFSET must not be negative"):
+		return "2201X" // invalid_row_count_in_result_offset_clause
 	case strings.Contains(msg, "current transaction is aborted"):
 		return "25P02" // in_failed_sql_transaction
 	case strings.Contains(msg, "read-only transaction"):

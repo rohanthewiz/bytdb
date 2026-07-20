@@ -6,10 +6,13 @@ import (
 )
 
 // ids runs a query whose first column is an int and returns the values
-// in result order.
-func ids(t *testing.T, d *DB, q string) []int64 {
+// in result order; trailing args bind to the query's placeholders.
+func ids(t *testing.T, d *DB, q string, args ...any) []int64 {
 	t.Helper()
-	res := exec(t, d, q)
+	res, err := d.Exec(q, args...)
+	if err != nil {
+		t.Fatalf("Exec(%q): %v", q, err)
+	}
 	out := make([]int64, len(res.Rows))
 	for i, r := range res.Rows {
 		out[i] = r[0].(int64)

@@ -319,14 +319,16 @@ func TestParseParams(t *testing.T) {
 		t.Fatalf("got %#v", neg.Where)
 	}
 
-	for _, src := range []string{
-		`select * from t where a = $0`, // params are 1-based
-		`select * from t limit $1`,     // LIMIT takes a literal count
-		`select * from t offset $1`,
-	} {
-		if _, err := Parse(src); err == nil {
-			t.Errorf("Parse(%q): expected error", src)
-		}
+	if _, err := Parse(`select * from t where a = $0`); err == nil { // params are 1-based
+		t.Error(`Parse($0): expected error`)
+	}
+
+	// LIMIT/OFFSET counts may be placeholders, held apart from the
+	// int64 fields (which keep their no-op defaults until binding).
+	lo := mustParse(t, `select * from t limit $1 offset $2`).(*Select)
+	if lo.LimitParam != Param(1) || lo.OffsetParam != Param(2) ||
+		lo.Limit != -1 || lo.Offset != 0 {
+		t.Fatalf("got limit %d/%v offset %d/%v", lo.Limit, lo.LimitParam, lo.Offset, lo.OffsetParam)
 	}
 }
 
