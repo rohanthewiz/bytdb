@@ -502,16 +502,23 @@ v0.6) and uploads whatever appended since its watermark as immutable
 chunk objects:
 
 ```
-<prefix>/gen/<generation-id>/<start>-<end>.wlog
+<prefix>/gen/<generation-id>/<start>-<end>.wlog   one shipped byte range
+<prefix>/gen/<generation-id>/manifest.json        completeness marker
 ```
 
 A compaction rewrites the file, so it (and each process start) rolls a
 new *generation* shipped from offset zero; older generations are
-pruned once enough newer ones exist. Because every record is
-CRC-framed with batch atomicity, `replicate.Restore` just concatenates
-the newest complete generation's chunks and the result opens exactly
-like a crash-recovered local file — a torn or missing tail chunk costs
-seconds of data, never validity.
+pruned once enough newer ones exist. The first time a generation is
+shipped in full it gets a `manifest.json` certifying its
+complete size, so `replicate.Restore` can pick the newest *complete*
+generation — a freshly rolled generation that has only shipped its
+first chunk is never chosen over a complete older one (no silent
+roll-backward), and a certified generation later missing chunks is
+detected rather than restored as a fragment. Because every record is
+CRC-framed with batch atomicity, restore just concatenates the chosen
+generation's chunks and the result opens exactly like a crash-recovered
+local file — a torn or missing tail chunk costs seconds of data, never
+validity.
 
 ```go
 e, _ := bytdb.Open("site.db")

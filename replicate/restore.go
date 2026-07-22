@@ -2,10 +2,12 @@ package replicate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,14 @@ import (
 // ErrNoReplica is returned by Restore when the store holds no
 // restorable generation under the given prefix. Test with errors.Is.
 var ErrNoReplica = errors.New("replicate: no restorable generation found")
+
+// ErrIncompleteReplica is returned by Restore when the store holds
+// generations that were certified complete (they carry a manifest) but
+// every one is now missing chunks below its certified size — the store
+// has lost data. Restore refuses to silently roll back to a truncated
+// fragment in that case; the operator must investigate the missing
+// objects. Test with errors.Is.
+var ErrIncompleteReplica = errors.New("replicate: all complete generations are missing chunks")
 
 // RestoreInfo describes what a Restore produced.
 type RestoreInfo struct {
@@ -31,11 +41,28 @@ type RestoreInfo struct {
 // the replay machinery treats the file exactly like a crash-recovered
 // local one.
 //
-// Generations are tried newest-first: one that never got its first
-// chunk uploaded (source died mid-ship) is skipped in favor of the
-// previous complete one. Within a generation the chunk chain must be
-// contiguous from offset zero; the chain is validated from the listing
-// alone before any object is downloaded.
+// "Complete" is authoritative, not inferred: the replicator writes a
+// per-generation manifest the first time a generation is shipped in full,
+// and refreshes it as the generation grows. Restore prefers the newest
+// generation that carries a manifest and whose chunk chain still reaches
+// its certified size, downloading nothing until the choice is made. This
+// is what stops a barely-started generation from a fresh compaction — its
+// chain begins at zero and so looks restorable — from silently shadowing
+// a complete older one (a roll-backward).
+//
+// Selection, newest-first:
+//
+//   - A manifested generation whose contiguous-from-zero chain reaches at
+//     least the certified size is restored (its full chain, which may
+//     extend past the certified point with a valid torn tail).
+//   - A manifested generation whose chain falls short of its certified
+//     size has lost chunks; it is skipped for an older complete one.
+//   - If manifests exist but every one is short, Restore fails with
+//     ErrIncompleteReplica rather than restore a truncated fragment.
+//   - If no generation carries a manifest at all (a store written before
+//     manifests, or one where nothing has caught up yet), Restore falls
+//     back to the legacy best-effort rule: the newest contiguous-from-zero
+//     chain, which offers no completeness guarantee.
 func Restore(ctx context.Context, store Storage, prefix, destPath string) (*RestoreInfo, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
@@ -50,9 +77,27 @@ func Restore(ctx context.Context, store Storage, prefix, destPath string) (*Rest
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(gens)))
 
+	// Pass 1: the newest complete (manifested) generation.
+	sawManifest := false
 	for _, gen := range gens {
-		chain, ok := contiguousChain(byGen[gen])
+		keys := byGen[gen]
+		if !slices.Contains(keys, manifestKey(prefix, gen)) {
+			continue // never certified complete; considered only in pass 2
+		}
+		sawManifest = true
+		man, err := loadManifest(ctx, store, prefix, gen)
+		if err != nil {
+			// The listing showed a manifest, so a Get failure is a real
+			// store error, not an absent object — surface it.
+			return nil, serr.Wrap(err, "generation", gen)
+		}
+		chain, ok := contiguousChain(keys)
 		if !ok {
+			continue // manifested but the chain no longer starts at zero
+		}
+		if end := chain[len(chain)-1].end; end < man.Size {
+			// Certified to man.Size but the chain is short: chunks below the
+			// certified point are gone. Prefer an older complete generation.
 			continue
 		}
 		info, err := assemble(ctx, store, gen, chain, destPath)
@@ -61,7 +106,39 @@ func Restore(ctx context.Context, store Storage, prefix, destPath string) (*Rest
 		}
 		return info, nil
 	}
-	return nil, serr.Wrap(ErrNoReplica, "prefix", prefix, "generationsSeen", strconv.Itoa(len(gens)))
+
+	// Pass 2: fallback only when nothing was ever certified complete.
+	// With manifests present but all short, refuse rather than roll back.
+	if !sawManifest {
+		for _, gen := range gens {
+			chain, ok := contiguousChain(byGen[gen])
+			if !ok {
+				continue
+			}
+			info, err := assemble(ctx, store, gen, chain, destPath)
+			if err != nil {
+				return nil, serr.Wrap(err, "generation", gen)
+			}
+			return info, nil
+		}
+		return nil, serr.Wrap(ErrNoReplica, "prefix", prefix, "generationsSeen", strconv.Itoa(len(gens)))
+	}
+	return nil, serr.Wrap(ErrIncompleteReplica, "prefix", prefix, "generationsSeen", strconv.Itoa(len(gens)))
+}
+
+// loadManifest downloads and parses a generation's completeness marker.
+// Only called for generations whose listing already showed the manifest
+// key, so a Get error here is a genuine store failure.
+func loadManifest(ctx context.Context, store Storage, prefix, gen string) (*generationManifest, error) {
+	data, err := store.Get(ctx, manifestKey(prefix, gen))
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "get manifest")
+	}
+	var man generationManifest
+	if err := json.Unmarshal(data, &man); err != nil {
+		return nil, serr.Wrap(err, "op", "parse manifest")
+	}
+	return &man, nil
 }
 
 // chunkRef is one parsed chunk key.

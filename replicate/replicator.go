@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -108,7 +109,14 @@ type Replicator struct {
 	gen       string
 	epoch     uint64
 	watermark int64
-	buf       bytes.Buffer // reused chunk staging buffer
+	// sealed is the size last certified in this generation's manifest.
+	// A generation earns a manifest once a ship catches up to the log
+	// tip (watermark == size); restore trusts a manifested generation as
+	// a complete snapshot. Tracking the last-sealed size lets a catch-up
+	// re-write the manifest only when the complete size actually grows,
+	// so idle ticks emit no PUT. Reset to 0 when the generation rolls.
+	sealed int64
+	buf    bytes.Buffer // reused chunk staging buffer
 
 	statusMu sync.Mutex
 	status   Status
@@ -219,6 +227,7 @@ func (r *Replicator) shipLocked(ctx context.Context) error {
 		r.gen = newGenerationID()
 		r.epoch = epoch
 		r.watermark = 0
+		r.sealed = 0
 		r.statusMu.Lock()
 		r.status.Generation, r.status.Epoch, r.status.Watermark = r.gen, epoch, 0
 		r.statusMu.Unlock()
@@ -255,6 +264,62 @@ func (r *Replicator) shipLocked(ctx context.Context) error {
 		r.statusMu.Lock()
 		r.status.Watermark = r.watermark
 		r.statusMu.Unlock()
+	}
+
+	// Reaching here means the loop drained the log without returning
+	// early, so the generation is fully shipped as of this size. Certify
+	// it with a manifest (or refresh an existing one to the new complete
+	// size) so restore can prefer this generation over any older complete
+	// one, and can detect a chain that later loses a chunk below its
+	// certified size. The manifest is metadata, not durability: a failed
+	// write is logged and retried on the next catch-up (r.sealed stays
+	// put), never failing the ship whose chunks are already stored.
+	if r.watermark > 0 && r.watermark != r.sealed {
+		if err := r.writeManifest(ctx); err != nil {
+			r.opt.Logf("replicate: manifest write failed (will retry): %v", err)
+		} else {
+			r.sealed = r.watermark
+		}
+	}
+	return nil
+}
+
+// generationManifest certifies that a generation was shipped in full at
+// least once: its chunks cover [0, Size) contiguously and form a
+// complete, self-consistent database snapshot. Restore prefers the newest
+// manifested generation and, seeing a manifest, treats a chain shorter
+// than Size as damage (missing chunks) rather than a valid torn tail — the
+// distinction that stops a barely-started post-compaction generation from
+// silently shadowing a complete older one.
+type generationManifest struct {
+	Generation     string `json:"generation"`
+	Epoch          uint64 `json:"epoch"`
+	Size           int64  `json:"size"`
+	SealedUnixNano int64  `json:"sealedUnixNano"`
+}
+
+// manifestKey names a generation's completeness marker. It lives under
+// the generation's own key space so listGenerations groups it with the
+// generation and pruning removes it alongside the chunks; the ".json"
+// suffix keeps contiguousChain from mistaking it for a ".wlog" chunk.
+func manifestKey(prefix, gen string) string {
+	return fmt.Sprintf("%sgen/%s/manifest.json", prefix, gen)
+}
+
+// writeManifest publishes the current generation's completeness marker at
+// the caught-up watermark. Callers hold shipMu.
+func (r *Replicator) writeManifest(ctx context.Context) error {
+	data, err := json.Marshal(generationManifest{
+		Generation:     r.gen,
+		Epoch:          r.epoch,
+		Size:           r.watermark,
+		SealedUnixNano: time.Now().UnixNano(),
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "marshal manifest")
+	}
+	if err := r.store.Put(ctx, manifestKey(r.opt.Prefix, r.gen), data); err != nil {
+		return serr.Wrap(err, "op", "put manifest", "generation", r.gen)
 	}
 	return nil
 }

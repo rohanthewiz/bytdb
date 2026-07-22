@@ -7,17 +7,22 @@
 // uploads whatever appended since its watermark as immutable chunk
 // objects. A compaction (or process restart) starts a fresh
 // "generation" shipped from offset zero; older generations are pruned
-// once enough newer ones exist. Restore concatenates the newest
-// complete generation's chunks back into a database file.
+// once enough newer ones exist. The first time a generation is shipped
+// in full it gets a manifest object certifying completeness, and Restore
+// concatenates the newest such generation's chunks back into a database
+// file.
 //
 // Bucket layout (all under an optional caller prefix):
 //
-//	gen/<generation-id>/<start>-<end>.wlog
+//	gen/<generation-id>/<start>-<end>.wlog   one shipped byte range
+//	gen/<generation-id>/manifest.json        completeness marker (once caught up)
 //
 // where start/end are 16-hex-digit byte offsets. Generation IDs embed a
 // UTC timestamp so plain lexicographic ordering is chronological, and
 // chunk names embed both ends of their range so a restore can verify
-// contiguity from the listing alone, before downloading anything.
+// contiguity from the listing alone, before downloading anything. The
+// manifest records the generation's certified-complete size, so restore
+// can tell a valid torn tail from a generation that has lost chunks.
 package replicate
 
 import "context"
