@@ -50,6 +50,19 @@ func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
 		// goroutine so its own re-entrant writes fail fast.
 		e.writerGID.Store(curGID())
 		defer e.writerGID.Store(0)
+		// btypedb's Update rolls back on an error RETURN but not on a
+		// panic — it has no recover — so a panic in fn would unwind past
+		// it with the writer lock still held, wedging every future write
+		// process-wide (reads still work, masking it). Roll back here to
+		// release the lock, then re-panic so the original failure and its
+		// stack are preserved for the caller. This is what makes the doc's
+		// "rolled back on error or panic" guarantee true for WriteTxn.
+		defer func() {
+			if r := recover(); r != nil {
+				tx.Rollback()
+				panic(r)
+			}
+		}()
 		return fn(&Txn{tx: tx, e: e})
 	})
 }

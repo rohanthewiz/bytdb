@@ -1646,6 +1646,21 @@ func (p *parser) returningClause(ret *Returning) error {
 }
 
 func (p *parser) selectStmt() (Statement, error) {
+	// Bound recursion through nested SELECTs exactly as expression()
+	// bounds nested expressions. A derived table or subquery in FROM
+	// re-enters selectStmt via the cycle selectCore → fromClause →
+	// tableRef → selectStmt — a path the expression-only depth guard
+	// never covered. Every full-SELECT entry (derived table, scalar/IN/
+	// EXISTS subquery, CTE body, UNION arm) funnels through here, so one
+	// counter here bounds them all. Without it, deeply nested FROM
+	// subqueries overflow the goroutine stack, and a stack overflow is a
+	// fatal runtime error recover() cannot catch — a single crafted
+	// query (well under the wire message-size cap) would take down the
+	// whole server, not just its connection.
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	s, err := p.selectCore()
 	if err != nil {
 		return nil, err

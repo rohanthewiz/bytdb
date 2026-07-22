@@ -78,9 +78,11 @@ SELECT/UPDATE/DELETE with a planner that pushes WHERE conjuncts to
 point gets and bounded index scans, joins (nested-loop with index
 rebinding; hash join when no index serves an equijoin), aggregates +
 GROUP BY/HAVING, window functions with full frame support, WITH CTEs,
-derived tables, UNION, `LIKE`/`ILIKE`, regex operators, CASE, casts,
-correlated subqueries, EXISTS, EXPLAIN, transaction blocks with
-savepoints, TRUNCATE, SET/SHOW.
+derived tables, UNION, `LIKE`/`ILIKE`, `BETWEEN`, regex operators,
+CASE, casts, correlated subqueries, EXISTS, EXPLAIN, transaction blocks
+with savepoints, TRUNCATE, SET/SHOW. `$n` placeholders bind in
+WHERE/ON/HAVING, INSERT/UPDATE values, `BETWEEN` bounds, and
+`LIMIT`/`OFFSET` counts.
 
 Types: `int`, `float`, `text`/`varchar(n)` (length enforced), `bool`,
 `bytea`, `timestamp[tz]`, `date`, `uuid`, `text[]`, `jsonb` — jsonb

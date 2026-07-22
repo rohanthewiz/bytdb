@@ -382,7 +382,21 @@ func decodeTextArrayBinary(raw []byte) (string, error) {
 	if n < 0 {
 		return bad()
 	}
-	elems := make([]any, 0, n)
+	// n is a wire-controlled element count (up to ~2.1e9). A well-formed
+	// body spends at least a 4-byte length prefix per element, so the
+	// real element count cannot exceed the bytes that remain. Clamp the
+	// preallocation to that ceiling: sizing make() by n alone lets a
+	// 20-byte parameter request tens of GB, and that allocation OOMs the
+	// process — a runtime throw that is fatal and bypasses run()'s
+	// recover fence, so one hostile Bind would take down the whole
+	// server, not just its connection. The loop below still validates
+	// every element against len(raw) and errors out the moment the body
+	// is exhausted.
+	capHint := int(n)
+	if maxElems := (len(raw) - 20) / 4; capHint > maxElems {
+		capHint = maxElems
+	}
+	elems := make([]any, 0, capHint)
 	p := 20 // past the dimension's (length, lower bound)
 	for range n {
 		if p+4 > len(raw) {

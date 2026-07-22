@@ -18,6 +18,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -27,6 +28,31 @@ import (
 
 	"github.com/rohanthewiz/serr"
 )
+
+// defaultHTTPClient bounds how long a request may stall while still
+// allowing arbitrarily large bodies. A blanket http.Client.Timeout
+// cannot be used: it caps the WHOLE request including the response body,
+// which would break a multi-GB restore Get. Instead the transport bounds
+// only the phases a black-holed or half-open endpoint stalls in — the
+// TCP dial, the TLS handshake, and the wait for response headers — so a
+// dead endpoint fails a ship/restore in seconds (letting the next tick
+// retry) instead of blocking the replicator, and via shipMu all of
+// replication, indefinitely. http.DefaultClient sets none of these.
+func defaultHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConns:          100,
+		},
+	}
+}
 
 // Config identifies the bucket and credentials.
 type Config struct {
@@ -84,7 +110,7 @@ func New(cfg Config) (*Client, error) {
 	}
 	c := &Client{cfg: cfg, base: u, http: cfg.HTTPClient}
 	if c.http == nil {
-		c.http = http.DefaultClient
+		c.http = defaultHTTPClient()
 	}
 	return c, nil
 }

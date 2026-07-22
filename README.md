@@ -181,6 +181,7 @@ ALTER TABLE t ADD COLUMN c type | DROP COLUMN c
 ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr) | FOREIGN KEY ...
 ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 ALTER TABLE t RENAME TO t2 | RENAME [COLUMN] c TO c2
+ALTER TABLE t OWNER TO role         -- accepted, no-op (bytdb has no roles)
 CREATE [UNIQUE] INDEX idx ON t (c [ASC|DESC], ...)
 DROP INDEX idx [ON t]
 CREATE SEQUENCE [IF NOT EXISTS] s [options] | ALTER SEQUENCE | DROP SEQUENCE
@@ -486,7 +487,7 @@ Beyond the milestones (production-readiness sweep and app-migration work):
 - [x] **Auth & serving**: SCRAM-SHA-256 with channel binding (SCRAM-SHA-256-PLUS) over TLS; server connection cap; `bytdbd -sync` fsync policy; query logging; `pg_stat_activity`
 - [x] **Types**: TIMESTAMP / TIMESTAMPTZ / DATE (int64 micros/days, chronological key order) and UUID (16-byte); one-dimensional `text[]` on canonical array-literal text (OID 1009, both wire formats, `array_to_string`/`array_length`, `= ANY(col)`); `jsonb` on canonical document text (OID 3802, binary format, `::jsonb`), with the operator family `->` `->>` `#>` `#>>` `@>` `<@` `?` `?|` `?&` `||` `-`
 - [x] **Constraints**: `VARCHAR(n)` enforcement (22001); UNIQUE constraint sugar over unique indexes; foreign keys — MATCH SIMPLE, NO ACTION/RESTRICT, end-of-statement checks, SQLSTATE 23503, schema-side guards — and `ON DELETE CASCADE` with transitive cascades that never bypass a NO ACTION constraint downstream
-- [x] **Statements**: TRUNCATE (transactional, RESTART IDENTITY); SET/RESET/SHOW; ALTER TABLE RENAME (table and column); `LIKE`/`ILIKE`; DEFAULT `now()`/`current_date` clock markers evaluated per statement
+- [x] **Statements**: TRUNCATE (transactional, RESTART IDENTITY); SET/RESET/SHOW; ALTER TABLE RENAME (table and column); ALTER TABLE OWNER TO (accepted as a no-op — bytdb has no roles — so pg_dump/goose DDL runs unmodified, even in a transaction block); `LIKE`/`ILIKE`; `BETWEEN`; `$n` placeholders in LIMIT/OFFSET; DEFAULT `now()`/`current_date` clock markers evaluated per statement
 - [x] **Query shapes**: derived tables, non-recursive WITH CTEs, persistent views (all via one virtual-table mechanism), `IN (SELECT ...)`, and hash joins for unindexed equijoins
 - [x] **Replication**: the `replicate` nested package — litestream-style asynchronous shipping of the storage log to any S3-compatible object store (dependency-free SigV4 client included), generation rollover on compaction/restart, retention pruning, point-in-time `Restore`; plus streaming `Engine.BackupTo(io.Writer)` for direct-to-bucket snapshots
 - [ ] Later: sequence functions in column DEFAULTs, `SELECT DISTINCT` ordered by select-list *expressions* (output names and positions only today), `DISTINCT ON`, `jsonb_set`/`jsonb_build_*`, jsonb indexing
@@ -540,6 +541,12 @@ forces a synchronous ship (after a critical transaction, say), and
 `Status()` feeds health endpoints. The `Storage` interface is four
 methods, so any store with atomic PUT and ordered listing can stand in
 for S3.
+
+The bundled S3 client defaults to bounded dial, TLS-handshake, and
+response-header timeouts (not a whole-request timeout, which would cap a
+large restore's body transfer), so a black-holed endpoint fails a ship
+in seconds and the next tick retries rather than wedging the replicator.
+Supply your own `Config.HTTPClient` to override.
 
 ## Design notes
 

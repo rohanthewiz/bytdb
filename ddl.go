@@ -283,6 +283,22 @@ func (e *Engine) DropColumn(table, name string) error {
 			}
 			desc.Indexes[i].Cols = cols
 		}
+		// Foreign-key child columns are stored as ordinals too, and must
+		// shift with the same rule. The guard above only refuses dropping a
+		// column that IS an FK child column; dropping an unrelated column
+		// with a LOWER ordinal is allowed, so without this the FK's Cols
+		// would keep pointing one slot too high — silently enforcing the
+		// constraint against the wrong column, or (when the child column
+		// was the last one) indexing past desc.Columns and panicking.
+		for i := range desc.ForeignKeys {
+			cols := slices.Clone(desc.ForeignKeys[i].Cols)
+			for j, c := range cols {
+				if c > ord {
+					cols[j] = c - 1
+				}
+			}
+			desc.ForeignKeys[i].Cols = cols
+		}
 		return desc, nil
 	})
 	if err != nil {

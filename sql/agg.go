@@ -55,6 +55,7 @@ type accum struct {
 	distinct bool
 	seen     map[string]bool // per group; allocated by newGroup
 	intSum   bool
+	sawFloat bool // a float value actually arrived at runtime
 	count    int64
 	sumI     int64
 	sumF     float64
@@ -106,6 +107,13 @@ func (a *accum) add(env *exEnv, vals []any) error {
 			a.sumI += n
 			a.sumF += float64(n)
 		case float64:
+			// intSum is a STATIC property (the argument's declared type is
+			// int), but an expression argument can yield a float at runtime
+			// — e.g. SUM(CASE WHEN c THEN 1 ELSE 1.5 END), whose type is
+			// taken from the first branch. Record that a float arrived so
+			// value() returns the float total (which sums both kinds) rather
+			// than the int-only sumI, which would silently drop this row.
+			a.sawFloat = true
 			a.sumF += n
 		default:
 			return serr.New(a.fn.name()+" requires a numeric argument",
@@ -131,7 +139,10 @@ func (a *accum) value() any {
 		if a.count == 0 {
 			return nil
 		}
-		if a.intSum {
+		// A pure-int sum returns the exact, overflow-checked int64. If any
+		// float slipped in through an expression argument, sumF holds the
+		// complete total (int rows were added to it too), so return that.
+		if a.intSum && !a.sawFloat {
 			return a.sumI
 		}
 		return a.sumF

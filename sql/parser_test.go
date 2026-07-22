@@ -420,6 +420,14 @@ func TestParseDepthLimit(t *testing.T) {
 	deep := func(n int, open, mid, close string) string {
 		return "select " + strings.Repeat(open, n) + mid + strings.Repeat(close, n)
 	}
+	// A derived table / subquery in FROM re-enters selectStmt, a
+	// recursion cycle the expression-only guard never covered — deeply
+	// nested FROM subqueries overflowed the stack until selectStmt gained
+	// its own enter/leave. Kept as its own builder because the nesting
+	// wraps the whole SELECT, not just an expression.
+	fromDeep := func(n int) string {
+		return "select * from " + strings.Repeat("(select * from ", n) + "t" + strings.Repeat(") x", n)
+	}
 	// 100k levels of each self-nesting construct; all must error.
 	for _, src := range []string{
 		deep(100_000, "(", "1", ")"),                       // parens: expression -> exprPrimary cycle
@@ -428,6 +436,7 @@ func TestParseDepthLimit(t *testing.T) {
 		deep(100_000, "case when true then ", "1", " end"), // CASE nesting
 		deep(100_000, "-(", "1", ")"),                      // unary minus + parens
 		deep(100_000, "abs(", "1", ")"),                    // function-call nesting
+		fromDeep(100_000),                                  // FROM derived-table nesting
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%.40q...): expected a depth error", src)

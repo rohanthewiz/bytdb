@@ -62,6 +62,10 @@ func FuzzParse(f *testing.F) {
 		"",
 		// deep nesting: past-the-guard depth must be a normal error
 		strings.Repeat("(", 2000) + "1" + strings.Repeat(")", 2000),
+		// FROM derived-table nesting: a distinct recursion cycle
+		// (selectStmt -> fromClause -> tableRef -> selectStmt) that the
+		// expression-only depth guard did not cover.
+		"SELECT * FROM " + strings.Repeat("(SELECT * FROM ", 2000) + "t" + strings.Repeat(") x", 2000),
 	}
 	for _, s := range seeds {
 		f.Add(s)
