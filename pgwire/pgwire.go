@@ -72,6 +72,27 @@ import (
 // connection's writes server-wide, indefinitely.
 const DefaultIdleTxTimeout = 5 * time.Minute
 
+// DefaultMaxConns caps concurrent client connections when
+// Server.MaxConns is zero. An unbounded default lets a peer open sockets
+// until the process runs out of file descriptors or memory (each
+// connection carries a goroutine, buffers, and its prepared-statement
+// maps), so a finite ceiling is the safer default; it matches Postgres's
+// stock max_connections. Set MaxConns negative for genuinely unlimited.
+const DefaultMaxConns = 100
+
+// DefaultIOTimeout bounds two per-connection I/O phases when the matching
+// Server field is zero: WriteTimeout (how long the server will block
+// pushing one statement's output to a client that has stopped reading)
+// and ReadTimeout (how long reading a single in-flight message body may
+// take once its bytes have started to arrive). Both guard against a peer
+// that opens a valid session and then withholds progress — most
+// dangerously while holding the engine's writer lock inside a
+// transaction block, where a stalled write cannot be caught by the
+// read-side idle-in-transaction deadline. Drivers send and drain whole
+// frames promptly, so a minute is enormous headroom; raise it for
+// deliberately slow bulk transfers, or set the field negative to disable.
+const DefaultIOTimeout = 60 * time.Second
+
 // Server serves one bytdb SQL frontend to any number of concurrent
 // client connections.
 type Server struct {
@@ -102,14 +123,46 @@ type Server struct {
 	// before Serve.
 	Auth *Credentials
 
-	// MaxConns caps concurrent client connections (0 = unlimited).
-	// Connections over the cap are accepted just long enough to be
-	// refused properly — FATAL 53300 "sorry, too many clients already",
-	// which drivers understand — rather than left hanging in a TCP
-	// backlog. CancelRequest connections are exempt: they carry one
-	// message and close, and refusing them would make an overloaded
-	// server impossible to relieve. Set before Serve.
+	// MaxConns caps concurrent client connections. Zero applies
+	// DefaultMaxConns; a negative value means genuinely unlimited (the
+	// former zero-value behavior). Connections over the cap are accepted
+	// just long enough to be refused properly — FATAL 53300 "sorry, too
+	// many clients already", which drivers understand — rather than left
+	// hanging in a TCP backlog. CancelRequest connections are exempt: they
+	// carry one message and close, and refusing them would make an
+	// overloaded server impossible to relieve. Set before Serve.
 	MaxConns int
+
+	// WriteTimeout bounds how long the server will block writing one
+	// statement's output to a client that has stopped reading. Zero
+	// applies DefaultIOTimeout; negative disables it. The critical case
+	// is a client that opens a writable transaction block (taking the
+	// engine's writer lock), issues a query with a large result, then
+	// stops draining: the server blocks in Flush with the lock held, and
+	// the read-side idle-in-transaction deadline cannot fire because the
+	// server is stuck writing, not reading. A write deadline is the only
+	// thing that frees the lock. Set before Serve.
+	WriteTimeout time.Duration
+
+	// ReadTimeout bounds how long reading a single in-flight message body
+	// may take once its first byte has arrived — not the idle wait
+	// between statements, which is governed by IdleTxTimeout and
+	// IdleTimeout. Zero applies DefaultIOTimeout; negative disables it.
+	// It caps a "slow body" peer that sends a frame header and then
+	// dribbles the payload, pinning a connection goroutine. Set before
+	// Serve.
+	ReadTimeout time.Duration
+
+	// IdleTimeout terminates a connection that sits idle between
+	// statements (outside any transaction block) longer than this. Zero
+	// or negative disables it — the default, because connection pools
+	// legitimately hold idle sessions open for long stretches and a
+	// blanket timeout would churn them. Enable it for untrusted clients
+	// as a slowloris backstop; a terminated session gets Postgres's
+	// FATAL 57P05 "terminating connection due to idle-session timeout".
+	// The in-transaction case is always covered by IdleTxTimeout, which
+	// also guards the writer lock. Set before Serve.
+	IdleTimeout time.Duration
 
 	// QueryLog, when non-nil, is called after every executed statement
 	// with its SQL text, wall-clock duration, and error (nil on
@@ -159,6 +212,50 @@ func (s *Server) idleTxTimeout() time.Duration {
 		return DefaultIdleTxTimeout
 	}
 	return s.IdleTxTimeout
+}
+
+// maxConns resolves the effective connection cap: 0 means unlimited to
+// the accept loop, so DefaultMaxConns applies at zero config and a
+// negative config is the explicit "unlimited" escape hatch.
+func (s *Server) maxConns() int {
+	switch {
+	case s.MaxConns < 0:
+		return 0 // unlimited
+	case s.MaxConns == 0:
+		return DefaultMaxConns
+	}
+	return s.MaxConns
+}
+
+// writeTimeout resolves WriteTimeout: 0 = default, negative = disabled.
+func (s *Server) writeTimeout() time.Duration {
+	switch {
+	case s.WriteTimeout < 0:
+		return 0 // disabled
+	case s.WriteTimeout == 0:
+		return DefaultIOTimeout
+	}
+	return s.WriteTimeout
+}
+
+// readTimeout resolves ReadTimeout: 0 = default, negative = disabled.
+func (s *Server) readTimeout() time.Duration {
+	switch {
+	case s.ReadTimeout < 0:
+		return 0 // disabled
+	case s.ReadTimeout == 0:
+		return DefaultIOTimeout
+	}
+	return s.ReadTimeout
+}
+
+// idleTimeout resolves the opt-in idle-session timeout; only a positive
+// value enables it, so pooled idle connections survive by default.
+func (s *Server) idleTimeout() time.Duration {
+	if s.IdleTimeout <= 0 {
+		return 0
+	}
+	return s.IdleTimeout
 }
 
 // NewServer wraps a SQL frontend for serving.
@@ -225,22 +322,26 @@ func (s *Server) Serve(ln net.Listener) error {
 			return err
 		}
 		c := &conn{
-			srv:     s,
-			nc:      nc,
-			idleTx:  s.idleTxTimeout(),
-			r:       bufio.NewReader(nc),
-			w:       bufio.NewWriter(nc),
-			sess:    s.db.NewSession(),
-			stmts:   map[string]*prepared{},
-			portals: map[string]*portal{},
-			pid:     s.nextPID.Add(1),
-			secret:  newCancelSecret(),
+			srv:      s,
+			nc:       nc,
+			idleTx:   s.idleTxTimeout(),
+			idleSess: s.idleTimeout(),
+			writeTx:  s.writeTimeout(),
+			readTx:   s.readTimeout(),
+			r:        bufio.NewReader(nc),
+			w:        bufio.NewWriter(nc),
+			sess:     s.db.NewSession(),
+			stmts:    map[string]*prepared{},
+			portals:  map[string]*portal{},
+			pid:      s.nextPID.Add(1),
+			secret:   newCancelSecret(),
 		}
 		s.mu.Lock()
 		// The over-limit decision is made under the same lock that
 		// registers the connection, so racing accepts cannot both squeak
-		// under the cap.
-		c.overLimit = s.MaxConns > 0 && len(s.conns) >= s.MaxConns
+		// under the cap. maxConns() folds in the default/unlimited policy.
+		eff := s.maxConns()
+		c.overLimit = eff > 0 && len(s.conns) >= eff
 		s.conns[nc] = struct{}{}
 		s.backends[c.pid] = c
 		s.mu.Unlock()

@@ -48,6 +48,11 @@ func sqlstate(msg string, hasPos bool) string {
 		return "42710" // duplicate_object
 	case strings.Contains(msg, "constraint") && strings.Contains(msg, "does not exist"):
 		return "42704" // undefined_object
+	case strings.Contains(msg, "prepared statement already exists"):
+		return "42P05" // duplicate_prepared_statement
+	case strings.Contains(msg, "too many prepared statements"),
+		strings.Contains(msg, "too many portals"):
+		return "54000" // program_limit_exceeded
 	case strings.Contains(msg, "wrong number of parameters"):
 		return "08P01" // protocol_violation
 	// A negative bound count surfaces at execution (a negative literal

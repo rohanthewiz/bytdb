@@ -5,6 +5,7 @@ package pgwire
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -15,6 +16,17 @@ import (
 // maxMsgLen bounds one frame's body; anything larger is a corrupt or
 // hostile stream.
 const maxMsgLen = 1 << 26 // 64 MiB
+
+// readBodyPrealloc caps how much of a message body is allocated up front.
+// A frame may legitimately reach maxMsgLen, but the length prefix is
+// wire-controlled: a client can declare the maximum and then send its
+// bytes slowly (or never), so trusting the declared size for the initial
+// allocation lets N idle connections pin N × 64 MiB before a single
+// payload byte lands. Reading through a bytes.Buffer instead grows the
+// allocation as real bytes arrive, so resident memory tracks what was
+// actually received; a read deadline (see conn.armBodyDeadline) then reaps
+// a connection that stalls part-way through a body.
+const readBodyPrealloc = 1 << 16 // 64 KiB
 
 // Startup request codes: the value a startup packet carries in its
 // protocol-version field.
@@ -95,11 +107,26 @@ func readBody(r *bufio.Reader) ([]byte, error) {
 	if n < 0 || n > maxMsgLen {
 		return nil, serr.New("bad message length", "length", fmt.Sprint(n))
 	}
-	body := make([]byte, n)
-	if _, err := io.ReadFull(r, body); err != nil {
+	if n == 0 {
+		return nil, nil
+	}
+	// Pre-size to the smaller of the declared length and the prealloc cap;
+	// bytes.Buffer.ReadFrom then grows the remainder geometrically as the
+	// payload arrives, so a client that stalls after declaring a huge
+	// length never forces the full allocation (see readBodyPrealloc).
+	var buf bytes.Buffer
+	buf.Grow(min(n, readBodyPrealloc))
+	got, err := io.CopyN(&buf, r, int64(n))
+	if err != nil {
+		// CopyN reports a short stream as plain io.EOF; normalize a
+		// partial read to io.ErrUnexpectedEOF so the contract matches the
+		// io.ReadFull(body) this replaced (EOF only on a clean boundary).
+		if err == io.EOF && got > 0 {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, err
 	}
-	return body, nil
+	return buf.Bytes(), nil
 }
 
 // rbuf consumes a message body; the first short read latches bad, so

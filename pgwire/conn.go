@@ -27,12 +27,15 @@ import (
 )
 
 type conn struct {
-	srv    *Server
-	nc     net.Conn      // the raw socket (or its TLS wrapper), for read deadlines
-	idleTx time.Duration // idle-in-transaction timeout; 0 = disabled
-	r      *bufio.Reader
-	w      *bufio.Writer
-	sess   *sql.Session
+	srv      *Server
+	nc       net.Conn      // the raw socket (or its TLS wrapper), for read/write deadlines
+	idleTx   time.Duration // idle-in-transaction timeout; 0 = disabled
+	idleSess time.Duration // idle-between-statements timeout; 0 = disabled
+	writeTx  time.Duration // per-statement output write deadline; 0 = disabled
+	readTx   time.Duration // in-flight message-body read deadline; 0 = disabled
+	r        *bufio.Reader
+	w        *bufio.Writer
+	sess     *sql.Session
 
 	// tlsOn: the stream has been upgraded to TLS. Gates RequireTLS and
 	// refuses a second SSLRequest.
@@ -117,6 +120,18 @@ func (c *conn) cancelQuery() {
 	c.cancelMu.Unlock()
 }
 
+// maxPreparedStmts / maxPortals bound how many named statements or
+// portals one connection may retain at once. Drivers reuse a small pool
+// of names, so real workloads never approach these; the ceilings exist so
+// a single authenticated client that keeps issuing Parse/Bind under fresh
+// names without Close cannot grow the maps until the process runs out of
+// memory. Crossing a ceiling yields Postgres's 54000 (program_limit_
+// exceeded) rather than an OOM.
+const (
+	maxPreparedStmts = 1 << 14 // 16384
+	maxPortals       = 1 << 14 // 16384
+)
+
 // prepared is one named (or unnamed) statement from Parse. A nil stmt
 // is the empty statement, which Describe answers with NoData and
 // Execute with EmptyQueryResponse.
@@ -171,7 +186,11 @@ func (c *conn) run() (err error) {
 	}
 	for {
 		c.armIdleDeadline()
-		typ, body, err := readMessage(c.r)
+		// Read the type byte under the idle deadline — a silent client
+		// blocks here. Once a message has begun, armBodyDeadline bounds
+		// the rest of the frame so a peer that dribbles a body cannot pin
+		// this goroutine (see readBodyPrealloc for the memory side).
+		typ, err := c.r.ReadByte()
 		if err != nil {
 			if c.idleTxExpired(err) {
 				// The client sat inside a transaction block past the
@@ -184,11 +203,30 @@ func (c *conn) run() (err error) {
 				c.w.Flush()
 				return serr.New("idle-in-transaction timeout")
 			}
+			if c.idleSessExpired(err) {
+				// Opt-in idle-session timeout (IdleTimeout): the client
+				// sat idle between statements too long. Postgres's exact
+				// FATAL 57P05.
+				c.send(msgErrorResponse, fatalBody(
+					"terminating connection due to idle-session timeout",
+					"57P05"))
+				c.w.Flush()
+				return serr.New("idle-session timeout")
+			}
+			return err
+		}
+		c.armBodyDeadline()
+		body, err := readBody(c.r)
+		if err != nil {
 			return err
 		}
 		if c.inErr && typ != msgSync && typ != msgTerminate {
 			continue
 		}
+		// The reply to this message is about to be written; bound how long
+		// the server will block on a client that has stopped reading —
+		// critically, one holding the writer lock inside a transaction.
+		c.armWriteDeadline()
 		r := &rbuf{b: body}
 		switch typ {
 		case msgQuery:
@@ -222,19 +260,53 @@ func (c *conn) run() (err error) {
 	}
 }
 
-// armIdleDeadline sets a read deadline while the session is inside a
-// transaction block ('T' or failed 'E' — both hold state; a writable
-// block holds the engine's global writer lock) and clears it when the
-// session is idle, where a silent client costs nothing.
+// armIdleDeadline sets the read deadline for the wait before the next
+// message's type byte, according to the session's state:
+//
+//   - Inside a transaction block ('T', or failed 'E' — both hold state,
+//     and a writable block holds the engine's global writer lock): the
+//     idle-in-transaction timeout, so a silent client cannot pin the lock.
+//   - Idle between statements: only the opt-in idle-session timeout, so a
+//     legitimately long-lived pooled connection is not reaped by default.
+//
+// When neither applies it clears any deadline left over from a prior
+// state, so a now-idle pooled session is not killed by a stale one.
 func (c *conn) armIdleDeadline() {
-	if c.nc == nil || c.idleTx <= 0 {
+	if c.nc == nil {
 		return
 	}
 	if c.sess.Status() != sql.TxIdle {
-		c.nc.SetReadDeadline(time.Now().Add(c.idleTx))
-	} else {
-		c.nc.SetReadDeadline(time.Time{})
+		if c.idleTx > 0 {
+			c.nc.SetReadDeadline(time.Now().Add(c.idleTx))
+			return
+		}
+	} else if c.idleSess > 0 {
+		c.nc.SetReadDeadline(time.Now().Add(c.idleSess))
+		return
 	}
+	c.nc.SetReadDeadline(time.Time{})
+}
+
+// armBodyDeadline bounds the read of one in-flight message body, once its
+// first byte has arrived. Disabled (readTx <= 0) it leaves whatever idle
+// deadline armIdleDeadline set in force, so an in-transaction body read
+// still inherits the idle-in-transaction bound.
+func (c *conn) armBodyDeadline() {
+	if c.nc == nil || c.readTx <= 0 {
+		return
+	}
+	c.nc.SetReadDeadline(time.Now().Add(c.readTx))
+}
+
+// armWriteDeadline bounds how long the server will block writing one
+// statement's reply. A write-deadline expiry latches into the buffered
+// writer's sticky error, surfaces at c.wErr(), and ends the connection —
+// which rolls back any open block and frees the writer lock.
+func (c *conn) armWriteDeadline() {
+	if c.nc == nil || c.writeTx <= 0 {
+		return
+	}
+	c.nc.SetWriteDeadline(time.Now().Add(c.writeTx))
 }
 
 // idleTxExpired reports whether a read error is the armed
@@ -243,6 +315,15 @@ func (c *conn) armIdleDeadline() {
 func (c *conn) idleTxExpired(err error) bool {
 	var ne net.Error
 	return c.idleTx > 0 && c.sess.Status() != sql.TxIdle &&
+		errors.As(err, &ne) && ne.Timeout()
+}
+
+// idleSessExpired reports whether a read error is the opt-in
+// idle-session deadline firing while the session sits idle between
+// statements (outside any transaction block).
+func (c *conn) idleSessExpired(err error) bool {
+	var ne net.Error
+	return c.idleSess > 0 && c.sess.Status() == sql.TxIdle &&
 		errors.As(err, &ne) && ne.Timeout()
 }
 
@@ -261,7 +342,11 @@ const startupTimeout = 30 * time.Second
 // target connection, then authenticate the startup message — SCRAM
 // when the server holds credentials, trust otherwise.
 func (c *conn) startup() error {
+	// Bound both directions of the whole pre-session phase: an
+	// unauthenticated peer must not pin a socket by stalling its reads
+	// (going silent) or its writes (never draining our handshake replies).
 	c.nc.SetReadDeadline(time.Now().Add(startupTimeout))
+	c.nc.SetWriteDeadline(time.Now().Add(startupTimeout))
 	for {
 		body, err := readStartup(c.r)
 		if err != nil {
@@ -343,10 +428,12 @@ func (c *conn) startup() error {
 			c.send(msgBackendKeyData, key)
 			c.statConnected(params)
 			c.ready()
-			// The session is established; from here the read deadline
-			// belongs to armIdleDeadline (which only manages it inside
-			// transaction blocks), so the startup one must go.
+			// The session is established; from here the deadlines belong
+			// to the per-message helpers (armIdleDeadline / armBodyDeadline
+			// for reads, armWriteDeadline for writes), so the startup ones
+			// must go.
 			c.nc.SetReadDeadline(time.Time{})
+			c.nc.SetWriteDeadline(time.Time{})
 			return c.wErr()
 		default:
 			return serr.New("unsupported protocol version", "version", fmt.Sprint(code))
@@ -378,8 +465,8 @@ func (c *conn) maybeStartTLS() error {
 		return err
 	}
 	tc := tls.Server(c.nc, c.srv.TLSConfig)
-	// Handshake reads inherit the startup deadline already armed on the
-	// underlying socket.
+	// Handshake reads and writes inherit the startup deadlines already
+	// armed on the underlying socket.
 	if err := tc.Handshake(); err != nil {
 		return serr.Wrap(err, "TLS handshake")
 	}
@@ -475,6 +562,21 @@ func (c *conn) parse(r *rbuf) {
 		c.protoError("bad Parse message")
 		return
 	}
+	// Postgres refuses to re-Parse an existing *named* statement (42P05);
+	// only the unnamed statement ("") may be silently replaced. Enforcing
+	// this both matches drivers' expectations and stops a name from being
+	// leaked-then-reused in a way that hides the cap below.
+	if name != "" {
+		if _, exists := c.stmts[name]; exists {
+			c.sendError(serr.New("prepared statement already exists", "name", name), "", 0)
+			return
+		}
+		if len(c.stmts) >= maxPreparedStmts {
+			c.sendError(serr.New("too many prepared statements",
+				"limit", fmt.Sprint(maxPreparedStmts)), "", 0)
+			return
+		}
+	}
 	p := &prepared{query: query, paramOIDs: oids}
 	if q := strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"); q != "" {
 		st, err := c.srv.db.Prepare(q)
@@ -514,6 +616,13 @@ func (c *conn) bind(r *rbuf) {
 	}
 	if r.bad {
 		c.protoError("bad Bind message")
+		return
+	}
+	// Bound retained portals as parse() bounds statements: a new name may
+	// not push the map past the ceiling. The unnamed portal "" is a single
+	// reused slot, so it never counts as growth.
+	if _, exists := c.portals[pname]; !exists && len(c.portals) >= maxPortals {
+		c.sendError(serr.New("too many portals", "limit", fmt.Sprint(maxPortals)), "", 0)
 		return
 	}
 	p, ok := c.stmts[sname]
