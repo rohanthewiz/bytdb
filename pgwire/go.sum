@@ -15,6 +15,8 @@ github.com/rohanthewiz/btypedb v0.6.0 h1:ZcpejLoqyy5yC0LvkHtXGnH+odFv+87EwqwShBj
 github.com/rohanthewiz/btypedb v0.6.0/go.mod h1:K+7M8clbmaVh33X9QYm1sA5A7DWDKOE1+O9WFQflMI0=
 github.com/rohanthewiz/btypedb v0.6.1 h1:h8MiuQFDTNk3bsqtUQIPcvLSY/2tBh2PJqvt0AAkdaQ=
 github.com/rohanthewiz/btypedb v0.6.1/go.mod h1:K+7M8clbmaVh33X9QYm1sA5A7DWDKOE1+O9WFQflMI0=
+github.com/rohanthewiz/btypedb v0.6.2 h1:JaWl0BOuFTBSOqlcd1O1LbBnfgH5jDZF21RYk9ptqjk=
+github.com/rohanthewiz/btypedb v0.6.2/go.mod h1:K+7M8clbmaVh33X9QYm1sA5A7DWDKOE1+O9WFQflMI0=
 github.com/rohanthewiz/serr v1.4.0 h1:twQnnRRB3+orPJBrdVBaxaYScNE+Dk9MxSLtEabvoGA=
 github.com/rohanthewiz/serr v1.4.0/go.mod h1:l01AbjXw1zP0kxe5tX5s/sADHiBbl0Rwfo/igde4b88=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
