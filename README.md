@@ -32,7 +32,9 @@ descending index columns, order-aware index selection, EXPLAIN,
 SCRAM-SHA-256(-PLUS) auth on the wire, and enough system catalog and
 expression language that psql's `\dt`, `\d`, `\d <table>`, `\di`,
 `\du`, and `\l` render for real — check and foreign-key constraints,
-column defaults, and sequences included.
+column defaults, and sequences included. The write-ahead log is
+optionally encrypted at rest (AES-256-GCM, value-only scope, opt-in via
+`WithEncryptionKey`), which flows through to replicas and backups.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -554,6 +556,50 @@ response-header timeouts (not a whole-request timeout, which would cap a
 large restore's body transfer), so a black-holed endpoint fails a ship
 in seconds and the next tick retries rather than wedging the replicator.
 Supply your own `Config.HTTPClient` to override.
+
+## Encryption at rest
+
+The write-ahead log can be encrypted with a 32-byte key you supply.
+Open with `WithEncryptionKey` and the on-disk log becomes AES-256-GCM
+ciphertext, while rows stay plaintext in memory — the in-memory B-tree
+orders by the decoded key, so queries, ordering, and range scans pay no
+crypto cost:
+
+```go
+key := loadKey() // 32 bytes from env / file / your KMS; bytdb never sources or persists it
+e, err := bytdb.Open("app.db", bytdb.WithEncryptionKey(key))
+```
+
+Each record's value is sealed as `nonce ‖ AES-256-GCM(value)` with a
+fresh random nonce and the op and key bound as additional data; the
+`op|klen|vlen|…|crc32` framing stays outside the ciphertext, so
+torn-tail detection and crash recovery run before any key is needed and
+the CRC still catches bit-rot. Encrypted logs carry a v2 header whose
+16-byte prefix is byte-identical to the plaintext header (so an older,
+encryption-unaware binary rejects the file cleanly) plus a key-check
+value that makes a wrong key fail fast, before any record is read.
+
+**Value-only scope.** Column *values* are encrypted; the tuple-encoded
+primary key stays cleartext on disk. It is aimed at databases whose PKs
+are surrogate IDs/UUIDs — primary-key column values are not protected.
+This protects data at rest (a stolen disk, backup, or object-store
+copy), not a running process's memory.
+
+Because replication and backup ship raw log bytes, `replicate` chunks
+and `Backup`/`BackupTo` output are ciphertext automatically, and a
+follower or a `Restore` target needs the **same key** to `Open` and
+serve. Lose the key and the data — and every backup — is unrecoverable.
+
+Reopening enforces the key, before any row is read: a wrong key returns
+`btypedb.ErrWrongKey`, a missing key `btypedb.ErrKeyRequired`, and a key
+on a plaintext database `btypedb.ErrNotEncrypted`. There is no in-place
+conversion or online key rotation yet — migrate (or rotate) by copying
+rows into a fresh database opened with the new option.
+
+`bytdbd` takes the key out-of-band, never on the command line (which
+would leak through `ps`): `-encryption-key-file <path>` or
+`-encryption-key-env <NAME>`, holding 32 raw bytes, 64 hex characters,
+or base64 of 32 bytes.
 
 ## Design notes
 

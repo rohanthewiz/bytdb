@@ -1,6 +1,6 @@
 ---
 name: bytdb-fast-memory-based-db
-description: Use bytdb as a fast, embedded, in-process SQL database for Go apps — datasets that fit in memory, durable via WAL, queryable through Go APIs or the Postgres wire protocol.
+description: Use bytdb as a fast, embedded, in-process SQL database for Go apps — datasets that fit in memory, durable via WAL (optionally encrypted at rest), queryable through Go APIs or the Postgres wire protocol.
 ---
 
 # bytdb: fast memory-based embedded database
@@ -134,6 +134,36 @@ info, err := replicate.Restore(ctx, store, "sites/mysite", "app.db")
 failover: a restored node comes up from object-store state with at
 most one Interval of loss. The `Storage` interface is four methods
 (Put/Get/List/Delete), so a fake or another store slots in easily.
+
+## Encryption at rest
+
+Encrypt the write-ahead log with a 32-byte key you supply — the file on
+disk (and therefore every replica chunk and backup) is AES-256-GCM
+ciphertext, while rows stay plaintext in memory, so queries, ordering,
+and scans pay no crypto cost:
+
+```go
+key := loadKey() // 32 bytes from env / file / KMS — bytdb never sources or persists it
+e, err := bytdb.Open("app.db", bytdb.WithEncryptionKey(key))
+```
+
+Value-only scope: each row's column values are sealed, but the
+primary-key bytes stay cleartext on disk — aimed at databases whose PKs
+are surrogate IDs/UUIDs, not sensitive natural keys. Because replication
+and backup ship raw log bytes, `replicate` chunks and `Backup`/`BackupTo`
+output become ciphertext automatically; a follower or a `Restore` target
+needs the *same* key to `Open` and serve — **lose the key and the data,
+and every backup, is unrecoverable**.
+
+Reopening enforces the key, all before any row is read: wrong key →
+`btypedb.ErrWrongKey`, missing key → `btypedb.ErrKeyRequired`, a key on a
+plaintext db → `btypedb.ErrNotEncrypted`. There is no in-place conversion
+or online key rotation yet — migrate (or rotate) by copying rows into a
+fresh db opened with the new option.
+
+`bytdbd` takes the key out-of-band, never on argv:
+`-encryption-key-file <path>` or `-encryption-key-env <NAME>` (32 raw
+bytes, 64 hex chars, or base64 of 32).
 
 ## Gotchas
 
