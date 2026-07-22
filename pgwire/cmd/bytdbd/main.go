@@ -19,6 +19,8 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -51,6 +53,10 @@ func main() {
 		"maximum concurrent client connections (0 = unlimited); excess clients get FATAL 53300")
 	logQueries := flag.Bool("log-queries", false,
 		"log every executed statement with its duration and outcome to stderr")
+	encKeyFile := flag.String("encryption-key-file", "",
+		"encrypt the WAL at rest with the AES-256 key in this file (32 raw bytes, 64 hex chars, or base64 of 32 bytes)")
+	encKeyEnv := flag.String("encryption-key-env", "",
+		"encrypt the WAL at rest with the AES-256 key in this environment variable (hex or base64 of 32 bytes)")
 	flag.Parse()
 	if *dbPath == "" {
 		log.Fatal("bytdbd: -db is required")
@@ -78,6 +84,15 @@ func main() {
 		engineOpts = append(engineOpts, bytdb.WithSyncNever())
 	default:
 		log.Fatalf("bytdbd: -sync must be always or never (got %q)", *syncMode)
+	}
+	// The key is sourced from a file or env var, never argv — a key on the
+	// command line would leak through ps and shell history.
+	encKey, err := loadEncryptionKey(*encKeyFile, *encKeyEnv)
+	if err != nil {
+		log.Fatalf("bytdbd: %s", serr.StringFromErr(err))
+	}
+	if encKey != nil {
+		engineOpts = append(engineOpts, bytdb.WithEncryptionKey(encKey))
 	}
 
 	e, err := bytdb.Open(*dbPath, engineOpts...)
@@ -125,6 +140,53 @@ func main() {
 		// Not Fatalf: the engine still needs its deferred Close.
 		fmt.Fprintf(os.Stderr, "bytdbd: %v\n", err)
 	}
+}
+
+// loadEncryptionKey sources the 32-byte WAL encryption key from a file or an
+// environment variable (at most one). Returns nil,nil when neither is set —
+// the database stays plaintext. Accepted encodings: exactly 32 raw bytes, 64
+// hex characters, or base64 of 32 bytes. The key is never taken from argv, so
+// it cannot leak through ps output or shell history.
+func loadEncryptionKey(file, env string) ([]byte, error) {
+	var raw []byte
+	switch {
+	case file != "" && env != "":
+		return nil, serr.New("set only one of -encryption-key-file / -encryption-key-env")
+	case file != "":
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, serr.Wrap(err, "reading encryption key file")
+		}
+		raw = b
+	case env != "":
+		v, ok := os.LookupEnv(env)
+		if !ok {
+			return nil, serr.New("encryption key env var is not set", "env", env)
+		}
+		raw = []byte(v)
+	default:
+		return nil, nil // no encryption requested
+	}
+	return decodeEncryptionKey(raw)
+}
+
+// decodeEncryptionKey interprets raw key material. Exactly 32 bytes is used
+// verbatim (a raw binary key file); otherwise the trimmed text is decoded as
+// hex (64 chars) or base64, and must yield 32 bytes.
+func decodeEncryptionKey(raw []byte) ([]byte, error) {
+	if len(raw) == 32 {
+		return raw, nil
+	}
+	s := strings.TrimSpace(string(raw))
+	if len(s) == 64 {
+		if k, err := hex.DecodeString(s); err == nil && len(k) == 32 {
+			return k, nil
+		}
+	}
+	if k, err := base64.StdEncoding.DecodeString(s); err == nil && len(k) == 32 {
+		return k, nil
+	}
+	return nil, serr.New("encryption key must be 32 raw bytes, 64 hex characters, or base64 of 32 bytes")
 }
 
 // loadTLS builds the server TLS config from a cert/key pair; both

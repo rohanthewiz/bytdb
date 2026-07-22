@@ -365,6 +365,26 @@ func WithSyncNever() btypedb.Option {
 	return btypedb.WithSyncPolicy(btypedb.SyncNever)
 }
 
+// WithEncryptionKey encrypts the write-ahead log at rest with AES-256-GCM,
+// keyed by a 32-byte master the caller supplies (env var, mounted file, KMS
+// — the engine neither sources nor persists it). Only each row's value bytes
+// are sealed; the tuple-encoded key stays cleartext, so ordering and range
+// scans are untouched and rows remain plaintext in memory — queries pay no
+// crypto cost. Because replication and backup ship raw log bytes, the
+// object-store replica and backup files become ciphertext too, and a follower
+// or restore needs this same key to Open.
+//
+// Value-only scope means primary-key column values are NOT protected on disk;
+// it is aimed at databases whose PKs are surrogate IDs/UUIDs. Opening with a
+// wrong or missing key fails with btypedb.ErrWrongKey / ErrKeyRequired;
+// passing a key to a plaintext database fails with btypedb.ErrNotEncrypted.
+// There is no in-place conversion — migrate by copying rows into a fresh
+// database opened with (or without) this option. Re-exported here so
+// embedders and bytdbd need not import btypedb.
+func WithEncryptionKey(key []byte) btypedb.Option {
+	return btypedb.WithEncryptionKey(key)
+}
+
 // Open opens (creating if necessary) the database at path and
 // validates the catalog.
 func Open(path string, opts ...btypedb.Option) (*Engine, error) {
