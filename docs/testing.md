@@ -7,29 +7,30 @@ loss.
 
 ## Current coverage
 
-Measured with `go test -count=1 -cover ./...` (Go 1.26.1, 2026-07-08):
+Measured with `go test -count=1 -cover ./...` (Go 1.26.1, 2026-07-30):
 
 | Package | Coverage | What it is |
 |---|---:|---|
-| `bytdb` (engine) | **83.9%** | Catalog, DDL, DML, indexes, transactions |
-| `bytdb/sql` | **83.2%** | Lexer, parser, planner, executor, sessions, syscat |
-| `bytdb/tuple` | **91.1%** | Order-preserving key encoding |
-| `bytdb/pgwire` | **87.2%** | Wire protocol server |
-| `btypedb` (storage) | **83.1%** | KV store, WAL, snapshots, TTL, compaction |
+| `bytdb` (engine) | **75.4%** | Catalog, DDL, DML, indexes, foreign keys, transactions |
+| `bytdb/sql` | **87.4%** | Lexer, parser, planner, executor, sessions, syscat |
+| `bytdb/tuple` | **97.3%** | Order-preserving key encoding |
+| `bytdb/pgwire` | **87.9%** | Wire protocol server, SCRAM auth, TLS |
+| `bytdb/replicate` | **80.4%** | Log shipping, generations, restore |
+| `bytdb/replicate/s3` | **89.4%** | Dependency-free SigV4 S3 client |
+| `btypedb` (storage) | **83.2%** | KV store, WAL, encryption, snapshots, TTL, compaction |
 
-Across the repositories: **281 test functions** and **4 fuzz targets**
-(`FuzzTupleRoundTrip`, `FuzzTupleOrder`, `FuzzMessageParse`, `FuzzParse`).
+Across the repositories: **561 test functions** and **11 fuzz targets**.
 (`pgwire/cmd/bytdbd` is a flag-parsing `main` and is intentionally untested.)
 
 ## The five tiers
 
 ```mermaid
 flowchart TD
-    t5["crash & power-loss<br/>SIGKILL a writing child · simulated power cuts ·<br/>every-prefix truncation · compaction crash points"]
-    t4["concurrency<br/>snapshots under writes · group commit + compaction ·<br/>concurrent wire connections"]
-    t3["property & fuzz<br/>tuple order ↔ bytes.Compare · scan/plan equivalence ·<br/>parser and protocol fuzzing"]
+    t5["crash & power-loss<br/>SIGKILL a writing child · simulated power cuts ·<br/>every-prefix truncation · compaction crash points ·<br/>encrypted-log recovery"]
+    t4["concurrency<br/>snapshots under writes · group commit + compaction ·<br/>concurrent wire connections · replicator under load"]
+    t3["property & fuzz<br/>tuple order ↔ bytes.Compare · scan/plan equivalence ·<br/>parser, protocol, executor, and codec fuzzing"]
     t2["semantic gaps vs Postgres<br/>three-valued logic · NaN ordering · overflow ·<br/>error wording and SQLSTATEs · ORM/psql probes verbatim"]
-    t1["unit & integration<br/>every statement type · DDL failure injection ·<br/>reentrancy guard · savepoints · TTL across reopen"]
+    t1["unit & integration<br/>every statement type · DDL failure injection ·<br/>reentrancy guard · savepoints · TTL across reopen ·<br/>FK cascades · jsonb/array/timestamp codecs"]
     t5 --> t4 --> t3 --> t2 --> t1
 ```
 
@@ -54,14 +55,25 @@ flowchart TD
 
 ### Property and fuzz tests
 
-- `FuzzTupleOrder` checks the load-bearing invariant of the whole design:
-  `bytes.Compare(Encode(a), Encode(b))` always equals the semantic comparison.
-  `FuzzTupleRoundTrip` proves decode ∘ encode is the identity.
+The 11 fuzz targets, by layer:
+
+| Target | Invariant it defends |
+|---|---|
+| `FuzzTupleOrder` | `bytes.Compare(Encode(a), Encode(b))` ≡ semantic comparison — the load-bearing invariant of the whole design |
+| `FuzzTupleRoundTrip` | decode ∘ encode is the identity |
+| `FuzzParse` | no SQL text can panic the parser |
+| `FuzzExec` | no parsed statement can panic the executor |
+| `FuzzMessageParse` | no wire bytes can panic the protocol reader |
+| `FuzzOpenRecord` | no log bytes can panic or corrupt WAL replay |
+| `FuzzOpenEncryptedFile` | malformed encrypted logs fail cleanly, never crash or mis-decrypt |
+| `FuzzJSONBCanon` | jsonb canonicalization is stable and round-trips |
+| `FuzzTextArrayCanon` | text[] array-literal canonicalization round-trips |
+| `FuzzTimestampRoundTrip` | timestamp codec round-trips across text/binary/key encodings |
+| `FuzzUUIDRoundTrip` | uuid codec round-trips across text/binary/key encodings |
+
 - `scan_property_test.go` and `sql/plan_property_test.go` cross-check scan and
   planner results against brute-force evaluation over generated data.
-- `FuzzParse` (SQL text) and `FuzzMessageParse` (wire bytes) assert no input
-  can panic the parser or the protocol reader (`pgwire/panic_test.go` adds a
-  panic fence test for the executor path).
+- `pgwire/panic_test.go` adds a panic fence test for the executor path.
 
 ### Fidelity to Postgres
 
@@ -76,7 +88,7 @@ SQLAlchemy, and ActiveRecord.
 ## Running the suite
 
 ```sh
-# root module (engine, sql, tuple) — go.work covers pgwire too
+# root module (engine, sql, tuple, replicate) — go.work covers pgwire too
 go test ./...
 
 # with coverage
@@ -92,4 +104,4 @@ go test -fuzz=FuzzTupleOrder ./tuple
 ```
 
 The crash and power-loss tests run as part of the normal suite — no special
-flags — which is why `btypedb`'s suite takes ~25 s.
+flags — which is why `btypedb`'s suite takes ~15 s.

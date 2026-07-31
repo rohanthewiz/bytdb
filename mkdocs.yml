@@ -47,6 +47,8 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - Features & Examples: features.md
+  - Replication & Backup: replication.md
+  - Encryption & Security: security.md
   - Considerations & Gotchas: gotchas.md
   - Testing: testing.md
   - Benchmarks: benchmarks.md
