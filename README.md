@@ -35,6 +35,10 @@ expression language that psql's `\dt`, `\d`, `\d <table>`, `\di`,
 column defaults, and sequences included. The write-ahead log is
 optionally encrypted at rest (AES-256-GCM, value-only scope, opt-in via
 `WithEncryptionKey`), which flows through to replicas and backups.
+Writes are single-writer (serializable) by default;
+`WithConcurrentWrites` opts into parallel OCC writers at snapshot
+isolation with SERIALIZABLE per transaction or session on request,
+surfacing conflicts as SQLSTATE 40001.
 
 - **`tuple`** — an order-preserving binary encoding for composite keys:
   for any two tuples, `bytes.Compare` on their encodings equals
@@ -350,11 +354,18 @@ redundant control statements warn without failing. `SAVEPOINT` marks
 a point inside the block — an O(1) copy-on-write snapshot of the
 transaction's state — that `ROLLBACK TO` rewinds to, clearing the
 failed state, so a block recovers from an error instead of losing
-everything; `RELEASE` drops the mark and keeps the work. Isolation levels
-parse and are ignored — single-writer transactions are serializable,
-which satisfies every level — and `READ ONLY` is honored. A writable
-block holds the engine's writer lock from `BEGIN` to its end (other
-sessions' writes wait; reads never do), and DDL cannot run inside a
+everything; `RELEASE` drops the mark and keeps the work. `READ ONLY`
+is honored, and isolation levels do what the engine's mode implies: in
+the default single-writer mode every transaction is serializable, so
+requesting a level is a no-op; under `WithConcurrentWrites` blocks run
+at snapshot isolation, and `BEGIN ISOLATION LEVEL SERIALIZABLE` (or
+`SET TRANSACTION` as the block's first statement, or the session
+default) opts a block up to serializable. In the default mode a
+writable block holds the engine's writer lock from `BEGIN` to its end
+(other sessions' writes wait; reads never do); under concurrent
+writes blocks commit optimistically instead, and a losing commit
+surfaces as SQLSTATE 40001 (see
+[Concurrent writes](#concurrent-writes)). DDL cannot run inside a
 block since every schema change is its own transaction.
 
 Errors are [serr](https://github.com/rohanthewiz/serr) structured
@@ -412,6 +423,76 @@ implemented. The end-to-end tests drive a real
 pgx v5 client — including pgx's statement cache and its simple
 protocol mode, which renders every argument as a quoted literal and
 so exercises the dialect's untyped-literal coercion.
+
+## Concurrent writes
+
+The default engine admits one writer at a time (SQLite-style), which
+makes every transaction serializable for free. Opening with
+`WithConcurrentWrites()` switches to optimistic concurrency: writers
+build transactions in parallel against O(1) COW snapshots and
+validate at commit, so a transaction fails — `bytdb.ErrTxConflict`
+embedded, SQLSTATE **40001** on the wire — only when a committed
+neighbor actually touched a key it depends on. Transactions then run
+at snapshot isolation; `BEGIN ISOLATION LEVEL SERIALIZABLE` (or a
+`SET TRANSACTION` / session default) opts a block up to full
+serializability by also tracking reads. Autocommit statements absorb
+up to three silent retries before a 40001 reaches the client;
+explicit blocks are never replayed by the server — the client
+retries, exactly as with Postgres. Identity draws and `nextval`
+become non-transactional in this mode (gaps on rollback, as in
+Postgres) so parallel inserts into one table don't collide on the
+counter key, and DDL always makes progress — it never returns 40001.
+
+Measured 2026-07-31 (Apple M3, 8 parallel writers, `SyncNever`,
+`go test -bench … -cpu 8`, median of 3 — `BenchmarkIdentityInsert*`
+and `BenchmarkSerializableHeavyTxn` here, `BenchmarkParallelUpdates*`
+in btypedb):
+
+| workload (per txn)                        | single-writer | OCC snapshot isolation | OCC serializable |
+|-------------------------------------------|---------------|------------------------|------------------|
+| single-row identity insert                | 11.4µs        | 11.2µs (1.0×)          | —                |
+| 400 reads + identity insert (SQL engine)  | 151µs         | 64µs (**2.4×**)        | 80µs (1.9×)      |
+| 2000 reads + 5 writes (btypedb storage)   | 511µs         | 142µs (**3.6×**)       | —                |
+| 20 reads + 5 writes (btypedb storage)     | 18.2µs        | 26.4µs (0.7×)          | —                |
+
+Long transactions are where OCC pays: read work that used to sit
+under the writer lock overlaps instead. Short transactions bound the
+win — a single-row insert is already mostly commit, so the modes tie
+— and OCC's per-commit overhead (snapshot copy, validation, replay)
+can make it *slower* on light workloads, as the last row shows. Hot
+single rows are the worst case for optimism: if a counter row
+thrashes even through the built-in retries, restructure the write
+rather than spinning on 40001. The full contract — who retries what,
+isolation-level semantics, sequence gaps, DDL — is in
+[docs/concurrency.md](docs/concurrency.md).
+
+For context, the same two workloads head-to-head against other
+embedded (and near-embedded) stores, same machine and date, durability
+off everywhere — so this compares transaction machinery, not disks.
+SQLite and DuckDB run through `database/sql` with prepared statements,
+Redis over localhost TCP with persistence off; medians of 3, 8
+parallel writers:
+
+| engine                              | single-row insert | 400 point reads + insert |
+|-------------------------------------|-------------------|--------------------------|
+| Badger (LSM, SSI txns)              | 2.7µs             | 140µs                    |
+| SQLite, mattn/cgo (WAL, sync OFF)   | 4.9µs             | 818µs                    |
+| SQLite, modernc pure-Go             | 6.3µs             | 1,592µs                  |
+| **bytdb OCC**                       | 11.5µs            | **63µs**                 |
+| **bytdb single-writer**             | 11.7µs            | 161µs                    |
+| BoltDB (NoSync)                     | 28.6µs            | 84µs                     |
+| Redis (localhost, no persistence)   | 38.2µs            | 153µs                    |
+| DuckDB (file, PK index)             | 73.7µs            | 9,662µs                  |
+
+Badger's batched commit pipeline owns cheap inserts; bytdb's OCC mode
+wins the read-heavy transaction shape outright, ahead of Bolt's
+zero-copy mmap reads and Badger's SSI. SQLite serializes writers
+(`_txlock=immediate`) while paying per-statement driver overhead 400
+times under the lock; Redis's heavy row is one MULTI/EXEC pipeline
+round trip — atomic, but not an isolated read-then-write transaction;
+DuckDB's per-point-lookup cost is the OLAP niche mismatch, not a
+defect. Raw C-API SQLite (no `database/sql`) would close some of its
+heavy-transaction gap.
 
 ## How it maps onto the key space
 
@@ -492,6 +573,7 @@ Beyond the milestones (production-readiness sweep and app-migration work):
 - [x] **Statements**: TRUNCATE (transactional, RESTART IDENTITY); SET/RESET/SHOW; ALTER TABLE RENAME (table and column); ALTER TABLE OWNER TO (accepted as a no-op — bytdb has no roles — so pg_dump/goose DDL runs unmodified, even in a transaction block); `LIKE`/`ILIKE`; `BETWEEN`; `$n` placeholders in LIMIT/OFFSET; DEFAULT `now()`/`current_date` clock markers evaluated per statement
 - [x] **Query shapes**: derived tables, non-recursive WITH CTEs, persistent views (all via one virtual-table mechanism), `IN (SELECT ...)`, and hash joins for unindexed equijoins
 - [x] **Replication**: the `replicate` nested package — litestream-style asynchronous shipping of the storage log to any S3-compatible object store (dependency-free SigV4 client included), generation rollover on compaction/restart, retention pruning, point-in-time `Restore`; plus streaming `Engine.BackupTo(io.Writer)` for direct-to-bucket snapshots
+- [x] **Concurrent writes (OCC)**: opt-in `WithConcurrentWrites` — parallel writers on COW snapshots with commit-time validation (snapshot isolation), SERIALIZABLE as an opt-in via read tracking (`BeginSerializable` / `BEGIN ISOLATION LEVEL SERIALIZABLE` / `SET TRANSACTION` / session default), SQLSTATE 40001 with silent autocommit retry (×3), non-transactional identity/sequence draws so parallel inserts never collide on the counter key, and DDL that escalates from optimistic to a brief exclusive stall so it always makes progress and never conflicts
 - [ ] Later: sequence functions in column DEFAULTs, `SELECT DISTINCT` ordered by select-list *expressions* (output names and positions only today), `DISTINCT ON`, `jsonb_set`/`jsonb_build_*`, jsonb indexing
 
 ## Replication
@@ -603,9 +685,11 @@ or base64 of 32 bytes.
 
 ## Design notes
 
-- **One writer at a time** (btypedb's model) means serializable
-  isolation comes free, SQLite-style. MVCC for concurrent writers is
-  explicitly out of scope until a real need appears.
+- **One writer at a time** (btypedb's default) means serializable
+  isolation comes free, SQLite-style. The concurrent-writer need did
+  appear, and it's the opt-in OCC mode above — validate-at-commit
+  over COW snapshots rather than MVCC version chains, so the storage
+  format and the single-writer default are untouched.
 - **btypedb's comparator indexes are not used** — SQL indexes will be
   key ranges, which makes them persistent and replayed from the WAL
   like all other data.
