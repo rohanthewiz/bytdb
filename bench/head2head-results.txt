@@ -1,0 +1,54 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/rohanthewiz/bytdb/bench
+cpu: Apple M3
+BenchmarkInsert_badger-8                	  457815	      2658 ns/op
+BenchmarkInsert_badger-8                	  396022	      2680 ns/op
+BenchmarkInsert_badger-8                	  461630	      2738 ns/op
+BenchmarkHeavy_badger-8                 	    9013	    126685 ns/op
+BenchmarkHeavy_badger-8                 	    9039	    135611 ns/op
+BenchmarkHeavy_badger-8                 	    9218	    134341 ns/op
+BenchmarkInsert_bolt-8                  	   42260	     28396 ns/op
+BenchmarkInsert_bolt-8                  	   42002	     27342 ns/op
+BenchmarkInsert_bolt-8                  	   44422	     27423 ns/op
+BenchmarkHeavy_bolt-8                   	   14758	     81147 ns/op
+BenchmarkHeavy_bolt-8                   	   14694	     81979 ns/op
+BenchmarkHeavy_bolt-8                   	   14737	     84404 ns/op
+BenchmarkInsert_bytdb_single_writer-8   	  105524	     11674 ns/op
+BenchmarkInsert_bytdb_single_writer-8   	  116067	     11348 ns/op
+BenchmarkInsert_bytdb_single_writer-8   	  119179	     11291 ns/op
+BenchmarkInsert_bytdb_occ-8             	  121531	     11195 ns/op
+BenchmarkInsert_bytdb_occ-8             	  117943	     11067 ns/op
+BenchmarkInsert_bytdb_occ-8             	  122979	     11133 ns/op
+BenchmarkHeavy_bytdb_single_writer-8    	    6712	    153502 ns/op
+BenchmarkHeavy_bytdb_single_writer-8    	    7308	    153147 ns/op
+BenchmarkHeavy_bytdb_single_writer-8    	    7219	    154235 ns/op
+BenchmarkHeavy_bytdb_occ-8              	   24421	     49254 ns/op
+BenchmarkHeavy_bytdb_occ-8              	   23866	     49468 ns/op
+BenchmarkHeavy_bytdb_occ-8              	   23594	     48961 ns/op
+BenchmarkInsert_duckdb-8                	   20295	     56555 ns/op
+BenchmarkInsert_duckdb-8                	   21416	     56514 ns/op
+BenchmarkInsert_duckdb-8                	   21547	     56047 ns/op
+BenchmarkHeavy_duckdb-8                 	     140	   8367784 ns/op
+BenchmarkHeavy_duckdb-8                 	     139	   8289421 ns/op
+BenchmarkHeavy_duckdb-8                 	     145	   8566235 ns/op
+BenchmarkInsert_redis-8                 	   32581	     36797 ns/op
+BenchmarkInsert_redis-8                 	   32042	     36810 ns/op
+BenchmarkInsert_redis-8                 	   32808	     37158 ns/op
+BenchmarkHeavy_redis-8                  	    8096	    145487 ns/op
+BenchmarkHeavy_redis-8                  	    7738	    145620 ns/op
+BenchmarkHeavy_redis-8                  	    8436	    144978 ns/op
+BenchmarkInsert_sqlite_mattn-8          	  232911	      5077 ns/op
+BenchmarkInsert_sqlite_mattn-8          	  227054	      5119 ns/op
+BenchmarkInsert_sqlite_mattn-8          	  233650	      5054 ns/op
+BenchmarkInsert_sqlite_modernc-8        	  174824	      5854 ns/op
+BenchmarkInsert_sqlite_modernc-8        	  172724	      5946 ns/op
+BenchmarkInsert_sqlite_modernc-8        	  184590	      6076 ns/op
+BenchmarkHeavy_sqlite_mattn-8           	    1855	    624678 ns/op
+BenchmarkHeavy_sqlite_mattn-8           	    1598	    798348 ns/op
+BenchmarkHeavy_sqlite_mattn-8           	    1778	    711705 ns/op
+BenchmarkHeavy_sqlite_modernc-8         	     830	   1370496 ns/op
+BenchmarkHeavy_sqlite_modernc-8         	     649	   1600031 ns/op
+BenchmarkHeavy_sqlite_modernc-8         	     648	   1600843 ns/op
+PASS
+ok  	github.com/rohanthewiz/bytdb/bench	89.506s

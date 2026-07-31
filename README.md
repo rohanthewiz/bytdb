@@ -450,10 +450,15 @@ in btypedb):
 
 | workload (per txn)                        | single-writer | OCC snapshot isolation | OCC serializable |
 |-------------------------------------------|---------------|------------------------|------------------|
-| single-row identity insert                | 11.4µs        | 11.2µs (1.0×)          | —                |
-| 400 reads + identity insert (SQL engine)  | 151µs         | 64µs (**2.4×**)        | 80µs (1.9×)      |
-| 2000 reads + 5 writes (btypedb storage)   | 511µs         | 142µs (**3.6×**)       | —                |
-| 20 reads + 5 writes (btypedb storage)     | 18.2µs        | 26.4µs (0.7×)          | —                |
+| single-row identity insert                | 11.4µs        | 11.0µs (1.0×)          | —                |
+| 400 reads + identity insert (SQL engine)  | 146µs         | 61µs (**2.4×**)        | 79µs (1.9×)      |
+| 2000 reads + 5 writes (btypedb storage)   | 500µs         | 231µs (**2.2×**)¹      | —                |
+| 20 reads + 5 writes (btypedb storage)     | 18.3µs        | 26.0µs (0.7×)          | —                |
+
+¹ This row writes 5 *random* keys per transaction over a 100k keyspace,
+so real conflicts and retries occur; it is bimodal run to run
+(126–268µs observed — up to ~4× on a good run, ~2.2× at the median).
+The other rows write fresh keys and are stable within a few percent.
 
 Long transactions are where OCC pays: read work that used to sit
 under the writer lock overlaps instead. Short transactions bound the
@@ -471,18 +476,36 @@ embedded (and near-embedded) stores, same machine and date, durability
 off everywhere — so this compares transaction machinery, not disks.
 SQLite and DuckDB run through `database/sql` with prepared statements,
 Redis over localhost TCP with persistence off; medians of 3, 8
-parallel writers:
+parallel writers. The harness is committed in this repo —
+`bench/head2head_test.go` documents each engine's exact mapping, and
+the table below is its verbatim output on an Apple M3. Validate it on
+your own hardware with:
+
+```sh
+./bench/head2head.sh          # starts/stops a throwaway Redis for you
+# or directly (Redis rows skip cleanly if no server on :63799):
+cd bench && go test -run '^$' -bench 'Insert_|Heavy_' -cpu 8 -count 3
+```
+
+The bench module resolves bytdb to the checkout you are sitting in, so
+you benchmark exactly the code you cloned; competitor libraries are
+pinned at their latest releases in `bench/go.mod`.
 
 | engine                              | single-row insert | 400 point reads + insert |
 |-------------------------------------|-------------------|--------------------------|
-| Badger (LSM, SSI txns)              | 2.7µs             | 140µs                    |
-| SQLite, mattn/cgo (WAL, sync OFF)   | 4.9µs             | 818µs                    |
-| SQLite, modernc pure-Go             | 6.3µs             | 1,592µs                  |
-| **bytdb OCC**                       | 11.5µs            | **63µs**                 |
-| **bytdb single-writer**             | 11.7µs            | 161µs                    |
-| BoltDB (NoSync)                     | 28.6µs            | 84µs                     |
-| Redis (localhost, no persistence)   | 38.2µs            | 153µs                    |
-| DuckDB (file, PK index)             | 73.7µs            | 9,662µs                  |
+| Badger (LSM, SSI txns)              | 2.7µs             | 134µs                    |
+| SQLite, mattn/cgo (WAL, sync OFF)   | 5.1µs             | 712µs                    |
+| SQLite, modernc pure-Go             | 5.9µs             | 1,600µs                  |
+| **bytdb OCC**                       | 11.1µs            | **49µs**                 |
+| **bytdb single-writer**             | 11.3µs            | 154µs                    |
+| BoltDB (NoSync)                     | 27.4µs            | 82µs                     |
+| Redis (localhost, no persistence)   | 36.8µs            | 145µs                    |
+| DuckDB (file, PK index)             | 56.5µs            | 8,368µs                  |
+
+(The bytdb heavy row here and the same shape in the table above came
+from separate same-day runs — 49µs vs 61µs is real run-to-run spread
+on OCC-heavy shapes, roughly ±20%; raw output for this table is
+committed at `bench/head2head-results.txt`.)
 
 Badger's batched commit pipeline owns cheap inserts; bytdb's OCC mode
 wins the read-heavy transaction shape outright, ahead of Bolt's

@@ -8,7 +8,10 @@ Dockerized Postgres. For analytical scans, DuckDB is in a different league,
 by design.
 
 Numbers below are real, from the harness in `bench/` — not synthetic claims.
-Rerun them yourself with `bench/run.sh`.
+Rerun them yourself with `bench/run.sh`. This page measures single-client
+latency; for the multi-writer concurrency comparison (bytdb's OCC mode vs
+Badger, SQLite, Bolt, Redis, and DuckDB under 8 parallel writers) see the
+README's "Concurrent writes" section, reproducible with `bench/head2head.sh`.
 
 ## Results
 
