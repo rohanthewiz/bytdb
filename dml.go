@@ -110,6 +110,11 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 	if err != nil {
 		return nil, err
 	}
+	// The duplicate probes here (this one and the unique-index ones
+	// below) are deliberately NOT marked as serializable reads: on the
+	// only path that commits, the probed key is itself written, so
+	// write-write validation already catches any concurrent writer of
+	// it — marking would only bloat bulk loads' read sets.
 	if tx.Contains(key) {
 		return nil, serr.New("duplicate primary key", "table", desc.Name)
 	}
@@ -173,6 +178,13 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 	if err != nil {
 		return nil, false, err
 	}
+	// Marked for serializable validation on both outcomes: a hit
+	// derives every new value from this row's contents, and a miss IS
+	// the statement's result — a row inserted here concurrently must
+	// conflict, not silently escape the update. (The newKey and
+	// unique-probe reads below stay unmarked: each is written on every
+	// committing path, so write-write validation covers them.)
+	tx.MarkRead(oldKey)
 	oldVal, ok := tx.Get(oldKey)
 	if !ok {
 		return nil, false, nil
@@ -316,6 +328,11 @@ func deleteRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any) (b
 	if err != nil {
 		return false, err
 	}
+	// Marked for the miss outcome (serializable mode): "nothing to
+	// delete" is a decision a concurrent insert of this key must
+	// invalidate. The hit outcome deletes the key, which write-write
+	// validation covers on its own.
+	tx.MarkRead(key)
 	val, ok := tx.Get(key)
 	if !ok {
 		return false, nil
@@ -384,6 +401,11 @@ func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, erro
 				return
 			}
 		}
+		// The whole [start, end) claim is marked even if the consumer
+		// stops early (LIMIT): the kv layer cannot see where iteration
+		// stopped, and over-claiming is merely conservative — a spurious
+		// conflict, never a missed one (serializable mode only).
+		markReadRange(v, start, end)
 		for k, val := range v.Ascend(start) {
 			if k >= end {
 				return
@@ -446,6 +468,8 @@ func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any, toIncl bool) ite
 				end = string(tuple.PrefixEnd([]byte(end)))
 			}
 		}
+		// See scanRows on why the full claim is marked (serializable).
+		markReadRange(v, start, end)
 		for k, val := range v.Descend(end) {
 			if k >= end {
 				continue

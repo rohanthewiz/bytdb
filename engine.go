@@ -310,26 +310,41 @@ type descCacheEntry struct {
 	desc *TableDesc
 }
 
-// ddlConflictRetries bounds updateDDL's re-runs on ErrTxConflict in
-// concurrent-writes mode. DDL closures re-read every descriptor and
-// counter from their own fresh snapshot, so re-running one is always
-// safe; the bound only prevents livelock under pathological contention.
-const ddlConflictRetries = 10
+// ddlOptimisticTries is how many times updateDDL attempts a DDL as an
+// exclusive-but-optimistic transaction — no locks held while the
+// closure runs, commit succeeds only if no other commit landed —
+// before escalating to a run under the writer lock, which cannot lose.
+// Two attempts cover the common case (a short closure slipping between
+// commits); a long closure under sustained writes (an index backfill)
+// loses every optimistic race, and re-running its full work more times
+// would only burn CPU before the inevitable escalation.
+const ddlOptimisticTries = 2
 
 // updateDDL runs one DDL transaction. With the catalog in the kv
 // keyspace, the descriptor write commits — or rolls back — atomically
 // with the schema change's data (backfill, range deletes), so there is
 // no publish/un-publish dance and no window where the engine
-// advertises schema that missed the disk. Concurrent DDL serializes on
-// the kv writer lock; each DDL resolves the descriptor it mutates
-// inside its own transaction, so it always builds on the committed
-// state of the one before it.
+// advertises schema that missed the disk. DDL serializes on the kv
+// writer lock; each DDL resolves the descriptor it mutates inside its
+// own transaction, so it always builds on the committed state of the
+// one before it.
 //
-// In concurrent-writes mode DDL instead serializes optimistically:
-// commits can fail with ErrTxConflict (two DDLs racing on the table-ID
-// counter, or a sequence watermark write racing a DROP). The closures
-// are pure functions of their snapshot, so those conflicts are retried
-// here rather than surfaced to every caller.
+// In concurrent-writes mode DDL stays FULLY serialized — against other
+// DDL and against every write transaction — where ordinary writes only
+// validate key overlap. Key overlap is not enough for schema changes
+// in either direction: an index backfill misses rows committed after
+// its snapshot without ever touching their keys, and an in-flight
+// insert planned against the old schema writes row keys no descriptor
+// write overlaps. So each DDL runs exclusive (btypedb.MarkExclusive):
+// it commits only onto an unmoved head, and its commit invalidates
+// every overlapping transaction via a wildcard validation entry. Any
+// commit landing mid-DDL therefore aborts the attempt; the closures
+// are pure functions of their snapshot, so the attempt is re-run here,
+// and after ddlOptimisticTries losses it escalates to
+// UpdateExclusive — the writer lock held across the closure — which
+// freezes the head and cannot lose. DDL under sustained write load
+// costs those writers one stall (plus a retry for the transactions the
+// wildcard aborts), never the DDL its progress.
 func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error {
 	if err := e.checkReentrantWrite("ddl"); err != nil {
 		return err
@@ -348,14 +363,20 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 		}
 		return e.testCommitErr
 	}
+	if !e.occ {
+		return e.kv.Update(fn)
+	}
 	var err error
-	for range ddlConflictRetries {
-		err = e.kv.Update(fn)
+	for range ddlOptimisticTries {
+		err = e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+			tx.MarkExclusive()
+			return fn(tx)
+		})
 		if !errors.Is(err, btypedb.ErrTxConflict) {
 			return err
 		}
 	}
-	return err
+	return e.kv.UpdateExclusive(fn)
 }
 
 // checkReentrantWrite refuses a one-shot write, DDL, or nested writable
@@ -365,6 +386,15 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 // goroutines pass — blocking behind the open transaction is their
 // normal, correct behavior.
 func (e *Engine) checkReentrantWrite(op string) error {
+	if e.occ {
+		// The hazard does not exist in concurrent-writes mode: Begin
+		// holds no lock across the transaction, so a same-goroutine
+		// one-shot write cannot block behind it — it just commits as
+		// its own transaction (and conflicts like any other writer).
+		// The writerGID marker is also meaningless here: it is a single
+		// slot, and occ mode allows many open writable transactions.
+		return nil
+	}
 	// Cheap common case first: no writable transaction open at all.
 	// The stack parse in curGID only runs while one is.
 	if g := e.writerGID.Load(); g != 0 && g == curGID() {
@@ -617,6 +647,38 @@ type kvView interface {
 	Contains(key string) bool
 	Ascend(from string) iter.Seq2[string, []byte]
 	Descend(from string) iter.Seq2[string, []byte]
+}
+
+// readMarker is the slice of btypedb.Tx that records a transaction's
+// semantic reads for serializable validation (see WriteTxnSerializable).
+// The shared read helpers receive a kvView, which may be a raw snapshot
+// as well as a transaction, so marking goes through a type assertion:
+// only a writable, read-tracking transaction records anything — every
+// other view (read-only snapshot, snapshot-isolation transaction,
+// default-mode transaction) makes the calls no-ops.
+//
+// The discipline for what to mark: every read whose RESULT the
+// transaction acts on, except reads that are always paired with a
+// write of the same key in the same code path — those are already
+// covered by write-write validation, and skipping them keeps bulk
+// writes from bloating the read set. Scans mark their semantic
+// [start, end) bounds, not the keys they yielded: the interval claim
+// is what catches phantoms (the keys a scan did NOT see).
+type readMarker interface {
+	MarkRead(key string)
+	MarkReadRange(min, max string)
+}
+
+func markRead(v kvView, key string) {
+	if m, ok := v.(readMarker); ok {
+		m.MarkRead(key)
+	}
+}
+
+func markReadRange(v kvView, min, max string) {
+	if m, ok := v.(readMarker); ok {
+		m.MarkReadRange(min, max)
+	}
 }
 
 // --- key helpers ---

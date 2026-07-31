@@ -240,6 +240,8 @@ func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any,
 				end = string(tuple.PrefixEnd([]byte(end)))
 			}
 		}
+		// See scanRows on why the full claim is marked (serializable).
+		markReadRange(v, start, end)
 		for k, val := range v.Descend(end) {
 			if k >= end {
 				continue
@@ -277,6 +279,8 @@ func scanIndexRows(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any) it
 				return
 			}
 		}
+		// See scanRows on why the full claim is marked (serializable).
+		markReadRange(v, start, end)
 		for k, val := range v.Ascend(start) {
 			if k >= end {
 				return
@@ -389,6 +393,11 @@ func rowFromIndexEntry(v kvView, desc *TableDesc, idx *IndexDesc, key string, va
 	if err != nil {
 		return Row{}, err
 	}
+	// The scan's range claim covers only the index entries; the row
+	// fetched through one is a separate read — an update to a
+	// non-indexed column rewrites the row key without ever entering
+	// the index range, and must still conflict (serializable mode).
+	markRead(v, rk)
 	rv, ok := v.Get(rk)
 	if !ok {
 		return Row{}, serr.New("index entry points at a missing row", "table", desc.Name, "index", idx.Name)

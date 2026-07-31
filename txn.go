@@ -19,8 +19,12 @@ import (
 // WithConcurrentWrites they overlap under snapshot isolation, and
 // Commit can fail with btypedb.ErrTxConflict — a retryable error
 // meaning another transaction touching the same keys committed first;
-// re-run the transaction from the top. Reads and scans are lock-free
-// over the snapshot in both modes.
+// re-run the transaction from the top. A transaction can individually
+// opt up to SERIALIZABLE (WriteTxnSerializable, BeginSerializable):
+// its reads are then validated at commit too, closing the write-skew
+// and phantom anomalies snapshot isolation admits, at the cost of more
+// conflicts. Reads and scans are lock-free over the snapshot in every
+// mode.
 //
 // DDL (CreateTable, CreateIndex, ...) cannot run inside a transaction
 // — a schema change is its own transaction.
@@ -68,6 +72,35 @@ func (t *Txn) flushSeqInvalidations() {
 // the process restarts (replay then drops them). Treat a commit error
 // as "durability unknown," not "definitely not applied."
 func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
+	return e.writeTxn(false, fn)
+}
+
+// WriteTxnSerializable is WriteTxn at SERIALIZABLE isolation. Only
+// meaningful with WithConcurrentWrites, where WriteTxn runs at
+// snapshot isolation: here the transaction's reads — point gets, FK
+// and uniqueness probes, scan ranges — are validated at commit
+// alongside its writes, so it commits only if it could have run alone
+// (write skew and phantoms conflict instead of committing). The cost
+// is a higher conflict rate, particularly for scan-heavy writers, so
+// it is opt-in per transaction, as in Postgres. The guarantee spans
+// the transactions that ask for it: a snapshot-isolation transaction
+// racing a serializable one can still write-skew (also as in
+// Postgres). Conflicts surface as btypedb.ErrTxConflict; re-run the
+// transaction from the top.
+//
+// Two engine-level reads stay outside the read set by design:
+// sequence/identity draws are non-transactional under concurrent
+// writes (see WithConcurrentWrites), and catalog reads need no
+// per-transaction validation because every DDL commit conflicts every
+// overlapping transaction wholesale.
+//
+// Without WithConcurrentWrites this is exactly WriteTxn — writers
+// fully serialize anyway.
+func (e *Engine) WriteTxnSerializable(fn func(tx *Txn) error) error {
+	return e.writeTxn(true, fn)
+}
+
+func (e *Engine) writeTxn(serializable bool, fn func(tx *Txn) error) error {
 	if err := e.checkReentrantWrite("write transaction"); err != nil {
 		return err
 	}
@@ -75,8 +108,14 @@ func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
 	// pending sequence invalidations (see Txn.dirtySeqPrefixes).
 	var txn *Txn
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
-		// The writer lock is ours from here to commit; mark the owning
-		// goroutine so its own re-entrant writes fail fast.
+		if serializable {
+			tx.TrackReads()
+		}
+		// Default mode: the writer lock is ours from here to commit;
+		// mark the owning goroutine so its own re-entrant writes fail
+		// fast. (In concurrent-writes mode the marker is vestigial —
+		// no lock is held across fn and checkReentrantWrite ignores
+		// it — but storing it is cheaper than branching on the mode.)
 		e.writerGID.Store(curGID())
 		defer e.writerGID.Store(0)
 		// btypedb's Update rolls back on an error RETURN but not on a
@@ -135,6 +174,22 @@ func (e *Engine) Begin(writable bool) (*Txn, error) {
 		return &Txn{tx: tx, e: e, releaseW: true}, nil
 	}
 	return e.readSnapshot()
+}
+
+// BeginSerializable starts a writable transaction at SERIALIZABLE
+// isolation — Begin(true) with the transaction's reads validated at
+// commit; see WriteTxnSerializable for the guarantee and its scope.
+// It exists for callers whose transaction boundaries arrive from
+// outside (a SQL session's BEGIN ISOLATION LEVEL SERIALIZABLE);
+// embedded callers should prefer WriteTxnSerializable, which cannot
+// leak the transaction.
+func (e *Engine) BeginSerializable() (*Txn, error) {
+	t, err := e.Begin(true)
+	if err != nil {
+		return nil, err
+	}
+	t.tx.TrackReads()
+	return t, nil
 }
 
 // readSnapshot opens a read-only transaction. Catalog consistency is
@@ -359,6 +414,9 @@ func (t *Txn) Get(table string, pkVals ...any) (Row, bool, error) {
 	if err != nil {
 		return Row{}, false, err
 	}
+	// A pure read either way — marked hit or miss, since the absence of
+	// a row is as much information as its contents (serializable mode).
+	t.tx.MarkRead(key)
 	val, ok := t.tx.Get(key)
 	if !ok {
 		return Row{}, false, nil

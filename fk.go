@@ -225,6 +225,11 @@ type FKRef struct {
 // on any table that references the named table. skipSelf drops the
 // table's references to itself (a table being dropped takes its own
 // FKs with it).
+//
+// The descriptor reads here are deliberately not marked for
+// serializable validation: only DDL writes descriptors, and every DDL
+// commit conflicts every overlapping transaction wholesale (see
+// updateDDL), which subsumes per-key catalog read tracking.
 func (e *Engine) referencingFKs(v kvView, table string, skipSelf bool) ([]FKRef, error) {
 	prefix := descTablePrefix()
 	end := string(tuple.PrefixEnd([]byte(prefix)))
