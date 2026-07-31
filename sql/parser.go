@@ -311,8 +311,40 @@ func (p *parser) statement() (Statement, error) {
 // SET TIME ZONE, the one grammar special case drivers actually send,
 // parses as the timezone parameter.
 func (p *parser) setStmt() (Statement, error) {
-	if !p.acceptKw("session") {
+	session := p.acceptKw("session")
+	if !session {
 		p.acceptKw("local")
+	}
+	// SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL x is
+	// the statement JDBC's setTransactionIsolation issues: it sets the
+	// session default, so it lowers to default_transaction_isolation.
+	if session && p.acceptKw("characteristics") {
+		for _, kw := range []string{"as", "transaction", "isolation", "level"} {
+			if err := p.expectKw(kw); err != nil {
+				return nil, err
+			}
+		}
+		lvl, err := p.isolationLevel()
+		if err != nil {
+			return nil, err
+		}
+		return &SetVar{Name: "default_transaction_isolation", Value: lvl, Tag: "SET"}, nil
+	}
+	// SET TRANSACTION ISOLATION LEVEL x scopes to the open block only;
+	// it lowers to the transaction_isolation parameter, which the
+	// Session treats transactionally (Postgres defines the parameter
+	// and the statement as equivalent).
+	if p.acceptKw("transaction") {
+		for _, kw := range []string{"isolation", "level"} {
+			if err := p.expectKw(kw); err != nil {
+				return nil, err
+			}
+		}
+		lvl, err := p.isolationLevel()
+		if err != nil {
+			return nil, err
+		}
+		return &SetVar{Name: "transaction_isolation", Value: lvl, Tag: "SET"}, nil
 	}
 	if p.acceptKw("time") {
 		if err := p.expectKw("zone"); err != nil {
@@ -603,10 +635,12 @@ func (p *parser) showStmt() (Statement, error) {
 }
 
 // txnModes parses BEGIN's transaction modes, in any order with
-// optional commas: ISOLATION LEVEL ... (accepted and ignored — every
-// engine transaction is serializable), READ ONLY / READ WRITE, and
-// [NOT] DEFERRABLE (ignored; it only matters for concurrent
-// serializable reads, which the engine gives for free).
+// optional commas: ISOLATION LEVEL ... (recorded — a Session opens a
+// SERIALIZABLE block with read-set validation under concurrent
+// writes; the weaker levels get the engine's default, which is at
+// least as strong as any of them), READ ONLY / READ WRITE, and [NOT]
+// DEFERRABLE (ignored; it only matters for concurrent serializable
+// reads, which the engine gives for free).
 func (p *parser) txnModes(tc *TxnControl) (Statement, error) {
 	for {
 		switch {
@@ -614,19 +648,11 @@ func (p *parser) txnModes(tc *TxnControl) (Statement, error) {
 			if err := p.expectKw("level"); err != nil {
 				return nil, err
 			}
-			switch {
-			case p.acceptKw("serializable"):
-			case p.acceptKw("repeatable"):
-				if err := p.expectKw("read"); err != nil {
-					return nil, err
-				}
-			case p.acceptKw("read"):
-				if !p.acceptKw("committed") && !p.acceptKw("uncommitted") {
-					return nil, p.unexpected("COMMITTED or UNCOMMITTED")
-				}
-			default:
-				return nil, p.unexpected("an isolation level")
+			lvl, err := p.isolationLevel()
+			if err != nil {
+				return nil, err
 			}
+			tc.Isolation = lvl
 		case p.acceptKw("read"):
 			switch {
 			case p.acceptKw("only"):
@@ -646,6 +672,28 @@ func (p *parser) txnModes(tc *TxnControl) (Statement, error) {
 		}
 		p.acceptOp(",")
 	}
+}
+
+// isolationLevel parses the level name after ISOLATION LEVEL,
+// normalized to Postgres's lowercase spelling ("serializable",
+// "repeatable read", ...). READ UNCOMMITTED normalizes to "read
+// committed", as Postgres itself treats it.
+func (p *parser) isolationLevel() (string, error) {
+	switch {
+	case p.acceptKw("serializable"):
+		return "serializable", nil
+	case p.acceptKw("repeatable"):
+		if err := p.expectKw("read"); err != nil {
+			return "", err
+		}
+		return "repeatable read", nil
+	case p.acceptKw("read"):
+		if !p.acceptKw("committed") && !p.acceptKw("uncommitted") {
+			return "", p.unexpected("COMMITTED or UNCOMMITTED")
+		}
+		return "read committed", nil
+	}
+	return "", p.unexpected("an isolation level")
 }
 
 // txnEnd parses COMMIT/ROLLBACK's tail: [WORK | TRANSACTION]

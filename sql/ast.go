@@ -930,15 +930,24 @@ const (
 
 // TxnControl is BEGIN / START TRANSACTION, COMMIT / END, ROLLBACK /
 // ABORT, or a savepoint statement, executed by a Session (a bare DB
-// rejects it). Isolation levels parse and are ignored — the engine's
-// single-writer transactions are serializable, which satisfies every
-// level — and READ ONLY is honored. Tag is the Postgres command tag
-// of the form used (END reports COMMIT, ABORT reports ROLLBACK).
+// rejects it). READ ONLY is honored, and so is the isolation level
+// where it can matter: under an engine opened WithConcurrentWrites,
+// BEGIN ISOLATION LEVEL SERIALIZABLE opens the block with read-set
+// validation (see bytdb.BeginSerializable); every other level — and
+// every level in the default single-writer mode — gets the engine's
+// default isolation, which is at least as strong as what was asked
+// for. Tag is the Postgres command tag of the form used (END reports
+// COMMIT, ABORT reports ROLLBACK).
 type TxnControl struct {
 	Kind     TxnKind
 	ReadOnly bool
-	Tag      string
-	Name     string // savepoint name for the savepoint kinds
+	// Isolation is the normalized requested level ("serializable",
+	// "repeatable read", "read committed") or "" when the BEGIN named
+	// none — distinct from an explicit weaker level, because "" defers
+	// to the session's default_transaction_isolation.
+	Isolation string
+	Tag       string
+	Name      string // savepoint name for the savepoint kinds
 }
 
 // Explain is EXPLAIN <statement>: describe the statement's access

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -65,8 +66,9 @@ func sqlstate(msg string, hasPos bool) string {
 		return "25P02" // in_failed_sql_transaction
 	case strings.Contains(msg, "read-only transaction"):
 		return "25006" // read_only_sql_transaction
-	case strings.Contains(msg, "cannot run inside a transaction block"):
-		return "25001" // active_sql_transaction
+	case strings.Contains(msg, "cannot run inside a transaction block"),
+		strings.Contains(msg, "must be called before any query"):
+		return "25001" // active_sql_transaction (late SET TRANSACTION)
 	case strings.Contains(msg, "can only be used in transaction blocks"):
 		return "25P01" // no_active_sql_transaction
 	case strings.Contains(msg, "savepoint") && strings.Contains(msg, "does not exist"):
@@ -111,6 +113,28 @@ func fatalBody(msg, code string) wbuf {
 	return b
 }
 
+// conflictBody builds the ErrorResponse for an optimistic-concurrency
+// loss: SQLSTATE 40001 (serialization_failure) with Postgres's exact
+// message and retry hint — connection pools and ORM retry middleware
+// pattern-match all three. Reaching here means the server has already
+// spent its own retries where it safely could (autocommit statements);
+// what remains is genuinely the client's to re-run.
+func conflictBody() wbuf {
+	var b wbuf
+	b.byte('S')
+	b.cstr("ERROR")
+	b.byte('V')
+	b.cstr("ERROR")
+	b.byte('C')
+	b.cstr("40001")
+	b.byte('M')
+	b.cstr("could not serialize access due to concurrent update")
+	b.byte('H')
+	b.cstr("The transaction might succeed if retried.")
+	b.byte(0)
+	return b
+}
+
 // noticeBody builds a NoticeResponse body for a statement warning —
 // the same field format as ErrorResponse, at WARNING severity, with
 // the code Postgres uses for the same notice.
@@ -121,6 +145,8 @@ func noticeBody(msg string) wbuf {
 		code = "25001" // active_sql_transaction
 	case strings.Contains(msg, "no transaction"):
 		code = "25P01" // no_active_sql_transaction
+	case strings.Contains(msg, "can only be used in transaction blocks"):
+		code = "25P01" // no_active_sql_transaction (stray SET TRANSACTION)
 	}
 	var b wbuf
 	b.byte('S')
@@ -147,6 +173,11 @@ func errorBody(err error, query string, base int) wbuf {
 	}
 	if errors.Is(err, context.Canceled) {
 		return cancelBody("canceling statement due to user request")
+	}
+	// An optimistic-concurrency loss likewise gets Postgres's canonical
+	// rendering rather than the engine's error text.
+	if errors.Is(err, bytdb.ErrTxConflict) {
+		return conflictBody()
 	}
 	msg := err.Error()
 	flds := serr.SErrFromErr(err).UserFields()

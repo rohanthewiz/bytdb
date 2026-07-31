@@ -196,7 +196,7 @@ key space an existing table owns (`engine.go`).
 
 ## Transactions
 
-The concurrency model is **single writer, many lock-free readers**:
+The default concurrency model is **single writer, many lock-free readers**:
 
 - A read transaction is an O(1) COW snapshot, frozen at `Begin`, and takes no
   locks while iterating.
@@ -205,6 +205,12 @@ The concurrency model is **single writer, many lock-free readers**:
 - Commit appends the batch to the WAL, then publishes with a **single pointer
   swap** — data, TTLs, and indexes change atomically for every future snapshot.
 - This is serializable isolation by construction (there is only ever one writer).
+
+Opening with `bytdb.WithConcurrentWrites()` trades the writer lock for
+optimistic concurrency control: write transactions overlap on private
+snapshots, validate at commit (first committer wins, the loser retries), and
+run at snapshot isolation with per-transaction opt-up to SERIALIZABLE. See
+[Concurrency & Isolation](concurrency.md).
 
 ```mermaid
 flowchart LR

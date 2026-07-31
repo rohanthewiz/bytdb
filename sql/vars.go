@@ -32,19 +32,41 @@ var showDefaults = map[string]string{
 	"standard_conforming_strings":   "on",
 	"timezone":                      "UTC",
 	"search_path":                   `"$user", public`,
-	"transaction_isolation":         "serializable", // every engine txn is
+	// The two isolation parameters are placeholders: every caller
+	// overlays the live values via execShow's iso argument, computed
+	// from the engine's write mode and the session's state. They stay
+	// in this map so SHOW ALL enumerates them.
+	"transaction_isolation":         "serializable",
 	"default_transaction_isolation": "serializable",
 	"statement_timeout":             "0",
 	"max_identifier_length":         "63",
 }
 
+// isoDefault is the isolation level the engine actually provides when
+// nobody asked for one: the single-writer default serializes every
+// transaction, and concurrent-writes mode runs snapshot isolation,
+// which Postgres calls repeatable read.
+func isoDefault(occ bool) string {
+	if occ {
+		return "repeatable read"
+	}
+	return "serializable"
+}
+
 // execShow answers SHOW name / SHOW ALL from the session's SET state
-// (vars, and the parsed statement_timeout) over the defaults. An
-// unknown, never-SET parameter is the Postgres error, wording and all.
-func execShow(sv *ShowVar, vars map[string]string, timeout time.Duration) (*Result, error) {
+// (vars, and the parsed statement_timeout) over the defaults. iso
+// overlays the two isolation parameters with their live values — SET
+// never lands them in vars (the Session gives them real semantics),
+// so they must be supplied. An unknown, never-SET parameter is the
+// Postgres error, wording and all.
+func execShow(sv *ShowVar, vars map[string]string, timeout time.Duration,
+	iso map[string]string) (*Result, error) {
 	get := func(name string) (string, bool) {
 		if name == "statement_timeout" && timeout > 0 {
 			return strconv.FormatInt(timeout.Milliseconds(), 10) + "ms", true
+		}
+		if v, ok := iso[name]; ok {
+			return v, true
 		}
 		if v, ok := vars[name]; ok {
 			return v, true

@@ -40,6 +40,7 @@ func TestSQLStateMapping(t *testing.T) {
 		{"current transaction is aborted, commands ignored", false, "25P02"},
 		{"cannot execute INSERT in a read-only transaction", false, "25006"},
 		{"CREATE INDEX CONCURRENTLY cannot run inside a transaction block", false, "25001"},
+		{"SET TRANSACTION ISOLATION LEVEL must be called before any query", false, "25001"},
 		{"SAVEPOINT can only be used in transaction blocks", false, "25P01"},
 		{"savepoint sp1 does not exist", false, "3B001"},
 

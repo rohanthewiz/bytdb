@@ -42,10 +42,18 @@ const (
 // ROLLBACK. One session serves one client connection; it is not safe
 // for concurrent use.
 //
-// A writable block holds the engine's single-writer lock from BEGIN
-// to COMMIT/ROLLBACK, so writes in other sessions block behind it
-// (reads do not — they run on snapshots). BEGIN READ ONLY takes no
-// lock. DDL cannot run inside a block: the engine gives each schema
+// What a writable block costs other sessions depends on the engine's
+// write mode. Default (single-writer): the block holds the engine's
+// writer lock from BEGIN to COMMIT/ROLLBACK, so writes in other
+// sessions block behind it (reads do not — they run on snapshots).
+// With bytdb.WithConcurrentWrites: BEGIN takes no lock, blocks in
+// other sessions proceed concurrently under snapshot isolation, and
+// contention surfaces at COMMIT as bytdb.ErrTxConflict — which a
+// block is never retried past (the client saw its reads), while
+// autocommit statements retry internally (see autocommitRetries).
+// BEGIN ISOLATION LEVEL SERIALIZABLE opts the block up to full
+// serializability in that mode. BEGIN READ ONLY takes no lock in any
+// mode. DDL cannot run inside a block: the engine gives each schema
 // change its own transaction.
 type Session struct {
 	db  *DB
@@ -55,6 +63,18 @@ type Session struct {
 	readOnly bool
 	aborted  bool
 	saves    []sesSave // savepoint stack, oldest first
+
+	// defIso is the session's default_transaction_isolation when SET,
+	// "" meaning the engine-mode default (isoDefault). txIso is the
+	// open block's level, fixed at BEGIN or by SET TRANSACTION; stale
+	// once the block ends (readers guard on s.tx != nil). txStmts
+	// marks that a query has executed in the block, after which SET
+	// TRANSACTION must be refused: reads already taken were not
+	// tracked, so upgrading late would validate an incomplete read set
+	// and silently void the serializable guarantee.
+	defIso  string
+	txIso   string
+	txStmts bool
 
 	// timeout is the session's statement_timeout: when positive, every
 	// statement runs under a deadline that far away, and expiry aborts
@@ -162,8 +182,9 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 		return s.setVar(sv)
 	}
 	if sv, ok := st.(*ShowVar); ok {
-		// SHOW reads the session's SET state over the defaults.
-		return execShow(sv, s.vars, s.timeout)
+		// SHOW reads the session's SET state over the defaults; the
+		// isolation parameters report live state, not stored text.
+		return execShow(sv, s.vars, s.timeout, s.isoShow())
 	}
 	if s.tx == nil {
 		return s.db.runCtx(ctx, st, args)
@@ -182,11 +203,53 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 		return nil, serr.New("cannot execute " + command(st) +
 			" in a read-only transaction")
 	}
+	// The block is about to touch data (even a failed statement may
+	// have read), which closes the SET TRANSACTION window for good.
+	s.txStmts = true
 	res, err := s.sdb.runCtx(ctx, st, args)
 	if err != nil {
 		s.aborted = true
 	}
 	return res, err
+}
+
+// sessionIso is the isolation level a new transaction gets when the
+// BEGIN names none: the SET default, else the engine mode's level.
+func (s *Session) sessionIso() string {
+	if s.defIso != "" {
+		return s.defIso
+	}
+	return isoDefault(s.db.e.ConcurrentWrites())
+}
+
+// isoShow computes the live values SHOW reports for the two isolation
+// parameters: the open block's level while one is open, the session
+// default otherwise.
+func (s *Session) isoShow() map[string]string {
+	cur := s.sessionIso()
+	if s.tx != nil {
+		cur = s.txIso
+	}
+	return map[string]string{
+		"transaction_isolation":         cur,
+		"default_transaction_isolation": s.sessionIso(),
+	}
+}
+
+// normalizeIso validates an isolation-parameter value, tolerating case
+// and whitespace as Postgres does. READ UNCOMMITTED normalizes to read
+// committed (Postgres treats them identically); false means the value
+// names no isolation level at all.
+func normalizeIso(v string) (string, bool) {
+	switch strings.ToLower(strings.Join(strings.Fields(v), " ")) {
+	case "serializable":
+		return "serializable", true
+	case "repeatable read":
+		return "repeatable read", true
+	case "read committed", "read uncommitted":
+		return "read committed", true
+	}
+	return "", false
 }
 
 // setVar applies a SET or RESET. statement_timeout is the one
@@ -198,6 +261,12 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 // transactional parameters, unwinding on ROLLBACK has nothing to
 // restore.
 func (s *Session) setVar(sv *SetVar) (*Result, error) {
+	if sv.Name == "transaction_isolation" {
+		return s.setTxnIso(sv)
+	}
+	if sv.Name == "default_transaction_isolation" {
+		return s.setDefaultIso(sv)
+	}
 	if sv.Name == "statement_timeout" {
 		d, err := parseTimeout(sv)
 		if err != nil {
@@ -212,6 +281,8 @@ func (s *Session) setVar(sv *SetVar) (*Result, error) {
 	if sv.Name == "all" && sv.IsDefault { // RESET ALL
 		s.timeout = 0
 		s.vars = nil
+		s.defIso = ""
+		s.db.serial = false
 		return &Result{Tag: sv.Tag}, nil
 	}
 	if sv.IsDefault {
@@ -222,6 +293,79 @@ func (s *Session) setVar(sv *SetVar) (*Result, error) {
 		s.vars = map[string]string{}
 	}
 	s.vars[sv.Name] = sv.Value
+	return &Result{Tag: sv.Tag}, nil
+}
+
+// setTxnIso applies SET TRANSACTION ISOLATION LEVEL (equivalently SET
+// transaction_isolation). It only has an effect inside a block, and
+// only before the block's first query — the upgrade to serializable
+// works by tracking reads from now on, so reads already taken would
+// escape validation. Both restrictions are Postgres's own, wording
+// included.
+func (s *Session) setTxnIso(sv *SetVar) (*Result, error) {
+	lvl := s.sessionIso() // RESET transaction_isolation
+	if !sv.IsDefault {
+		var ok bool
+		if lvl, ok = normalizeIso(sv.Value); !ok {
+			if s.tx != nil {
+				s.aborted = true
+			}
+			return nil, serr.New(`invalid value for parameter "transaction_isolation"`,
+				"value", sv.Value)
+		}
+	}
+	if s.tx == nil {
+		// A warning, not an error, as in Postgres: drivers issue this
+		// statement unconditionally on pool checkout.
+		return &Result{Tag: sv.Tag,
+			Notice: "SET TRANSACTION can only be used in transaction blocks"}, nil
+	}
+	if s.txStmts {
+		s.aborted = true
+		return nil, serr.New(
+			"SET TRANSACTION ISOLATION LEVEL must be called before any query")
+	}
+	// Upgrading to serializable means tracking reads from here on; with
+	// no query run yet, "from here on" is the whole block, so the
+	// guarantee is intact. Only meaningful for a writable block under
+	// concurrent writes — a read-only serializable transaction always
+	// commits, and the single-writer default is serializable already —
+	// and there is no downgrade: once tracking, a weaker requested
+	// level just means validating reads nobody required us to (sound,
+	// merely conservative).
+	if lvl == "serializable" && s.txIso != "serializable" &&
+		!s.readOnly && s.db.e.ConcurrentWrites() {
+		s.tx.TrackReads()
+	}
+	s.txIso = lvl
+	return &Result{Tag: sv.Tag}, nil
+}
+
+// setDefaultIso applies SET default_transaction_isolation (also the
+// lowered form of SET SESSION CHARACTERISTICS AS TRANSACTION
+// ISOLATION LEVEL): the default for transactions that do not name a
+// level — including autocommit statements, which under concurrent
+// writes really do run serializable when the default says so (two
+// overlapping single statements can write-skew just like two blocks).
+func (s *Session) setDefaultIso(sv *SetVar) (*Result, error) {
+	if sv.IsDefault {
+		s.defIso = ""
+		s.db.serial = false
+		return &Result{Tag: sv.Tag}, nil
+	}
+	lvl, ok := normalizeIso(sv.Value)
+	if !ok {
+		if s.tx != nil {
+			s.aborted = true
+		}
+		return nil, serr.New(`invalid value for parameter "default_transaction_isolation"`,
+			"value", sv.Value)
+	}
+	s.defIso = lvl
+	// The serial flag reaches every autocommit write through the
+	// session's DB copy; gate on the engine mode so the single-writer
+	// default never pays for read tracking it does not need.
+	s.db.serial = lvl == "serializable" && s.db.e.ConcurrentWrites()
 	return &Result{Tag: sv.Tag}, nil
 }
 
@@ -280,11 +424,27 @@ func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 		if s.tx != nil {
 			return &Result{Notice: "there is already a transaction in progress"}, nil
 		}
-		tx, err := s.db.e.Begin(!tc.ReadOnly)
+		iso := tc.Isolation
+		if iso == "" {
+			iso = s.sessionIso()
+		}
+		// A serializable writable block under concurrent writes gets
+		// read tracking from the start; anywhere else — weaker levels,
+		// read-only blocks (which always commit), or the single-writer
+		// default (serializable for free) — the plain Begin already
+		// delivers at least the level asked for.
+		var tx *bytdb.Txn
+		var err error
+		if iso == "serializable" && !tc.ReadOnly && s.db.e.ConcurrentWrites() {
+			tx, err = s.db.e.BeginSerializable()
+		} else {
+			tx, err = s.db.e.Begin(!tc.ReadOnly)
+		}
 		if err != nil {
 			return nil, err
 		}
 		s.tx, s.readOnly, s.aborted, s.saves = tx, tc.ReadOnly, false, nil
+		s.txIso, s.txStmts = iso, false
 		s.sdb = &DB{e: s.db.e, tx: tx, seq: s.db.seq}
 		return &Result{}, nil
 	case TxnCommit:

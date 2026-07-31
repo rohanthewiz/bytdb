@@ -3,8 +3,17 @@ package bytdb
 import (
 	"strings"
 
+	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/serr"
 )
+
+// ErrTxConflict is the kv store's optimistic-concurrency conflict,
+// re-exported so embedders and the SQL/wire layers can match it with
+// errors.Is without importing btypedb. It is returned by Commit (and
+// the closure-running write methods) only under WithConcurrentWrites,
+// and it is always retryable: another transaction touching the same
+// keys committed first — re-run the transaction from the top.
+var ErrTxConflict = btypedb.ErrTxConflict
 
 // ErrText renders an error for user-facing surfaces (a REPL, a wire
 // protocol, a CLI): the message followed by the error's structured

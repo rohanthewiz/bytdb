@@ -629,8 +629,12 @@ COMMIT;
 - A failed block refuses everything but `ROLLBACK` (SQLSTATE 25P02); `COMMIT`
   of a failed block performs — and reports — `ROLLBACK`, as in Postgres.
 - `SAVEPOINT` / `ROLLBACK TO` / `RELEASE`, with Postgres name-shadowing rules.
-- Isolation levels parse and are ignored: the single-writer engine is
-  serializable, which satisfies all of them. `READ ONLY` is honored.
+- Isolation levels are honored where they can matter: under
+  `WithConcurrentWrites`, `BEGIN ISOLATION LEVEL SERIALIZABLE` (or `SET
+  TRANSACTION` before the block's first query) opts the block up from snapshot
+  isolation to full serializability; every other combination already gets at
+  least the level asked for. `READ ONLY` is honored. See
+  [Concurrency & Isolation](concurrency.md).
 - Every bare statement is atomic — a multi-row `INSERT` that fails on row 900
   leaves nothing behind.
 

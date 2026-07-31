@@ -192,6 +192,17 @@ func (e *Engine) BeginSerializable() (*Txn, error) {
 	return t, nil
 }
 
+// TrackReads upgrades an open writable transaction to SERIALIZABLE:
+// from this call on, its reads join commit-time validation exactly as
+// under BeginSerializable. It exists for the one caller that learns
+// the isolation level after Begin — a SQL session handling SET
+// TRANSACTION ISOLATION LEVEL SERIALIZABLE as its block's first
+// statement. Reads performed before the call are NOT retroactively
+// tracked, so the guarantee only holds when nothing has been read
+// yet; the SQL layer enforces "before any query" (as Postgres does)
+// rather than this method trying to detect it.
+func (t *Txn) TrackReads() { t.tx.TrackReads() }
+
 // readSnapshot opens a read-only transaction. Catalog consistency is
 // free: descriptors resolve from the same snapshot as the data.
 func (e *Engine) readSnapshot() (*Txn, error) {

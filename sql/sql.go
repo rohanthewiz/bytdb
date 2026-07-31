@@ -33,8 +33,11 @@
 //	DELETE FROM t [WHERE ...] [RETURNING ...]
 //	TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
 //	SET [SESSION|LOCAL] name {=|TO} value | RESET name | RESET ALL
+//	SET TRANSACTION ISOLATION LEVEL level
+//	SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL level
 //	SHOW name | SHOW ALL
-//	BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT
+//	BEGIN | START TRANSACTION [ISOLATION LEVEL level] [READ ONLY|READ WRITE]
+//	       ... COMMIT | END | ROLLBACK | ABORT
 //	SAVEPOINT name | RELEASE [SAVEPOINT] name | ROLLBACK TO [SAVEPOINT] name
 //
 // FROM names one table or a left-deep chain of joins:
@@ -340,7 +343,9 @@ package sql
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
@@ -378,6 +383,14 @@ type DB struct {
 	// server installs it (SetActivityProvider) so sessions can see the
 	// other backends. Copied along with the DB into every session.
 	activity func() []Activity
+
+	// serial makes autocommit write statements run at SERIALIZABLE
+	// isolation (WriteTxnSerializable instead of WriteTxn). A Session
+	// sets it when default_transaction_isolation is serializable under
+	// an engine with concurrent writes; everywhere else it stays false
+	// — in the single-writer default the plain path is already
+	// serializable, so tracking reads would be pure overhead.
+	serial bool
 }
 
 // Activity is one backend's pg_stat_activity row, reported by the
@@ -423,6 +436,9 @@ func (d *DB) read(fn func(*bytdb.Txn) error) error {
 func (d *DB) write(fn func(*bytdb.Txn) error) error {
 	if d.tx != nil {
 		return fn(d.tx)
+	}
+	if d.serial {
+		return d.e.WriteTxnSerializable(fn)
 	}
 	return d.e.WriteTxn(fn)
 }
@@ -541,9 +557,52 @@ func toEngineColumn(c ColDef) (bytdb.Column, error) {
 	return col, nil
 }
 
+// autocommitRetries is how many times an autocommit statement that
+// loses optimistic validation (bytdb.ErrTxConflict, only possible
+// under WithConcurrentWrites) is silently re-run before the conflict
+// surfaces. Retrying here is safe precisely because the statement is
+// autocommit: no intermediate result ever reached the client, so the
+// whole statement is replayable — unlike a statement inside a
+// BEGIN...COMMIT block, whose conflict can only appear at COMMIT and
+// is never retried (the client has seen the block's reads).
+const autocommitRetries = 3
+
+// testInjectConflicts, when positive, converts that many successful
+// autocommit results into bytdb.ErrTxConflict — the deterministic way
+// tests exercise the retry loop, since a real conflict needs another
+// commit to land inside this statement's tiny validation window. The
+// statement's effects have already been applied when the error is
+// injected (and will be applied again on retry), so tests using it
+// must run idempotent statements. Never set outside tests.
+var testInjectConflicts atomic.Int64
+
 // run binds args into st, adapts quoted literals to their column
-// types, and dispatches it.
+// types, and dispatches it — re-running on optimistic-conflict loss
+// when it is safe to (see autocommitRetries).
 func (d *DB) run(st Statement, args []any) (*Result, error) {
+	attempt := func() (*Result, error) {
+		res, err := d.dispatch(st, args)
+		if err == nil && d.tx == nil &&
+			testInjectConflicts.Load() > 0 && testInjectConflicts.Add(-1) >= 0 {
+			res, err = nil, bytdb.ErrTxConflict
+		}
+		return res, err
+	}
+	res, err := attempt()
+	for tries := 0; tries < autocommitRetries &&
+		d.tx == nil && errors.Is(err, bytdb.ErrTxConflict); tries++ {
+		// Respect a canceled statement scope: retrying a statement the
+		// client already gave up on would just burn a validation window.
+		if d.ctx != nil && d.ctx.Err() != nil {
+			break
+		}
+		res, err = attempt()
+	}
+	return res, err
+}
+
+// dispatch is one execution attempt of run: bind, coerce, execute.
+func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 	st, err := bindParams(st, args)
 	if err != nil {
 		return nil, err
@@ -669,8 +728,13 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 	case *Truncate:
 		return d.execTruncate(s)
 	case *ShowVar:
-		// A bare DB has no SET state; SHOW reports the defaults.
-		return execShow(s, nil, 0)
+		// A bare DB has no SET state; SHOW reports the defaults, with
+		// the isolation parameters describing the engine's actual mode.
+		lvl := isoDefault(d.e.ConcurrentWrites())
+		return execShow(s, nil, 0, map[string]string{
+			"transaction_isolation":         lvl,
+			"default_transaction_isolation": lvl,
+		})
 	case *CreateSequence:
 		return d.execCreateSequence(s)
 	case *DropSequence:
@@ -705,6 +769,9 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 			txnRun := d.e.ReadTxn
 			if selectWritesSequences(s) {
 				txnRun = d.e.WriteTxn
+				if d.serial {
+					txnRun = d.e.WriteTxnSerializable
+				}
 			}
 			err := txnRun(func(tx *bytdb.Txn) error {
 				dw := *d

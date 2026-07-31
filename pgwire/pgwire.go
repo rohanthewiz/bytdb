@@ -31,8 +31,15 @@
 //     error fails the block until ROLLBACK, COMMIT of a failed block
 //     reports ROLLBACK, redundant control statements raise
 //     NoticeResponse warnings, and a dropped connection rolls back.
-//     A writable block holds the engine's single-writer lock, so
-//     other connections' writes (not reads) wait behind it.
+//     In the engine's default mode a writable block holds the single
+//     writer lock, so other connections' writes (not reads) wait
+//     behind it; with bytdb.WithConcurrentWrites blocks overlap under
+//     snapshot isolation and a losing COMMIT surfaces as SQLSTATE
+//     40001 (serialization_failure) with a retry hint — never
+//     retried server-side for blocks, while autocommit statements
+//     retry internally first. BEGIN ISOLATION LEVEL SERIALIZABLE
+//     (and SET TRANSACTION / SET SESSION CHARACTERISTICS) opt blocks
+//     up to full serializability in that mode.
 //     SAVEPOINT / RELEASE / ROLLBACK TO work too — pgx's nested
 //     transactions ride on them — with ROLLBACK TO recovering a
 //     failed block ('E' back to 'T').
@@ -66,10 +73,14 @@ import (
 
 // DefaultIdleTxTimeout is the idle-in-transaction timeout applied when
 // Server.IdleTxTimeout is zero. Postgres ships with this protection
-// off, but bytdb cannot afford that default: a writable transaction
-// block holds the engine's single global writer lock, so one client
-// that sends BEGIN and then goes silent stalls every other
-// connection's writes server-wide, indefinitely.
+// off, but bytdb cannot afford that default: in the engine's default
+// mode a writable transaction block holds the single global writer
+// lock, so one client that sends BEGIN and then goes silent stalls
+// every other connection's writes server-wide, indefinitely. Under
+// WithConcurrentWrites no lock is held, but the timeout stays: an
+// abandoned block still pins its snapshot, and the longer it sits the
+// more committed history its eventual COMMIT must validate against —
+// it would lose with a conflict anyway.
 const DefaultIdleTxTimeout = 5 * time.Minute
 
 // DefaultMaxConns caps concurrent client connections when

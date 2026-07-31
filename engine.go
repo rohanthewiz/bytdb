@@ -496,6 +496,13 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 // Close closes the underlying store.
 func (e *Engine) Close() error { return e.kv.Close() }
 
+// ConcurrentWrites reports whether the engine was opened with
+// WithConcurrentWrites. Layers above use it to describe isolation
+// honestly (SHOW transaction_isolation) and to skip serializable
+// read tracking where the single-writer default already guarantees
+// serializability for free.
+func (e *Engine) ConcurrentWrites() bool { return e.occ }
+
 // Backup writes a consistent point-in-time copy of the database to
 // destPath without blocking readers or writers: every transaction
 // committed before the call is in the copy, whole — catalog and rows
