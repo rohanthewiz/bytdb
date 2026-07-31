@@ -49,7 +49,7 @@ func (e *Engine) Insert(table string, vals ...any) error {
 		if err != nil {
 			return err
 		}
-		_, err = insertRow(tx, desc, vals)
+		_, err = insertRow(e, tx, desc, vals)
 		return err
 	})
 	if err != nil {
@@ -72,7 +72,7 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 		if err != nil {
 			return err
 		}
-		stored, err := insertRow(tx, desc, vals)
+		stored, err := insertRow(e, tx, desc, vals)
 		if err != nil {
 			return err
 		}
@@ -90,10 +90,11 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 // that must report the final values (RETURNING) get engine truth
 // rather than re-deriving it. Checks run before any write, so a failed
 // insert leaves the transaction clean — except identity counter draws
-// and bumps, which stay: they are harmless (at worst a gap) and roll
-// back with the transaction anyway if it aborts.
-func insertRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]any, error) {
-	vals, err := fillIdentity(tx, desc, vals)
+// and bumps, which stay: they are harmless (at worst a gap) and, in
+// serialized mode, roll back with the transaction anyway if it aborts
+// (in concurrent-writes mode they are engine-level and always stand).
+func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]any, error) {
+	vals, err := fillIdentity(e, tx, desc, vals)
 	if err != nil {
 		return nil, err
 	}

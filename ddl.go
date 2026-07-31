@@ -128,11 +128,15 @@ func validMaxLen(c Column) error {
 // cannot be dropped (drop the referencing constraint or table first);
 // its own foreign keys go with it.
 func (e *Engine) DropTable(name string) error {
+	// Captured for the post-commit allocator invalidation below; a
+	// retried closure just overwrites it with the same ID.
+	var droppedID uint64
 	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.descFromView(tx, name)
 		if err != nil {
 			return err
 		}
+		droppedID = desc.ID
 		refs, err := e.referencingFKs(tx, name, true)
 		if err != nil {
 			return err
@@ -158,6 +162,10 @@ func (e *Engine) DropTable(name string) error {
 	if err != nil {
 		return serr.Wrap(err, "op", "drop table", "table", name)
 	}
+	// In concurrent-writes mode the table's identity counters may have
+	// live in-memory allocators; drop them so no cached draw can write
+	// the deleted keys back.
+	e.invalidateCounterPrefix(string(identitySeqTablePrefix(droppedID)))
 	return nil
 }
 
@@ -226,6 +234,9 @@ func hasRows(tx *btypedb.Tx[string, []byte], tableID uint64) bool {
 // with the same name gets a fresh ID, so the old data can never
 // resurface.
 func (e *Engine) DropColumn(table, name string) error {
+	// Captured for the post-commit allocator invalidation below ("" when
+	// the dropped column had no identity counter).
+	var droppedCounterKey string
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(name)
 		if ord < 0 {
@@ -234,7 +245,8 @@ func (e *Engine) DropColumn(table, name string) error {
 		if old.Columns[ord].Identity {
 			// The counter goes with the column; the column ID is never
 			// reused, so nothing can resurrect it.
-			if _, err := tx.Delete(identitySeqKey(old.ID, old.Columns[ord].ID)); err != nil {
+			droppedCounterKey = identitySeqKey(old.ID, old.Columns[ord].ID)
+			if _, err := tx.Delete(droppedCounterKey); err != nil {
 				return nil, err
 			}
 		}
@@ -303,6 +315,11 @@ func (e *Engine) DropColumn(table, name string) error {
 	})
 	if err != nil {
 		return serr.Wrap(err, "op", "drop column", "table", table, "column", name)
+	}
+	if droppedCounterKey != "" {
+		// Concurrent-writes mode: no cached draw may write the deleted
+		// counter key back.
+		e.invalidateCounter(droppedCounterKey)
 	}
 	return nil
 }

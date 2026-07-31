@@ -12,9 +12,15 @@ import (
 // catalog alike. Descriptors resolve lazily from the snapshot itself,
 // so the schema a transaction sees is exactly the schema of the data
 // it sees — there is no second snapshot to tear. A writable
-// transaction sees its own changes and commits them atomically; only
-// one runs at a time, so isolation is serializable. Reads and scans
-// are lock-free over the snapshot.
+// transaction sees its own changes and commits them atomically.
+//
+// Isolation depends on the engine's write mode. Default: writable
+// transactions run one at a time, so isolation is serializable. With
+// WithConcurrentWrites they overlap under snapshot isolation, and
+// Commit can fail with btypedb.ErrTxConflict — a retryable error
+// meaning another transaction touching the same keys committed first;
+// re-run the transaction from the top. Reads and scans are lock-free
+// over the snapshot in both modes.
 //
 // DDL (CreateTable, CreateIndex, ...) cannot run inside a transaction
 // — a schema change is its own transaction.
@@ -28,6 +34,26 @@ type Txn struct {
 	// lifetime (including nil for absent tables — the snapshot cannot
 	// change underneath, so a miss is a miss for good).
 	descs map[string]*TableDesc
+	// dirtySeqPrefixes are counter-key prefixes this transaction
+	// deletes transactionally (today: Truncate's RESTART IDENTITY
+	// range). In concurrent-writes mode the engine's in-memory
+	// allocators must drop their caches when — and only when — those
+	// deletes commit, so the prefixes are collected here and flushed by
+	// the commit paths. Invalidation is always safe (a re-anchor just
+	// re-reads stored state), so a savepoint rollback that undoes the
+	// truncate needs no compensating bookkeeping.
+	dirtySeqPrefixes []string
+}
+
+// flushSeqInvalidations discards allocators for every counter range
+// the just-committed transaction deleted. Called only after a
+// successful commit — invalidating for a rolled-back delete would be
+// harmless but pointless.
+func (t *Txn) flushSeqInvalidations() {
+	for _, p := range t.dirtySeqPrefixes {
+		t.e.invalidateCounterPrefix(p)
+	}
+	t.dirtySeqPrefixes = nil
 }
 
 // WriteTxn runs fn in a writable transaction: committed if fn returns
@@ -45,7 +71,10 @@ func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
 	if err := e.checkReentrantWrite("write transaction"); err != nil {
 		return err
 	}
-	return e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	// txn escapes the closure so the commit outcome can flush its
+	// pending sequence invalidations (see Txn.dirtySeqPrefixes).
+	var txn *Txn
+	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
 		// The writer lock is ours from here to commit; mark the owning
 		// goroutine so its own re-entrant writes fail fast.
 		e.writerGID.Store(curGID())
@@ -63,8 +92,13 @@ func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
 				panic(r)
 			}
 		}()
-		return fn(&Txn{tx: tx, e: e})
+		txn = &Txn{tx: tx, e: e}
+		return fn(txn)
 	})
+	if err == nil && txn != nil {
+		txn.flushSeqInvalidations()
+	}
+	return err
 }
 
 // ReadTxn runs fn over a read-only snapshot: a point-in-time view of
@@ -80,10 +114,12 @@ func (e *Engine) ReadTxn(fn func(tx *Txn) error) error {
 }
 
 // Begin starts a transaction the caller must end with Commit or
-// Rollback. A writable transaction takes the engine's single-writer
-// lock at Begin and holds it until it ends: other writable
-// transactions, one-shot writes, and DDL block behind it (reads and
-// read-only transactions do not). Prefer WriteTxn and ReadTxn, which
+// Rollback. In the default mode a writable transaction takes the
+// engine's single-writer lock at Begin and holds it until it ends:
+// other writable transactions, one-shot writes, and DDL block behind
+// it (reads and read-only transactions do not). In concurrent-writes
+// mode Begin never blocks; contention surfaces at Commit as
+// btypedb.ErrTxConflict instead. Prefer WriteTxn and ReadTxn, which
 // cannot leak the lock; Begin exists for callers whose transaction
 // boundaries arrive from outside, like a SQL session's BEGIN/COMMIT.
 func (e *Engine) Begin(writable bool) (*Txn, error) {
@@ -121,6 +157,9 @@ func (e *Engine) readSnapshot() (*Txn, error) {
 func (t *Txn) Commit() error {
 	err := t.tx.Commit()
 	t.releaseWriter()
+	if err == nil {
+		t.flushSeqInvalidations()
+	}
 	return err
 }
 
@@ -215,7 +254,7 @@ func (t *Txn) InsertReturning(table string, vals ...any) (Row, error) {
 	if err != nil {
 		return Row{}, err
 	}
-	stored, err := insertRow(t.tx, desc, vals)
+	stored, err := insertRow(t.e, t.tx, desc, vals)
 	if err != nil {
 		return Row{}, serr.Wrap(err, "op", "insert", "table", table)
 	}
@@ -280,6 +319,17 @@ func (t *Txn) Truncate(table string, restartIdentity bool) error {
 		idPrefix := identitySeqTablePrefix(desc.ID)
 		if _, err := t.tx.DeleteRange(string(idPrefix), string(tuple.PrefixEnd(idPrefix))); err != nil {
 			return serr.Wrap(err, "op", "truncate", "table", table)
+		}
+		if t.e.occ {
+			// The engine's in-memory allocators must drop this table's
+			// counters when the delete commits, or cached draws would
+			// keep counting past the restart. Deferred to commit: an
+			// aborted truncate must not disturb them. (A concurrent
+			// insert that draws between our commit and the flush keeps
+			// its high value — it raced the truncate and lost nothing
+			// but gaplessness; the primary key check still guards
+			// against collisions either way.)
+			t.dirtySeqPrefixes = append(t.dirtySeqPrefixes, string(idPrefix))
 		}
 	}
 	return nil

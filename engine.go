@@ -15,6 +15,7 @@ package bytdb
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -265,6 +266,21 @@ func (d *TableDesc) isPK(ordinal int) bool {
 type Engine struct {
 	kv *btypedb.DB[string, []byte]
 
+	// occ mirrors the kv store's concurrent-writes mode. It never
+	// changes after Open, so it is read without synchronization. When
+	// set, sequence and identity allocation route through the in-memory
+	// allocators below instead of the transactional counter keys — see
+	// seqalloc.go for why OCC forces that split.
+	occ bool
+
+	// seqMu guards the allocator maps (not the allocators themselves —
+	// each carries its own mutex, so a watermark extension on one
+	// sequence never blocks allocation on another). Populated lazily,
+	// only in occ mode.
+	seqMu        sync.Mutex
+	seqAllocs    map[string]*counterAlloc
+	seqObjAllocs map[string]*seqObjAlloc
+
 	// descCache avoids re-parsing descriptor JSON on every resolution.
 	// One entry per table name, validated by blob identity: a hit
 	// counts only when the snapshot's stored bytes equal the cached
@@ -294,6 +310,12 @@ type descCacheEntry struct {
 	desc *TableDesc
 }
 
+// ddlConflictRetries bounds updateDDL's re-runs on ErrTxConflict in
+// concurrent-writes mode. DDL closures re-read every descriptor and
+// counter from their own fresh snapshot, so re-running one is always
+// safe; the bound only prevents livelock under pathological contention.
+const ddlConflictRetries = 10
+
 // updateDDL runs one DDL transaction. With the catalog in the kv
 // keyspace, the descriptor write commits — or rolls back — atomically
 // with the schema change's data (backfill, range deletes), so there is
@@ -302,6 +324,12 @@ type descCacheEntry struct {
 // the kv writer lock; each DDL resolves the descriptor it mutates
 // inside its own transaction, so it always builds on the committed
 // state of the one before it.
+//
+// In concurrent-writes mode DDL instead serializes optimistically:
+// commits can fail with ErrTxConflict (two DDLs racing on the table-ID
+// counter, or a sequence watermark write racing a DROP). The closures
+// are pure functions of their snapshot, so those conflicts are retried
+// here rather than surfaced to every caller.
 func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error {
 	if err := e.checkReentrantWrite("ddl"); err != nil {
 		return err
@@ -320,7 +348,14 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 		}
 		return e.testCommitErr
 	}
-	return e.kv.Update(fn)
+	var err error
+	for range ddlConflictRetries {
+		err = e.kv.Update(fn)
+		if !errors.Is(err, btypedb.ErrTxConflict) {
+			return err
+		}
+	}
+	return err
 }
 
 // checkReentrantWrite refuses a one-shot write, DDL, or nested writable
@@ -385,6 +420,28 @@ func WithEncryptionKey(key []byte) btypedb.Option {
 	return btypedb.WithEncryptionKey(key)
 }
 
+// WithConcurrentWrites lets write transactions run concurrently under
+// optimistic concurrency control: they execute against private
+// snapshots and validate at commit, where the first committer wins and
+// the loser's commit fails with btypedb.ErrTxConflict — a retryable
+// error (re-run the transaction from the top). Isolation is snapshot
+// isolation, Postgres REPEATABLE READ in spirit.
+//
+// The mode also changes sequence and identity semantics to Postgres':
+// allocation becomes non-transactional and gap-tolerant. NextSeq,
+// nextval, and identity draws are never rolled back — values drawn by
+// an aborted transaction are burned — and SetSeq/setval take effect
+// immediately rather than at commit. Without this trade concurrent
+// inserts into the same table would all conflict on its counter key,
+// and OCC would buy nothing. See seqalloc.go.
+//
+// Off by default: transactions serialize on the writer lock exactly as
+// before, allocation stays transactional and gapless-on-rollback, and
+// ErrTxConflict is never returned.
+func WithConcurrentWrites() btypedb.Option {
+	return btypedb.WithConcurrentWrites()
+}
+
 // Open opens (creating if necessary) the database at path and
 // validates the catalog.
 func Open(path string, opts ...btypedb.Option) (*Engine, error) {
@@ -392,7 +449,13 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "open kv store")
 	}
-	e := &Engine{kv: kv, descCache: map[string]descCacheEntry{}}
+	e := &Engine{
+		kv:           kv,
+		occ:          kv.ConcurrentWrites(),
+		descCache:    map[string]descCacheEntry{},
+		seqAllocs:    map[string]*counterAlloc{},
+		seqObjAllocs: map[string]*seqObjAlloc{},
+	}
 	if err := e.loadCatalog(); err != nil {
 		kv.Close()
 		return nil, err

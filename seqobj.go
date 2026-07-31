@@ -22,12 +22,15 @@ import (
 // from the state. Object IDs come from the same counter as table IDs,
 // so a sequence's ID doubles as a unique pg_class oid.
 //
-// Allocation is transactional, like identity columns: a NextVal in a
-// rolled-back transaction is not consumed (Postgres burns the value
-// instead — callers wanting gap behavior for compatibility should not
-// rely on either). Cache is stored and reported but allocation is
-// effectively CACHE 1: this engine has a single writer, so batching
-// values would only manufacture gaps.
+// Allocation depends on the engine's write mode. Default (serialized):
+// transactional, like identity columns — a NextVal in a rolled-back
+// transaction is not consumed (Postgres burns the value instead —
+// callers wanting gap behavior for compatibility should not rely on
+// either), and Cache is stored and reported but allocation is
+// effectively CACHE 1, since a single writer batching values would
+// only manufacture gaps. Concurrent-writes mode: non-transactional and
+// gap-tolerant with CACHE honored, exactly Postgres' semantics — see
+// seqalloc.go.
 
 // fmtInt renders an int64 for error messages.
 func fmtInt(v int64) string { return strconv.FormatInt(v, 10) }
@@ -118,6 +121,9 @@ func (e *Engine) CreateSequence(desc *SeqDesc) error {
 	if err != nil {
 		return serr.Wrap(err, "op", "create sequence", "sequence", desc.Name)
 	}
+	// A leftover allocator from a dropped same-named sequence must not
+	// serve the new one's draws.
+	e.invalidateSeqObj(sqlSeqKey(desc.Name))
 	return nil
 }
 
@@ -134,6 +140,9 @@ func (e *Engine) DropSequence(name string) (existed bool, err error) {
 	if err != nil {
 		return false, serr.Wrap(err, "op", "drop sequence", "sequence", name)
 	}
+	// After the delete lands, no cached draws may survive: a nextval
+	// racing the drop must re-anchor and report "does not exist".
+	e.invalidateSeqObj(sqlSeqKey(name))
 	return existed, nil
 }
 
@@ -158,6 +167,9 @@ func (e *Engine) AlterSequence(name string, mutate func(*SeqDesc) error) error {
 	if err != nil {
 		return serr.Wrap(err, "op", "alter sequence", "sequence", name)
 	}
+	// Drop cached draws so RESTART and option changes apply from the
+	// very next nextval, not after the old cache drains.
+	e.invalidateSeqObj(sqlSeqKey(name))
 	return nil
 }
 
@@ -201,52 +213,85 @@ func (e *Engine) Sequences() []*SeqDesc {
 	return out
 }
 
-// NextVal allocates the sequence's next value within the transaction:
-// Start on the first call, then steps of Increment, cycling to the
-// opposite bound when CYCLE was declared and erroring past a bound
-// otherwise, with Postgres' wording.
+// stepSeq advances d by one draw, returning the value drawn: Start
+// itself on the first call (Called false), then steps of Increment,
+// cycling to the opposite bound when CYCLE was declared and erroring
+// past a bound otherwise, with Postgres' wording. It is the single
+// step function for both allocation modes — transactional NextVal and
+// the OCC allocator's batched reservations — so the two can never
+// drift on bound or cycle behavior.
+func stepSeq(d *SeqDesc, name string) (int64, error) {
+	if !d.Called {
+		d.Called = true
+		return d.Last, nil
+	}
+	next := d.Last + d.Increment
+	// The step can leave [Min, Max] arithmetically or by int64
+	// wraparound; wraparound shows up as the sum moving against the
+	// increment's direction.
+	over := d.Increment > 0 && (next > d.Max || next < d.Last)
+	under := d.Increment < 0 && (next < d.Min || next > d.Last)
+	if over || under {
+		if !d.Cycle {
+			bound, word := d.Max, "maximum"
+			if under {
+				bound, word = d.Min, "minimum"
+			}
+			return 0, serr.New(`nextval: reached ` + word + ` value of sequence "` +
+				name + `" (` + fmtInt(bound) + `)`)
+		}
+		if over {
+			next = d.Min
+		} else {
+			next = d.Max
+		}
+	}
+	d.Last = next
+	return next, nil
+}
+
+// NextVal allocates the sequence's next value: Start on the first
+// call, then steps of Increment with CYCLE/bound handling.
+//
+// In the default mode the draw is transactional: it commits or rolls
+// back with the transaction. In concurrent-writes mode it routes to
+// the engine's non-transactional allocator — the value is never rolled
+// back and CACHE batches durable writes — matching Postgres nextval.
 func (t *Txn) NextVal(name string) (int64, error) {
+	if t.e.occ {
+		if !t.tx.Writable() {
+			return 0, serr.Wrap(btypedb.ErrTxNotWritable, "op", "nextval", "sequence", name)
+		}
+		return t.e.allocSeqObj(name)
+	}
 	desc, err := seqDescIn(t.tx, name)
 	if err != nil {
 		return 0, err
 	}
-	if !desc.Called {
-		desc.Called = true
-	} else {
-		next := desc.Last + desc.Increment
-		// The step can leave [Min, Max] arithmetically or by int64
-		// wraparound; wraparound shows up as the sum moving against the
-		// increment's direction.
-		over := desc.Increment > 0 && (next > desc.Max || next < desc.Last)
-		under := desc.Increment < 0 && (next < desc.Min || next > desc.Last)
-		if over || under {
-			if !desc.Cycle {
-				bound, word := desc.Max, "maximum"
-				if under {
-					bound, word = desc.Min, "minimum"
-				}
-				return 0, serr.New(`nextval: reached ` + word + ` value of sequence "` +
-					name + `" (` + fmtInt(bound) + `)`)
-			}
-			if over {
-				next = desc.Min
-			} else {
-				next = desc.Max
-			}
-		}
-		desc.Last = next
+	v, err := stepSeq(desc, name)
+	if err != nil {
+		return 0, err
 	}
 	if err := writeSeqDescIn(t.tx, desc); err != nil {
 		return 0, err
 	}
-	return desc.Last, nil
+	return v, nil
 }
 
-// SetVal is setval: it repositions the sequence at v within the
-// transaction. called=true means v was "already returned" (the next
-// NextVal steps past it); false means the next NextVal returns v
-// itself.
+// SetVal is setval: it repositions the sequence at v. called=true
+// means v was "already returned" (the next NextVal steps past it);
+// false means the next NextVal returns v itself.
+//
+// Transactional in the default mode; in concurrent-writes mode it
+// takes effect immediately and survives a rollback, as Postgres
+// documents for setval.
 func (t *Txn) SetVal(name string, v int64, called bool) error {
+	if t.e.occ {
+		if !t.tx.Writable() {
+			return serr.Wrap(btypedb.ErrTxNotWritable, "op", "setval", "sequence", name)
+		}
+		return t.e.setValDirect(name, v, called)
+	}
 	desc, err := seqDescIn(t.tx, name)
 	if err != nil {
 		return err

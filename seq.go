@@ -14,11 +14,14 @@ import (
 // to hand out as a big-endian uint64, created lazily on first use.
 // Sequence names are their own namespace, separate from table names.
 //
-// Allocation is transactional: a sequence bumped inside a transaction
-// that rolls back is not bumped at all, so today's values have no gaps.
-// Callers should still not depend on gaplessness — SetSeq can skip
-// values, and a future engine may cache allocations for concurrency —
-// only on distinctness and monotonicity per name.
+// Allocation depends on the engine's write mode. Default (serialized):
+// transactional — a sequence bumped inside a transaction that rolls
+// back is not bumped at all, so values have no gaps.
+// Concurrent-writes mode: non-transactional and gap-tolerant via the
+// in-memory allocators in seqalloc.go — draws are never rolled back,
+// and SetSeq/DeleteSeq through a Txn take effect immediately. Callers
+// should depend only on distinctness and monotonicity per name (SetSeq
+// can break even those — that is its caller's contract).
 
 // nextFromCounter allocates the next value from the 8-byte big-endian
 // counter at key, starting at start when the key is absent. A malformed
@@ -77,6 +80,18 @@ func checkSeqName(name string) error {
 // An error does not guarantee the value was discarded — see Insert on
 // why a failed commit reads as "durability unknown."
 func (e *Engine) NextSeq(name string) (uint64, error) {
+	if e.occ {
+		// Non-transactional allocator path; no reentrancy guard needed —
+		// it never blocks behind an open transaction.
+		if err := checkSeqName(name); err != nil {
+			return 0, err
+		}
+		v, err := e.allocCounter(seqNameKey(name), 1, name)
+		if err != nil {
+			return 0, serr.Wrap(err, "op", "next sequence value", "sequence", name)
+		}
+		return v, nil
+	}
 	if err := e.checkReentrantWrite("next sequence value"); err != nil {
 		return 0, err
 	}
@@ -93,9 +108,17 @@ func (e *Engine) NextSeq(name string) (uint64, error) {
 }
 
 // NextSeq allocates the next value from the named sequence within the
-// transaction (see Engine.NextSeq). The bump commits or rolls back
-// with the transaction.
+// transaction (see Engine.NextSeq). In the default mode the bump
+// commits or rolls back with the transaction; in concurrent-writes
+// mode the draw is non-transactional and survives a rollback (the
+// value is burned — Postgres sequence semantics).
 func (t *Txn) NextSeq(name string) (uint64, error) {
+	if t.e.occ {
+		if !t.tx.Writable() {
+			return 0, serr.Wrap(btypedb.ErrTxNotWritable, "op", "next sequence value", "sequence", name)
+		}
+		return t.e.NextSeq(name)
+	}
 	v, err := nextSeqIn(t.tx, name)
 	if err != nil {
 		return 0, serr.Wrap(err, "op", "next sequence value", "sequence", name)
@@ -115,6 +138,15 @@ func nextSeqIn(tx *btypedb.Tx[string, []byte], name string) (uint64, error) {
 // makes NextSeq repeat them — that is the caller's contract to keep
 // (it exists for restore and setval-style adjustment).
 func (e *Engine) SetSeq(name string, next uint64) error {
+	if e.occ {
+		if err := checkSeqName(name); err != nil {
+			return err
+		}
+		if err := e.setCounterDirect(seqNameKey(name), next); err != nil {
+			return serr.Wrap(err, "op", "set sequence", "sequence", name)
+		}
+		return nil
+	}
 	if err := e.checkReentrantWrite("set sequence"); err != nil {
 		return err
 	}
@@ -128,8 +160,15 @@ func (e *Engine) SetSeq(name string, next uint64) error {
 }
 
 // SetSeq sets the named sequence's next value within the transaction
-// (see Engine.SetSeq).
+// (see Engine.SetSeq). In concurrent-writes mode it takes effect
+// immediately and survives a rollback, like Postgres setval.
 func (t *Txn) SetSeq(name string, next uint64) error {
+	if t.e.occ {
+		if !t.tx.Writable() {
+			return serr.Wrap(btypedb.ErrTxNotWritable, "op", "set sequence", "sequence", name)
+		}
+		return t.e.SetSeq(name, next)
+	}
 	if err := setSeqIn(t.tx, name, next); err != nil {
 		return serr.Wrap(err, "op", "set sequence", "sequence", name)
 	}
@@ -145,8 +184,20 @@ func setSeqIn(tx *btypedb.Tx[string, []byte], name string, next uint64) error {
 
 // PeekSeq reports the value the named sequence would return next,
 // without allocating it. ok is false when the sequence does not exist
-// (never used, or deleted).
+// (never used, or deleted). In concurrent-writes mode the answer comes
+// from the live allocator when one is loaded — the stored record is a
+// high watermark there, ahead of the next draw by the unhanded cache.
 func (e *Engine) PeekSeq(name string) (next uint64, ok bool, err error) {
+	if e.occ {
+		if err := checkSeqName(name); err != nil {
+			return 0, false, err
+		}
+		if v, ok, handled := e.peekCounterOCC(seqNameKey(name)); handled {
+			return v, ok, nil
+		}
+		// No live allocator: nothing is cached, so the stored value is
+		// exactly the next draw. Fall through to the stored read.
+	}
 	err = e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
 		next, ok, err = peekSeqIn(tx, name)
 		return err
@@ -158,8 +209,13 @@ func (e *Engine) PeekSeq(name string) (next uint64, ok bool, err error) {
 }
 
 // PeekSeq reports the named sequence's next value in the transaction's
-// view (see Engine.PeekSeq).
+// view (see Engine.PeekSeq). In concurrent-writes mode allocation is
+// engine-level, so this reports the live allocator state, not the
+// snapshot.
 func (t *Txn) PeekSeq(name string) (next uint64, ok bool, err error) {
+	if t.e.occ {
+		return t.e.PeekSeq(name)
+	}
 	next, ok, err = peekSeqIn(t.tx, name)
 	if err != nil {
 		return 0, false, serr.Wrap(err, "op", "peek sequence", "sequence", name)
@@ -185,6 +241,16 @@ func peekSeqIn(v kvView, name string) (uint64, bool, error) {
 // DeleteSeq removes the named sequence; a later NextSeq recreates it
 // at 1. Deleting an absent sequence is a no-op reported by existed.
 func (e *Engine) DeleteSeq(name string) (existed bool, err error) {
+	if e.occ {
+		if err := checkSeqName(name); err != nil {
+			return false, err
+		}
+		existed, err = e.deleteCounterDirect(seqNameKey(name))
+		if err != nil {
+			return false, serr.Wrap(err, "op", "delete sequence", "sequence", name)
+		}
+		return existed, nil
+	}
 	if err := e.checkReentrantWrite("delete sequence"); err != nil {
 		return false, err
 	}
@@ -199,8 +265,15 @@ func (e *Engine) DeleteSeq(name string) (existed bool, err error) {
 }
 
 // DeleteSeq removes the named sequence within the transaction (see
-// Engine.DeleteSeq).
+// Engine.DeleteSeq). In concurrent-writes mode the delete takes effect
+// immediately and survives a rollback.
 func (t *Txn) DeleteSeq(name string) (existed bool, err error) {
+	if t.e.occ {
+		if !t.tx.Writable() {
+			return false, serr.Wrap(btypedb.ErrTxNotWritable, "op", "delete sequence", "sequence", name)
+		}
+		return t.e.DeleteSeq(name)
+	}
 	existed, err = deleteSeqIn(t.tx, name)
 	if err != nil {
 		return false, serr.Wrap(err, "op", "delete sequence", "sequence", name)
