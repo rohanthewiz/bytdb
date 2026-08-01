@@ -76,6 +76,9 @@ make full runs reliable. Watchdog pattern used here:
   future lesson wants it (symbols present).
 - bytdb main `8fd5c49` + this doc; btypedb main `3692710` (= v0.7.0);
   no occ branches anywhere.
-- Open: verify.mjs spawn-race hardening (above); the uncaptured bytdb
-  root-test cold-run flake from the release session; `.cats-todo/`
+- Open: verify.mjs spawn-race hardening (above); `.cats-todo/`
   untracked in both repos by design.
+- ~~The uncaptured bytdb root-test cold-run flake~~ — **retired
+  2026-07-31**: deliberate cold repro (`go clean -cache`, full suite,
+  output tee'd) came back all green; see addendum in
+  `2026-0731-1249-occ-release-and-reproducible-benchmarks.md`.

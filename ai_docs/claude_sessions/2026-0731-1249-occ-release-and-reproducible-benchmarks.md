@@ -37,6 +37,13 @@ piped to `tail`). Happened while the toolchain compiled the whole dep
 tree from scratch, so likely a timing-sensitive test under CPU
 starvation.
 
+> **Retired 2026-07-31 (later session):** deliberate cold repro —
+> `go clean -cache` then `GOWORK=off go test ./...` with output fully
+> captured via `tee` — all 6 packages green (root 15.4s, sql 9.6s),
+> exit 0, no FAIL/panic. Did not reproduce under the same cold-compile
+> conditions; consistent with the CPU-starvation guess. If it ever
+> recurs, capture the full log (don't pipe to `tail`).
+
 `occ-stage1` (btypedb) and `occ-stage2` (bytdb) are fully merged and
 deletable; left in place.
 
