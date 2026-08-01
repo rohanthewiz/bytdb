@@ -85,6 +85,13 @@ surfacing conflicts as SQLSTATE 40001.
   extended query protocols, text and binary formats, inferred
   parameter types, and structured errors with SQLSTATE codes and
   error positions.
+- **`database/sql` driver** — the `stdlib` package (stdlib-only, so it
+  stays in the core module) registers bytdb as the driver `"bytdb"`,
+  reaching an embedded database in process: no server, no socket, no
+  wire encoding. One engine per file, one bytdb Session per pooled
+  connection, isolation levels mapped onto `BEGIN`, and the date/time
+  and UUID types decoded back out of their integer and byte
+  representations.
 - **system catalog** — virtual `pg_catalog` and `information_schema`
   tables synthesized from the engine catalog, so clients and ORMs
   introspect with the queries they already send (GORM's `HasTable`,
@@ -373,6 +380,74 @@ errors: `%v` prints just the message, `bytdb.ErrText(err)` renders it
 with the structured attributes for user-facing surfaces — `wrong
 number of parameters (want: 1, got: 0)` — and a serr-aware logger
 gets the full context including code locations.
+
+## database/sql
+
+The `stdlib` package registers bytdb as a `database/sql` driver named
+`"bytdb"`, so an embedded database is reachable through the interface
+the Go ecosystem already speaks — sqlx, ORMs, migration tools, and any
+code written against `*sql.DB`. It needs nothing outside the standard
+library, so it lives in the core module.
+
+```go
+import (
+    "database/sql"
+    "time"
+
+    _ "github.com/rohanthewiz/bytdb/stdlib"
+)
+
+db, err := sql.Open("bytdb", "app.bytdb")
+defer db.Close()
+
+_, err = db.Exec(`CREATE TABLE users (id serial PRIMARY KEY, name text, joined timestamp)`)
+_, err = db.Exec(`INSERT INTO users (name, joined) VALUES ($1, $2)`, "ada", time.Now())
+
+var name string
+var joined time.Time
+err = db.QueryRow(`SELECT name, joined FROM users WHERE id = $1`, 1).Scan(&name, &joined)
+```
+
+It is the in-process counterpart to `pgwire`: both put bytdb behind
+`database/sql`, this one with no server, no socket, and no wire
+encoding, at the cost that the database lives in the calling process.
+
+**DSN.** A filesystem path, optionally followed by engine options —
+`app.bytdb`, `file:app.bytdb`, `/var/lib/app.bytdb?sync=never`. The
+options are `sync=never` (leave WAL fsyncs to the OS),
+`concurrent_writes=true` (OCC instead of the single-writer lock), and
+`encryption_key=<64 hex digits>`. An unrecognized option is an error
+rather than a silent no-op: a typo in a durability or encryption
+setting should not be something you discover from its consequences.
+bytdb has no in-memory mode, so a path is always a real file, created
+on first open.
+
+**One engine per file.** btypedb takes the database file for itself, so
+every `*sql.DB` on a path shares one engine and each pooled connection
+gets its own Session — one engine, many sessions, the same shape
+pgwire serves. Opening the same path twice with different options is an
+error rather than a silent adoption of whichever set got there first.
+A program that already holds an `*bytdb.Engine` should use
+`stdlib.OpenEngine(e)` instead of a DSN, since the file cannot be
+opened twice; `stdlib.Engine(ctx, db)` goes the other way, reaching the
+engine behind a `*sql.DB` for the ordered range and index scans SQL
+does not express.
+
+**Transactions.** `BeginTx` maps `database/sql`'s isolation levels onto
+`BEGIN`'s — the four Postgres levels pass through (READ UNCOMMITTED
+folding into READ COMMITTED), and the levels `database/sql` defines
+beyond those are refused rather than silently downgraded. Under
+`WithConcurrentWrites` a losing commit returns `bytdb.ErrTxConflict`,
+matched with `errors.Is` or `stdlib.IsRetryable`, and retried from the
+top; autocommit statements are retried inside bytdb and never surface
+one.
+
+**Types.** The date/time and UUID types ride on `int64` and `[]byte`
+runtime representations so they sort in the key encoding, so the driver
+decodes them back on the way out: a `timestamp` scans into a
+`time.Time`, a `date` and a `uuid` into their text forms, `text[]` and
+`jsonb` into their canonical literals. `ColumnTypeDatabaseTypeName` and
+`ColumnTypeScanType` report both sides for the ORMs that ask.
 
 ## Postgres wire protocol
 
