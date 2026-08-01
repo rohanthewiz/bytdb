@@ -76,8 +76,10 @@ make full runs reliable. Watchdog pattern used here:
   future lesson wants it (symbols present).
 - bytdb main `8fd5c49` + this doc; btypedb main `3692710` (= v0.7.0);
   no occ branches anywhere.
-- Open: verify.mjs spawn-race hardening (above); `.cats-todo/`
-  untracked in both repos by design.
+- Open: `.cats-todo/` untracked in both repos by design.
+- ~~verify.mjs spawn-race hardening~~ — **applied 2026-07-31** (later
+  session): go-learn `712ec9e` on master adds the per-spawn 30s
+  timeout + one retry to `run()`; database track re-verified ALL PASS.
 - ~~The uncaptured bytdb root-test cold-run flake~~ — **retired
   2026-07-31**: deliberate cold repro (`go clean -cache`, full suite,
   output tee'd) came back all green; see addendum in
