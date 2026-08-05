@@ -24,14 +24,14 @@ const ServerVersion = "16.0 (bytdb)"
 // values the wire server also reports at startup. A Session's SET
 // values overlay these.
 var showDefaults = map[string]string{
-	"server_version":                ServerVersion,
-	"server_encoding":               "UTF8",
-	"client_encoding":               "UTF8",
-	"datestyle":                     "ISO, MDY",
-	"integer_datetimes":             "on",
-	"standard_conforming_strings":   "on",
-	"timezone":                      "UTC",
-	"search_path":                   `"$user", public`,
+	"server_version":              ServerVersion,
+	"server_encoding":             "UTF8",
+	"client_encoding":             "UTF8",
+	"datestyle":                   "ISO, MDY",
+	"integer_datetimes":           "on",
+	"standard_conforming_strings": "on",
+	"timezone":                    "UTC",
+	"search_path":                 `"$user", public`,
 	// The two isolation parameters are placeholders: every caller
 	// overlays the live values via execShow's iso argument, computed
 	// from the engine's write mode and the session's state. They stay

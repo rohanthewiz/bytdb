@@ -397,3 +397,52 @@ func TestRestoreChunkSizeMismatch(t *testing.T) {
 		t.Fatalf("err = %v, want chunk size mismatch", err)
 	}
 }
+
+// Regression: retention used to count generations by name alone, so a
+// run of incomplete (unmanifested) generations — restarts or
+// compactions during slow shipping — could push the only complete,
+// restorable generation past the horizon and delete it. The newest
+// manifested generation must survive pruning wherever it falls.
+func TestPruneKeepsNewestManifestedGeneration(t *testing.T) {
+	store := newMemStore()
+	ctx := context.Background()
+
+	put := func(key string) {
+		t.Helper()
+		if err := store.Put(ctx, key, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// genA: complete (chunk + manifest). genB, genC: partial ships that
+	// died before catching up (chunks only). genD is current.
+	put("gen/2026a/0000000000000000-0000000000000040.wlog")
+	put("gen/2026a/manifest.json")
+	put("gen/2026b/0000000000000000-0000000000000010.wlog")
+	put("gen/2026c/0000000000000000-0000000000000008.wlog")
+
+	r := &Replicator{store: store, opt: Options{
+		RetainGenerations: 3, // current + 2 prior by name — the window that used to evict genA
+		Logf:              func(format string, args ...any) { t.Logf(format, args...) },
+	}, gen: "2026d"}
+	if err := r.pruneGenerations(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if keys, _ := store.List(ctx, "gen/2026a/"); len(keys) != 2 {
+		t.Fatalf("the only manifested generation was pruned (has %d objects, want 2)", len(keys))
+	}
+
+	// And an old unmanifested generation is still prunable once a newer
+	// manifested one exists: manifest genC, re-prune with a tight window.
+	put("gen/2026c/manifest.json")
+	r.opt.RetainGenerations = 2 // keep only 1 prior by name (genC)
+	if err := r.pruneGenerations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if keys, _ := store.List(ctx, "gen/2026b/"); len(keys) != 0 {
+		t.Fatalf("unmanifested generation should have been pruned, still has %d objects", len(keys))
+	}
+	if keys, _ := store.List(ctx, "gen/2026c/"); len(keys) != 2 {
+		t.Fatalf("newest manifested generation was pruned (has %d objects, want 2)", len(keys))
+	}
+}

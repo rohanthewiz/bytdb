@@ -117,7 +117,6 @@ func (e *Engine) writeTxn(serializable bool, fn func(tx *Txn) error) error {
 		// no lock is held across fn and checkReentrantWrite ignores
 		// it — but storing it is cheaper than branching on the mode.)
 		e.writerGID.Store(curGID())
-		defer e.writerGID.Store(0)
 		// btypedb's Update rolls back on an error RETURN but not on a
 		// panic — it has no recover — so a panic in fn would unwind past
 		// it with the writer lock still held, wedging every future write
@@ -131,6 +130,14 @@ func (e *Engine) writeTxn(serializable bool, fn func(tx *Txn) error) error {
 				panic(r)
 			}
 		}()
+		// Registered after the recover defer so it runs FIRST on unwind
+		// (defers are LIFO): the marker must be gone before Rollback
+		// releases the writer lock, or a next writer that has already
+		// acquired the lock and stored its own GID gets it clobbered
+		// back to 0 — silently disabling checkReentrantWrite for it.
+		// The normal path clears here too, before Update's commit
+		// releases the lock, preserving the same ordering.
+		defer e.writerGID.Store(0)
 		txn = &Txn{tx: tx, e: e}
 		return fn(txn)
 	})
@@ -138,6 +145,24 @@ func (e *Engine) writeTxn(serializable bool, fn func(tx *Txn) error) error {
 		txn.flushSeqInvalidations()
 	}
 	return err
+}
+
+// guardPanic wraps a kv transaction closure with the recover→rollback→
+// re-panic pattern writeTxn documents: btypedb's Update/UpdateExclusive
+// have no recover of their own, so an escaping panic would hold the
+// writer lock forever. Used by updateDDL, whose closures can run
+// caller-supplied callbacks (AddCheck's validate, AlterSequence's
+// mutate) that this package cannot vouch for.
+func guardPanic(fn func(tx *btypedb.Tx[string, []byte]) error) func(tx *btypedb.Tx[string, []byte]) error {
+	return func(tx *btypedb.Tx[string, []byte]) error {
+		defer func() {
+			if r := recover(); r != nil {
+				tx.Rollback()
+				panic(r)
+			}
+		}()
+		return fn(tx)
+	}
 }
 
 // ReadTxn runs fn over a read-only snapshot: a point-in-time view of
@@ -221,8 +246,15 @@ func (e *Engine) readSnapshot() (*Txn, error) {
 // WriteTxn on why a failed commit can leave them visible until the
 // process restarts.
 func (t *Txn) Commit() error {
-	err := t.tx.Commit()
+	// Clear the reentrancy marker BEFORE commit releases the writer
+	// lock. Cleared after, the store races with the next writer: it can
+	// acquire the lock and store its own GID in the gap, and our late
+	// Store(0) would erase it — silently disabling checkReentrantWrite
+	// for that transaction. Clearing early is safe: the owning goroutine
+	// issues no further engine writes once commit begins, and other
+	// goroutines were always allowed to block on the lock.
 	t.releaseWriter()
+	err := t.tx.Commit()
 	if err == nil {
 		t.flushSeqInvalidations()
 	}
@@ -232,17 +264,20 @@ func (t *Txn) Commit() error {
 // Rollback discards the transaction's writes and releases it. Rolling
 // back a finished transaction is a no-op.
 func (t *Txn) Rollback() error {
-	err := t.tx.Rollback()
-	t.releaseWriter()
-	return err
+	t.releaseWriter() // before the lock is released — see Commit
+	return t.tx.Rollback()
 }
 
 // releaseWriter clears the engine's reentrancy marker once a writable
 // Begin transaction ends, whatever the outcome — the writer lock is
 // released either way. A no-op for read transactions and for the
-// closure-scoped WriteTxn, which clears its own marker.
+// closure-scoped WriteTxn, which clears its own marker. One-shot:
+// releaseW flips off on first use so the common `defer tx.Rollback()`
+// after a successful Commit cannot re-clear a marker that by then
+// belongs to the next writer.
 func (t *Txn) releaseWriter() {
 	if t.releaseW {
+		t.releaseW = false
 		t.e.writerGID.Store(0)
 	}
 }

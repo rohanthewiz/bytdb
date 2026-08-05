@@ -65,7 +65,7 @@ func (d *DB) prepareUpsert(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, o
 			{name: "excluded", desc: desc, off: w},
 		},
 		width: 2 * w,
-	}}
+	}, subs: newSubMemo()}
 	u.b = binds{}
 	if err := u.b.bind(oc.Where, u.env.sc); err != nil {
 		return nil, err

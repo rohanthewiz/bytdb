@@ -206,27 +206,64 @@ func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
 
 // unescape reads an escaped byte string whose stored bytes are XOR
 // mask, returning the logical bytes.
+//
+// Two passes: first locate the terminator and count escape pairs, then
+// emit into one exact-size allocation. This runs for every string and
+// bytes element of every row decoded, and the old byte-at-a-time append
+// from a zero-capacity slice re-allocated geometrically (~10 growths
+// for a 1 KB value) on each — pure GC tax on the scan path. The common
+// no-escape case reduces to one allocation plus a copy (or an XOR loop
+// when a descending column's mask is set).
 func unescape(data []byte, mask byte) (raw, rest []byte, err error) {
-	raw = []byte{}
+	esc := escByte ^ mask // the escape byte as it appears in stored form
+	n, escapes, end := 0, 0, -1
+scan:
 	for i := 0; i < len(data); i++ {
-		if data[i]^mask != escByte {
-			raw = append(raw, data[i]^mask)
+		if data[i] != esc {
+			n++
 			continue
 		}
 		if i+1 >= len(data) {
-			break
+			break // dangling escape byte: unterminated
 		}
 		switch data[i+1] ^ mask {
 		case escaped00:
-			raw = append(raw, escByte)
+			n++
+			escapes++
 			i++
 		case terminator:
-			return raw, data[i+2:], nil
+			end = i
+			break scan
 		default:
 			return nil, nil, serr.New("tuple: invalid escape sequence")
 		}
 	}
-	return nil, nil, serr.New("tuple: unterminated byte-string element")
+	if end < 0 {
+		return nil, nil, serr.New("tuple: unterminated byte-string element")
+	}
+	rest = data[end+2:]
+	body := data[:end]
+	raw = make([]byte, n)
+	if escapes == 0 {
+		if mask == 0 {
+			copy(raw, body)
+		} else {
+			for i, b := range body {
+				raw[i] = b ^ mask
+			}
+		}
+		return raw, rest, nil
+	}
+	j := 0
+	for i := 0; i < len(body); i++ {
+		b := body[i] ^ mask
+		if b == escByte {
+			i++ // skip the pair's second byte; the escape byte is the value
+		}
+		raw[j] = b
+		j++
+	}
+	return raw, rest, nil
 }
 
 // Compare orders two tuples element-wise with the same semantics the

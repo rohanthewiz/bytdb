@@ -73,7 +73,9 @@ One path is one engine per process: every `*sql.DB` on it shares the
 engine, and each pooled connection gets its own session. A program
 already holding a `*bytdb.Engine` should use `stdlib.OpenEngine(e)` —
 the file cannot be opened twice. `stdlib.IsRetryable(err)` spots
-commit conflicts under concurrent writes.
+commit conflicts under concurrent writes. `Tx.Commit` on a block that
+already failed returns `stdlib.ErrCommitRolledBack` (the block rolled
+back, Postgres-style — nothing was written); match with `errors.Is`.
 
 **4. Postgres wire protocol** — psql, pgx, GORM, `database/sql`
 connect as if to Postgres:
@@ -101,7 +103,10 @@ GROUP BY/HAVING, window functions with full frame support, WITH CTEs,
 derived tables, UNION, `SELECT DISTINCT`, `LIKE`/`ILIKE`, `BETWEEN`,
 `ANY`/`ALL`, regex operators,
 CASE, casts, correlated subqueries, EXISTS, EXPLAIN, transaction blocks
-with savepoints, TRUNCATE, SET/SHOW. `$n` placeholders bind in
+with savepoints, TRUNCATE, SET/SHOW. Uncorrelated subqueries evaluate
+once per statement (Postgres InitPlan semantics), so
+`WHERE x >= (SELECT min(x) FROM t)` costs one inner scan, not one per
+outer row. `$n` placeholders bind in
 WHERE/ON/HAVING, INSERT/UPDATE values, `BETWEEN` bounds, and
 `LIMIT`/`OFFSET` counts.
 
@@ -228,6 +233,11 @@ bytes, 64 hex chars, or base64 of 32).
 - **INSERT VALUES entries are full expressions** (`nextval('s')`
   works) but column references don't resolve there.
 - `now()` is statement-frozen, not transaction-frozen as in Postgres.
+- **Correlated subqueries run per outer row** with their correlated
+  predicate as a post-scan filter (no index pushdown) — fine for small
+  outer sets, quadratic for large ones. Rewrite as a JOIN (index
+  nested-loop or hash join) when the outer side is big. Uncorrelated
+  subqueries are cheap (evaluated once, see above).
 - Sequence/identity allocation is **transactional in the default mode**
   (a rollback reuses the value) and gap-tolerant Postgres-style under
   `WithConcurrentWrites` (a rollback burns it).

@@ -169,6 +169,17 @@ type TableDesc struct {
 	Checks        []CheckDesc `json:"checks,omitempty"`
 	ForeignKeys   []FKDesc    `json:"foreign_keys,omitempty"`
 	NextColID     uint32      `json:"next_col_id"`
+
+	// ordByID maps a column's stable ID to its ordinal (-1 = dropped),
+	// indexed directly by ID. It exists because decodeRow resolves the
+	// ordinal for every non-PK value of every row read — a linear scan
+	// there makes row decoding O(columns²), which shows on wide tables.
+	// Built by parseDesc, so every descriptor served from the parse
+	// cache carries it; deliberately dropped by clone(), whose result
+	// DDL mutates — a nil table falls back to the linear scan, and the
+	// mutated descriptor is re-parsed (table rebuilt) the next time it
+	// is resolved from storage.
+	ordByID []int32
 }
 
 // marshalDesc encodes a descriptor for the system descriptors table,
@@ -219,6 +230,10 @@ func (d *TableDesc) clone() *TableDesc {
 	c.Indexes = slices.Clone(d.Indexes)
 	c.Checks = slices.Clone(d.Checks)
 	c.ForeignKeys = slices.Clone(d.ForeignKeys)
+	// The clone exists to be mutated, which would desynchronize a
+	// carried-over lookup table; drop it and let colOrdinalByID fall
+	// back to the linear scan until the descriptor is re-parsed.
+	c.ordByID = nil
 	return &c
 }
 
@@ -236,12 +251,40 @@ func (d *TableDesc) ColIndex(name string) int {
 // stable ID, or -1 — the not-found case is normal: it means a row
 // value carries data for a since-dropped column.
 func (d *TableDesc) colOrdinalByID(id uint32) int {
+	if d.ordByID != nil {
+		if int(id) < len(d.ordByID) {
+			return int(d.ordByID[id])
+		}
+		return -1
+	}
 	for i := range d.Columns {
 		if d.Columns[i].ID == id {
 			return i
 		}
 	}
 	return -1
+}
+
+// buildOrdByID populates the ID→ordinal lookup. Column IDs are dense —
+// NextColID grows by one per column ever added — so direct indexing is
+// compact; the cap only guards a corrupt descriptor with an absurd ID,
+// which keeps the (correct) linear fallback instead.
+func (d *TableDesc) buildOrdByID() {
+	var maxID uint32
+	for i := range d.Columns {
+		maxID = max(maxID, d.Columns[i].ID)
+	}
+	if maxID > 4096 {
+		return
+	}
+	t := make([]int32, maxID+1)
+	for i := range t {
+		t[i] = -1
+	}
+	for i := range d.Columns {
+		t[d.Columns[i].ID] = int32(i)
+	}
+	d.ordByID = t
 }
 
 func (d *TableDesc) isPK(ordinal int) bool {
@@ -349,6 +392,15 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 	if err := e.checkReentrantWrite("ddl"); err != nil {
 		return err
 	}
+	// Some DDL closures run caller-supplied callbacks inside the
+	// transaction — AddCheck's per-row validate, AlterSequence's
+	// mutate — so a panic can originate outside this package. As with
+	// WriteTxn (see writeTxn), btypedb's Update has no recover: the
+	// panic would unwind with the writer lock held (or, under
+	// UpdateExclusive, with the head frozen), wedging every future
+	// write process-wide. Guard every path the same way: roll back to
+	// release, then re-panic with the original value.
+	fn = guardPanic(fn)
 	if e.testCommitErr != nil {
 		// Simulate the failed commit: run the closure, then roll the
 		// transaction back, leaving both disk and the catalog exactly
@@ -588,6 +640,7 @@ func parseDesc(blob []byte) (*TableDesc, error) {
 			"descriptor format version %d is newer than this bytdb supports (%d); upgrade bytdb",
 			desc.FormatVersion, descFormatVersion)
 	}
+	desc.buildOrdByID()
 	return desc, nil
 }
 
@@ -644,6 +697,18 @@ func (e *Engine) descFromView(v kvView, table string) (*TableDesc, error) {
 func (e *Engine) cacheStore(name, blob string, desc *TableDesc) {
 	e.cacheMu.Lock()
 	e.descCache[name] = descCacheEntry{blob: blob, desc: desc}
+	e.cacheMu.Unlock()
+}
+
+// cacheEvict drops a name's parse-cache entry after DROP or RENAME
+// commits. Without it the entry lives forever — the blob-identity check
+// keeps a dead entry from ever being USED wrongly, but nothing else
+// removes it, so create/drop churn (per-tenant tables, test harnesses)
+// would leak one parsed descriptor per name. Readers still on old
+// snapshots simply re-parse — the cache is a pure performance layer.
+func (e *Engine) cacheEvict(name string) {
+	e.cacheMu.Lock()
+	delete(e.descCache, name)
 	e.cacheMu.Unlock()
 }
 

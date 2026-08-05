@@ -451,14 +451,21 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 			fp.steps[0].plan = p
 			keys = nil
 		}
-		env := &exEnv{d: d, tx: tx, sc: sc}
+		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo()}
 		var evalErr error
+		// One reusable evaluation env for the expression items, its .row
+		// swapped per row. A fresh copy per expression per row escapes to
+		// the heap (evalEx takes a pointer) — millions of allocations on
+		// large scans for no benefit: evaluation never retains the env
+		// past the call (subqueries build their own, linking outer only
+		// for the call's duration). runJoin mutates env.row for join
+		// predicates, so the items get their own env rather than sharing.
+		rowEnv := *env
 		// With no ORDER BY the join order is the result order, so
 		// collection can end at OFFSET+LIMIT rows.
 		err = runJoin(tx, fp, env, func(vals []any) bool {
+			rowEnv.row = vals[:sc.width]
 			for _, ex := range exprs {
-				rowEnv := *env
-				rowEnv.row = vals[:sc.width]
 				v, e := evalEx(&rowEnv, ex)
 				if e != nil {
 					evalErr = e
@@ -787,9 +794,9 @@ func (rp *retProj) row(vals []any) ([]any, error) {
 	combined := vals
 	if len(rp.exprs) > 0 {
 		combined = slices.Clone(vals)
+		rowEnv := *rp.env // one copy per row, not per expression
+		rowEnv.row = vals
 		for _, ex := range rp.exprs {
-			rowEnv := *rp.env
-			rowEnv.row = vals
 			v, err := evalEx(&rowEnv, ex)
 			if err != nil {
 				return nil, err
@@ -936,7 +943,10 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		// The environment expression values evaluate in: transaction and
 		// DB for nextval/subqueries, an empty scope so column references
 		// fail. Built once; VALUES expressions never read a row.
-		venv := &exEnv{d: d, tx: tx, sc: &scope{}}
+		// Seeding the subquery memo here gives uncorrelated subqueries in
+		// VALUES statement-snapshot semantics (evaluated once), matching
+		// Postgres rather than re-running per VALUES row.
+		venv := &exEnv{d: d, tx: tx, sc: &scope{}, subs: newSubMemo()}
 		for _, row := range s.Rows {
 			vals := row
 			// s.Cols (not ords) is the column-list signal: DEFAULT VALUES
@@ -1279,7 +1289,7 @@ func (d *DB) tableEnv(tx *bytdb.Txn, table string, desc *bytdb.TableDesc) *exEnv
 		tables: []scopeTable{{name: table, desc: desc}},
 		width:  len(desc.Columns),
 	}
-	return &exEnv{d: d, tx: tx, sc: sc}
+	return &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo()}
 }
 
 // collectPKs materializes the primary keys of every row the plan

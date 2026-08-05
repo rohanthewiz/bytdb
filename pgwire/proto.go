@@ -17,6 +17,15 @@ import (
 // hostile stream.
 const maxMsgLen = 1 << 26 // 64 MiB
 
+// maxPreAuthLen bounds frames read before authentication completes: the
+// startup packet and the SASL exchange. Postgres caps the startup
+// packet at 10,000 bytes; 16 KiB is roomy for any real parameter set or
+// SCRAM message. Without the tighter cap, every unauthenticated
+// connection could buffer up to maxMsgLen before MaxConns or the
+// credential check got a chance to refuse it — 64 MiB of attacker
+// -controlled memory per socket, before any authentication.
+const maxPreAuthLen = 1 << 14 // 16 KiB
+
 // readBodyPrealloc caps how much of a message body is allocated up front.
 // A frame may legitimately reach maxMsgLen, but the length prefix is
 // wire-controlled: a client can declare the maximum and then send its
@@ -88,23 +97,35 @@ func readMessage(r *bufio.Reader) (byte, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	body, err := readBody(r)
+	body, err := readBody(r, maxMsgLen)
+	return typ, body, err
+}
+
+// readMessagePreAuth is readMessage under the pre-authentication frame
+// cap, for the SASL exchange.
+func readMessagePreAuth(r *bufio.Reader) (byte, []byte, error) {
+	typ, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	body, err := readBody(r, maxPreAuthLen)
 	return typ, body, err
 }
 
 // readStartup reads one untyped startup frame (the client's first
-// message has no type byte).
+// message has no type byte). Nothing is authenticated yet, so the small
+// cap applies.
 func readStartup(r *bufio.Reader) ([]byte, error) {
-	return readBody(r)
+	return readBody(r, maxPreAuthLen)
 }
 
-func readBody(r *bufio.Reader) ([]byte, error) {
+func readBody(r *bufio.Reader, limit int) ([]byte, error) {
 	var lb [4]byte
 	if _, err := io.ReadFull(r, lb[:]); err != nil {
 		return nil, err
 	}
 	n := int(binary.BigEndian.Uint32(lb[:])) - 4
-	if n < 0 || n > maxMsgLen {
+	if n < 0 || n > limit {
 		return nil, serr.New("bad message length", "length", fmt.Sprint(n))
 	}
 	if n == 0 {

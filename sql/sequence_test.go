@@ -233,3 +233,21 @@ func TestSequenceSurvivesReopen(t *testing.T) {
 		t.Fatalf("after reopen: %v", res.Rows)
 	}
 }
+
+// Regression: selectWritesSequences didn't walk the statement's CTEs,
+// so a nextval inside WITH — or inside a derived table, which lowers to
+// a synthetic CTE at parse — dispatched the SELECT into a read-only
+// transaction and failed with "transaction is read-only".
+func TestNextvalInCTEAndDerivedTable(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create sequence s`)
+
+	res := exec(t, d, `with x as (select nextval('s') as v) select v from x`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(1)}}) {
+		t.Fatalf("nextval in CTE: %v", res.Rows)
+	}
+	res = exec(t, d, `select v from (select nextval('s') as v) dt`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(2)}}) {
+		t.Fatalf("nextval in derived table: %v", res.Rows)
+	}
+}

@@ -327,6 +327,16 @@ func (r *Replicator) writeManifest(ctx context.Context) error {
 // pruneGenerations deletes all but the newest RetainGenerations-1 prior
 // generations (the current one, being brand new and empty, is the
 // +1). Callers hold shipMu.
+//
+// The newest MANIFESTED generation is never pruned, wherever it falls
+// in the retention window. Retention counts generations by name alone,
+// and restarts or compactions during slow shipping roll incomplete
+// (unmanifested) generations that count equally — enough of them in a
+// row would push the only complete, restorable generation past the
+// horizon and delete it, leaving Restore nothing but partial prefixes
+// (the exact roll-backward the manifest machinery exists to prevent).
+// Keeping it can hold one generation beyond RetainGenerations until a
+// newer one completes; that is the right trade.
 func (r *Replicator) pruneGenerations(ctx context.Context) error {
 	byGen, err := listGenerations(ctx, r.store, r.opt.Prefix)
 	if err != nil {
@@ -339,12 +349,24 @@ func (r *Replicator) pruneGenerations(ctx context.Context) error {
 		}
 	}
 	sort.Strings(gens)
+	newestManifested := ""
+	for _, g := range gens { // ascending: the last manifested one wins
+		for _, key := range byGen[g] {
+			if strings.HasSuffix(key, "/manifest.json") {
+				newestManifested = g
+				break
+			}
+		}
+	}
 	keep := r.opt.RetainGenerations - 1
 	if len(gens) <= keep {
 		return nil
 	}
 	var errs []error
 	for _, g := range gens[:len(gens)-keep] {
+		if g == newestManifested {
+			continue
+		}
 		for _, key := range byGen[g] {
 			if err := r.store.Delete(ctx, key); err != nil {
 				errs = append(errs, serr.Wrap(err, "key", key))

@@ -40,10 +40,12 @@
 //
 // # What database/sql cannot carry
 //
-// A statement's Notice (bytdb's warning for a redundant BEGIN, say) and its
-// Tag override (a COMMIT that actually rolled back) have nowhere to go in
-// database/sql's interfaces and are dropped. Callers who need them should use
-// the sql package directly, or reach the engine through Engine.
+// A statement's Notice (bytdb's warning for a redundant BEGIN, say) has
+// nowhere to go in database/sql's interfaces and is dropped. Callers who need
+// it should use the sql package directly, or reach the engine through Engine.
+// One Tag override does matter and is NOT dropped: COMMIT of a failed
+// transaction block actually rolls back, and Tx.Commit reports that as
+// ErrCommitRolledBack rather than a nil that would read as durability.
 package stdlib
 
 import (
@@ -575,9 +577,24 @@ func (c *conn) Begin() (driver.Tx, error) {
 // lost race surfaces, as bytdb.ErrTxConflict (see IsRetryable).
 type tx struct{ c *conn }
 
+// ErrCommitRolledBack is returned by Tx.Commit when the transaction block had
+// already failed: following Postgres, COMMIT of an aborted block performs a
+// rollback, and every write in the block is gone. Without this error a caller
+// that missed (or a layer that swallowed) the original statement error would
+// read Commit's nil as the data being durable — the same hazard lib/pq's
+// ErrInFailedTransaction and pgx's ErrTxCommitRollback exist for. Match with
+// errors.Is.
+var ErrCommitRolledBack = errors.New("commit of an aborted transaction block: rolled back")
+
 func (t *tx) Commit() error {
-	_, err := t.c.run(context.Background(), "COMMIT", nil)
-	return err
+	res, err := t.c.run(context.Background(), "COMMIT", nil)
+	if err != nil {
+		return err
+	}
+	if res.Tag == "ROLLBACK" {
+		return t.c.wrap(ErrCommitRolledBack, "COMMIT")
+	}
+	return nil
 }
 
 func (t *tx) Rollback() error {

@@ -190,6 +190,17 @@ type joinStep struct {
 	tmpls  []predTmpl
 	plan   *plan // precomputed access path (order-aware single-table scan); nil: plan per outer row
 
+	// tmplPreds/tmplPlan cache the nested-loop inner scan across outer
+	// rows. Planning from scratch per outer row cost ~6 map allocations
+	// plus a full predicate re-analysis, all to reach the same access
+	// path every time: which columns are bound and the Go type of each
+	// bound value (fixed per source column) fully determine planScan's
+	// choice. So the template Pred nodes are allocated once and their
+	// Vals mutated per outer row, and the plan built on the first row is
+	// reused with only its pushed bounds refreshed (plan.rebind).
+	tmplPreds []*Pred
+	tmplPlan  *plan
+
 	// hashEq, when non-empty, switches this step from the nested loop
 	// to a hash join: the inner table (filtered by the static
 	// conjuncts) is scanned once into a hash table keyed by these
@@ -407,19 +418,14 @@ func (j *joinRun) rec(k int, partial []any) {
 		return
 	}
 
-	// Fill the templates from the outer row. A NULL source value can
-	// never satisfy its conjunct, so the scan is skipped outright (a
-	// LEFT JOIN still NULL-extends below).
-	exprs := make([]BoolExpr, 0, len(step.static)+len(step.tmpls))
-	exprs = append(exprs, step.static...)
+	// A NULL source value can never satisfy its conjunct, so the scan
+	// is skipped outright (a LEFT JOIN still NULL-extends below).
 	skip := false
 	for _, tp := range step.tmpls {
-		v := partial[tp.srcOrd]
-		if v == nil {
+		if partial[tp.srcOrd] == nil {
 			skip = true
 			break
 		}
-		exprs = append(exprs, &Pred{Item: tp.item, Op: tp.op, Val: v})
 	}
 
 	matched := false
@@ -438,15 +444,8 @@ func (j *joinRun) rec(k int, partial []any) {
 		} else {
 			pl := step.plan
 			if pl == nil {
-				var expr BoolExpr
-				switch {
-				case len(exprs) == 1:
-					expr = exprs[0]
-				case len(exprs) > 1:
-					expr = &And{Exprs: exprs}
-				}
 				var err error
-				if pl, err = planScan(step.st.desc, step.st.name, expr); err != nil {
+				if pl, err = step.rowPlan(partial); err != nil {
 					j.err = err
 					return
 				}
@@ -469,6 +468,43 @@ func (j *joinRun) rec(k int, partial []any) {
 		copy(vals, partial)
 		j.rec(k+1, vals)
 	}
+}
+
+// rowPlan returns the step's inner-scan plan bound to the current
+// outer row. The first call allocates the template Preds, assembles the
+// pushdown expression, and plans; later calls mutate the template Vals
+// in place and refresh the plan's pushed bounds. The residual filter
+// and binds reference the same Pred nodes, so they see the new values
+// with no rebuild.
+func (step *joinStep) rowPlan(partial []any) (*plan, error) {
+	if step.tmplPlan == nil {
+		exprs := make([]BoolExpr, 0, len(step.static)+len(step.tmpls))
+		exprs = append(exprs, step.static...)
+		step.tmplPreds = make([]*Pred, len(step.tmpls))
+		for i, tp := range step.tmpls {
+			pr := &Pred{Item: tp.item, Op: tp.op, Val: partial[tp.srcOrd]}
+			step.tmplPreds[i] = pr
+			exprs = append(exprs, pr)
+		}
+		var expr BoolExpr
+		switch {
+		case len(exprs) == 1:
+			expr = exprs[0]
+		case len(exprs) > 1:
+			expr = &And{Exprs: exprs}
+		}
+		pl, err := planScan(step.st.desc, step.st.name, expr)
+		if err != nil {
+			return nil, err
+		}
+		step.tmplPlan = pl
+		return pl, nil
+	}
+	for i, tp := range step.tmpls {
+		step.tmplPreds[i].Val = partial[tp.srcOrd]
+	}
+	step.tmplPlan.rebind()
+	return step.tmplPlan, nil
 }
 
 // stepNext extends the outer row with one candidate inner row,

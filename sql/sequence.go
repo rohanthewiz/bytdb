@@ -213,6 +213,14 @@ func selectWritesSequences(s *Select) bool {
 	if s == nil {
 		return false
 	}
+	// CTEs run as part of this statement — and derived tables (FROM
+	// (SELECT ...) alias) lower to synthetic CTEs at parse — so a
+	// nextval inside either must make the whole statement writable too.
+	for _, c := range s.With {
+		if selectWritesSequences(c.Sel) {
+			return true
+		}
+	}
 	for _, it := range s.Items {
 		if exprWritesSequences(it.Ex) {
 			return true

@@ -997,3 +997,37 @@ func TestShortRowReadsAsNull(t *testing.T) {
 		t.Errorf("dest = %v, want [1 <nil>]", dest)
 	}
 }
+
+// Regression: COMMIT of a failed transaction block rolls back (Postgres
+// semantics), and the driver used to return nil from Tx.Commit anyway —
+// a caller that missed the original statement error read "committed"
+// for data that was gone. It must surface ErrCommitRolledBack.
+func TestCommitOfAbortedBlockErrors(t *testing.T) {
+	db := open(t, tempDSN(t, ""))
+	exec(t, db, `create table c (id int primary key)`)
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`insert into c values (1)`); err != nil {
+		t.Fatal(err)
+	}
+	// Abort the block: duplicate PK.
+	if _, err := tx.Exec(`insert into c values (1)`); err == nil {
+		t.Fatal("duplicate insert unexpectedly succeeded")
+	}
+	err = tx.Commit()
+	if !errors.Is(err, ErrCommitRolledBack) {
+		t.Fatalf("Commit of aborted block: err = %v, want ErrCommitRolledBack", err)
+	}
+
+	// And nothing from the block survived.
+	var n int
+	if err := db.QueryRow(`select count(*) from c`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("rows after rolled-back commit = %d, want 0", n)
+	}
+}

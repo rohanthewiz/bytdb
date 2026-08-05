@@ -769,7 +769,7 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 			return err
 		}
 		q.resultCols(s, res)
-		env := &exEnv{d: d, tx: tx, sc: fp.sc}
+		env := &exEnv{d: d, tx: tx, sc: fp.sc, subs: newSubMemo()}
 		groups, err := aggScanGroups(tx, fp, q, env)
 		if err != nil {
 			return err

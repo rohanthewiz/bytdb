@@ -21,7 +21,8 @@ func TestCastValPairs(t *testing.T) {
 		1.5::text, true::text, null::text,
 		'true'::bool, 'f'::boolean, null::bool,
 		'2.5'::numeric, 1::float8, 2.25::real, null::decimal`)
-	want := [][]any{{int64(42), int64(3), nil, int64(7),
+	// 3.9::bigint rounds (Postgres float→int semantics), not truncates.
+	want := [][]any{{int64(42), int64(4), nil, int64(7),
 		int64(123), int64(5), nil,
 		int64(99), int64(42), nil,
 		"1.5", "true", nil,
@@ -58,10 +59,28 @@ func TestCastValErrors(t *testing.T) {
 		{`select 'abc'::float8`, "invalid input syntax for type float"},
 		{`select '{1}'::int[]`, "array casts are not supported"},
 		{`select 1::json`, "unsupported cast"},
+		// Out-of-range and NaN float→int raise 22003 as Postgres does;
+		// Go's native conversion was implementation-defined (saturates
+		// on arm64, wraps on amd64).
+		{`select 1e300::int`, "bigint out of range"},
+		{`select (-1e300)::bigint`, "bigint out of range"},
+		{`select ('nan'::float8)::int`, "bigint out of range"},
 	} {
 		if _, err := d.Exec(c.q); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err %v, want containing %q", c.q, err, c.want)
 		}
+	}
+}
+
+// Float→int casts round half to even (Postgres rint semantics), and
+// ::float is an accepted alias for double precision.
+func TestFloatIntCastRounding(t *testing.T) {
+	d := openDB(t)
+
+	res := exec(t, d, `select 1.7::int, 2.5::int, 3.5::int, (-1.7)::int, 1.5::float`)
+	want := [][]any{{int64(2), int64(2), int64(4), int64(-2), 1.5}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("got %v, want %v", res.Rows, want)
 	}
 }
 

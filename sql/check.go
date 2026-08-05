@@ -114,9 +114,9 @@ func tableChecks(desc *bytdb.TableDesc) ([]namedCheck, error) {
 // checkRow evaluates every check against one row (vals in declared
 // column order), erroring on the first definitely-false one.
 func checkRow(env *exEnv, table string, checks []namedCheck, vals []any) error {
+	rowEnv := *env // one copy per row, not per check
+	rowEnv.row = vals
 	for _, ck := range checks {
-		rowEnv := *env
-		rowEnv.row = vals
 		t, err := evalTruth(&rowEnv, ck.ex)
 		if err != nil {
 			return serr.Wrap(err, "constraint", ck.name)
@@ -158,9 +158,9 @@ func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
 	// Checks cannot hold subqueries, so evaluation never needs a
 	// transaction in the environment.
 	env := &exEnv{d: d, sc: sc}
+	rowEnv := *env // reused across the validation scan; only .row varies
 	err := d.e.AddCheck(s.Table, bytdb.CheckDesc{Name: name, Expr: s.Check.Text},
 		func(row bytdb.Row) error {
-			rowEnv := *env
 			rowEnv.row = row.Vals
 			t, err := evalTruth(&rowEnv, s.Check.Ex)
 			if err != nil {

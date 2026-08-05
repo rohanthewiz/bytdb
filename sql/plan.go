@@ -215,6 +215,42 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 	return p, nil
 }
 
+// rebind refreshes the plan's pushed-down values from its pushed
+// conjuncts, after the caller mutated those Preds' Vals in place (the
+// nested-loop join re-binds its templates per outer row — see
+// joinStep.rowPlan). The access path itself cannot have changed: which
+// columns carry predicates, and the Go type of each bound value, are
+// fixed across rows. The positional mapping below is exact because of
+// planScanOrdered's append order: the equality prefix contributes
+// matched (from[i], stops[i], pushed[i]) triples, then an optional
+// range lower bound appends to from before an optional range stop
+// appends to stops — in both the ascending and descending arrangements.
+func (p *plan) rebind() {
+	if p.get != nil {
+		for i := range p.get {
+			p.get[i] = p.pushed[i].Val
+		}
+		return
+	}
+	eqN := 0
+	for eqN < len(p.stops) && p.stops[eqN].kind == stopNE {
+		eqN++
+	}
+	n := 0
+	for i := 0; i < eqN; i++ {
+		p.from[i] = p.pushed[n].Val
+		p.stops[i].val = p.pushed[n].Val
+		n++
+	}
+	if len(p.from) > eqN {
+		p.from[eqN] = p.pushed[n].Val
+		n++
+	}
+	if len(p.stops) > eqN {
+		p.stops[eqN].val = p.pushed[n].Val
+	}
+}
+
 // conjuncts flattens the predicates that must hold for every matching
 // row: leaves of top-level AND chains. OR and NOT subtrees contribute
 // nothing (their predicates are not individually required).

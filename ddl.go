@@ -166,6 +166,7 @@ func (e *Engine) DropTable(name string) error {
 	// live in-memory allocators; drop them so no cached draw can write
 	// the deleted keys back.
 	e.invalidateCounterPrefix(string(identitySeqTablePrefix(droppedID)))
+	e.cacheEvict(name)
 	return nil
 }
 
@@ -423,6 +424,7 @@ func (e *Engine) RenameTable(oldName, newName string) error {
 	if err != nil {
 		return serr.Wrap(err, "op", "rename table", "table", oldName, "to", newName)
 	}
+	e.cacheEvict(oldName)
 	return nil
 }
 

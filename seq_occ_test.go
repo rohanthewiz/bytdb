@@ -1,6 +1,7 @@
 package bytdb
 
 import (
+	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -679,5 +680,50 @@ func BenchmarkIdentityInsertHeavyTxn(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+// Regression: a watermark extension used to take max(stale in-memory
+// position, stored value), so a SetSeq that committed a BACKWARD move
+// mid-extension (its post-commit invalidation blocked on the allocator
+// mutex the extension holds) was durably overwritten by the stale
+// position — the committed set had zero effect, an outcome no serial
+// order of the two operations produces. The extension must instead
+// treat stored < anchored-watermark as an external reset and re-anchor
+// on the stored value.
+func TestOCCBackwardSetDuringExtensionReanchors(t *testing.T) {
+	e := openOCCEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+
+	// Exhaust the first reserved batch so the next draw must extend.
+	for i := uint64(1); i <= seqAllocBatch; i++ {
+		v, err := e.NextSeq("s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v != i {
+			t.Fatalf("draw = %d, want %d", v, i)
+		}
+	}
+
+	// Land the durable backward write exactly as a concurrent SetSeq
+	// does, WITHOUT the allocator invalidation that sequential SetSeq
+	// would run afterward — in the real interleaving that invalidation
+	// has not happened yet when the extension's transaction reads.
+	err := e.seqPut(func(tx *btypedb.Tx[string, []byte]) error {
+		return tx.Set(seqNameKey("s"), binary.BigEndian.AppendUint64(nil, 5))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The extension must observe the backward move and re-anchor at 5,
+	// not resurrect its stale position (which would draw seqAllocBatch+1).
+	v, err := e.NextSeq("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 5 {
+		t.Fatalf("draw after backward set = %d, want 5 (stale watermark resurrected the old position)", v)
 	}
 }

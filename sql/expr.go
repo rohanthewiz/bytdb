@@ -36,6 +36,10 @@ type exEnv struct {
 	grp   *group // current group in an aggregate query's group phase
 	win   []any  // current row's precomputed window values (window queries)
 	outer *exEnv
+	// subs is the statement's uncorrelated-subquery memo, seeded on
+	// root envs by the statement executors; see subcache.go. Copies of
+	// an env share it (pointer), and subMemo climbs outer to find it.
+	subs *subMemo
 }
 
 // exGroupRef and exAccRef are the shapes resolveAgg rewrites an
@@ -464,7 +468,7 @@ func parseArrayLiteral(s string) ([]any, error) {
 // collectSubColumn runs a (possibly correlated) subquery and returns
 // its single output column's values — the row-set form of ANY/ALL's
 // right-hand side, sharing evalArraySub's non-aggregate constraints.
-func collectSubColumn(env *exEnv, sel *Select) ([]any, error) {
+func runSubColumn(env *exEnv, sel *Select) ([]any, error) {
 	if sel.Star || len(sel.Items) != 1 {
 		return nil, serr.New("a subquery on the right of ANY/ALL must select exactly one column")
 	}
@@ -553,21 +557,42 @@ func evalCase(env *exEnv, n *ExCase) (any, error) {
 
 // --- regex matching (~, !~, ~*, !~*) ---
 
-var reCache sync.Map // pattern (with flags applied) -> *regexp.Regexp
+// reCache memoizes compiled patterns. It is bounded because patterns
+// are not always plan constants: WHERE a LIKE b compiles one pattern
+// per distinct row value, and an unbounded package-level cache would
+// pin every one of them for the life of the process. On overflow the
+// whole cache resets — crude, but the steady state (a bounded set of
+// literal patterns) re-compiles each survivor exactly once, and the
+// data-driven case that trips the cap gets no benefit from any smarter
+// eviction.
+const reCacheMax = 1024
+
+var (
+	reCacheMu sync.RWMutex
+	reCache   = make(map[string]*regexp.Regexp) // pattern (with flags applied) -> compiled
+)
 
 func compileRegex(pat string, insensitive bool) (*regexp.Regexp, error) {
 	key := pat
 	if insensitive {
 		key = "(?i)" + pat
 	}
-	if re, ok := reCache.Load(key); ok {
-		return re.(*regexp.Regexp), nil
+	reCacheMu.RLock()
+	re, ok := reCache[key]
+	reCacheMu.RUnlock()
+	if ok {
+		return re, nil
 	}
 	re, err := regexp.Compile(key)
 	if err != nil {
 		return nil, serr.New("invalid regular expression", "pattern", pat)
 	}
-	reCache.Store(key, re)
+	reCacheMu.Lock()
+	if len(reCache) >= reCacheMax {
+		clear(reCache)
+	}
+	reCache[key] = re
+	reCacheMu.Unlock()
 	return re, nil
 }
 
@@ -612,6 +637,23 @@ func likeRegex(pat string) (string, error) {
 // arithmetic whose true result does not fit int64. A fresh error per
 // use keeps serr stack context; the constructor is trivial.
 func errIntRange() error { return serr.New("bigint out of range") }
+
+// floatToInt is the float→integer cast: round half to even (Postgres
+// float8→int uses rint), then range-check. Go's native conversion is
+// implementation-defined out of range — it saturates on arm64 and wraps
+// to MinInt64 on amd64 — so without the check `1e300::int` silently
+// produced different garbage per platform; Postgres raises 22003.
+func floatToInt(x float64) (any, error) {
+	r := math.RoundToEven(x)
+	// 2^63 is exactly representable in float64; anything at or above it
+	// (and anything below -2^63, which itself is a valid int64) is out
+	// of range. NaN fails both comparisons' complements, so test it
+	// explicitly.
+	if math.IsNaN(r) || r < -9223372036854775808.0 || r >= 9223372036854775808.0 {
+		return nil, errIntRange()
+	}
+	return int64(r), nil
+}
 
 func arith(op string, l, r any) (any, error) {
 	if op == "||" {
@@ -799,7 +841,7 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 		case int64:
 			return x, nil
 		case float64:
-			return int64(x), nil
+			return floatToInt(x)
 		case string:
 			n, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
 			if err != nil {
@@ -849,7 +891,7 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			return nil, nil
 		}
 		return coerceLit(v, bytdb.TBool)
-	case "float4", "float8", "real", "numeric", "decimal":
+	case "float", "float4", "float8", "real", "numeric", "decimal":
 		switch x := v.(type) {
 		case nil:
 			return nil, nil
@@ -1257,7 +1299,7 @@ func constraintdef(d *DB, oid int64) any {
 // reaches the enclosing rows through the environment chain — that is
 // the whole correlation mechanism. The result is the single item's
 // value from the single row; zero rows read as NULL.
-func evalSubquery(env *exEnv, sel *Select) (any, error) {
+func runScalarSub(env *exEnv, sel *Select) (any, error) {
 	if len(sel.Union) > 0 {
 		return nil, serr.New("UNION in a scalar subquery is not supported")
 	}
@@ -1431,7 +1473,7 @@ func dedupScalars(vals []any) ([]any, error) {
 // rendered as a Postgres array literal ("{}" when empty). The
 // subquery's single output column sorts ascending when it has any
 // ORDER BY (the one psql writes is ORDER BY 1).
-func evalArraySub(env *exEnv, sel *Select) (any, error) {
+func runArraySub(env *exEnv, sel *Select) (any, error) {
 	if sel.Star || len(sel.Items) != 1 {
 		return nil, serr.New("ARRAY(SELECT ...) must select exactly one column")
 	}
@@ -1508,7 +1550,7 @@ func textArrayValue(vals []any) string {
 
 // evalExistsSub runs EXISTS (SELECT ...): whether the (possibly
 // correlated) subquery yields any row; its select list is irrelevant.
-func evalExistsSub(env *exEnv, sel *Select) (any, error) {
+func runExistsSub(env *exEnv, sel *Select) (any, error) {
 	if len(sel.Union) > 0 || sel.GroupBy != nil || sel.Having != nil {
 		return nil, serr.New("this EXISTS (SELECT ...) shape is not supported")
 	}
@@ -1717,7 +1759,7 @@ func castColType(typ string) bytdb.ColType {
 		return bytdb.TInt
 	case "bool", "boolean":
 		return bytdb.TBool
-	case "float4", "float8", "real", "numeric", "decimal":
+	case "float", "float4", "float8", "real", "numeric", "decimal":
 		return bytdb.TFloat
 	case "timestamp", "timestamptz":
 		return bytdb.TTimestamp

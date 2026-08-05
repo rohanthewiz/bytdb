@@ -481,8 +481,8 @@ func (c *conn) authSCRAM(user string) error {
 	}
 
 	// SASLInitialResponse: mechanism name, then the length-prefixed
-	// client-first-message.
-	typ, body, err := readMessage(c.r)
+	// client-first-message. Still unauthenticated: small frame cap.
+	typ, body, err := readMessagePreAuth(c.r)
 	if err != nil {
 		return err
 	}
@@ -523,7 +523,7 @@ func (c *conn) authSCRAM(user string) error {
 	}
 
 	// SASLResponse: the body is the client-final-message, unadorned.
-	typ, body, err = readMessage(c.r)
+	typ, body, err = readMessagePreAuth(c.r)
 	if err != nil {
 		return err
 	}

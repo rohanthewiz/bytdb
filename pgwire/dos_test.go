@@ -170,24 +170,24 @@ func TestReadBodyBounds(t *testing.T) {
 
 	// A body well past the pre-allocation threshold round-trips intact.
 	big := bytes.Repeat([]byte{0xAB}, 4*readBodyPrealloc)
-	got, err := readBody(frameOf(len(big), big))
+	got, err := readBodyMax(frameOf(len(big), big))
 	if err != nil || !bytes.Equal(got, big) {
 		t.Fatalf("full body: err=%v len(got)=%d", err, len(got))
 	}
 
 	// A huge declared length with only a few bytes present must fail as a
 	// short read, not hang or allocate the declared size.
-	if _, err := readBody(frameOf(1<<25, []byte{1, 2, 3})); err != io.ErrUnexpectedEOF {
+	if _, err := readBodyMax(frameOf(1<<25, []byte{1, 2, 3})); err != io.ErrUnexpectedEOF {
 		t.Fatalf("truncated huge claim: err=%v, want ErrUnexpectedEOF", err)
 	}
 
 	// Over the hard frame cap is rejected before any read of the body.
-	if _, err := readBody(frameOf(maxMsgLen+1, nil)); err == nil {
+	if _, err := readBodyMax(frameOf(maxMsgLen+1, nil)); err == nil {
 		t.Fatal("over-cap length accepted")
 	}
 
 	// A zero-length body is nil, no error.
-	if got, err := readBody(frameOf(0, nil)); err != nil || got != nil {
+	if got, err := readBodyMax(frameOf(0, nil)); err != nil || got != nil {
 		t.Fatalf("zero-length body: err=%v got=%v", err, got)
 	}
 }

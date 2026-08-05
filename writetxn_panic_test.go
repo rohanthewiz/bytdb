@@ -59,3 +59,51 @@ func TestWriteTxnPanicReleasesWriterLock(t *testing.T) {
 		t.Fatalf("post-panic insert missing (ok=%v err=%v)", ok, err)
 	}
 }
+
+// Regression: DDL closures can run caller-supplied callbacks (AddCheck's
+// per-row validate, AlterSequence's mutate) inside the kv transaction.
+// updateDDL used to pass them to kv.Update unguarded, so a panic there
+// unwound with the writer lock held — the same process-wide write wedge
+// WriteTxn already guards against.
+func TestDDLPanicReleasesWriterLock(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "ddlpanic.db"))
+	defer e.Close()
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", int64(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	panicked := func() (caught bool) {
+		defer func() { caught = recover() != nil }()
+		_ = e.AddCheck("t", CheckDesc{Name: "ck", Expr: "id > 0"}, func(Row) error {
+			panic("validate boom")
+		})
+		return
+	}()
+	if !panicked {
+		t.Fatal("AddCheck swallowed the validate panic instead of propagating it")
+	}
+
+	// The next write must not block on a leaked writer lock.
+	done := make(chan error, 1)
+	go func() { done <- e.Insert("t", int64(2)) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("insert after panicked DDL: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("insert blocked after a panicked DDL — the writer lock leaked")
+	}
+
+	// And the half-added constraint must have been rolled back.
+	desc := e.Table("t")
+	if desc == nil {
+		t.Fatal("table t missing after panicked DDL")
+	}
+	if len(desc.Checks) != 0 {
+		t.Fatalf("check from panicked DDL survived: %+v", desc.Checks)
+	}
+}

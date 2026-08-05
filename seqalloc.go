@@ -212,7 +212,20 @@ func (a *counterAlloc) loadLocked(e *Engine, key string, start uint64, what stri
 // concurrent SetSeq/restore that moved the counter forward is jumped
 // past, never clobbered, and a concurrently deleted counter is not
 // resurrected (errSeqReset). Caller holds a.mu.
-func (a *counterAlloc) reserveLocked(e *Engine, key string, floor uint64, what string) error {
+//
+// extending distinguishes the two callers, because they mean different
+// things by floor. A draw extension (takeLocked) passes the allocator's
+// own position — pure memory of its last reservation, with no semantic
+// weight — so a stored value BELOW the anchored watermark means an
+// external SetSeq/restore moved the counter backward since we anchored,
+// and maxing the stale position back in would durably erase that
+// committed set. That case returns errSeqReset so the caller discards
+// the allocator and re-anchors on the stored value (the same semantics
+// a restart gives). A bump (bumpCounterAllocTo) passes an explicit
+// value from user data as floor — a semantic requirement that must win
+// over any stored value, backward-set or not — so it keeps the plain
+// max.
+func (a *counterAlloc) reserveLocked(e *Engine, key string, floor uint64, what string, extending bool) error {
 	var base, wm uint64
 	err := e.seqPut(func(tx *btypedb.Tx[string, []byte]) error {
 		base = floor
@@ -221,7 +234,11 @@ func (a *counterAlloc) reserveLocked(e *Engine, key string, floor uint64, what s
 				return serr.New("sequence value is corrupt",
 					"sequence", what, "len", fmt.Sprint(len(raw)))
 			}
-			if s := binary.BigEndian.Uint64(raw); s > base {
+			s := binary.BigEndian.Uint64(raw)
+			if extending && s < a.watermark {
+				return errSeqReset
+			}
+			if s > base {
 				base = s
 			}
 		} else if a.existed {
@@ -277,7 +294,7 @@ func (a *counterAlloc) takeLocked(e *Engine, key string, start uint64, what stri
 		return 0, err
 	}
 	if a.next >= a.watermark {
-		if err := a.reserveLocked(e, key, a.next, what); err != nil {
+		if err := a.reserveLocked(e, key, a.next, what, true); err != nil {
 			return 0, err
 		}
 	}
@@ -311,7 +328,7 @@ func (e *Engine) bumpCounterAllocTo(key string, next uint64, what string) error 
 				a.next = next
 				return nil
 			}
-			return a.reserveLocked(e, key, next, what)
+			return a.reserveLocked(e, key, next, what, false)
 		}()
 		a.mu.Unlock()
 		if errors.Is(err, errSeqReset) {

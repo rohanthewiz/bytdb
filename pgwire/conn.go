@@ -216,7 +216,7 @@ func (c *conn) run() (err error) {
 			return err
 		}
 		c.armBodyDeadline()
-		body, err := readBody(c.r)
+		body, err := readBody(c.r, maxMsgLen)
 		if err != nil {
 			return err
 		}
@@ -637,6 +637,27 @@ func (c *conn) bind(r *rbuf) {
 	if len(vals) != want {
 		c.sendError(serr.New("wrong number of parameters",
 			"want", fmt.Sprint(want), "got", fmt.Sprint(len(vals))), "", 0)
+		return
+	}
+	// The protocol allows 0 format codes (all text), 1 (applies to
+	// every item), or exactly one per item — Postgres's own wording
+	// below. Anything else used to index formatFor out of range: a
+	// panic any client could trigger at will, where the fuzz target
+	// promises malformed frames produce protocol errors, never panics.
+	if len(pformats) > 1 && len(pformats) != len(vals) {
+		c.protoError(fmt.Sprintf("bind message has %d parameter formats but %d parameters",
+			len(pformats), len(vals)))
+		return
+	}
+	// Result formats are consumed later (Describe 'P' and Execute), so
+	// reject the mismatch here, at the message that carried it.
+	ncols := 0
+	if p.info != nil {
+		ncols = len(p.info.Cols)
+	}
+	if len(formats) > 1 && len(formats) != ncols {
+		c.protoError(fmt.Sprintf("bind message has %d result formats but query has %d columns",
+			len(formats), ncols))
 		return
 	}
 	args := make([]any, len(vals))
