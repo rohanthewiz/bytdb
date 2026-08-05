@@ -1,6 +1,6 @@
 ---
 name: bytdb-fast-memory-based-db
-description: Use bytdb as a fast, embedded, in-process SQL database for Go apps — datasets that fit in memory, durable via WAL (optionally encrypted at rest), queryable through Go APIs or the Postgres wire protocol.
+description: Use bytdb as a fast, embedded, in-process SQL database for Go apps — datasets that fit in memory, durable via WAL (optionally encrypted at rest), queryable through Go APIs, a database/sql driver, or the Postgres wire protocol.
 ---
 
 # bytdb: fast memory-based embedded database
@@ -13,11 +13,11 @@ it when a Go app needs fast local SQL without an external server, or a
 Postgres-compatible endpoint without running Postgres.
 
 ```bash
-go get github.com/rohanthewiz/bytdb        # engine + sql (zero serving deps)
+go get github.com/rohanthewiz/bytdb        # engine + sql + stdlib driver (zero serving deps)
 go get github.com/rohanthewiz/bytdb/pgwire # only if serving the wire protocol
 ```
 
-## Three ways in
+## Four ways in
 
 **1. Engine API** — typed rows, primary keys, ordered scans, no SQL:
 
@@ -55,7 +55,27 @@ id := res.Rows[0][0].(int64)
 res, err = db.Exec(`SELECT name FROM users WHERE meta->>'role' = $1`, "admin")
 ```
 
-**3. Postgres wire protocol** — psql, pgx, GORM, `database/sql`
+**3. database/sql driver** — the stdlib interface, in-process (no
+server, no socket, no wire encoding), so sqlx, ORMs, and anything
+written against `*sql.DB` works:
+
+```go
+import (
+    "database/sql"
+    _ "github.com/rohanthewiz/bytdb/stdlib"
+)
+
+db, err := sql.Open("bytdb", "app.db") // DSN = path [+ options], e.g.
+                                       // "app.db?concurrent_writes=true"
+```
+
+One path is one engine per process: every `*sql.DB` on it shares the
+engine, and each pooled connection gets its own session. A program
+already holding a `*bytdb.Engine` should use `stdlib.OpenEngine(e)` —
+the file cannot be opened twice. `stdlib.IsRetryable(err)` spots
+commit conflicts under concurrent writes.
+
+**4. Postgres wire protocol** — psql, pgx, GORM, `database/sql`
 connect as if to Postgres:
 
 ```go
@@ -78,7 +98,8 @@ SELECT/UPDATE/DELETE with a planner that pushes WHERE conjuncts to
 point gets and bounded index scans, joins (nested-loop with index
 rebinding; hash join when no index serves an equijoin), aggregates +
 GROUP BY/HAVING, window functions with full frame support, WITH CTEs,
-derived tables, UNION, `LIKE`/`ILIKE`, `BETWEEN`, regex operators,
+derived tables, UNION, `SELECT DISTINCT`, `LIKE`/`ILIKE`, `BETWEEN`,
+`ANY`/`ALL`, regex operators,
 CASE, casts, correlated subqueries, EXISTS, EXPLAIN, transaction blocks
 with savepoints, TRUNCATE, SET/SHOW. `$n` placeholders bind in
 WHERE/ON/HAVING, INSERT/UPDATE values, `BETWEEN` bounds, and
@@ -96,6 +117,31 @@ downstream). Errors carry Postgres wording and SQLSTATEs.
 `DEFAULT` takes constants plus `now()`/`current_date` (evaluated once
 per INSERT statement). `serial` draws from a durable per-column
 counter; read generated keys back with `RETURNING id`.
+
+## Concurrent writes (opt-in)
+
+The default engine is single-writer: serializable by construction,
+writes queue behind the writer lock, reads never block. Opting in
+lets write transactions run concurrently:
+
+```go
+e, err := bytdb.Open("app.db", bytdb.WithConcurrentWrites())
+```
+
+Writes then use optimistic concurrency control at snapshot isolation:
+each transaction runs against its own snapshot and validates at
+commit — first committer wins, and a losing COMMIT fails with
+`bytdb.ErrTxConflict` (SQLSTATE 40001 over the wire, with Postgres's
+retry hint) for the client to retry from BEGIN. Autocommit statements
+are retried internally (3 attempts) and rarely surface conflicts.
+`BEGIN ISOLATION LEVEL SERIALIZABLE`, `SET TRANSACTION`, or
+`default_transaction_isolation` opts a transaction up to full
+SERIALIZABLE via read-set validation. Two side effects of the mode:
+sequence/identity draws become non-transactional and gap-tolerant
+(Postgres semantics — in the default mode they are transactional and
+gapless-on-rollback), and DDL escalates to a brief exclusive stall
+instead of validating, so it always makes progress and never returns
+40001.
 
 ## Backup and replication
 
@@ -167,9 +213,11 @@ bytes, 64 hex chars, or base64 of 32).
 
 ## Gotchas
 
-- **One writer at a time** (serializable by construction): a writable
-  transaction block holds the writer lock from BEGIN to COMMIT — keep
-  blocks short. Reads never block.
+- **One writer at a time — by default**: a writable transaction block
+  holds the writer lock from BEGIN to COMMIT — keep blocks short.
+  Reads never block. Under `WithConcurrentWrites` blocks don't queue,
+  but a long block risks losing commit validation (40001) instead —
+  keep them short either way, and be ready to retry from BEGIN.
 - **DDL cannot run inside a transaction block**; every schema change
   is its own transaction. TRUNCATE is DML and does roll back.
 - **ALTER TABLE ADD COLUMN with DEFAULT / NOT NULL** requires an
@@ -180,13 +228,15 @@ bytes, 64 hex chars, or base64 of 32).
 - **INSERT VALUES entries are full expressions** (`nextval('s')`
   works) but column references don't resolve there.
 - `now()` is statement-frozen, not transaction-frozen as in Postgres.
+- Sequence/identity allocation is **transactional in the default mode**
+  (a rollback reuses the value) and gap-tolerant Postgres-style under
+  `WithConcurrentWrites` (a rollback burns it).
 - Errors are [serr](https://github.com/rohanthewiz/serr) structured
   errors: log with `logger.LogErr(err, "context")`, render user-facing
   text with `bytdb.ErrText(err)`.
-- Not implemented: MVCC concurrent writers, RIGHT/FULL joins,
-  triggers, NUMERIC(p,s), arrays beyond `text[]`, jsonb indexing,
-  COPY, live HA/failover (replication is async recovery, see above).
-  Datasets must fit in RAM.
+- Not implemented: RIGHT/FULL joins, triggers, NUMERIC(p,s), arrays
+  beyond `text[]`, jsonb indexing, COPY, live HA/failover (replication
+  is async recovery, see above). Datasets must fit in RAM.
 
 ## Verifying changes
 
