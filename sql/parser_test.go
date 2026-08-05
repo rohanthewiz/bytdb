@@ -76,6 +76,36 @@ func TestParseCreateTableErrors(t *testing.T) {
 	}
 }
 
+func TestParseTableIfExists(t *testing.T) {
+	ct := mustParse(t, `create table if not exists t (id int primary key)`).(*CreateTable)
+	if !ct.IfNotExists || ct.Table != "t" {
+		t.Fatalf("create if not exists: got %#v", ct)
+	}
+	dt := mustParse(t, `drop table if exists t`).(*DropTable)
+	if !dt.IfExists || dt.Table != "t" {
+		t.Fatalf("drop if exists: got %#v", dt)
+	}
+
+	// The plain forms leave the flags off.
+	if ct := mustParse(t, `create table u (id int)`).(*CreateTable); ct.IfNotExists {
+		t.Fatal("plain create parsed as IF NOT EXISTS")
+	}
+	if dt := mustParse(t, `drop table u`).(*DropTable); dt.IfExists {
+		t.Fatal("plain drop parsed as IF EXISTS")
+	}
+
+	// A half-written clause is a syntax error, not a table named "if".
+	for _, src := range []string{
+		`create table if exists t (id int)`,
+		`create table if not t (id int)`,
+		`drop table if t`,
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Errorf("Parse(%q): expected error", src)
+		}
+	}
+}
+
 func TestParseSelect(t *testing.T) {
 	st := mustParse(t, `SELECT name, age FROM users
 		WHERE age >= 21 AND 100 > score AND city = 'Reno' AND note IS NOT NULL

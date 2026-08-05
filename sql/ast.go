@@ -593,24 +593,31 @@ type FKDef struct {
 	OnDelete string
 }
 
-// CreateTable is CREATE TABLE t (col type [constraints], ...,
-// [PRIMARY KEY (col, ...)], [[CONSTRAINT name] CHECK (expr)], ...).
+// CreateTable is CREATE TABLE [IF NOT EXISTS] t (col type
+// [constraints], ..., [PRIMARY KEY (col, ...)],
+// [[CONSTRAINT name] CHECK (expr)], ...).
 // Uniques collects UNIQUE constraints — column-level and table-level
 // alike — as column lists; the executor lowers each to a unique index
 // (UNIQUE here is sugar over CREATE UNIQUE INDEX, as the pg_constraint
 // synthesis assumes). FKs collects FOREIGN KEY constraints, column-
-// level REFERENCES included.
+// level REFERENCES included. IfNotExists makes the statement a no-op
+// when a table of that name exists — a name check only; as in
+// Postgres, the existing table's schema is not compared to this one.
 type CreateTable struct {
-	Table   string
-	Cols    []ColDef
-	PK      []string
-	Checks  []CheckDef
-	Uniques [][]string
-	FKs     []FKDef
+	Table       string
+	Cols        []ColDef
+	PK          []string
+	Checks      []CheckDef
+	Uniques     [][]string
+	FKs         []FKDef
+	IfNotExists bool
 }
 
-// DropTable is DROP TABLE t.
-type DropTable struct{ Table string }
+// DropTable is DROP TABLE [IF EXISTS] t.
+type DropTable struct {
+	Table    string
+	IfExists bool
+}
 
 // Truncate is TRUNCATE [TABLE] t [, ...] [RESTART|CONTINUE IDENTITY]
 // [RESTRICT]: delete every row (and index entry) of each named table

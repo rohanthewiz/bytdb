@@ -212,11 +212,18 @@ func (p *parser) statement() (Statement, error) {
 	case p.acceptKw("drop"):
 		switch {
 		case p.acceptKw("table"):
-			name, err := p.tableName()
-			if err != nil {
+			dt := &DropTable{}
+			if p.acceptKw("if") {
+				if err := p.expectKw("exists"); err != nil {
+					return nil, err
+				}
+				dt.IfExists = true
+			}
+			var err error
+			if dt.Table, err = p.tableName(); err != nil {
 				return nil, err
 			}
-			return &DropTable{Table: name}, nil
+			return dt, nil
 		case p.acceptKw("view"):
 			dv := &DropView{}
 			if p.acceptKw("if") {
@@ -728,6 +735,20 @@ func (p *parser) txnEnd(tc *TxnControl) (Statement, error) {
 // --- DDL ---
 
 func (p *parser) createTable() (Statement, error) {
+	// CREATE TABLE [IF NOT EXISTS] name (...). The IF NOT EXISTS
+	// clause is resolved by the executor (skip when the name is
+	// taken), so the parse here only records the flag — same split
+	// as createSequence's.
+	ifNotExists := false
+	if p.acceptKw("if") {
+		if err := p.expectKw("not"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("exists"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
 	name, err := p.tableName()
 	if err != nil {
 		return nil, err
@@ -735,7 +756,7 @@ func (p *parser) createTable() (Statement, error) {
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
-	ct := &CreateTable{Table: name}
+	ct := &CreateTable{Table: name, IfNotExists: ifNotExists}
 	for {
 		// A table-level constraint: [CONSTRAINT name] PRIMARY KEY (...)
 		// or [CONSTRAINT name] CHECK (expr). Postgres has no stored name

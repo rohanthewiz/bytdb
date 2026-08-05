@@ -282,12 +282,12 @@ what lands in the bucket is ciphertext.
 The SQL surface at a glance:
 
 ```sql
-CREATE TABLE t (id serial PRIMARY KEY,            -- or PRIMARY KEY (a, b)
+CREATE TABLE [IF NOT EXISTS] t (id serial PRIMARY KEY, -- or PRIMARY KEY (a, b)
                 c type [NOT NULL] [UNIQUE] [DEFAULT lit]
                        [REFERENCES p [(col)] [ON DELETE CASCADE]], ...,
                 [UNIQUE (cols)] [[CONSTRAINT name] CHECK (expr)]
                 [[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES p [(cols)]])
-DROP TABLE t
+DROP TABLE [IF EXISTS] t
 ALTER TABLE t ADD COLUMN c type | DROP COLUMN c
 ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr) | FOREIGN KEY ...
 ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
