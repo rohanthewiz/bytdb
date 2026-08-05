@@ -476,17 +476,7 @@ func runSubColumn(env *exEnv, sel *Select) ([]any, error) {
 	if it.Agg != AggNone || sel.GroupBy != nil || sel.Having != nil || len(sel.Union) > 0 {
 		return nil, serr.New("this subquery shape is not supported on the right of ANY/ALL")
 	}
-	lk := env.d.lookup(env.tx.Table)
-	sc, err := buildScope(lk, sel.From)
-	if err != nil {
-		return nil, err
-	}
-	from := make([]FromItem, len(sel.From))
-	copy(from, sel.From)
-	for k := range from {
-		from[k].On = decorrelate(from[k].On, sc.prefix(k+1))
-	}
-	fp, err := prepareFrom(lk, from, decorrelate(sel.Where, sc))
+	fp, empty, err := prepareSubFrom(env, sel)
 	if err != nil {
 		return nil, err
 	}
@@ -494,16 +484,18 @@ func runSubColumn(env *exEnv, sel *Select) ([]any, error) {
 	sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
 	var vals []any
 	var evalErr error
-	err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
-		rowEnv := *sub
-		rowEnv.row = rowVals
-		var v any
-		if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
-			return false
-		}
-		vals = append(vals, v)
-		return true
-	})
+	if !empty {
+		err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
+			rowEnv := *sub
+			rowEnv.row = rowVals
+			var v any
+			if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
+				return false
+			}
+			vals = append(vals, v)
+			return true
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1310,24 +1302,15 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 	if sel.GroupBy != nil || sel.Having != nil {
 		return nil, serr.New("GROUP BY in a scalar subquery is not supported")
 	}
-	lk := env.d.lookup(env.tx.Table)
-	sc, err := buildScope(lk, sel.From)
-	if err != nil {
-		return nil, err
-	}
-	from := make([]FromItem, len(sel.From))
-	copy(from, sel.From)
-	for k := range from {
-		from[k].On = decorrelate(from[k].On, sc.prefix(k+1))
-	}
-	where := decorrelate(sel.Where, sc)
-	fp, err := prepareFrom(lk, from, where)
+	fp, empty, err := prepareSubFrom(env, sel)
 	if err != nil {
 		return nil, err
 	}
 
 	// A single aggregate item — (SELECT count(*) FROM ... WHERE
-	// correlated) — folds the matching rows into one accumulator.
+	// correlated) — folds the matching rows into one accumulator. An
+	// empty invocation still reports the accumulator's zero-row value
+	// (count 0, min/max/sum/avg NULL).
 	if it.Agg != AggNone {
 		acc := accum{fn: it.Agg, ord: -1}
 		if !it.Star {
@@ -1346,11 +1329,13 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 		}
 		sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
 		var addErr error
-		err = runJoin(env.tx, fp, sub, func(vals []any) bool {
-			sub.row = vals
-			addErr = acc.add(sub, vals)
-			return addErr == nil
-		})
+		if !empty {
+			err = runJoin(env.tx, fp, sub, func(vals []any) bool {
+				sub.row = vals
+				addErr = acc.add(sub, vals)
+				return addErr == nil
+			})
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1372,25 +1357,27 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 		seen := map[string]bool{}
 		var vals []any
 		var evalErr error
-		err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
-			rowEnv := *sub
-			rowEnv.row = rowVals
-			var v any
-			if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
-				return false
-			}
-			kb, e := tuple.Encode(v)
-			if e != nil {
-				evalErr = serr.Wrap(e, "op", "encode row for dedup")
-				return false
-			}
-			if seen[string(kb)] {
-				return true
-			}
-			seen[string(kb)] = true
-			vals = append(vals, v)
-			return int64(len(vals)) < satAdd(sel.Offset, 2)
-		})
+		if !empty {
+			err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
+				rowEnv := *sub
+				rowEnv.row = rowVals
+				var v any
+				if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
+					return false
+				}
+				kb, e := tuple.Encode(v)
+				if e != nil {
+					evalErr = serr.Wrap(e, "op", "encode row for dedup")
+					return false
+				}
+				if seen[string(kb)] {
+					return true
+				}
+				seen[string(kb)] = true
+				vals = append(vals, v)
+				return int64(len(vals)) < satAdd(sel.Offset, 2)
+			})
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1420,23 +1407,25 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 	skip, take := sel.Offset, sel.Limit
 	count := int64(0)
 	var evalErr error
-	err = runJoin(env.tx, fp, sub, func(vals []any) bool {
-		if skip > 0 {
-			skip--
-			return true
-		}
-		if take >= 0 && count >= take {
-			return false
-		}
-		count++
-		if count > 1 {
-			return false
-		}
-		rowEnv := *sub
-		rowEnv.row = vals
-		out, evalErr = evalEx(&rowEnv, itemEx)
-		return evalErr == nil
-	})
+	if !empty {
+		err = runJoin(env.tx, fp, sub, func(vals []any) bool {
+			if skip > 0 {
+				skip--
+				return true
+			}
+			if take >= 0 && count >= take {
+				return false
+			}
+			count++
+			if count > 1 {
+				return false
+			}
+			rowEnv := *sub
+			rowEnv.row = vals
+			out, evalErr = evalEx(&rowEnv, itemEx)
+			return evalErr == nil
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1481,17 +1470,7 @@ func runArraySub(env *exEnv, sel *Select) (any, error) {
 	if it.Agg != AggNone || sel.GroupBy != nil || sel.Having != nil || len(sel.Union) > 0 {
 		return nil, serr.New("this ARRAY(SELECT ...) shape is not supported")
 	}
-	lk := env.d.lookup(env.tx.Table)
-	sc, err := buildScope(lk, sel.From)
-	if err != nil {
-		return nil, err
-	}
-	from := make([]FromItem, len(sel.From))
-	copy(from, sel.From)
-	for k := range from {
-		from[k].On = decorrelate(from[k].On, sc.prefix(k+1))
-	}
-	fp, err := prepareFrom(lk, from, decorrelate(sel.Where, sc))
+	fp, empty, err := prepareSubFrom(env, sel)
 	if err != nil {
 		return nil, err
 	}
@@ -1499,16 +1478,18 @@ func runArraySub(env *exEnv, sel *Select) (any, error) {
 	sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
 	var vals []any
 	var evalErr error
-	err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
-		rowEnv := *sub
-		rowEnv.row = rowVals
-		var v any
-		if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
-			return false
-		}
-		vals = append(vals, v)
-		return true
-	})
+	if !empty {
+		err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
+			rowEnv := *sub
+			rowEnv.row = rowVals
+			var v any
+			if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
+				return false
+			}
+			vals = append(vals, v)
+			return true
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1554,34 +1535,28 @@ func runExistsSub(env *exEnv, sel *Select) (any, error) {
 	if len(sel.Union) > 0 || sel.GroupBy != nil || sel.Having != nil {
 		return nil, serr.New("this EXISTS (SELECT ...) shape is not supported")
 	}
-	lk := env.d.lookup(env.tx.Table)
-	sc, err := buildScope(lk, sel.From)
+	fp, empty, err := prepareSubFrom(env, sel)
 	if err != nil {
 		return nil, err
 	}
-	from := make([]FromItem, len(sel.From))
-	copy(from, sel.From)
-	for k := range from {
-		from[k].On = decorrelate(from[k].On, sc.prefix(k+1))
-	}
-	fp, err := prepareFrom(lk, from, decorrelate(sel.Where, sc))
-	if err != nil {
-		return nil, err
-	}
-	sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
 	found := false
-	err = runJoin(env.tx, fp, sub, func([]any) bool {
-		found = true
-		return false
-	})
-	if err != nil {
-		return nil, err
+	if !empty {
+		sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
+		err = runJoin(env.tx, fp, sub, func([]any) bool {
+			found = true
+			return false
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	return found, nil
 }
 
 // decorrelate rewrites the predicates of a subquery condition that do
-// not resolve in the subquery's own scope into Cond leaves.
+// not resolve in the subquery's own scope into Cond leaves. WHERE
+// clauses go through decorrelateCollect (corrsub.go), which also
+// extracts pushable correlated conjuncts as scan-bound templates.
 func decorrelate(e BoolExpr, sc *scope) BoolExpr {
 	switch n := e.(type) {
 	case nil:

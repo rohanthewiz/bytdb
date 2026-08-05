@@ -233,11 +233,15 @@ bytes, 64 hex chars, or base64 of 32).
 - **INSERT VALUES entries are full expressions** (`nextval('s')`
   works) but column references don't resolve there.
 - `now()` is statement-frozen, not transaction-frozen as in Postgres.
-- **Correlated subqueries run per outer row** with their correlated
-  predicate as a post-scan filter (no index pushdown) — fine for small
-  outer sets, quadratic for large ones. Rewrite as a JOIN (index
-  nested-loop or hash join) when the outer side is big. Uncorrelated
-  subqueries are cheap (evaluated once, see above).
+- **Correlated subqueries run per outer row**, but a correlated
+  conjunct of the form `inner_col op outer_ref` (`=`, `<`, `<=`, `>`,
+  `>=`, at the WHERE's top AND level) pushes into the inner scan's
+  index like a join predicate — an indexed `WHERE t.x = outer.y` is a
+  point lookup per outer row, not a full scan. Shapes that can't push
+  (the conjunct under OR/NOT, function-wrapped columns, correlated ON
+  clauses) still full-scan per outer row — rewrite those as a JOIN
+  when the outer side is big. Uncorrelated subqueries are cheap
+  (evaluated once, see above).
 - Sequence/identity allocation is **transactional in the default mode**
   (a rollback reuses the value) and gap-tolerant Postgres-style under
   `WithConcurrentWrites` (a rollback burns it).

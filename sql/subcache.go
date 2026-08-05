@@ -36,10 +36,15 @@ type subMemo struct {
 	// corr memoizes the static correlation verdict per node, so a
 	// correlated subquery pays for the AST walk once, not per row.
 	corr map[*Select]bool
+	// plans holds correlated subqueries' prepared FROMs (scope, join
+	// steps, pushdown templates) so re-invocation per outer row binds
+	// values and rebinds scan bounds instead of re-planning from
+	// scratch; see corrsub.go.
+	plans map[*Select]*subPrep
 }
 
 func newSubMemo() *subMemo {
-	return &subMemo{vals: map[*Select]any{}, corr: map[*Select]bool{}}
+	return &subMemo{vals: map[*Select]any{}, corr: map[*Select]bool{}, plans: map[*Select]*subPrep{}}
 }
 
 // The four subquery evaluators: memoize when a memo is present and the
