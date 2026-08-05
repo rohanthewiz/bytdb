@@ -537,7 +537,8 @@ func TestOCCSeqReadOnlyGuard(t *testing.T) {
 // A concurrent mix: writers hammer identity inserts while another
 // goroutine truncates with restart. Nothing may violate PK uniqueness
 // at any point, whatever the interleaving — inserts may lose to the
-// truncate's range claim (ErrTxConflict) and retry.
+// truncate's range claim, or draw a value the restarted counter
+// re-issues to someone else; both surface as ErrTxConflict and retry.
 func TestOCCTruncateInsertRace(t *testing.T) {
 	e := openOCCEngine(t, filepath.Join(t.TempDir(), "test.db"))
 	defer e.Close()

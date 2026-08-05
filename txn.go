@@ -427,9 +427,11 @@ func (t *Txn) Truncate(table string, restartIdentity bool) error {
 			// keep counting past the restart. Deferred to commit: an
 			// aborted truncate must not disturb them. (A concurrent
 			// insert that draws between our commit and the flush keeps
-			// its high value — it raced the truncate and lost nothing
-			// but gaplessness; the primary key check still guards
-			// against collisions either way.)
+			// its stale value — it raced the truncate and lost nothing
+			// but gaplessness. If the restarted counter later re-issues
+			// that value, the loser's uniqueness probe catches it and
+			// insertRow reports btypedb.ErrTxConflict — see drawnRaced —
+			// so nothing commits twice and the loser just retries.)
 			t.dirtySeqPrefixes = append(t.dirtySeqPrefixes, string(idPrefix))
 		}
 	}

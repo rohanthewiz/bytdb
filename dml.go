@@ -94,7 +94,7 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 // serialized mode, roll back with the transaction anyway if it aborts
 // (in concurrent-writes mode they are engine-level and always stand).
 func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]any, error) {
-	vals, err := fillIdentity(e, tx, desc, vals)
+	vals, drawn, err := fillIdentity(e, tx, desc, vals)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +116,13 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 	// write-write validation already catches any concurrent writer of
 	// it — marking would only bloat bulk loads' read sets.
 	if tx.Contains(key) {
+		// An occupant under a key the engine itself drew is a lost race
+		// with concurrent counter movement, not bad caller data — report
+		// it as the retryable conflict it is (see drawnRaced).
+		if drawnRaced(e, desc.PKCols, drawn) {
+			return nil, serr.Wrap(btypedb.ErrTxConflict,
+				"reason", "identity draw raced a concurrent counter reset", "table", desc.Name)
+		}
 		return nil, serr.New("duplicate primary key", "table", desc.Name)
 	}
 	type entry struct {
@@ -129,6 +136,14 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 			return nil, err
 		}
 		if enforced && tx.Contains(ek) {
+			// Same reclassification as the primary-key probe above: a
+			// unique index over an identity column collides the same way
+			// when its draw races a counter reset.
+			if drawnRaced(e, desc.Indexes[i].Cols, drawn) {
+				return nil, serr.Wrap(btypedb.ErrTxConflict,
+					"reason", "identity draw raced a concurrent counter reset",
+					"table", desc.Name, "index", desc.Indexes[i].Name)
+			}
 			return nil, serr.New("unique index violation", "table", desc.Name, "index", desc.Indexes[i].Name)
 		}
 		entries[i] = entry{ek, ev}
