@@ -41,7 +41,7 @@ flowchart TD
 
 ## Why it exists
 
-- **Embedded first.** Point reads run in ~4 µs because there is no network, no
+- **Embedded first.** Point reads run in ~5 µs because there is no network, no
   serialization boundary, and no buffer pool — the working set lives in memory
   as copy-on-write B-trees, durably backed by a write-ahead log.
 - **One file, real durability.** Every commit is a CRC-framed, atomically-replayed

@@ -9,7 +9,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/rohanthewiz/btypedb v0.7.0
-	github.com/rohanthewiz/bytdb v0.7.0
+	github.com/rohanthewiz/bytdb v0.8.0
 	github.com/rohanthewiz/bytdb/pgwire v0.0.0
 	go.etcd.io/bbolt v1.5.0
 	modernc.org/sqlite v1.55.0

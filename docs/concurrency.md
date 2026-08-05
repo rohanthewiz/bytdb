@@ -138,14 +138,14 @@ to a brief exclusive stall that cannot lose. Two consequences:
 
 Stay with the default when writes are occasional or naturally serial: it is
 simpler, gapless, and already serializable. Reach for `WithConcurrentWrites`
-when independent writers contend — the benchmarks (re-run 2026-07-31, Apple
-M3, 8 writers) measure ~1.9–2.4× on a heavy SQL transaction of 400 reads
-plus an identity insert (snapshot isolation 61µs/txn, serializable 79µs,
-single-writer 146µs), ~2–4× at the storage layer for read-dominated
-transactions with contended random writes (bimodal run to run as conflicts
-retry), and parity on single-row autocommit inserts — while OCC's
+when independent writers contend — the benchmarks (re-run 2026-08-05, Apple
+M1 Pro, 8 writers) measure ~1.9–2.5× on a heavy SQL transaction of 400 reads
+plus an identity insert (snapshot isolation 79µs/txn, serializable 101µs,
+single-writer 195µs), ~5× at the storage layer for read-dominated
+transactions with contended random writes (conflict-dependent run to run
+as retries land), and parity on single-row autocommit inserts — while OCC's
 per-commit overhead can lose to the writer lock outright on light
-lock-free workloads (btypedb's 20-read bench: 26.0µs vs 18.3µs). The
+lock-free workloads (btypedb's 20-read bench: 30.4µs vs 24.6µs). The
 cross-database comparison in the README's Concurrent writes section is
 reproducible with `bench/head2head.sh`. Hot single rows are the worst
 case for optimism:

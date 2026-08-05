@@ -2,7 +2,7 @@
 
 How does bytdb compare to an in-memory PostgreSQL, DuckDB, and Redis? The
 short version: **for point operations, embedded bytdb is the fastest thing
-here by an order of magnitude — because there is no wire.** Over its own
+here by a wide margin — because there is no wire.** Over its own
 Postgres protocol it is competitive with Redis and several times faster than
 Dockerized Postgres. For analytical scans, DuckDB is in a different league,
 by design.
@@ -19,23 +19,23 @@ Latency per operation (lower is better), single client, sequential:
 
 | Target | insert (durable single row) | insert (batched ×1000) | point read | point update | full-scan aggregate (100k rows) |
 |---|---:|---:|---:|---:|---:|
-| **bytdb** embedded, `SyncAlways` | 4,221.6 µs | 6.5 µs/row | **4.2 µs** | 4,571.4 µs | 31.2 ms |
-| **bytdb** embedded, `SyncEverySecond` | **16.8 µs** | **1.9 µs/row** | **4.0 µs** | **22.8 µs** | 30.6 ms |
-| **bytdb** over pgwire (TCP loopback) | 50.9 µs | 2.0 µs/row | 35.9 µs | 60.4 µs | 31.0 ms |
-| **PostgreSQL 16** (Docker, data dir on tmpfs) | 173.8 µs | 3.4 µs/row | 199.6 µs | 212.3 µs | 4.8 ms |
-| **DuckDB** (in-memory, Go driver) | 161.2 µs | 6.3 µs/row | 76.2 µs | 118.0 µs | **0.39 ms** |
-| **Redis 7** (local server, RDB persistence) | 31.2 µs | 1.2 µs/row | 30.4 µs | 29.1 µs | n/a — no SQL |
+| **bytdb** embedded, `SyncAlways` | 3,938.8 µs | 6.6 µs/row | **5.6 µs** | 3,988.3 µs | 26.7 ms |
+| **bytdb** embedded, `SyncEverySecond` | **18.8 µs** | **2.0 µs/row** | **5.2 µs** | **23.6 µs** | 26.4 ms |
+| **bytdb** over pgwire (TCP loopback) | 57.8 µs | 2.1 µs/row | 39.6 µs | 59.0 µs | 26.8 ms |
+| **PostgreSQL 16** (Docker, data dir on tmpfs) | 186.2 µs | 3.4 µs/row | 182.3 µs | 186.7 µs | 4.4 ms |
+| **DuckDB** (in-memory, Go driver) | 153.4 µs | 10.4 µs/row | 98.4 µs | 143.1 µs | **0.34 ms** |
+| **Redis 7** (local server, RDB persistence) | 31.8 µs | 1.2 µs/row | 28.9 µs | 29.0 µs | n/a — no SQL |
 
 Same data as throughput, for the ops/sec-minded:
 
 | Target | durable single inserts | batched insert rows/s | point reads |
 |---|---:|---:|---:|
-| bytdb embedded, `SyncAlways` | 237/s | 154k/s | 238k/s |
-| bytdb embedded, `SyncEverySecond` | 59.5k/s | 526k/s | 250k/s |
-| bytdb over pgwire | 19.6k/s | 500k/s | 27.9k/s |
-| PostgreSQL 16 (tmpfs) | 5.8k/s | 294k/s | 5.0k/s |
-| DuckDB (in-memory) | 6.2k/s | 159k/s | 13.1k/s |
-| Redis 7 | 32.1k/s | 833k/s | 32.9k/s |
+| bytdb embedded, `SyncAlways` | 254/s | 152k/s | 179k/s |
+| bytdb embedded, `SyncEverySecond` | 53.2k/s | 500k/s | 192k/s |
+| bytdb over pgwire | 17.3k/s | 476k/s | 25.3k/s |
+| PostgreSQL 16 (tmpfs) | 5.4k/s | 294k/s | 5.5k/s |
+| DuckDB (in-memory) | 6.5k/s | 96k/s | 10.2k/s |
+| Redis 7 | 31.4k/s | 833k/s | 34.6k/s |
 
 ## Read the durability column first
 
@@ -51,33 +51,33 @@ single-insert column:
 | Redis (default RDB) | Everything since the last RDB snapshot is gone (minutes). |
 
 So the one configuration in this lineup that survives a power cut is bytdb
-`SyncAlways` — at 4.2 ms per solo commit on a Mac (Apple's `F_FULLFSYNC`
+`SyncAlways` — at 3.9 ms per solo commit on a Mac (Apple's `F_FULLFSYNC`
 pushes through the drive cache; Postgres doing genuinely durable commits on
 this hardware would pay the same price). Batching amortizes it: 1,000-row
-transactions bring `SyncAlways` down to 6.5 µs/row. And group commit means
-concurrent writers share one fsync — the 4.2 ms is a *solo* worst case.
+transactions bring `SyncAlways` down to 6.6 µs/row. And group commit means
+concurrent writers share one fsync — the 3.9 ms is a *solo* worst case.
 
 ## What the numbers say
 
-**Point reads: embedded beats every server, ~7× faster than Redis.**
-4 µs vs 30 µs is not bytdb out-engineering Redis — it is the absence of a
+**Point reads: embedded beats every server, ~5× faster than Redis.**
+5 µs vs 29 µs is not bytdb out-engineering Redis — it is the absence of a
 network round-trip, protocol encode/decode, and syscalls. That is the embedded
 value proposition in one number. The same query through bytdb's own wire
-protocol costs 36 µs — right in Redis territory, ~5× faster than the
+protocol costs 40 µs — right in Redis territory, ~5× faster than the
 Dockerized Postgres.
 
 **Writes without per-commit fsync: bytdb leads.** At `SyncEverySecond`
 (a stronger guarantee than Redis's default), embedded single-row inserts run
-at 17 µs vs Redis's 31 µs and tmpfs-Postgres's 174 µs.
+at 19 µs vs Redis's 32 µs and tmpfs-Postgres's 186 µs.
 
-**Analytical scans: DuckDB wins by 80×, as it should.** `SELECT count(*),
-sum(amount)` over 100k rows: DuckDB 0.39 ms (columnar, vectorized), Postgres
-4.8 ms, bytdb 31 ms. bytdb executes row-at-a-time over a B-tree with
+**Analytical scans: DuckDB wins by ~80×, as it should.** `SELECT count(*),
+sum(amount)` over 100k rows: DuckDB 0.34 ms (columnar, vectorized), Postgres
+4.4 ms, bytdb 26 ms. bytdb executes row-at-a-time over a B-tree with
 interpreted expressions and no parallelism. If your workload is scanning
 millions of rows to aggregate, use DuckDB — or feed it from bytdb.
 
-**The wire tax is visible and honest.** Embedded 4 µs → pgwire 36 µs for the
-identical query on the identical engine: ~30 µs is what TCP loopback plus
+**The wire tax is visible and honest.** Embedded 5 µs → pgwire 40 µs for the
+identical query on the identical engine: ~35 µs is what TCP loopback plus
 Postgres protocol framing costs anyone.
 
 ## Methodology
@@ -94,7 +94,7 @@ Postgres protocol framing costs anyone.
   same payload as `SET k:<id> "<name>|<amount>"`.
 - **Environment**: Apple M1 Pro, 16 GB, macOS 26.5.1, Go 1.26.1. PostgreSQL
   16.14 (`postgres:16-alpine`, Docker VM, `PGDATA` on tmpfs, stock config).
-  DuckDB via `go-duckdb` v2.3.5. Redis 7.0.0 local, `--save '' --appendonly no`.
+  DuckDB via `go-duckdb` v2.4.3. Redis 7.0.0 local, `--save '' --appendonly no`.
   bytdb WAL on the local SSD (APFS).
 
 ```mermaid

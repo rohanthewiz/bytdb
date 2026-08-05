@@ -45,25 +45,25 @@ speaks the Postgres dialect your tools already know.
 ## Benchmarks
 
 Head-to-head against other embedded (and near-embedded) stores: same
-machine, same date (2026-07-31, Apple M3), durability off everywhere —
+machine, same date (2026-08-05, Apple M1 Pro), durability off everywhere —
 so this compares transaction machinery, not disks. SQLite and DuckDB
 run through `database/sql` with prepared statements, Redis over
 localhost TCP with persistence off; medians of 3, 8 parallel writers.
 
 | engine                              | single-row insert | 400 point reads + insert |
 |-------------------------------------|-------------------|--------------------------|
-| Badger (LSM, SSI txns)              | 2.7µs             | 134µs                    |
-| SQLite, mattn/cgo (WAL, sync OFF)   | 5.1µs             | 712µs                    |
-| SQLite, modernc pure-Go             | 5.9µs             | 1,600µs                  |
-| **bytdb OCC**                       | 11.1µs            | **49µs**                 |
-| **bytdb single-writer**             | 11.3µs            | 154µs                    |
-| BoltDB (NoSync)                     | 27.4µs            | 82µs                     |
-| Redis (localhost, no persistence)   | 36.8µs            | 145µs                    |
-| DuckDB (file, PK index)             | 56.5µs            | 8,368µs                  |
+| Badger (LSM, SSI txns)              | 4.2µs             | 146µs                    |
+| SQLite, mattn/cgo (WAL, sync OFF)   | 8.1µs             | 1,212µs                  |
+| SQLite, modernc pure-Go             | 11.7µs            | 2,118µs                  |
+| **bytdb single-writer**             | 14.3µs            | 189µs                    |
+| **bytdb OCC**                       | 14.7µs            | **51µs**                 |
+| Redis (localhost, no persistence)   | 21.9µs            | 222µs                    |
+| BoltDB (NoSync)                     | 36.7µs            | 106µs                    |
+| DuckDB (file, PK index)             | 97.9µs            | 10,015µs                 |
 
 Badger's batched commit pipeline owns cheap inserts; bytdb's OCC mode
 wins the read-heavy transaction shape outright — ahead of Bolt's
-zero-copy mmap reads and Badger's SSI, and 14× ahead of the fastest
+zero-copy mmap reads and Badger's SSI, and 24× ahead of the fastest
 SQLite. (SQLite serializes writers while paying per-statement driver
 overhead 400 times under the lock; Redis's heavy row is one MULTI/EXEC
 pipeline round trip — atomic, but not an isolated read-then-write
@@ -90,15 +90,16 @@ And bytdb against itself — what opting into concurrent writes buys
 
 | workload (per txn)                        | single-writer | OCC snapshot isolation | OCC serializable |
 |-------------------------------------------|---------------|------------------------|------------------|
-| single-row identity insert                | 11.4µs        | 11.0µs (1.0×)          | —                |
-| 400 reads + identity insert (SQL engine)  | 146µs         | 61µs (**2.4×**)        | 79µs (1.9×)      |
-| 2000 reads + 5 writes (btypedb storage)   | 500µs         | 231µs (**2.2×**)¹      | —                |
-| 20 reads + 5 writes (btypedb storage)     | 18.3µs        | 26.0µs (0.7×)          | —                |
+| single-row identity insert                | 14.6µs        | 14.8µs (1.0×)          | —                |
+| 400 reads + identity insert (SQL engine)  | 195µs         | 79µs (**2.5×**)        | 101µs (1.9×)     |
+| 2000 reads + 5 writes (btypedb storage)   | 634µs         | 125µs (**5.1×**)¹      | —                |
+| 20 reads + 5 writes (btypedb storage)     | 24.6µs        | 30.4µs (0.8×)          | —                |
 
 ¹ This row writes 5 *random* keys per transaction over a 100k keyspace,
-so real conflicts and retries occur; it is bimodal run to run
-(126–268µs observed — up to ~4× on a good run, ~2.2× at the median).
-The other rows write fresh keys and are stable within a few percent.
+so real conflicts and retries occur and the OCC ratio is
+conflict-dependent run to run (all three samples landed 124–131µs
+here; conflict-heavier sessions have measured as low as ~2×). The
+other rows write fresh keys and are stable within a few percent.
 
 Long transactions are where OCC pays: read work that used to sit under
 the writer lock overlaps instead. Short transactions bound the win,
