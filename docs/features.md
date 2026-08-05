@@ -198,8 +198,8 @@ DROP SEQUENCE IF EXISTS order_ids;
 - Options: `AS smallint|integer|bigint` (bounds the declarable range),
   `INCREMENT [BY]` (negative descends), `MINVALUE`/`MAXVALUE`/`NO
   MINVALUE`/`NO MAXVALUE`, `START [WITH]`, `CYCLE`/`NO CYCLE`, `CACHE n`
-  (stored and reported; allocation behaves as `CACHE 1` — the engine has a
-  single writer, so batching would only manufacture gaps), `IF [NOT]
+  (stored and reported; allocation behaves as `CACHE 1` — under the default
+  single writer, batching would only manufacture gaps), `IF [NOT]
   EXISTS` with Postgres' skip notices. Exhaustion, bounds, and option
   validation carry Postgres' wording (`nextval: reached maximum value of
   sequence "s" (20)`).
@@ -209,9 +209,10 @@ DROP SEQUENCE IF EXISTS order_ids;
   relation, so `\ds` and driver probes work.
 - `nextval` works directly in an INSERT — `VALUES (nextval('order_ids'),
   ...)` — since VALUES entries are full expressions. Allocation is
-  transactional — see
+  transactional in the default single-writer mode, and non-transactional
+  (gap-tolerant, as in Postgres) under `WithConcurrentWrites` — see
   [Considerations & Gotchas](gotchas.md#sql-that-is-deliberately-not-there)
-  for the two deliberate divergences from Postgres.
+  for the deliberate divergences from Postgres.
 
 ## RETURNING
 
@@ -663,24 +664,30 @@ Postgres's `unrecognized configuration parameter` error, and everything but
 
 ## The Go APIs
 
-Three levels, all usable in one program:
+Four levels, all usable in one program:
 
 ```go
-// 1. SQL (most apps): bsql.New(engine).Exec / Prepare / Session
-// 2. Engine: typed relational operations without SQL
+// 1. database/sql: the stdlib driver, for code written against *sql.DB
+//    (sqlx, ORMs, migration tools) — see The database/sql Driver page
+import _ "github.com/rohanthewiz/bytdb/stdlib"
+db, _ := sql.Open("bytdb", "app.bytdb")
+
+// 2. SQL (most apps): bsql.New(engine).Exec / Prepare / Session
+// 3. Engine: typed relational operations without SQL
 e.CreateTable("users",
     []bytdb.Column{{Name: "id", Type: bytdb.TInt}, {Name: "name", Type: bytdb.TString}},
     "id")
 e.Insert("users", int64(1), "ada")
 row, found, _ := e.Get("users", int64(1))
 
-// engine transactions: snapshot reads, single writer
+// engine transactions: snapshot reads; one writer by default,
+// optimistic concurrency under WithConcurrentWrites (see Concurrency & Isolation)
 e.WriteTxn(func(tx *bytdb.Txn) error {
     tx.Insert("users", int64(2), "bob")
     return tx.Update("users", []any{int64(1)}, map[string]any{"name": "ada l."})
 })
 
-// 3. btypedb directly: ordered typed KV with TTL
+// 4. btypedb directly: ordered typed KV with TTL
 kv, _ := btypedb.Open("cache.db", btypedb.StringCodec, btypedb.BytesCodec)
 kv.SetTTL("session:abc", token, 30*time.Minute) // expires, survives restart
 for k, v := range kv.Ascend("session:") { ... } // ordered iteration
@@ -705,7 +712,8 @@ Tested against real clients, not just protocol specs:
   (`information_schema.tables`), SQLAlchemy's `select pg_catalog.version()`,
   ActiveRecord/SQLAlchemy column introspection over
   `pg_attribute`/`pg_class`/`pg_type` (`pgwire/orm_test.go`)
-- **`database/sql`** via the pgx stdlib adapter
+- **`database/sql`** via the pgx stdlib adapter — or, without a server at all,
+  through the embedded [`bytdb/stdlib` driver](stdlib.md)
 
 Errors carry Postgres SQLSTATEs (42P01 undefined_table, 23505
 unique_violation, 23503 foreign_key_violation, 25P02

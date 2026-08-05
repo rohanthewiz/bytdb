@@ -48,6 +48,7 @@ nav:
   - Architecture: architecture.md
   - Features & Examples: features.md
   - Concurrency & Isolation: concurrency.md
+  - The database/sql Driver: stdlib.md
   - Replication & Backup: replication.md
   - Encryption & Security: security.md
   - Considerations & Gotchas: gotchas.md

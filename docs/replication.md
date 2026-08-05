@@ -91,7 +91,7 @@ on `bytdb.Engine`:
   blocked, because the bytes being copied are immutable.
 
 The `epoch` is bumped in exactly one place: after compaction's atomic
-rename swaps in the rewritten file (`btypedb/compact.go:107`). Epochs restart
+rename swaps in the rewritten file (`btypedb/compact.go:93`). Epochs restart
 at 0 on `Open`, so a process restart looks like a compaction to the
 replicator — deliberately, since crash recovery may truncate a torn tail and
 post-restart appends could diverge from previously shipped bytes.

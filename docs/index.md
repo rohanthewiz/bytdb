@@ -52,6 +52,10 @@ flowchart TD
   CTEs, views, foreign keys with `ON DELETE CASCADE`, transactions and
   savepoints, `$1` placeholders, Postgres-matching error wording and SQLSTATEs,
   and enough of `pg_catalog` for `psql \d` and ORM introspection to work.
+- **Two write modes.** The default single writer makes every transaction
+  serializable for free; `WithConcurrentWrites()` opts into optimistic
+  concurrency — parallel writers over COW snapshots, with Postgres's
+  SQLSTATE 40001 conflict-and-retry semantics.
 - **Operable.** Asynchronous replication to any S3-compatible store with
   point-in-time restore, streaming online backup, and opt-in WAL encryption at
   rest that flows through to replicas and backups automatically.
@@ -80,6 +84,21 @@ for _, row := range res.Rows {
 }
 ```
 
+### Through `database/sql`
+
+```go
+import (
+    "database/sql"
+    _ "github.com/rohanthewiz/bytdb/stdlib"
+)
+
+db, err := sql.Open("bytdb", "app.bytdb?concurrent_writes=true")
+```
+
+Same embedded engine, behind the interface sqlx, ORMs, and migration tools
+already speak — no server, no socket. See
+[The database/sql Driver](stdlib.md).
+
 ### As a server
 
 ```sh
@@ -93,6 +112,8 @@ psql "postgres://any@127.0.0.1:5433/any?sslmode=disable"
 |---|---|
 | [Architecture](architecture.md) | The keyspace, tuple encoding, WAL and recovery, transactions and COW snapshots, indexes, foreign keys, the SQL pipeline, compaction, the wire server |
 | [Features & Examples](features.md) | The full SQL surface with verified examples, the Go APIs, TTL and KV-level features |
+| [Concurrency & Isolation](concurrency.md) | The two write modes: single-writer default vs `WithConcurrentWrites()` OCC — isolation levels, 40001 conflicts, who retries what |
+| [The database/sql Driver](stdlib.md) | The embedded `stdlib` driver: DSN options, engine sharing, transactions and conflict retries, type mapping |
 | [Replication & Backup](replication.md) | Litestream-style log shipping to S3, generations, point-in-time restore, online backup |
 | [Encryption & Security](security.md) | WAL encryption at rest, SCRAM authentication, TLS, operational hardening |
 | [Considerations & Gotchas](gotchas.md) | What is deliberately not supported, concurrency model, durability nuances, sizing |
@@ -106,6 +127,7 @@ psql "postgres://any@127.0.0.1:5433/any?sslmode=disable"
 | `github.com/rohanthewiz/bytdb` | Relational engine: catalog, DDL, DML, indexes, foreign keys, transactions |
 | `bytdb/tuple` | Order-preserving tuple encoding for keys |
 | `bytdb/sql` | Lexer, parser, planner, executor, sessions, system catalog |
+| `bytdb/stdlib` | `database/sql` driver for the embedded engine (driver name `bytdb`) |
 | `bytdb/pgwire` | PostgreSQL wire-protocol server (`cmd/bytdbd`) |
 | `bytdb/replicate` | Asynchronous replication to S3-compatible object stores |
 | `github.com/rohanthewiz/btypedb` | Storage engine: ordered typed KV, WAL (optionally encrypted), snapshots, TTL, compaction |

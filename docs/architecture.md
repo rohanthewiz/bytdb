@@ -4,8 +4,10 @@ bytdb is four layers, each of which is useful on its own. The relational layer
 (`bytdb`) turns tables into ordered key ranges; the SQL layer (`bytdb/sql`)
 turns statements into engine calls; the wire layer (`bytdb/pgwire`) turns
 Postgres clients into SQL-layer sessions; and everything bottoms out in
-`btypedb`, an ordered key-value store with a write-ahead log. A fifth,
-optional piece — `bytdb/replicate` — tails the log to an object store
+`btypedb`, an ordered key-value store with a write-ahead log. Two optional
+pieces ride alongside: `bytdb/stdlib`, a `database/sql` driver that serves
+the same SQL-layer sessions in-process ([its own page](stdlib.md)), and
+`bytdb/replicate`, which tails the log to an object store
 ([its own page](replication.md)).
 
 ```mermaid
@@ -19,7 +21,7 @@ flowchart LR
         vt[CTEs · derived tables ·<br/>views — virtual tables]
     end
     subgraph engine ["bytdb engine"]
-        ddl[DDL] & dml[DML] & idx[secondary indexes] & fk[foreign keys] --> txn[Txn: snapshot reads,<br/>single writer]
+        ddl[DDL] & dml[DML] & idx[secondary indexes] & fk[foreign keys] --> txn[Txn: snapshot reads;<br/>single writer, or OCC under<br/>WithConcurrentWrites]
     end
     subgraph kvstore ["btypedb"]
         cow[COW B-trees<br/>in memory] <--> wal[WAL — single file,<br/>optionally encrypted]

@@ -13,13 +13,23 @@ copy of hot tree nodes during writes/snapshots.
 
 ## Concurrency model
 
-- **One writer at a time.** A writable transaction holds the engine-wide writer
-  lock from `BEGIN` to `COMMIT`/`ROLLBACK`; other writers queue behind it.
-  Readers never wait — they run on lock-free snapshots.
-- **Keep write transactions short.** A long-running write block stalls every
-  other writer in the process (and every other wire connection) — which is
-  why the wire server ships with a 5-minute idle-in-transaction timeout *on
-  by default*.
+- **One writer at a time — by default.** Out of the box, a writable transaction
+  holds the engine-wide writer lock from `BEGIN` to `COMMIT`/`ROLLBACK`; other
+  writers queue behind it. Readers never wait — they run on lock-free
+  snapshots. The upside of the queue: every transaction is serializable for
+  free.
+- **Concurrent writers are opt-in.** Opening with
+  `bytdb.WithConcurrentWrites()` switches the engine to optimistic
+  concurrency: writers build transactions in parallel against COW snapshots
+  and validate at commit, and a losing commit surfaces as
+  `bytdb.ErrTxConflict` (SQLSTATE **40001** on the wire). Isolation levels,
+  retry responsibilities, and sequence semantics all change with it — read
+  [Concurrency & Isolation](concurrency.md) before turning it on.
+- **Keep write transactions short.** In the default mode a long-running write
+  block stalls every other writer in the process (and every other wire
+  connection) — which is why the wire server ships with a 5-minute
+  idle-in-transaction timeout *on by default*. Under concurrent writes a
+  long block doesn't stall anyone, but it widens its own conflict window.
 - **Reentrancy trap (guarded):** calling a one-shot write, DDL, or a second
   writable transaction *from the goroutine that already holds the open write
   transaction* would deadlock the engine forever, because the writer lock is
@@ -96,10 +106,13 @@ Deliberate Postgres *divergences* to know about:
 - `DISTINCT` inside a window aggregate (`COUNT(DISTINCT x) OVER (...)`)
   **works** here — Postgres rejects it ("DISTINCT is not implemented for
   window functions"); DuckDB supports it the same way.
-- Sequence allocation is **transactional**: a `nextval` in a rolled-back
-  transaction is not consumed, so the value is handed out again later.
-  Postgres burns it. Code that relies on rolled-back values staying burned
-  (rare, but it exists) will see reuse.
+- Sequence allocation is **transactional** in the default single-writer mode:
+  a `nextval` in a rolled-back transaction is not consumed, so the value is
+  handed out again later. Postgres burns it. Code that relies on rolled-back
+  values staying burned (rare, but it exists) will see reuse. Under
+  `WithConcurrentWrites` allocation switches to Postgres's non-transactional
+  behavior — a rollback leaves a gap
+  ([Concurrency & Isolation](concurrency.md)).
 - Identity columns use **MySQL's collision rule**: an explicit insert bumps
   the counter past itself, so draws after a restore never collide.
 - `LIKE`'s `ESCAPE` accepts only the default backslash — any other escape
@@ -180,7 +193,9 @@ Easy to confuse:
   means a slow open. Compaction also rolls the replication generation — see
   [Replication & Backup](replication.md).
 - **One process per file.** There is no file locking for multi-process access;
-  the wire server is the intended way to share a database.
+  the wire server is the intended way to share a database across processes.
+  Within one process, sharing is free: every `*sql.DB` the
+  [`stdlib` driver](stdlib.md) opens on a path reuses the same engine.
 - **Online backup**: `Engine.Backup(destPath)` writes a consistent
   point-in-time copy without blocking readers or writers;
   `Engine.BackupTo(w)` streams the same bytes. Restoring is just `Open` on

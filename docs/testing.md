@@ -7,19 +7,20 @@ loss.
 
 ## Current coverage
 
-Measured with `go test -count=1 -cover ./...` (Go 1.26.1, 2026-07-30):
+Measured with `go test -count=1 -cover ./...` (Go 1.26.1, 2026-08-04):
 
 | Package | Coverage | What it is |
 |---|---:|---|
-| `bytdb` (engine) | **75.4%** | Catalog, DDL, DML, indexes, foreign keys, transactions |
+| `bytdb` (engine) | **77.7%** | Catalog, DDL, DML, indexes, foreign keys, transactions, OCC |
 | `bytdb/sql` | **87.4%** | Lexer, parser, planner, executor, sessions, syscat |
 | `bytdb/tuple` | **97.3%** | Order-preserving key encoding |
-| `bytdb/pgwire` | **87.9%** | Wire protocol server, SCRAM auth, TLS |
+| `bytdb/stdlib` | **86.6%** | `database/sql` driver for the embedded engine |
+| `bytdb/pgwire` | **88.0%** | Wire protocol server, SCRAM auth, TLS |
 | `bytdb/replicate` | **80.4%** | Log shipping, generations, restore |
 | `bytdb/replicate/s3` | **89.4%** | Dependency-free SigV4 S3 client |
-| `btypedb` (storage) | **83.2%** | KV store, WAL, encryption, snapshots, TTL, compaction |
+| `btypedb` (storage) | **83.5%** | KV store, WAL, encryption, snapshots, TTL, compaction |
 
-Across the repositories: **561 test functions** and **11 fuzz targets**.
+Across the repositories: **655 test functions** and **11 fuzz targets**.
 (`pgwire/cmd/bytdbd` is a flag-parsing `main` and is intentionally untested.)
 
 ## The five tiers
