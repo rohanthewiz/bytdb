@@ -95,6 +95,27 @@ func FuzzExec(f *testing.F) {
 		`EXPLAIN SELECT * FROM t WHERE age = 1`,
 		`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT s1`,
 		`SELECT '' , -0.0, 9223372036854775807 + 1`,
+		// semantic-corner shapes, mirroring the tricky_test.go suite:
+		// name-resolution precedence, qualified ORDER BY under DISTINCT,
+		// set-op dedup, frame-default ties, three-valued shortcuts, and
+		// the int64 edges — so mutation starts from the boundaries where
+		// wrong-answer bugs have actually lived, not just crash surfaces.
+		`SELECT DISTINCT t.age FROM t ORDER BY t.age DESC`,
+		`SELECT DISTINCT a.age FROM t a ORDER BY a.age`,
+		`SELECT age AS id FROM t ORDER BY id, name`,
+		`SELECT e.age FROM t e ORDER BY t.age`,
+		`SELECT name, age FROM t ORDER BY 2 DESC, 1 ASC`,
+		`SELECT age, sum(age) OVER (ORDER BY name) FROM t`,
+		`SELECT rank() OVER (ORDER BY age), dense_rank() OVER (ORDER BY age DESC) FROM t`,
+		`SELECT count(*) FROM (SELECT name FROM t UNION ALL SELECT label FROM u) x`,
+		`SELECT 1 AS n UNION SELECT 2 ORDER BY n DESC`,
+		`SELECT NULL AND false, NULL OR true`,
+		`SELECT count(*) FROM t WHERE name = name`,
+		`SELECT count(*) FROM t HAVING count(*) > 100`,
+		`SELECT coalesce((SELECT age FROM t WHERE false), -1)`,
+		`SELECT name FROM t o WHERE age = (SELECT max(age) FROM t i WHERE i.name = o.name)`,
+		`SELECT count(*), count(u.label) FROM t LEFT JOIN u ON u.tid = t.id AND u.label = 'z'`,
+		`SELECT (-9223372036854775807 - 1) / -1, (-9223372036854775807 - 1) % -1`,
 		// malformed / hostile fragments (parse-error boundary)
 		``, `SELECT`, `SELECT * FROM`, `SELECT 1 +`, `SELECT $0`,
 	}
