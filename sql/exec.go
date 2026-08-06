@@ -1375,7 +1375,11 @@ func (d *DB) execUnion(s *Select) (*Result, error) {
 //
 // ORDER BY is therefore restricted to output columns and positions
 // (Postgres's rule, for the same reason: a sort key the projection
-// dropped would decide which duplicate survives, invisibly).
+// dropped would decide which duplicate survives, invisibly). A
+// qualified name (ORDER BY n.updated_at) is still fine when it
+// denotes a selected column — Postgres resolves it to the same
+// column reference — so those rewrite to positions up front rather
+// than being rejected for carrying a qualifier.
 func (d *DB) execSelectDistinct(s *Select) (*Result, error) {
 	core := *s
 	core.Distinct = false
@@ -1389,12 +1393,77 @@ func (d *DB) execSelectDistinct(s *Select) (*Result, error) {
 		return nil, err
 	}
 	notInList := "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
-	keys, err := outputSortKeys(s.OrderBy, res.Cols, notInList, notInList)
+	keys, err := outputSortKeys(resolveQualifiedOrder(s, res.Cols), res.Cols, notInList, notInList)
 	if err != nil {
 		return nil, err
 	}
 	res.Rows = sortLimitRows(rows, keys, s.Offset, s.Limit)
 	return res, nil
+}
+
+// resolveQualifiedOrder rewrites qualified ORDER BY columns (ORDER BY
+// n.updated_at) into select-list positions when the reference provably
+// denotes a selected column, leaving every other item untouched. Two
+// proofs are attempted, in order:
+//
+//  1. When select items map 1:1 onto output columns (no star
+//     expansion), a qualified name matches a plain-column item that is
+//     either the identical reference, or the same bare name in a
+//     query whose single FROM binding is the qualifier (a bare name
+//     can only have bound to that table).
+//  2. Otherwise (SELECT * / t.* shapes, where item info is absent or
+//     misaligned), the qualifier must be the query's single FROM
+//     binding, and the name matches output columns directly — safe
+//     because every output column then comes from that one table.
+//
+// Anything unproven passes through unchanged for outputSortKeys to
+// reject, keeping Postgres's error for genuinely unselected columns.
+// Multi-table star shapes (SELECT DISTINCT * FROM a, b ORDER BY a.x)
+// stay unresolved: without per-column provenance the qualifier cannot
+// be validated, so bytdb errs on the strict side there.
+func resolveQualifiedOrder(s *Select, cols []string) []OrderItem {
+	// Binding name of a sole FROM table: its alias when present,
+	// else the table name. "" disables the single-table shortcuts.
+	singleFrom := ""
+	if len(s.From) == 1 && s.From[0].FuncArgs == nil {
+		if singleFrom = s.From[0].Alias; singleFrom == "" {
+			singleFrom = s.From[0].Table
+		}
+	}
+	itemsAligned := !s.Star && len(s.Items) == len(cols)
+	order := slices.Clone(s.OrderBy)
+	for idx, o := range order {
+		if o.Ex != nil || o.Agg != AggNone || o.IsLit || o.Col.Table == "" {
+			continue
+		}
+		pos := -1
+		if itemsAligned {
+			for i, it := range s.Items {
+				if it.Ex != nil || it.IsLit || it.Star || it.Agg != AggNone {
+					continue
+				}
+				if it.Col == o.Col ||
+					(it.Col.Table == "" && it.Col.Name == o.Col.Name && o.Col.Table == singleFrom) {
+					pos = i
+					break
+				}
+			}
+		} else if o.Col.Table == singleFrom {
+			for i, c := range cols {
+				if c == o.Col.Name {
+					pos = i
+					break
+				}
+			}
+		}
+		if pos >= 0 {
+			order[idx] = OrderItem{
+				SelectItem: SelectItem{IsLit: true, Lit: int64(pos + 1)},
+				Desc:       o.Desc,
+			}
+		}
+	}
+	return order
 }
 
 // outputSortKeys resolves ORDER BY items against a materialized

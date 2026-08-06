@@ -135,7 +135,11 @@ func TestSelectDistinctErrors(t *testing.T) {
 	for _, q := range []string{
 		`select distinct dept from emp order by sal`,
 		`select distinct dept from emp order by sal + 1`,
-		`select distinct dept from emp order by emp.dept`,
+		// Qualified, but naming a column the projection dropped.
+		`select distinct dept from emp order by emp.sal`,
+		// The alias shadows nothing for a qualified reference: emp.dept
+		// means the real column, which is not selected.
+		`select distinct sal as dept from emp order by emp.dept`,
 	} {
 		if _, err := d.Exec(q); err == nil ||
 			!strings.Contains(err.Error(), "ORDER BY expressions must appear in select list") {
@@ -151,6 +155,55 @@ func TestSelectDistinctErrors(t *testing.T) {
 	if _, err := d.Exec(`select distinct on (dept) dept, sal from emp`); err == nil ||
 		!strings.Contains(err.Error(), "SELECT DISTINCT ON is not supported") {
 		t.Fatalf("distinct on: %v", err)
+	}
+}
+
+func TestSelectDistinctQualifiedOrder(t *testing.T) {
+	d := distinctDB(t)
+
+	// A qualified ORDER BY column is fine when it denotes a selected
+	// column — Postgres resolves n.col and a selected bare col to the
+	// same reference — whether the select item is qualified, bare, or
+	// the table sits behind an alias.
+	for _, q := range []string{
+		`select distinct emp.dept from emp order by emp.dept`,
+		`select distinct dept from emp order by emp.dept`,
+		`select distinct e.dept from emp e order by e.dept`,
+		`select distinct dept from emp e order by e.dept`,
+	} {
+		res := exec(t, d, q)
+		want := [][]any{{"eng"}, {"ops"}, {"sales"}, {nil}}
+		if !reflect.DeepEqual(res.Rows, want) {
+			t.Fatalf("%s: %v", q, res.Rows)
+		}
+	}
+
+	// DESC survives the rewrite to a select-list position.
+	res := exec(t, d, `select distinct e.sal from emp e order by e.sal desc`)
+	want := [][]any{{int64(300)}, {int64(200)}, {int64(100)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("qualified desc: %v", res.Rows)
+	}
+
+	// SELECT * over a single table: output columns all come from that
+	// table, so its qualifier resolves against output names.
+	res = exec(t, d, `select distinct * from emp order by emp.sal desc, emp.id`)
+	var ids []any
+	for _, r := range res.Rows {
+		ids = append(ids, r[0])
+	}
+	wantIDs := []any{int64(5), int64(2), int64(7), int64(1), int64(3), int64(4), int64(6)}
+	if !reflect.DeepEqual(ids, wantIDs) {
+		t.Fatalf("distinct * qualified order: %v", ids)
+	}
+
+	// Join: an exactly-matching qualified item resolves; the qualifier
+	// disambiguates between the two arms of the self join.
+	res = exec(t, d, `select distinct e.dept, m.sal from emp e join emp m on e.id = m.id
+		where e.dept is not null order by m.sal desc, e.dept`)
+	want = [][]any{{"sales", int64(300)}, {"eng", int64(200)}, {"eng", int64(100)}, {"ops", int64(100)}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("join qualified order: %v", res.Rows)
 	}
 }
 
