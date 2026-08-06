@@ -30,6 +30,11 @@ func FuzzTextArrayCanon(f *testing.F) {
 		``, `a,b`, `{a`, `a}`, `{a,}`, `{,a}`, `{"a}`, `{"a" b}`,
 		`{a"b"}`, `{{a},{b}}`, `{"\`, `{`, `}`, `{"`,
 		"{\x00}", "{a\x00b}", `{"\\"}`,
+		// whitespace-alphabet edges: \v and \f are array whitespace (must
+		// be quoted to survive as content), while Unicode spaces like
+		// U+00A0 are ordinary content — trimming them was the corruption
+		// found by this fuzzer (corpus a539fd920997b53c).
+		"{\"\f0\"}", "{\"\v0\"}", "{\f}", "{\va,b\f}", "{ }", "{a b}", "{\" \"}",
 	} {
 		f.Add(s)
 	}

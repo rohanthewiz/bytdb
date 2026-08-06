@@ -127,6 +127,18 @@ func FormatUUID(b []byte) string {
 // Elements are string or nil (a SQL NULL element). Only one dimension
 // exists; '{{a},{b}}' is rejected rather than silently flattened.
 
+// arraySpace is the whitespace alphabet of array literals — the six
+// ASCII bytes Postgres's array_isspace accepts, used for every trim and
+// skip in this codec AND for the formatter's quoting decision. The two
+// sides sharing one definition is a correctness invariant, not a style
+// choice: any byte the parser trims but the formatter leaves unquoted
+// is silent corruption (canon("{\f0}") would drop the \f on re-parse).
+// Deliberately narrower than unicode.IsSpace — a non-breaking space or
+// other Unicode space is element content, exactly as in Postgres.
+const arraySpace = " \t\n\r\v\f"
+
+func isArraySpace(c byte) bool { return strings.IndexByte(arraySpace, c) >= 0 }
+
 // ParseTextArray reads a Postgres one-dimensional array literal into
 // its elements. Quoted elements ("a \"b\"") unescape backslash
 // sequences; unquoted elements trim surrounding whitespace, may not be
@@ -136,12 +148,12 @@ func ParseTextArray(s string) ([]any, error) {
 	malformed := func() error {
 		return serr.New(`malformed array literal: "` + s + `"`)
 	}
-	t := strings.TrimSpace(s)
+	t := strings.Trim(s, arraySpace)
 	if len(t) < 2 || t[0] != '{' || t[len(t)-1] != '}' {
 		return nil, malformed()
 	}
 	body := t[1 : len(t)-1]
-	if strings.TrimSpace(body) == "" {
+	if strings.Trim(body, arraySpace) == "" {
 		return []any{}, nil
 	}
 	var elems []any
@@ -149,7 +161,7 @@ func ParseTextArray(s string) ([]any, error) {
 	for {
 		// Each loop iteration consumes one element and the comma after
 		// it. Whitespace around elements is decoration, not content.
-		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+		for i < len(body) && isArraySpace(body[i]) {
 			i++
 		}
 		if i < len(body) && body[i] == '{' {
@@ -190,7 +202,7 @@ func ParseTextArray(s string) ([]any, error) {
 				}
 				i++
 			}
-			tok := strings.TrimSpace(body[start:i])
+			tok := strings.Trim(body[start:i], arraySpace)
 			if tok == "" {
 				return nil, malformed()
 			}
@@ -202,7 +214,7 @@ func ParseTextArray(s string) ([]any, error) {
 		}
 		// After an element: optional whitespace, then a comma (another
 		// element follows) or the end of the body.
-		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+		for i < len(body) && isArraySpace(body[i]) {
 			i++
 		}
 		if i >= len(body) {
@@ -253,7 +265,7 @@ func textArrayNeedsQuotes(s string) bool {
 	if s == "" || strings.EqualFold(s, "null") {
 		return true
 	}
-	return strings.ContainsAny(s, "{},\"\\ \t\n\r")
+	return strings.ContainsAny(s, `{},"\`+arraySpace)
 }
 
 // CanonTextArray parses and re-renders an array literal, producing the
