@@ -1684,17 +1684,26 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 			return bytdb.TJSONB
 		case "->>", "#>>":
 			return bytdb.TString
+		}
+		// Each operand's type is computed exactly once. The "-" arm
+		// previously recursed into both operands for the JSONB check and
+		// then again for the float check below; on a left-nested chain of
+		// binary minus that doubling compounds to 2^depth calls, so a
+		// 30-term `SELECT 0-0-0-...` burned seconds of CPU in type
+		// derivation alone (surfaced by FuzzExec as a hung worker).
+		lt, rt := exprType(sc, n.L), exprType(sc, n.R)
+		switch n.Op {
 		case "||":
-			if exprType(sc, n.L) == bytdb.TJSONB || exprType(sc, n.R) == bytdb.TJSONB {
+			if lt == bytdb.TJSONB || rt == bytdb.TJSONB {
 				return bytdb.TJSONB
 			}
 			return bytdb.TString
 		case "-":
-			if exprType(sc, n.L) == bytdb.TJSONB || exprType(sc, n.R) == bytdb.TJSONB {
+			if lt == bytdb.TJSONB || rt == bytdb.TJSONB {
 				return bytdb.TJSONB
 			}
 		}
-		if exprType(sc, n.L) == bytdb.TFloat || exprType(sc, n.R) == bytdb.TFloat {
+		if lt == bytdb.TFloat || rt == bytdb.TFloat {
 			return bytdb.TFloat
 		}
 		return bytdb.TInt

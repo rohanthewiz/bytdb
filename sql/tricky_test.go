@@ -156,6 +156,27 @@ func TestTrickyIntegerArithmetic(t *testing.T) {
 	wantRows(t, d, `select -9223372036854775808 / -1`, [][]any{{9.223372036854776e+18}})
 }
 
+// TestTrickyDeepArithChain pins type derivation as linear in expression
+// size. exprType's "-" arm used to recurse into both operands twice
+// (once for the JSONB check, once for the numeric check), which
+// compounds to 2^depth on a left-nested minus chain — FuzzExec surfaced
+// a ~30-term SELECT that burned seconds in type derivation alone
+// (corpus entry testdata/fuzz/FuzzExec/416d7daa00af8c28). A 500-term
+// chain finishes instantly when derivation is linear and effectively
+// never (2^500) when it regresses, so plain test timeouts are a
+// sufficient detector with no fragile wall-clock assertion.
+func TestTrickyDeepArithChain(t *testing.T) {
+	d := openDB(t)
+	q := "select 1" + strings.Repeat("-0", 500) + "-$1"
+	res, err := d.Exec(q, int64(1))
+	if err != nil {
+		t.Fatalf("deep minus chain: %v", err)
+	}
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(0)}}) {
+		t.Fatalf("deep minus chain = %v; want 0", res.Rows)
+	}
+}
+
 // TestTrickyDistinctUnionNulls pins the "NULLs are distinct for =, but
 // equal for grouping" split: DISTINCT and UNION dedup treat two NULLs
 // as the same value even though NULL = NULL is UNKNOWN in a WHERE.
