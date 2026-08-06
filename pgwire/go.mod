@@ -5,7 +5,7 @@ go 1.26.1
 require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/rohanthewiz/btypedb v0.7.0
-	github.com/rohanthewiz/bytdb v0.8.0
+	github.com/rohanthewiz/bytdb v0.9.0
 	github.com/rohanthewiz/serr v1.4.0
 	golang.org/x/text v0.29.0
 )
