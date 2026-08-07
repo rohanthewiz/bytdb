@@ -695,19 +695,27 @@ type DropConstraint struct {
 // show what was requested.
 type AlterOwner struct{ Table, Owner string }
 
-// CreateIndex is CREATE [UNIQUE] INDEX name ON t (col [ASC|DESC], ...).
-// Desc is parallel to Cols (nil: all ascending).
+// CreateIndex is CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON t
+// (col [ASC|DESC], ...). Desc is parallel to Cols (nil: all
+// ascending). IfNotExists turns a name collision on the target table
+// into a notice, as with CreateTable — the requested columns are
+// never compared to the existing index's.
 type CreateIndex struct {
-	Name   string
-	Table  string
-	Unique bool
-	Cols   []string
-	Desc   []bool
+	Name        string
+	Table       string
+	Unique      bool
+	Cols        []string
+	Desc        []bool
+	IfNotExists bool
 }
 
-// DropIndex is DROP INDEX name [ON t]. With no ON clause the index is
-// resolved by name across tables.
-type DropIndex struct{ Name, Table string }
+// DropIndex is DROP INDEX [IF EXISTS] name [ON t]. With no ON clause
+// the index is resolved by name across tables. IfExists turns a
+// missing index into a notice instead of an error.
+type DropIndex struct {
+	Name, Table string
+	IfExists    bool
+}
 
 // SeqOptions is the option list of CREATE or ALTER SEQUENCE. Pointer
 // fields distinguish "not mentioned" (nil — keep the default, or on

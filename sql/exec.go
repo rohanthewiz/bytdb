@@ -1602,6 +1602,11 @@ func (d *DB) execTruncate(s *Truncate) (*Result, error) {
 }
 
 func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
+	// IF EXISTS resolves here, like DROP TABLE's: a missing index (or,
+	// with an ON clause, a missing table) becomes a notice; anything
+	// else — including an ambiguous name, which is a real conflict the
+	// clause cannot paper over — still errors below.
+	notFound := &Result{Notice: `index "` + s.Name + `" does not exist, skipping`}
 	table := s.Table
 	if table == "" {
 		var found []string
@@ -1612,11 +1617,18 @@ func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 		}
 		switch len(found) {
 		case 0:
+			if s.IfExists {
+				return notFound, nil
+			}
 			return nil, serr.New("no such index", "index", s.Name)
 		case 1:
 			table = found[0]
 		default:
 			return nil, serr.New("index name is ambiguous; use DROP INDEX name ON table", "index", s.Name)
+		}
+	} else if s.IfExists {
+		if t := d.e.Table(table); t == nil || t.Index(s.Name) == nil {
+			return notFound, nil
 		}
 	}
 	if err := d.e.DropIndex(table, s.Name); err != nil {

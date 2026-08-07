@@ -1284,6 +1284,19 @@ func (p *parser) identList(what string) ([]string, error) {
 }
 
 func (p *parser) createIndex(unique bool) (Statement, error) {
+	// IF NOT EXISTS is resolved by the executor (skip when the name is
+	// taken on the target table); the parse only records the flag —
+	// same split as createTable's.
+	ifNotExists := false
+	if p.acceptKw("if") {
+		if err := p.expectKw("not"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("exists"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
 	name, err := p.ident("an index name")
 	if err != nil {
 		return nil, err
@@ -1295,7 +1308,7 @@ func (p *parser) createIndex(unique bool) (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	ci := &CreateIndex{Name: name, Table: table, Unique: unique}
+	ci := &CreateIndex{Name: name, Table: table, Unique: unique, IfNotExists: ifNotExists}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
@@ -1332,11 +1345,18 @@ func (p *parser) createIndex(unique bool) (Statement, error) {
 }
 
 func (p *parser) dropIndex() (Statement, error) {
+	ifExists := false
+	if p.acceptKw("if") {
+		if err := p.expectKw("exists"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
 	name, err := p.ident("an index name")
 	if err != nil {
 		return nil, err
 	}
-	di := &DropIndex{Name: name}
+	di := &DropIndex{Name: name, IfExists: ifExists}
 	if p.acceptKw("on") {
 		if di.Table, err = p.tableName(); err != nil {
 			return nil, err

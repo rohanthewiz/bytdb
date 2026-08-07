@@ -815,6 +815,17 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// checked, matching the "ignore" half of parse-and-ignore.
 		return &Result{}, nil
 	case *CreateIndex:
+		// IF NOT EXISTS is a name check only, as with CREATE TABLE: an
+		// index with this name on the target table makes the statement a
+		// no-op, whatever its columns. The check is scoped to the table
+		// because bytdb names indexes per table (unlike Postgres's
+		// schema-wide relation namespace) — the same name on another
+		// table would not have collided anyway.
+		if s.IfNotExists {
+			if t := d.e.Table(s.Table); t != nil && t.Index(s.Name) != nil {
+				return &Result{Notice: `relation "` + s.Name + `" already exists, skipping`}, nil
+			}
+		}
 		keys := make([]bytdb.IndexCol, len(s.Cols))
 		for i, c := range s.Cols {
 			keys[i] = bytdb.IndexCol{Name: c, Desc: i < len(s.Desc) && s.Desc[i]}
