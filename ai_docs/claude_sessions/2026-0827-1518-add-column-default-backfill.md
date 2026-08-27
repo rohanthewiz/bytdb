@@ -1,9 +1,14 @@
-# Session: ADD COLUMN ... DEFAULT backfill + ALTER COLUMN SET/DROP DEFAULT
+# Session: ADD COLUMN ... DEFAULT backfill, SET/DROP DEFAULT, SET/DROP NOT NULL
 
 - Session ID: `28e17be5-a6c6-43fa-9792-20a3bc7f163c`
 - Date: 2026-08-27
 - Branch: `main` (started clean at `5b34bc2`, the v0.9.1 pgwire pin bump)
-- Released as: **v0.10.0** (`ff1d722`), followed by `181f093` pgwire pin bump
+- Released as: **v0.10.0** (`ff1d722`) — backfill + SET/DROP DEFAULT
+- Then **v0.11.0** (`4d97a49`) — SET/DROP NOT NULL, after a scaling question
+
+One session, two releases: the second came out of asking what the new
+backfill would cost on a 100M-row table. The measurements are recorded
+below because they are the reason SET NOT NULL exists.
 
 ## Trigger
 
@@ -186,3 +191,148 @@ values and the new default came back intact from the WAL.
   fast-default route from the analysis above is the alternative — it
   needs `encodeRowValue` to write an explicit NULL tag for columns
   carrying a MissingVal.
+
+
+---
+
+# Part 2 — the 100M-row question, and SET NOT NULL (v0.11.0)
+
+## The question
+
+> "What if my database already contains 100 million rows? What would
+> be the estimated cost of this migration?"
+
+Measured rather than estimated: a scratch harness loaded 100k / 400k /
+1.6M rows (~60-byte rows: `id int pk, body text`) and timed
+`AddColumn` with a DEFAULT while sampling live heap (`HeapAlloc`) on a
+2 ms ticker. All costs are linear in row count, so per-row constants
+extrapolate. Run on an M1.
+
+## What the backfill actually costs
+
+| | per row | x 100M |
+|---|---|---|
+| Wall time | 0.6-0.8 us | ~60-80 s |
+| **Transient peak heap** | **+710-950 B** | **+71-95 GB** |
+| WAL / disk growth | ~130-150 B | ~13-15 GB, one commit |
+| Settled heap growth (int col) | ~60 B | ~6 GB |
+| (table itself, live) | ~370 B | ~37 GB |
+
+**Time is not the problem; memory is.** The +710-950 B/row is
+irreducible: COW node copies and new row buffers stay *live* until the
+single transaction commits. Confirmed not to be GC slack by re-running
+at `GOGC=25` — the peak barely moved (950 -> 710 B/row). At 100M rows
+that is a ~110-130 GB peak: it OOMs. The all-or-nothing guarantee is
+exactly what makes it unaffordable, since there is no partial state to
+release.
+
+Contrast, same table, chunked `UPDATE` in 5k-row transactions:
+
+| | one-shot | chunked |
+|---|---|---|
+| Transient peak (GOGC=25) | +710 B/row | **+93 B/row** |
+| Wall time | 0.7 us/row | 2.6 us/row |
+
+The chunked peak is dominated by GC pacing (heap targets ~2x live),
+not by the migration — which is why lowering GOGC moves it and does
+not move the one-shot number. `EXPLAIN` confirmed each chunk is an
+`Index Scan using t_pkey` with `Index Cond`, so the loop is O(n)
+overall, not O(n^2), and it is restartable after an interruption.
+
+## The gap that surfaced
+
+The batched path had no way to end at a **required** column: bytdb had
+no `ALTER COLUMN SET NOT NULL`, so the only route to NOT NULL was the
+one-shot `ADD COLUMN ... NOT NULL DEFAULT x` — precisely the statement
+you cannot afford at 100M rows. Hence v0.11.0.
+
+## What was implemented
+
+### `Engine.SetColumnNotNull` / `DropColumnNotNull` (`ddl.go`)
+
+`SetColumnNotNull` validates every existing row inside the transaction
+that publishes the flag, so no write can slip between the check and
+the publish. A single NULL aborts with the wording AddColumn already
+used for the equivalent case (extracted to `notNullValueErr`):
+`column "c" of relation "t" contains null values`, SQLSTATE 23502.
+
+`columnHasNoNulls` reads the stored value tuples **directly** rather
+than going through `decodeRow`. The trick is the same storage fact the
+backfill exploits from the other side: `encodeRowValue` omits NULL
+columns, so the *presence* of a pair tagged with the column ID is
+exactly what "not NULL" means. One tuple decode per row, no row
+materialized — which is the whole point on a table too large to
+rewrite. Key columns skip the scan entirely (`coercePK` rejects NULL,
+so they are non-NULL by construction).
+
+`DropColumnNotNull` is a descriptor flip, refused on a primary-key
+column (the key encoding has no NULL to encode) and on an identity
+column (its counter is what guarantees a value). Both operations are
+idempotent (`nil, nil` from the closure, so `alterDesc` skips the
+write).
+
+Scope note: only `SET NOT NULL` was asked for; `DROP NOT NULL` came
+along because Postgres pairs them, it is a one-line flip, and the
+parser's error message would otherwise have been odd.
+
+### SQL layer
+
+- `sql/ast.go` — `AlterColumnNotNull{Table, Col, NotNull}`.
+- `sql/parser.go` — the ALTER COLUMN arm's SET/DROP branches became
+  inner switches; each rejects unknown sub-clauses by name
+  ("only SET DEFAULT and SET NOT NULL are supported by ALTER COLUMN").
+- `sql/sql.go` — executor arm; registered in the three DDL switches
+  (`isDDL`, `writeTarget`, statement tag) as `AlterColumnDefault` was.
+
+### Measured cost of the new path
+
+| | per row | x 100M |
+|---|---|---|
+| `SET NOT NULL` scan | 0.17-0.20 us, +90 B transient | ~20 s, ~9 GB |
+| `ADD COLUMN ... NOT NULL DEFAULT` | 0.7 us, +710 B **live** | ~70 s, +71 GB |
+
+The 90 B/row here is GC pacing over per-row decode garbage, not
+retained state, so `GOMEMLIMIT` bounds it — unlike the backfill, whose
+memory is live to the commit and cannot be capped.
+
+## The migration this completes
+
+None of these steps rewrites the table in one transaction:
+
+```sql
+ALTER TABLE t ADD COLUMN c int;               -- O(1), rows read NULL
+ALTER TABLE t ALTER COLUMN c SET DEFAULT 1;   -- O(1), future inserts covered
+UPDATE t SET c = 1 WHERE c IS NULL AND id >= $lo AND id < $hi;  -- batched
+ALTER TABLE t ALTER COLUMN c SET NOT NULL;    -- read-only validating scan
+```
+
+## Tests and verification
+
+- `default_backfill_test.go` — `TestSetDropColumnNotNull` (refusal over
+  a NULL with nothing published, the flag rejecting later INSERT and
+  UPDATE-to-NULL, idempotence, reopen, key-column no-op, primary-key
+  and unknown-column rejections) and `TestSetNotNullIdentity`.
+- `sql/default_test.go` — `TestAlterColumnNotNull`, ending with the
+  full four-statement migration above. One stale assertion in
+  `TestAlterColumnDefault` that expected `SET NOT NULL` to be
+  unsupported now tests `SET UNIQUE` instead.
+- Wire (pgx over `bytdbd`): the migration end to end, the flag live for
+  new writes (23502 on both INSERT and UPDATE-to-NULL), a column still
+  holding NULLs refusing the constraint, and the rejection paths.
+
+## Docs
+
+`README.md` statement list; `docs/features.md` gained the SET/DROP NOT
+NULL bullet with the migration recipe; `docs/gotchas.md` narrowed the
+"deliberately not there" ALTER COLUMN row and gained the measured
+reason to prefer the batched path on a large table.
+
+## Still absent after v0.11.0
+
+- `ALTER COLUMN TYPE`, `SET STORAGE`, and friends.
+- `ADD COLUMN` of an identity column (the backfill machinery now
+  exists, but the counter semantics were not in scope).
+- Nothing in the engine warns when a DEFAULT backfill is about to be
+  enormous. A row-count threshold that errors with a pointer to the
+  batched recipe would be a reasonable follow-up — it was raised as an
+  option, not implemented.
