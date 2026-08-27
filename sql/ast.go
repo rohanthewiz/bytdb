@@ -687,6 +687,20 @@ type DropConstraint struct {
 	IfExists bool
 }
 
+// AlterColumnDefault is ALTER TABLE t ALTER [COLUMN] c
+// SET DEFAULT expr | DROP DEFAULT. Drop marks the DROP form; SET
+// DEFAULT NULL parses to Drop as well, since a NULL default is
+// exactly what a defaultless column already supplies (the same
+// normalization ColDef applies to DEFAULT NULL in CREATE TABLE).
+// Default holds the constant, or an ExprDefault marker for the clock
+// functions, and is nil when Drop is set.
+type AlterColumnDefault struct {
+	Table   string
+	Col     string
+	Default any
+	Drop    bool
+}
+
 // AlterOwner is ALTER TABLE t OWNER TO role. bytdb has no roles or
 // ownership, but pg_dump output and migration tools (goose, etc.) emit
 // these routinely, so the statement is parsed and executed as a no-op
@@ -986,29 +1000,30 @@ type SetVar struct {
 	Tag       string // command tag: SET or RESET
 }
 
-func (*CreateTable) stmt()    {}
-func (*Explain) stmt()        {}
-func (*DropTable) stmt()      {}
-func (*Truncate) stmt()       {}
-func (*ShowVar) stmt()        {}
-func (*CreateView) stmt()     {}
-func (*DropView) stmt()       {}
-func (*AddColumn) stmt()      {}
-func (*DropColumn) stmt()     {}
-func (*RenameTable) stmt()    {}
-func (*RenameColumn) stmt()   {}
-func (*AddConstraint) stmt()  {}
-func (*AddFK) stmt()          {}
-func (*DropConstraint) stmt() {}
-func (*AlterOwner) stmt()     {}
-func (*CreateIndex) stmt()    {}
-func (*DropIndex) stmt()      {}
-func (*CreateSequence) stmt() {}
-func (*DropSequence) stmt()   {}
-func (*AlterSequence) stmt()  {}
-func (*Insert) stmt()         {}
-func (*Select) stmt()         {}
-func (*Update) stmt()         {}
-func (*Delete) stmt()         {}
-func (*TxnControl) stmt()     {}
-func (*SetVar) stmt()         {}
+func (*CreateTable) stmt()        {}
+func (*Explain) stmt()            {}
+func (*DropTable) stmt()          {}
+func (*Truncate) stmt()           {}
+func (*ShowVar) stmt()            {}
+func (*CreateView) stmt()         {}
+func (*DropView) stmt()           {}
+func (*AddColumn) stmt()          {}
+func (*DropColumn) stmt()         {}
+func (*RenameTable) stmt()        {}
+func (*RenameColumn) stmt()       {}
+func (*AddConstraint) stmt()      {}
+func (*AddFK) stmt()              {}
+func (*DropConstraint) stmt()     {}
+func (*AlterColumnDefault) stmt() {}
+func (*AlterOwner) stmt()         {}
+func (*CreateIndex) stmt()        {}
+func (*DropIndex) stmt()          {}
+func (*CreateSequence) stmt()     {}
+func (*DropSequence) stmt()       {}
+func (*AlterSequence) stmt()      {}
+func (*Insert) stmt()             {}
+func (*Select) stmt()             {}
+func (*Update) stmt()             {}
+func (*Delete) stmt()             {}
+func (*TxnControl) stmt()         {}
+func (*SetVar) stmt()             {}

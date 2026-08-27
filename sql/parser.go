@@ -1431,6 +1431,38 @@ func (p *parser) alterTable() (Statement, error) {
 				"table", table, "column", col.Name)
 		}
 		return &AddColumn{Table: table, Col: col}, nil
+	case p.acceptKw("alter"):
+		// ALTER [COLUMN] c SET DEFAULT expr | DROP DEFAULT. The other
+		// Postgres column alterations (SET/DROP NOT NULL, TYPE, and the
+		// storage/statistics knobs) are rejected by name below rather
+		// than as a bare parse error, so the message says what bytdb
+		// does support.
+		p.acceptKw("column")
+		col, err := p.ident("a column name")
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case p.acceptKw("set"):
+			if !p.acceptKw("default") {
+				return nil, serr.New("only SET DEFAULT is supported by ALTER COLUMN",
+					"table", table, "column", col)
+			}
+			v, err := p.defaultLiteral(col)
+			if err != nil {
+				return nil, err
+			}
+			// SET DEFAULT NULL declares what a defaultless column
+			// already does — the same normalization colDef applies.
+			return &AlterColumnDefault{Table: table, Col: col, Default: v, Drop: v == nil}, nil
+		case p.acceptKw("drop"):
+			if !p.acceptKw("default") {
+				return nil, serr.New("only DROP DEFAULT is supported by ALTER COLUMN",
+					"table", table, "column", col)
+			}
+			return &AlterColumnDefault{Table: table, Col: col, Drop: true}, nil
+		}
+		return nil, p.unexpected("SET DEFAULT or DROP DEFAULT")
 	case p.acceptKw("rename"):
 		// RENAME TO t | RENAME [COLUMN] c TO d.
 		if p.acceptKw("to") {
@@ -1487,7 +1519,7 @@ func (p *parser) alterTable() (Statement, error) {
 		}
 		return &AlterOwner{Table: table, Owner: owner}, nil
 	}
-	return nil, p.unexpected("ADD, DROP, RENAME, or OWNER")
+	return nil, p.unexpected("ADD, ALTER, DROP, RENAME, or OWNER")
 }
 
 // --- DML ---

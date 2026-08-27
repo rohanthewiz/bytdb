@@ -100,8 +100,7 @@ func TestDefaultInteractions(t *testing.T) {
 		t.Fatalf("column_default: %v", res.Rows)
 	}
 
-	// ADD COLUMN with DEFAULT works on an empty table only (no
-	// backfill story), same rule as NOT NULL.
+	// ADD COLUMN with DEFAULT on an empty table: later inserts get it.
 	exec(t, d, `create table a (id int primary key)`)
 	exec(t, d, `alter table a add column v int default 3`)
 	exec(t, d, `insert into a (id) values (1)`)
@@ -109,9 +108,12 @@ func TestDefaultInteractions(t *testing.T) {
 	if !reflect.DeepEqual(res.Rows, [][]any{{int64(3)}}) {
 		t.Fatalf("added column default: %v", res.Rows)
 	}
-	if _, err := d.Exec(`alter table a add column w int default 9`); err == nil ||
-		!strings.Contains(err.Error(), "non-empty") {
-		t.Fatalf("add default to non-empty: %v", err)
+	// ...and on a non-empty table the existing rows are backfilled, so
+	// the column reads the default everywhere, as in Postgres.
+	exec(t, d, `alter table a add column w int default 9`)
+	res = exec(t, d, `select v, w from a`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(3), int64(9)}}) {
+		t.Fatalf("backfilled column default: %v", res.Rows)
 	}
 }
 
@@ -241,5 +243,67 @@ func TestDefaultSurvivesReopen(t *testing.T) {
 	res := exec(t, d, `select v from t order by id`)
 	if !reflect.DeepEqual(res.Rows, [][]any{{"d'quote"}, {"d'quote"}}) {
 		t.Fatalf("after reopen: %v", res.Rows)
+	}
+}
+
+// TestAlterColumnDefault covers ALTER TABLE ... ALTER COLUMN
+// SET/DROP DEFAULT: a descriptor-only change that steers later
+// inserts and leaves stored rows alone.
+func TestAlterColumnDefault(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, n int, ts timestamp)`)
+	exec(t, d, `insert into t (id, n) values (1, 5)`)
+
+	exec(t, d, `alter table t alter column n set default 42`)
+	exec(t, d, `insert into t (id) values (2)`)
+	res := exec(t, d, `select id, n from t order by id`)
+	// Row 1 keeps its value: SET DEFAULT never rewrites rows.
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(1), int64(5)}, {int64(2), int64(42)}}) {
+		t.Fatalf("after set default: %v", res.Rows)
+	}
+	// information_schema reports the new literal.
+	res = exec(t, d, `select column_default from information_schema.columns
+		where table_name = 't' and column_name = 'n'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"42"}}) {
+		t.Fatalf("column_default: %v", res.Rows)
+	}
+
+	// The optional COLUMN keyword, and the clock markers.
+	exec(t, d, `alter table t alter ts set default now()`)
+	exec(t, d, `insert into t (id) values (3)`)
+	res = exec(t, d, `select count(*) from t where ts is not null`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(1)}}) {
+		t.Fatalf("now() default: %v", res.Rows)
+	}
+
+	// DROP DEFAULT, and SET DEFAULT NULL as its synonym.
+	exec(t, d, `alter table t alter column n drop default`)
+	exec(t, d, `insert into t (id) values (4)`)
+	res = exec(t, d, `select n from t where id = 4`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{nil}}) {
+		t.Fatalf("after drop default: %v", res.Rows)
+	}
+	exec(t, d, `alter table t alter column ts set default null`)
+	res = exec(t, d, `select column_default from information_schema.columns
+		where table_name = 't' and column_name = 'ts'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{nil}}) {
+		t.Fatalf("column_default after set default null: %v", res.Rows)
+	}
+	// DROP DEFAULT on a column that has none is a no-op, not an error.
+	exec(t, d, `alter table t alter column ts drop default`)
+
+	for _, tc := range []struct{ q, want string }{
+		{`alter table t alter column n set default 'abc'`, "invalid input syntax"},
+		{`alter table t alter column n set default now()`, "requires a timestamp or date column"},
+		{`alter table t alter column nope set default 1`, "does not exist"},
+		{`alter table ghosts alter column n set default 1`, "no such table"},
+		{`alter table t alter column n set not null`, "only SET DEFAULT is supported"},
+		{`alter table t alter column n drop not null`, "only DROP DEFAULT is supported"},
+		{`alter table t alter column n type text`, ""}, // parse error is enough
+	} {
+		err := execErr(t, d, tc.q)
+		if tc.want != "" && !strings.Contains(err, tc.want) {
+			t.Fatalf("%s: %v (want %q)", tc.q, err, tc.want)
+		}
 	}
 }

@@ -116,6 +116,8 @@ func writeTarget(st Statement) string {
 		return s.Table
 	case *RenameColumn:
 		return s.Table
+	case *AlterColumnDefault:
+		return s.Table
 	case *DropConstraint:
 		return s.Table
 	case *CreateIndex:

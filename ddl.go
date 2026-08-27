@@ -2,6 +2,7 @@ package bytdb
 
 import (
 	"slices"
+	"time"
 
 	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/bytdb/tuple"
@@ -170,11 +171,21 @@ func (e *Engine) DropTable(name string) error {
 	return nil
 }
 
-// AddColumn appends a column to a table. No rows are rewritten:
-// existing rows read the new column as NULL. Subsequent inserts must
-// supply the new arity. A NOT NULL column can only be added while the
-// table is empty (existing rows would read it as NULL), checked in
-// the same transaction that publishes the descriptor.
+// AddColumn appends a column to a table. Without a DEFAULT no rows
+// are rewritten: existing rows read the new column as NULL.
+// Subsequent inserts must supply the new arity.
+//
+// With a DEFAULT, existing rows are backfilled with its value in the
+// same transaction that publishes the descriptor, so the column reads
+// back the way Postgres would read it — the whole statement is atomic,
+// and a failure part-way leaves neither the rows nor the descriptor
+// changed. That makes NOT NULL DEFAULT x legal on a non-empty table
+// too; NOT NULL without a (non-NULL) default still requires an empty
+// table, since existing rows would read as NULL.
+//
+// The backfill costs one rewrite per row. It is skipped entirely when
+// the default evaluates to NULL, which is what stored rows already
+// read.
 func (e *Engine) AddColumn(table string, col Column) error {
 	if col.Name == "" {
 		return serr.New("column name is required", "table", table)
@@ -198,21 +209,74 @@ func (e *Engine) AddColumn(table string, col Column) error {
 		col.ID = desc.NextColID
 		desc.NextColID++
 		desc.Columns = append(desc.Columns, col)
-		if col.NotNull && hasRows(tx, desc.ID) {
+		// The default's value is wanted twice over: to decide whether
+		// existing rows can satisfy NOT NULL, and to write into them.
+		// A default the engine cannot evaluate (see default.go) fails
+		// the statement here rather than leaving rows reading NULL
+		// while new inserts get the default.
+		var fill any
+		if col.Default != "" {
+			var err error
+			// One instant for the entire statement, so every backfilled
+			// row shares a single now() — the same granularity a
+			// multi-row INSERT gets.
+			if fill, err = columnDefaultValue(&col, time.Now().UTC()); err != nil {
+				return nil, err
+			}
+		}
+		if fill == nil && col.NotNull && hasRows(tx, desc.ID) {
 			return nil, serr.New(`column "` + col.Name + `" of relation "` + table +
 				`" contains null values`)
 		}
-		// Postgres backfills existing rows with the default; this engine
-		// leaves stored rows untouched (they would read NULL), so the two
-		// are only equivalent on an empty table.
-		if col.Default != "" && hasRows(tx, desc.ID) {
-			return nil, serr.New("adding a column with DEFAULT to a non-empty table is not supported",
-				"table", table, "column", col.Name)
+		if fill != nil {
+			if err := backfillColumn(tx, desc, col.ID, fill); err != nil {
+				return nil, err
+			}
 		}
 		return desc, nil
 	})
 	if err != nil {
 		return serr.Wrap(err, "op", "add column", "table", table, "column", col.Name)
+	}
+	return nil
+}
+
+// backfillColumn writes val into every existing row of the table as
+// the new column's value. Rows are stored as a sparse sequence of
+// (column ID, value) pairs (see encodeRowValue), and the column ID is
+// freshly allocated, so no row can already carry a pair for it: the
+// new pair is appended to the stored value as-is, with no decode and
+// re-encode of the columns already there. Appending also keeps the
+// pairs in column order, which is how encodeRowValue writes them,
+// though decodeRow does not depend on that.
+//
+// No index maintenance is needed: the column is brand new, so no
+// index can cover it, and no other column's value moves.
+//
+// Keys are collected before any write rather than written during the
+// scan, so the iteration is never walking a tree it is mutating.
+func backfillColumn(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint32, val any) error {
+	prefix := tablePrefix(desc.ID)
+	end := string(tuple.PrefixEnd(prefix))
+	var keys []string
+	var vals [][]byte
+	for k, v := range tx.Ascend(string(prefix)) {
+		if k >= end {
+			break
+		}
+		keys = append(keys, k)
+		// The iterator's value may alias storage; the appended copy
+		// below is what gets written, so never append in place.
+		vals = append(vals, v)
+	}
+	for i, k := range keys {
+		buf, err := tuple.Append(append([]byte(nil), vals[i]...), int64(colID), val)
+		if err != nil {
+			return serr.Wrap(err, "op", "backfill column default", "table", desc.Name)
+		}
+		if err := tx.Set(k, buf); err != nil {
+			return serr.Wrap(err, "op", "backfill column default", "table", desc.Name)
+		}
 	}
 	return nil
 }
@@ -321,6 +385,72 @@ func (e *Engine) DropColumn(table, name string) error {
 		// Concurrent-writes mode: no cached draw may write the deleted
 		// counter key back.
 		e.invalidateCounter(droppedCounterKey)
+	}
+	return nil
+}
+
+// SetColumnDefault sets or replaces a column's DEFAULT, given as the
+// SQL literal text the descriptor stores (what CREATE TABLE's DEFAULT
+// clause renders to: 'a string', 42, true, or the evaluated markers
+// now() / current_date). Passing "" is the same as DropColumnDefault.
+//
+// Existing rows are not touched, as in Postgres — a DEFAULT only
+// supplies values for inserts that omit the column. Backfilling old
+// rows is AddColumn's job, or an explicit UPDATE.
+//
+// The literal is validated against the column type here rather than
+// at the first insert, so a typo fails the DDL statement. That means
+// only defaults the engine can evaluate (see default.go) are
+// accepted.
+func (e *Engine) SetColumnDefault(table, column, literal string) error {
+	if literal == "" {
+		return e.DropColumnDefault(table, column)
+	}
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		ord := old.ColIndex(column)
+		if ord < 0 {
+			return nil, serr.New("no such column", "table", table, "column", column)
+		}
+		if old.Columns[ord].Identity {
+			// The identity counter is the column's value source; a
+			// DEFAULT alongside it would be a second, conflicting one.
+			return nil, serr.New("conflicting DEFAULT for identity column",
+				"table", table, "column", column)
+		}
+		desc := old.clone()
+		desc.Columns[ord].Default = literal
+		probe := desc.Columns[ord]
+		if _, err := columnDefaultValue(&probe, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+		return desc, nil
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "set column default", "table", table, "column", column)
+	}
+	return nil
+}
+
+// DropColumnDefault clears a column's DEFAULT. Like Postgres's DROP
+// DEFAULT it succeeds whether or not one was set, and leaves stored
+// rows alone: columns already written keep their values, and later
+// inserts that omit the column get NULL (which a NOT NULL column then
+// rejects).
+func (e *Engine) DropColumnDefault(table, column string) error {
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		ord := old.ColIndex(column)
+		if ord < 0 {
+			return nil, serr.New("no such column", "table", table, "column", column)
+		}
+		if old.Columns[ord].Default == "" {
+			return nil, nil // nothing to publish; alterDesc skips the write
+		}
+		desc := old.clone()
+		desc.Columns[ord].Default = ""
+		return desc, nil
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "drop column default", "table", table, "column", column)
 	}
 	return nil
 }

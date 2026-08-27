@@ -56,8 +56,11 @@ CREATE TABLE items (
   enforced on INSERT and UPDATE with Postgres wording:
   `new row for relation "items" violates check constraint "items_price_check"`
   (SQLSTATE 23514). `BETWEEN` works inside them.
-- `ALTER TABLE t ADD COLUMN c type` — **O(1)**: no rows are rewritten; existing
-  rows read the new column as NULL.
+- `ALTER TABLE t ADD COLUMN c type` — **O(1)** without a `DEFAULT`: no rows are
+  rewritten; existing rows read the new column as NULL. With a `DEFAULT`,
+  existing rows are backfilled in the same transaction that publishes the
+  column (O(rows), all-or-nothing), so `NOT NULL DEFAULT x` works on a
+  non-empty table too.
 - `ALTER TABLE t DROP COLUMN c` — also O(1); data stays under a retired column
   ID and is skipped on decode.
 - `ALTER TABLE t ADD CONSTRAINT n CHECK (...)` validates existing rows;
@@ -74,8 +77,15 @@ CREATE TABLE items (
   multi-row insert stamps every row with the same instant. Applied when a
   column-list insert omits the column, as the `DEFAULT` keyword in `VALUES`,
   and via `INSERT ... DEFAULT VALUES`. General expression defaults stay
-  rejected; `ADD COLUMN ... DEFAULT` needs an empty table (no backfill).
+  rejected. `ADD COLUMN ... DEFAULT` backfills existing rows; a default the
+  engine cannot evaluate to a constant fails the statement rather than
+  leaving old rows reading NULL.
   *(verified in `sql/default_test.go`)*
+- `ALTER TABLE t ALTER [COLUMN] c SET DEFAULT expr | DROP DEFAULT` changes the
+  descriptor only — later inserts get the new default, stored rows are left
+  alone (Postgres semantics; use `ADD COLUMN ... DEFAULT` or an `UPDATE` to
+  touch existing rows). `SET DEFAULT NULL` is the same as `DROP DEFAULT`, and
+  `DROP DEFAULT` on a column without one is a no-op.
 - Defaults surface in the catalog — `pg_attrdef` rows (with `pg_get_expr` and
   `pg_attribute.atthasdef`) and `information_schema.columns.column_default` —
   so psql's `\d` renders the Default column and ORMs introspect them; identity

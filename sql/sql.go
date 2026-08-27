@@ -14,6 +14,8 @@
 //	ALTER TABLE t DROP [COLUMN] c
 //	ALTER TABLE t RENAME TO t2
 //	ALTER TABLE t RENAME [COLUMN] c TO d
+//	ALTER TABLE t ALTER [COLUMN] c SET DEFAULT expr
+//	ALTER TABLE t ALTER [COLUMN] c DROP DEFAULT
 //	ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
 //	ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 //	ALTER TABLE t OWNER TO role       (accepted and ignored; no roles)
@@ -627,22 +629,33 @@ func toEngineColumn(c ColDef) (bytdb.Column, error) {
 	col := bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull,
 		Identity: c.Identity, MaxLen: c.MaxLen}
 	if c.HasDefault {
-		if ed, ok := c.Default.(ExprDefault); ok {
-			if c.Type != bytdb.TTimestamp && c.Type != bytdb.TDate {
-				return bytdb.Column{}, serr.New(
-					"DEFAULT "+string(ed)+" requires a timestamp or date column",
-					"column", c.Name)
-			}
-			col.Default = string(ed)
-			return col, nil
-		}
-		cv, err := coerceLit(c.Default, c.Type)
+		text, err := renderDefault(c.Default, c.Type, c.Name)
 		if err != nil {
-			return bytdb.Column{}, serr.Wrap(err, "clause", "DEFAULT", "column", c.Name)
+			return bytdb.Column{}, err
 		}
-		col.Default = renderLit(cv)
+		col.Default = text
 	}
 	return col, nil
+}
+
+// renderDefault validates a parsed DEFAULT against the column type it
+// will live on and returns the literal text the descriptor stores —
+// shared by CREATE TABLE / ADD COLUMN (through toEngineColumn) and by
+// ALTER COLUMN SET DEFAULT, so both accept exactly the same defaults.
+func renderDefault(v any, typ bytdb.ColType, colName string) (string, error) {
+	if ed, ok := v.(ExprDefault); ok {
+		if typ != bytdb.TTimestamp && typ != bytdb.TDate {
+			return "", serr.New(
+				"DEFAULT "+string(ed)+" requires a timestamp or date column",
+				"column", colName)
+		}
+		return string(ed), nil
+	}
+	cv, err := coerceLit(v, typ)
+	if err != nil {
+		return "", serr.Wrap(err, "clause", "DEFAULT", "column", colName)
+	}
+	return renderLit(cv), nil
 }
 
 // autocommitRetries is how many times an autocommit statement that
@@ -808,6 +821,33 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		return d.execAddFK(s)
 	case *DropConstraint:
 		return d.execDropConstraint(s)
+	case *AlterColumnDefault:
+		// DROP DEFAULT needs nothing from the descriptor; SET DEFAULT
+		// needs the column type to render (and type-check) the literal,
+		// exactly as CREATE TABLE does.
+		if s.Drop {
+			if err := d.e.DropColumnDefault(s.Table, s.Col); err != nil {
+				return nil, err
+			}
+			return &Result{}, nil
+		}
+		desc := d.e.Table(s.Table)
+		if desc == nil {
+			return nil, serr.New("no such table", "table", s.Table)
+		}
+		ord := desc.ColIndex(s.Col)
+		if ord < 0 {
+			return nil, serr.New(`column "`+s.Col+`" of relation "`+s.Table+`" does not exist`,
+				"table", s.Table, "column", s.Col)
+		}
+		text, err := renderDefault(s.Default, desc.Columns[ord].Type, s.Col)
+		if err != nil {
+			return nil, err
+		}
+		if err := d.e.SetColumnDefault(s.Table, s.Col, text); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
 	case *AlterOwner:
 		// No roles in bytdb; the statement exists only so Postgres DDL
 		// (pg_dump output, goose migrations) runs unmodified. Succeed

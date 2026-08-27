@@ -69,6 +69,7 @@ Parse-time rejections with pointed errors:
 | Not supported | Use instead / note |
 |---|---|
 | `ALTER TABLE ... ADD PRIMARY KEY / ADD UNIQUE` | Declare PK at create; unique via `CREATE UNIQUE INDEX` or the `UNIQUE` constraint sugar at create |
+| `ALTER TABLE ... ALTER COLUMN` other than `SET DEFAULT` / `DROP DEFAULT` (`SET NOT NULL`, `TYPE`, ...) | Recreate the column, or the table, with the shape you want |
 | `RIGHT` / `FULL` / `NATURAL` joins | Rewrite as `LEFT`/`INNER` |
 | `WITH RECURSIVE`; `WITH` on INSERT/UPDATE/DELETE; data-modifying CTEs | CTEs are SELECT-only and non-recursive |
 | Writable or materialized views; `WITH CHECK OPTION` | Views are read-only, materialized per statement |
@@ -147,8 +148,12 @@ Three semantic notes that surprise people (all Postgres-faithful):
 
 ## Schema-change edges
 
-- `ADD COLUMN ... NOT NULL` is allowed **only on an empty table** (there is no
-  backfill).
+- `ADD COLUMN ... NOT NULL` without a `DEFAULT` is allowed **only on an empty
+  table** — existing rows would read NULL. With a non-NULL `DEFAULT` the rows
+  are backfilled, so `NOT NULL DEFAULT x` is fine on a non-empty table (at
+  O(rows), unlike the O(1) defaultless `ADD COLUMN`).
+- `ALTER COLUMN ... SET DEFAULT` does **not** touch existing rows (as in
+  Postgres). Only `ADD COLUMN ... DEFAULT` backfills.
 - `DROP COLUMN` cannot drop a primary-key, indexed, or foreign-key column
   (drop the index/constraint first).
 - Dropped-column data is not rewritten out of existing rows — it lingers under

@@ -1,0 +1,222 @@
+package bytdb
+
+import (
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestAddColumnBackfill covers the core promise: a DEFAULT on a
+// non-empty table lands in the rows that already exist, so the column
+// reads the same for old and new rows.
+func TestAddColumnBackfill(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+	insertPeople(t, e, []any{1, "ada", 36, "a@x"}, []any{2, "grace", 45, "g@x"})
+
+	if err := e.AddColumn("people", Column{Name: "city", Type: TString, Default: "'nyc'"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []any{1, 2} {
+		row, ok, err := e.Get("people", id)
+		if err != nil || !ok {
+			t.Fatal(err)
+		}
+		if row.Col("city") != "nyc" {
+			t.Fatalf("backfilled column for %v = %v; want nyc", id, row.Col("city"))
+		}
+	}
+
+	// The backfill wrote only the new column: everything else survives.
+	row, _, _ := e.Get("people", 1)
+	if row.Col("name") != "ada" || row.Col("age") != int64(36) || row.Col("email") != "a@x" {
+		t.Fatalf("backfill disturbed existing columns: %v", row.Vals)
+	}
+
+	// An index built afterwards sees the backfilled values, which is
+	// the observable proof the rows were rewritten rather than merely
+	// reading a descriptor-level fallback.
+	if _, err := e.CreateIndex("people", "by-city", false, "city"); err != nil {
+		t.Fatal(err)
+	}
+	got := names(t, e.ScanIndex("people", "by-city", nil, nil))
+	if want := []string{"ada", "grace"}; !slices.Equal(got, want) {
+		t.Fatalf("index over backfilled column = %v; want %v", got, want)
+	}
+
+	// NOT NULL is now satisfiable on a non-empty table when a default
+	// supplies the value.
+	if err := e.AddColumn("people", Column{Name: "active", Type: TBool, NotNull: true, Default: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	row, _, _ = e.Get("people", 2)
+	if row.Col("active") != true {
+		t.Fatalf("NOT NULL DEFAULT backfill = %v; want true", row.Col("active"))
+	}
+}
+
+// TestAddColumnBackfillTypes runs the literal decoder over the forms
+// the SQL layer stores, including the evaluated clock markers.
+func TestAddColumnBackfillTypes(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+	insertPeople(t, e, []any{1, "ada", 36, "a@x"})
+
+	before := time.Now().UTC()
+	for _, c := range []struct {
+		col  Column
+		want any
+	}{
+		{Column{Name: "n", Type: TInt, Default: "-7"}, int64(-7)},
+		{Column{Name: "f", Type: TFloat, Default: "1.5"}, 1.5},
+		{Column{Name: "b", Type: TBool, Default: "false"}, false},
+		{Column{Name: "s", Type: TString, Default: "'it''s'"}, "it's"},
+		{Column{Name: "tags", Type: TTextArray, Default: "'{a,b}'"}, "{a,b}"},
+		{Column{Name: "doc", Type: TJSONB, Default: `'{"a": 1}'`}, `{"a":1}`},
+		// DEFAULT NULL is what stored rows already read: no rewrite,
+		// no error.
+		{Column{Name: "nul", Type: TInt, Default: "null"}, nil},
+	} {
+		if err := e.AddColumn("people", c.col); err != nil {
+			t.Fatalf("add %s: %v", c.col.Name, err)
+		}
+		row, _, _ := e.Get("people", 1)
+		if got := row.Col(c.col.Name); got != c.want {
+			t.Fatalf("backfilled %s = %#v; want %#v", c.col.Name, got, c.want)
+		}
+	}
+
+	// now() resolves once, at DDL time, to an instant inside the
+	// statement's window.
+	if err := e.AddColumn("people", Column{Name: "seen", Type: TTimestamp, Default: "now()"}); err != nil {
+		t.Fatal(err)
+	}
+	row, _, _ := e.Get("people", 1)
+	seen, ok := row.Col("seen").(int64)
+	if !ok || seen < before.UnixMicro() || seen > time.Now().UTC().UnixMicro() {
+		t.Fatalf("now() backfill = %v; want an instant within the test", row.Col("seen"))
+	}
+
+	// current_date truncates to the UTC day on a date column.
+	if err := e.AddColumn("people", Column{Name: "day", Type: TDate, Default: "current_date"}); err != nil {
+		t.Fatal(err)
+	}
+	row, _, _ = e.Get("people", 1)
+	wantDay := time.Date(before.Year(), before.Month(), before.Day(), 0, 0, 0, 0, time.UTC).Unix() / 86400
+	if row.Col("day") != wantDay {
+		t.Fatalf("current_date backfill = %v; want %v", row.Col("day"), wantDay)
+	}
+}
+
+// TestAddColumnBackfillRejections: a default the engine cannot
+// evaluate must fail the statement outright rather than half-apply.
+func TestAddColumnBackfillRejections(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+	insertPeople(t, e, []any{1, "ada", 36, "a@x"})
+
+	for _, c := range []struct{ name, def string }{
+		{"expr", "1 + 2"},
+		{"call", "gen_random_uuid()"},
+		{"concat", "'a' || 'b'"},
+	} {
+		err := e.AddColumn("people", Column{Name: c.name, Type: TString, Default: c.def})
+		if err == nil {
+			t.Fatalf("default %q accepted", c.def)
+		}
+		// Either "not a literal ..." or the malformed-string wording,
+		// depending on where the text stops looking like a constant.
+		if !strings.Contains(err.Error(), "literal") {
+			t.Fatalf("default %q: %v", c.def, err)
+		}
+		// Nothing was published: the failed add left no column behind.
+		if e.Table("people").ColIndex(c.name) >= 0 {
+			t.Fatalf("column %q published despite the error", c.name)
+		}
+	}
+
+	// A default of the wrong type fails the same way.
+	if err := e.AddColumn("people", Column{Name: "n", Type: TInt, Default: "'abc'"}); err == nil {
+		t.Fatal("type-incompatible default accepted")
+	}
+
+	// NOT NULL with no usable value still needs an empty table.
+	err := e.AddColumn("people", Column{Name: "req", Type: TInt, NotNull: true})
+	if err == nil || !strings.Contains(err.Error(), "contains null values") {
+		t.Fatalf("NOT NULL without default on a non-empty table: %v", err)
+	}
+	err = e.AddColumn("people", Column{Name: "req", Type: TInt, NotNull: true, Default: "null"})
+	if err == nil || !strings.Contains(err.Error(), "contains null values") {
+		t.Fatalf("NOT NULL DEFAULT NULL on a non-empty table: %v", err)
+	}
+}
+
+// TestSetDropColumnDefault covers the descriptor-only alterations:
+// they change what future inserts get, never what rows already hold.
+func TestSetDropColumnDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	e := openEngine(t, path)
+	peopleTable(t, e)
+	insertPeople(t, e, []any{1, "ada", 36, "a@x"})
+
+	if err := e.SetColumnDefault("people", "email", "'none@x'"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Table("people").Columns[3].Default; got != "'none@x'" {
+		t.Fatalf("stored default = %q", got)
+	}
+	// Existing rows keep their values — SET DEFAULT is not a backfill.
+	row, _, _ := e.Get("people", 1)
+	if row.Col("email") != "a@x" {
+		t.Fatalf("SET DEFAULT rewrote a row: %v", row.Col("email"))
+	}
+
+	// It survives a reopen, like every other descriptor change.
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e = openEngine(t, path)
+	defer e.Close()
+	if got := e.Table("people").Columns[3].Default; got != "'none@x'" {
+		t.Fatalf("default after reopen = %q", got)
+	}
+
+	// Replacing and dropping.
+	if err := e.SetColumnDefault("people", "email", "'other@x'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DropColumnDefault("people", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Table("people").Columns[3].Default; got != "" {
+		t.Fatalf("default after drop = %q", got)
+	}
+	// DROP DEFAULT is idempotent, as in Postgres.
+	if err := e.DropColumnDefault("people", "email"); err != nil {
+		t.Fatal(err)
+	}
+	// SetColumnDefault("") is the drop.
+	if err := e.SetColumnDefault("people", "email", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rejections: unknown table/column, and a literal the column
+	// cannot hold (caught at DDL time, not at the first insert).
+	if err := e.SetColumnDefault("ghosts", "email", "'x'"); err == nil {
+		t.Fatal("unknown table accepted")
+	}
+	if err := e.SetColumnDefault("people", "nope", "'x'"); err == nil {
+		t.Fatal("unknown column accepted")
+	}
+	if err := e.DropColumnDefault("people", "nope"); err == nil {
+		t.Fatal("unknown column accepted by drop")
+	}
+	if err := e.SetColumnDefault("people", "age", "'abc'"); err == nil {
+		t.Fatal("type-incompatible default accepted")
+	}
+}
