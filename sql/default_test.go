@@ -297,13 +297,73 @@ func TestAlterColumnDefault(t *testing.T) {
 		{`alter table t alter column n set default now()`, "requires a timestamp or date column"},
 		{`alter table t alter column nope set default 1`, "does not exist"},
 		{`alter table ghosts alter column n set default 1`, "no such table"},
-		{`alter table t alter column n set not null`, "only SET DEFAULT is supported"},
-		{`alter table t alter column n drop not null`, "only DROP DEFAULT is supported"},
+		{`alter table t alter column n set unique`, "only SET DEFAULT and SET NOT NULL"},
+		{`alter table t alter column n drop unique`, "only DROP DEFAULT and DROP NOT NULL"},
 		{`alter table t alter column n type text`, ""}, // parse error is enough
 	} {
 		err := execErr(t, d, tc.q)
 		if tc.want != "" && !strings.Contains(err, tc.want) {
 			t.Fatalf("%s: %v (want %q)", tc.q, err, tc.want)
+		}
+	}
+}
+
+// TestAlterColumnNotNull covers ALTER TABLE ... ALTER COLUMN
+// SET/DROP NOT NULL, including the migration shape it exists for:
+// ADD COLUMN, SET DEFAULT, fill in batches, then SET NOT NULL.
+func TestAlterColumnNotNull(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, body text)`)
+	exec(t, d, `insert into t (id, body) values (1, 'a'), (2, null), (3, 'c')`)
+
+	// A NULL in the column refuses the constraint, Postgres-worded.
+	err := execErr(t, d, `alter table t alter column body set not null`)
+	if !strings.Contains(err, "contains null values") {
+		t.Fatalf("set not null over a NULL: %v", err)
+	}
+
+	exec(t, d, `update t set body = 'b' where body is null`)
+	exec(t, d, `alter table t alter column body set not null`)
+	if e := execErr(t, d, `insert into t (id) values (4)`); !strings.Contains(e, "not-null") {
+		t.Fatalf("insert NULL after set not null: %v", e)
+	}
+	// information_schema reflects the flag.
+	res := exec(t, d, `select is_nullable from information_schema.columns
+		where table_name = 't' and column_name = 'body'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"NO"}}) {
+		t.Fatalf("is_nullable: %v", res.Rows)
+	}
+
+	exec(t, d, `alter table t alter column body drop not null`)
+	exec(t, d, `insert into t (id) values (4)`)
+	res = exec(t, d, `select is_nullable from information_schema.columns
+		where table_name = 't' and column_name = 'body'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"YES"}}) {
+		t.Fatalf("is_nullable after drop: %v", res.Rows)
+	}
+
+	// The whole point: the large-table migration, without ever
+	// rewriting the table in one transaction.
+	exec(t, d, `alter table t add column version int`)             // O(1)
+	exec(t, d, `alter table t alter column version set default 1`) // O(1)
+	exec(t, d, `update t set version = 1 where version is null`)   // batched in practice
+	exec(t, d, `alter table t alter column version set not null`)  // read-only scan
+	exec(t, d, `insert into t (id, body) values (5, 'e')`)
+	res = exec(t, d, `select count(*) from t where version = 1`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(5)}}) {
+		t.Fatalf("migrated column: %v", res.Rows)
+	}
+
+	for _, tc := range []struct{ q, want string }{
+		{`alter table t alter column id drop not null`, "primary key"},
+		{`alter table t alter column nope set not null`, "no such column"},
+		{`alter table ghosts alter column body set not null`, "no such table"},
+		{`alter table t alter column body set unique`, "only SET DEFAULT and SET NOT NULL"},
+		{`alter table t alter column body drop unique`, "only DROP DEFAULT and DROP NOT NULL"},
+		{`alter table t alter column body set not`, ""}, // truncated: parse error
+	} {
+		if e := execErr(t, d, tc.q); tc.want != "" && !strings.Contains(e, tc.want) {
+			t.Fatalf("%s: %v (want %q)", tc.q, e, tc.want)
 		}
 	}
 }

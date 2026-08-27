@@ -1444,25 +1444,37 @@ func (p *parser) alterTable() (Statement, error) {
 		}
 		switch {
 		case p.acceptKw("set"):
-			if !p.acceptKw("default") {
-				return nil, serr.New("only SET DEFAULT is supported by ALTER COLUMN",
-					"table", table, "column", col)
+			switch {
+			case p.acceptKw("default"):
+				v, err := p.defaultLiteral(col)
+				if err != nil {
+					return nil, err
+				}
+				// SET DEFAULT NULL declares what a defaultless column
+				// already does — the same normalization colDef applies.
+				return &AlterColumnDefault{Table: table, Col: col, Default: v, Drop: v == nil}, nil
+			case p.acceptKw("not"):
+				if err := p.expectKw("null"); err != nil {
+					return nil, err
+				}
+				return &AlterColumnNotNull{Table: table, Col: col, NotNull: true}, nil
 			}
-			v, err := p.defaultLiteral(col)
-			if err != nil {
-				return nil, err
-			}
-			// SET DEFAULT NULL declares what a defaultless column
-			// already does — the same normalization colDef applies.
-			return &AlterColumnDefault{Table: table, Col: col, Default: v, Drop: v == nil}, nil
+			return nil, serr.New("only SET DEFAULT and SET NOT NULL are supported by ALTER COLUMN",
+				"table", table, "column", col)
 		case p.acceptKw("drop"):
-			if !p.acceptKw("default") {
-				return nil, serr.New("only DROP DEFAULT is supported by ALTER COLUMN",
-					"table", table, "column", col)
+			switch {
+			case p.acceptKw("default"):
+				return &AlterColumnDefault{Table: table, Col: col, Drop: true}, nil
+			case p.acceptKw("not"):
+				if err := p.expectKw("null"); err != nil {
+					return nil, err
+				}
+				return &AlterColumnNotNull{Table: table, Col: col}, nil
 			}
-			return &AlterColumnDefault{Table: table, Col: col, Drop: true}, nil
+			return nil, serr.New("only DROP DEFAULT and DROP NOT NULL are supported by ALTER COLUMN",
+				"table", table, "column", col)
 		}
-		return nil, p.unexpected("SET DEFAULT or DROP DEFAULT")
+		return nil, p.unexpected("SET or DROP of DEFAULT or NOT NULL")
 	case p.acceptKw("rename"):
 		// RENAME TO t | RENAME [COLUMN] c TO d.
 		if p.acceptKw("to") {

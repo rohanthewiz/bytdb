@@ -701,6 +701,14 @@ type AlterColumnDefault struct {
 	Drop    bool
 }
 
+// AlterColumnNotNull is ALTER TABLE t ALTER [COLUMN] c
+// SET NOT NULL | DROP NOT NULL. NotNull distinguishes the two forms.
+type AlterColumnNotNull struct {
+	Table   string
+	Col     string
+	NotNull bool
+}
+
 // AlterOwner is ALTER TABLE t OWNER TO role. bytdb has no roles or
 // ownership, but pg_dump output and migration tools (goose, etc.) emit
 // these routinely, so the statement is parsed and executed as a no-op
@@ -1015,6 +1023,7 @@ func (*AddConstraint) stmt()      {}
 func (*AddFK) stmt()              {}
 func (*DropConstraint) stmt()     {}
 func (*AlterColumnDefault) stmt() {}
+func (*AlterColumnNotNull) stmt() {}
 func (*AlterOwner) stmt()         {}
 func (*CreateIndex) stmt()        {}
 func (*DropIndex) stmt()          {}

@@ -86,6 +86,23 @@ CREATE TABLE items (
   alone (Postgres semantics; use `ADD COLUMN ... DEFAULT` or an `UPDATE` to
   touch existing rows). `SET DEFAULT NULL` is the same as `DROP DEFAULT`, and
   `DROP DEFAULT` on a column without one is a no-op.
+- `ALTER TABLE t ALTER [COLUMN] c SET NOT NULL | DROP NOT NULL`. `SET NOT NULL`
+  validates every existing row inside the transaction that publishes the flag —
+  a single NULL aborts it with `column "c" of relation "t" contains null
+  values` (SQLSTATE 23502) — but the scan is **read-only**: it rewrites nothing
+  and materializes no rows, so it is the affordable way to make a column
+  required on a table too large to rewrite in one transaction:
+
+  ```sql
+  ALTER TABLE t ADD COLUMN c int;               -- O(1), rows read NULL
+  ALTER TABLE t ALTER COLUMN c SET DEFAULT 1;   -- O(1), future inserts covered
+  UPDATE t SET c = 1 WHERE c IS NULL AND id >= $lo AND id < $hi;  -- in batches
+  ALTER TABLE t ALTER COLUMN c SET NOT NULL;    -- read-only validating scan
+  ```
+
+  `DROP NOT NULL` is a descriptor flip; it is refused on a primary-key column
+  (the key encoding has no NULL to encode) and on an identity column (whose
+  counter is what guarantees a value).
 - Defaults surface in the catalog — `pg_attrdef` rows (with `pg_get_expr` and
   `pg_attribute.atthasdef`) and `information_schema.columns.column_default` —
   so psql's `\d` renders the Default column and ORMs introspect them; identity

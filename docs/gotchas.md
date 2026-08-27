@@ -69,7 +69,7 @@ Parse-time rejections with pointed errors:
 | Not supported | Use instead / note |
 |---|---|
 | `ALTER TABLE ... ADD PRIMARY KEY / ADD UNIQUE` | Declare PK at create; unique via `CREATE UNIQUE INDEX` or the `UNIQUE` constraint sugar at create |
-| `ALTER TABLE ... ALTER COLUMN` other than `SET DEFAULT` / `DROP DEFAULT` (`SET NOT NULL`, `TYPE`, ...) | Recreate the column, or the table, with the shape you want |
+| `ALTER TABLE ... ALTER COLUMN` other than `SET`/`DROP DEFAULT` and `SET`/`DROP NOT NULL` (`TYPE`, `SET STORAGE`, ...) | Recreate the column, or the table, with the shape you want |
 | `RIGHT` / `FULL` / `NATURAL` joins | Rewrite as `LEFT`/`INNER` |
 | `WITH RECURSIVE`; `WITH` on INSERT/UPDATE/DELETE; data-modifying CTEs | CTEs are SELECT-only and non-recursive |
 | Writable or materialized views; `WITH CHECK OPTION` | Views are read-only, materialized per statement |
@@ -154,6 +154,13 @@ Three semantic notes that surprise people (all Postgres-faithful):
   O(rows), unlike the O(1) defaultless `ADD COLUMN`).
 - `ALTER COLUMN ... SET DEFAULT` does **not** touch existing rows (as in
   Postgres). Only `ADD COLUMN ... DEFAULT` backfills.
+- On a **large** table, prefer `ADD COLUMN` (no DEFAULT) + `ALTER COLUMN SET
+  DEFAULT` + a batched `UPDATE` + `ALTER COLUMN SET NOT NULL` over the one-shot
+  `ADD COLUMN ... NOT NULL DEFAULT x`. The one-shot form is atomic, so every
+  rewritten row stays live in memory until the commit — measured at roughly
+  +0.7–1 KB of transient heap *per row* (on top of the table itself) for a
+  ~60-byte row. The batched path bounds that by the chunk size, and
+  `SET NOT NULL`'s validating scan rewrites nothing at all.
 - `DROP COLUMN` cannot drop a primary-key, indexed, or foreign-key column
   (drop the index/constraint first).
 - Dropped-column data is not rewritten out of existing rows — it lingers under

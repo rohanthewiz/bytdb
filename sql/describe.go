@@ -332,7 +332,7 @@ func command(st Statement) string {
 		return "DROP VIEW"
 	case *AddColumn, *DropColumn, *RenameTable, *RenameColumn,
 		*AddConstraint, *AddFK, *DropConstraint, *AlterOwner,
-		*AlterColumnDefault:
+		*AlterColumnDefault, *AlterColumnNotNull:
 		return "ALTER TABLE"
 	case *CreateIndex:
 		return "CREATE INDEX"

@@ -220,3 +220,105 @@ func TestSetDropColumnDefault(t *testing.T) {
 		t.Fatal("type-incompatible default accepted")
 	}
 }
+
+// TestSetDropColumnNotNull covers the validating flag flip: the cheap
+// half of the "add a required column" migration on a table too large
+// to rewrite in one transaction.
+func TestSetDropColumnNotNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	e := openEngine(t, path)
+	peopleTable(t, e)
+	insertPeople(t, e, []any{1, "ada", 36, "a@x"}, []any{2, "grace", 45, nil})
+
+	// A column with a NULL in it is refused, with Postgres's wording,
+	// and nothing is published.
+	err := e.SetColumnNotNull("people", "email")
+	if err == nil || !strings.Contains(err.Error(), "contains null values") {
+		t.Fatalf("SET NOT NULL over a NULL: %v", err)
+	}
+	if e.Table("people").Columns[3].NotNull {
+		t.Fatal("flag published despite the NULL")
+	}
+
+	// Fill the gap and it succeeds; the flag then rejects new NULLs.
+	if _, err := e.Update("people", []any{2}, map[string]any{"email": "g@x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SetColumnNotNull("people", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if !e.Table("people").Columns[3].NotNull {
+		t.Fatal("NOT NULL not published")
+	}
+	if err := e.Insert("people", 3, "hopper", 50, nil); err == nil {
+		t.Fatal("NULL accepted after SET NOT NULL")
+	}
+	if _, err := e.Update("people", []any{1}, map[string]any{"email": nil}); err == nil {
+		t.Fatal("update to NULL accepted after SET NOT NULL")
+	}
+
+	// Idempotent, and it survives a reopen.
+	if err := e.SetColumnNotNull("people", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e = openEngine(t, path)
+	defer e.Close()
+	if !e.Table("people").Columns[3].NotNull {
+		t.Fatal("NOT NULL lost across reopen")
+	}
+
+	// A key column needs no scan and is already NOT NULL by
+	// construction; setting it is a no-op rather than an error.
+	if err := e.SetColumnNotNull("people", "id"); err != nil {
+		t.Fatal(err)
+	}
+
+	// DROP NOT NULL is the descriptor flip back, idempotent, and
+	// refused on a primary key.
+	if err := e.DropColumnNotNull("people", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if e.Table("people").Columns[3].NotNull {
+		t.Fatal("NOT NULL not cleared")
+	}
+	if err := e.Insert("people", 4, "katherine", 60, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DropColumnNotNull("people", "email"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DropColumnNotNull("people", "id"); err == nil ||
+		!strings.Contains(err.Error(), "primary key") {
+		t.Fatalf("DROP NOT NULL on a key column: %v", err)
+	}
+
+	// Unknown table/column on both.
+	if err := e.SetColumnNotNull("ghosts", "email"); err == nil {
+		t.Fatal("unknown table accepted")
+	}
+	if err := e.SetColumnNotNull("people", "nope"); err == nil {
+		t.Fatal("unknown column accepted")
+	}
+	if err := e.DropColumnNotNull("people", "nope"); err == nil {
+		t.Fatal("unknown column accepted by drop")
+	}
+}
+
+// TestSetNotNullIdentity: identity columns are NOT NULL by definition,
+// so the flag cannot be dropped from one.
+func TestSetNotNullIdentity(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	if _, err := e.CreateTable("s", []Column{
+		{Name: "id", Type: TInt}, {Name: "n", Type: TInt, Identity: true},
+	}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DropColumnNotNull("s", "n"); err == nil ||
+		!strings.Contains(err.Error(), "identity") {
+		t.Fatalf("DROP NOT NULL on an identity column: %v", err)
+	}
+}

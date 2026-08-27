@@ -225,8 +225,7 @@ func (e *Engine) AddColumn(table string, col Column) error {
 			}
 		}
 		if fill == nil && col.NotNull && hasRows(tx, desc.ID) {
-			return nil, serr.New(`column "` + col.Name + `" of relation "` + table +
-				`" contains null values`)
+			return nil, notNullValueErr(table, col.Name)
 		}
 		if fill != nil {
 			if err := backfillColumn(tx, desc, col.ID, fill); err != nil {
@@ -453,6 +452,119 @@ func (e *Engine) DropColumnDefault(table, column string) error {
 		return serr.Wrap(err, "op", "drop column default", "table", table, "column", column)
 	}
 	return nil
+}
+
+// SetColumnNotNull marks a column NOT NULL, validating every existing
+// row inside the transaction that publishes the flag: a single NULL
+// aborts the statement with Postgres's wording (SQLSTATE 23502), and
+// no write can slip in between the check and the publish.
+//
+// This is the cheap half of the "add a required column" migration on
+// a large table: the scan is read-only, so unlike AddColumn's DEFAULT
+// backfill it rewrites nothing and holds nothing but the descriptor
+// in memory. The usual sequence is ADD COLUMN (O(1)) -> SET DEFAULT
+// (O(1)) -> fill the rows in batches -> SET NOT NULL.
+func (e *Engine) SetColumnNotNull(table, column string) error {
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		ord := old.ColIndex(column)
+		if ord < 0 {
+			return nil, serr.New("no such column", "table", table, "column", column)
+		}
+		if old.Columns[ord].NotNull {
+			return nil, nil // already set; nothing to publish
+		}
+		// A key column is non-NULL by construction (coercePK rejects
+		// NULL), so the scan has nothing to find.
+		if !old.isPK(ord) {
+			ok, err := columnHasNoNulls(tx, old, old.Columns[ord].ID)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, notNullValueErr(table, column)
+			}
+		}
+		desc := old.clone()
+		desc.Columns[ord].NotNull = true
+		return desc, nil
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "set not null", "table", table, "column", column)
+	}
+	return nil
+}
+
+// DropColumnNotNull clears a column's NOT NULL flag. Descriptor-only
+// and always cheap. A primary-key column cannot lose it (the key
+// encoding has no NULL to encode), nor can an identity column, whose
+// counter is what guarantees a value.
+func (e *Engine) DropColumnNotNull(table, column string) error {
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		ord := old.ColIndex(column)
+		if ord < 0 {
+			return nil, serr.New("no such column", "table", table, "column", column)
+		}
+		if old.isPK(ord) {
+			return nil, serr.New(`column "`+column+`" is in a primary key`,
+				"table", table, "column", column)
+		}
+		if old.Columns[ord].Identity {
+			return nil, serr.New("an identity column is always NOT NULL",
+				"table", table, "column", column)
+		}
+		if !old.Columns[ord].NotNull {
+			return nil, nil // nothing to publish
+		}
+		desc := old.clone()
+		desc.Columns[ord].NotNull = false
+		return desc, nil
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "drop not null", "table", table, "column", column)
+	}
+	return nil
+}
+
+// notNullValueErr is the "existing rows violate the new constraint"
+// error, worded as Postgres words it (SQLSTATE 23502, the same
+// wording AddColumn uses for the equivalent case).
+func notNullValueErr(table, column string) error {
+	return serr.New(`column "` + column + `" of relation "` + table +
+		`" contains null values`)
+}
+
+// columnHasNoNulls reports whether every row in the table holds a
+// value for the column with the given stable ID.
+//
+// It reads the stored value tuples directly rather than going through
+// decodeRow: a NULL column is simply omitted from a row's value
+// (encodeRowValue), so the presence of a pair tagged with this column
+// ID is exactly what "not NULL" means. That keeps the validation scan
+// to one tuple decode per row and no row materialization at all —
+// which is the point of SET NOT NULL on a table too large to rewrite.
+func columnHasNoNulls(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint32) (bool, error) {
+	prefix := tablePrefix(desc.ID)
+	end := string(tuple.PrefixEnd(prefix))
+	for k, v := range tx.Ascend(string(prefix)) {
+		if k >= end {
+			break
+		}
+		pairs, err := tuple.Decode(v)
+		if err != nil {
+			return false, serr.Wrap(err, "op", "validate not null", "table", desc.Name)
+		}
+		found := false
+		for j := 0; j+1 < len(pairs); j += 2 {
+			if id, ok := pairs[j].(int64); ok && uint32(id) == colID && pairs[j+1] != nil {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // AddCheck appends a CHECK constraint to a table. The engine treats

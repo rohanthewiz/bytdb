@@ -16,6 +16,7 @@
 //	ALTER TABLE t RENAME [COLUMN] c TO d
 //	ALTER TABLE t ALTER [COLUMN] c SET DEFAULT expr
 //	ALTER TABLE t ALTER [COLUMN] c DROP DEFAULT
+//	ALTER TABLE t ALTER [COLUMN] c SET NOT NULL | DROP NOT NULL
 //	ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
 //	ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 //	ALTER TABLE t OWNER TO role       (accepted and ignored; no roles)
@@ -845,6 +846,20 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 			return nil, err
 		}
 		if err := d.e.SetColumnDefault(s.Table, s.Col, text); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
+	case *AlterColumnNotNull:
+		// SET NOT NULL validates every existing row in the engine, in
+		// the transaction that publishes the flag; DROP NOT NULL is a
+		// descriptor flip.
+		if s.NotNull {
+			if err := d.e.SetColumnNotNull(s.Table, s.Col); err != nil {
+				return nil, err
+			}
+			return &Result{}, nil
+		}
+		if err := d.e.DropColumnNotNull(s.Table, s.Col); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
