@@ -678,6 +678,25 @@ const autocommitRetries = 3
 // must run idempotent statements. Never set outside tests.
 var testInjectConflicts atomic.Int64
 
+// relationExists reports whether the name is taken by any relation.
+//
+// Tables, sequences and views share one namespace in the engine — the
+// CreateTable/CreateSequence/CreateView closures each reject a name
+// held by any of the three (see ddl.go, seqobj.go, view.go). An
+// IF NOT EXISTS guard that consulted only its own kind would therefore
+// be narrower than the collision it exists to skip: the statement
+// would still fail with "already exists" on a name held by a relation
+// of a different kind, which is exactly what IF NOT EXISTS promises
+// not to do. Postgres skips on any relation in the schema; so does
+// this.
+//
+// Indexes are deliberately not consulted: bytdb scopes index names to
+// their table rather than to the schema, so an index name never
+// collides with a relation name in the first place.
+func (d *DB) relationExists(name string) bool {
+	return d.e.Table(name) != nil || d.e.Sequence(name) != nil || d.e.View(name) != nil
+}
+
 // run binds args into st, adapts quoted literals to their column
 // types, and dispatches it — re-running on optimistic-conflict loss
 // when it is safe to (see autocommitRetries).
@@ -717,10 +736,11 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 	}
 	switch s := st.(type) {
 	case *CreateTable:
-		// IF NOT EXISTS is a name check only, as in Postgres: a table
-		// (of any shape) with this name makes the statement a no-op —
-		// the requested columns are never compared to the existing ones.
-		if s.IfNotExists && d.e.Table(s.Table) != nil {
+		// IF NOT EXISTS is a name check only, as in Postgres: a
+		// relation (of any kind or shape) with this name makes the
+		// statement a no-op — the requested columns are never compared
+		// to the existing ones.
+		if s.IfNotExists && d.relationExists(s.Table) {
 			return &Result{Notice: `relation "` + s.Table + `" already exists, skipping`}, nil
 		}
 		cols := make([]bytdb.Column, len(s.Cols))

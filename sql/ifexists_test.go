@@ -130,3 +130,54 @@ func TestIndexIfExistsDDL(t *testing.T) {
 		t.Fatalf("second drop should notice: %q", res.Notice)
 	}
 }
+
+// TestIfNotExistsCrossRelationKind pins that IF NOT EXISTS honors the
+// whole relation namespace, not just its own kind.
+//
+// Tables, sequences and views share one namespace in the engine, so a
+// name held by any of them collides with a CREATE of any other. Before
+// this was fixed, each guard consulted only its own catalog — CREATE
+// TABLE IF NOT EXISTS over an existing sequence checked for a *table*,
+// found none, proceeded, and hit the engine's namespace check as a
+// hard "already exists" error. That is precisely the error the clause
+// promises to swallow.
+func TestIfNotExistsCrossRelationKind(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create sequence s`)
+	exec(t, d, `create table tbl (id int primary key)`)
+	exec(t, d, `create view v as select id from tbl`)
+
+	// A table over each other relation kind.
+	for _, name := range []string{"s", "v"} {
+		res := exec(t, d, `create table if not exists `+name+` (id int primary key)`)
+		if !strings.Contains(res.Notice, `relation "`+name+`" already exists, skipping`) {
+			t.Fatalf("create table if not exists over %q: notice %q", name, res.Notice)
+		}
+	}
+
+	// A sequence over each other relation kind.
+	for _, name := range []string{"tbl", "v"} {
+		res := exec(t, d, `create sequence if not exists `+name)
+		if !strings.Contains(res.Notice, `relation "`+name+`" already exists, skipping`) {
+			t.Fatalf("create sequence if not exists over %q: notice %q", name, res.Notice)
+		}
+	}
+
+	// The unguarded forms must still error — the fix widens what the
+	// guard skips, never what a plain CREATE tolerates.
+	if _, err := d.Exec(`create table s (id int primary key)`); err == nil {
+		t.Fatal("unguarded create table over a sequence name should error")
+	}
+	if _, err := d.Exec(`create sequence tbl`); err == nil {
+		t.Fatal("unguarded create sequence over a table name should error")
+	}
+
+	// Nothing was clobbered: each relation is still its original kind.
+	if res := exec(t, d, `select nextval('s')`); len(res.Rows) != 1 {
+		t.Fatalf("sequence s no longer usable: %v", res.Rows)
+	}
+	exec(t, d, `insert into tbl values (1)`)
+	if res := exec(t, d, `select id from v`); !reflect.DeepEqual(res.Rows, [][]any{{int64(1)}}) {
+		t.Fatalf("view v no longer usable: %v", res.Rows)
+	}
+}

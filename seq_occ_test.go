@@ -52,9 +52,7 @@ func TestOCCConcurrentIdentityInserts(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, writers)
 	for w := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range perWriter {
 				err := e.WriteTxn(func(tx *Txn) error {
 					return tx.Insert("events", nil, "w")
@@ -65,7 +63,7 @@ func TestOCCConcurrentIdentityInserts(t *testing.T) {
 				}
 			}
 			_ = w
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -278,9 +276,7 @@ func TestOCCNextValConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, workers)
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range perWorker {
 				var v int64
 				err := e.WriteTxn(func(tx *Txn) error {
@@ -301,7 +297,7 @@ func TestOCCNextValConcurrent(t *testing.T) {
 				seen[v] = true
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -548,9 +544,7 @@ func TestOCCTruncateInsertRace(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, writers+1)
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 30 {
 				err := e.WriteTxn(func(tx *Txn) error {
 					return tx.Insert("events", nil, "w")
@@ -562,11 +556,9 @@ func TestOCCTruncateInsertRace(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for range 10 {
 			err := e.WriteTxn(func(tx *Txn) error {
 				return tx.Truncate("events", true)
@@ -576,7 +568,7 @@ func TestOCCTruncateInsertRace(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -726,5 +718,86 @@ func TestOCCBackwardSetDuringExtensionReanchors(t *testing.T) {
 	}
 	if v != 5 {
 		t.Fatalf("draw after backward set = %d, want 5 (stale watermark resurrected the old position)", v)
+	}
+}
+
+// TestOCCTruncateInsertRaceUniqueIndex is TestOCCTruncateInsertRace's
+// shape moved off the primary key and onto a unique secondary index.
+//
+// dml.go reclassifies a draw collision as ErrTxConflict in two places:
+// the primary-key probe and the unique-index probe. Only the first had
+// a test. The second is what a table whose PK is caller-supplied but
+// whose identity column carries a uniqueness constraint of its own
+// depends on — there a restarted counter re-issuing a cached draw
+// collides on the index, not on the key, and a caller who saw a raw
+// "unique index violation" would read a lost race as data corruption.
+//
+// The reclassification cannot be provoked deterministically: an
+// explicit value bumps the shared allocator (bumpCounterAllocTo), so
+// only a true race with TRUNCATE ... RESTART IDENTITY — whose cache
+// invalidation is deferred to commit — re-issues a live value. The
+// contention below reaches it on most runs but not all, which is why
+// the assertions are invariants rather than a demand that it fire:
+// whatever the interleaving, no bare uniqueness error may escape and
+// no duplicate may survive. Both hold on every interleaving, so the
+// test cannot flake in the other direction either.
+func TestOCCTruncateInsertRaceUniqueIndex(t *testing.T) {
+	e := openOCCEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	// PK is caller-supplied and distinct per writer, so a collision
+	// observed here can only be the index's, never the key's.
+	if _, err := e.CreateTable("events", []Column{
+		{Name: "id", Type: TInt},
+		{Name: "n", Type: TInt, Identity: true},
+	}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateIndex("events", "events_n_uq", true, "n"); err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, writers+1)
+	for w := range writers {
+		wg.Go(func() {
+			for i := range 200 {
+				err := e.WriteTxn(func(tx *Txn) error {
+					return tx.Insert("events", w*100000+i, nil)
+				})
+				if err != nil && !errors.Is(err, btypedb.ErrTxConflict) {
+					// A bare "unique index violation" here is the bug
+					// this test exists to catch.
+					errs <- err
+					return
+				}
+			}
+		})
+	}
+	wg.Go(func() {
+		for range 60 {
+			err := e.WriteTxn(func(tx *Txn) error {
+				return tx.Truncate("events", true)
+			})
+			if err != nil && !errors.Is(err, btypedb.ErrTxConflict) {
+				errs <- err
+				return
+			}
+		}
+	})
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	// The uniqueness the index promises held throughout.
+	seen := map[int64]bool{}
+	for _, r := range collect(t, e.Scan("events")) {
+		n := r.Col("n").(int64)
+		if seen[n] {
+			t.Fatalf("duplicate identity value %d under a unique index", n)
+		}
+		seen[n] = true
 	}
 }

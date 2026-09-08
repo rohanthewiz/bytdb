@@ -90,12 +90,18 @@ or standalone: `go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd
 
 ## What the SQL dialect covers
 
-Postgres-flavored and deliberately small. Full DDL (tables, ASC/DESC
-indexes, sequences, views, ALTER ... ADD/DROP COLUMN / RENAME /
-constraints; `ALTER TABLE ... OWNER TO` is accepted as a no-op — bytdb
+Postgres-flavored and deliberately small.
+
+Full DDL: tables, ASC/DESC indexes, sequences, views, `ALTER ...
+ADD/DROP COLUMN / RENAME / constraints`, `ALTER COLUMN SET|DROP
+DEFAULT`, `ALTER COLUMN SET|DROP NOT NULL`, `IF NOT EXISTS` on CREATE
+TABLE/INDEX/SEQUENCE and `IF EXISTS` on DROP
+TABLE/INDEX/SEQUENCE/VIEW/CONSTRAINT (views take `CREATE OR REPLACE`
+instead). `ALTER TABLE ... OWNER TO` is accepted as a no-op — bytdb
 has no roles, so pg_dump/goose migration DDL runs unmodified, even
-inside transaction blocks), INSERT with `ON CONFLICT` upsert and
-RETURNING,
+inside transaction blocks.
+
+Then: INSERT with `ON CONFLICT` upsert and RETURNING,
 SELECT/UPDATE/DELETE with a planner that pushes WHERE conjuncts to
 point gets and bounded index scans, joins (nested-loop with index
 rebinding; hash join when no index serves an equijoin), aggregates +
@@ -225,8 +231,35 @@ bytes, 64 hex chars, or base64 of 32).
   keep them short either way, and be ready to retry from BEGIN.
 - **DDL cannot run inside a transaction block**; every schema change
   is its own transaction. TRUNCATE is DML and does roll back.
-- **ALTER TABLE ADD COLUMN with DEFAULT / NOT NULL** requires an
-  empty table (no backfill machinery, by design).
+- **ALTER TABLE ADD COLUMN is O(1) without a DEFAULT** — nothing is
+  rewritten and existing rows read the new column as NULL. A non-NULL
+  `DEFAULT` backfills every row in the same transaction that publishes
+  the descriptor, which is O(rows) but makes `NOT NULL DEFAULT x`
+  legal on a non-empty table. `NOT NULL` *without* a default still
+  requires an empty table (existing rows would read NULL).
+- **On a large table, don't use the one-shot `ADD COLUMN ... NOT NULL
+  DEFAULT x`.** It is atomic, so every rewritten row stays live in
+  memory until the commit — roughly +0.7-1 KB of transient heap *per
+  row* for a ~60-byte row, which `GOMEMLIMIT` cannot cap. Prefer:
+
+  ```sql
+  ALTER TABLE t ADD COLUMN c int;               -- O(1), rows read NULL
+  ALTER TABLE t ALTER COLUMN c SET DEFAULT 1;   -- O(1), future inserts covered
+  UPDATE t SET c = 1 WHERE c IS NULL AND id >= $lo AND id < $hi;  -- in batches
+  ALTER TABLE t ALTER COLUMN c SET NOT NULL;    -- read-only validating scan
+  ```
+
+  `SET NOT NULL`'s scan materializes no rows and rewrites nothing, so
+  it is affordable on a table too large to rewrite in one transaction.
+  The engine **refuses** a one-shot backfill over 1M rows
+  (`DefaultBackfillLimit`) rather than OOM-killing mid-migration;
+  `Engine.SetBackfillLimit(n)` raises it, `0` disables it.
+- **A DEFAULT that backfills must be something the engine can evaluate**
+  — a constant, `now()`, or `current_date`. Anything else (an
+  expression, a cast, `gen_random_uuid()`) *fails the ALTER* rather
+  than leaving old rows NULL while new inserts get a value.
+- `ALTER COLUMN SET DEFAULT` never touches existing rows, as in
+  Postgres; only `ADD COLUMN ... DEFAULT` backfills.
 - `ON UPDATE CASCADE` and `SET NULL/DEFAULT` FK actions are rejected
   at parse — only `ON DELETE CASCADE` exists. Index the child FK
   columns or cascade probes are full scans per deleted parent key.

@@ -322,3 +322,72 @@ func TestSetNotNullIdentity(t *testing.T) {
 		t.Fatalf("DROP NOT NULL on an identity column: %v", err)
 	}
 }
+
+// TestAddColumnBackfillLimit covers the guard that refuses a one-shot
+// ADD COLUMN ... DEFAULT on a table too large to rewrite in one
+// transaction. The three cases that matter are the boundary (a table
+// exactly at the cap still runs), one row past it (refused, and
+// nothing changed), and the disabled guard (0 means no cap).
+func TestAddColumnBackfillLimit(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+	for i := 1; i <= 4; i++ {
+		insertPeople(t, e, []any{i, "p", 1, "e"})
+	}
+
+	// Exactly at the cap: allowed. The guard is "more than limit", not
+	// "limit or more" — pinning that here keeps a future off-by-one
+	// from silently tightening the rule.
+	e.SetBackfillLimit(4)
+	if err := e.AddColumn("people", Column{Name: "city", Type: TString, Default: "'nyc'"}); err != nil {
+		t.Fatalf("backfill at exactly the limit should run: %v", err)
+	}
+	if row, _, _ := e.Get("people", 1); row.Col("city") != "nyc" {
+		t.Fatalf("city = %v; want nyc", row.Col("city"))
+	}
+
+	// One row over: refused, and the refusal is atomic — no descriptor
+	// change, so the column does not exist even partially.
+	e.SetBackfillLimit(3)
+	err := e.AddColumn("people", Column{Name: "zip", Type: TString, Default: "'10001'"})
+	if err == nil {
+		t.Fatal("backfill over the limit should be refused")
+	}
+	if !strings.Contains(err.Error(), "backfill limit") {
+		t.Fatalf("error should name the limit: %v", err)
+	}
+	if !strings.Contains(err.Error(), "SET NOT NULL") {
+		t.Fatalf("error should name the batched alternative: %v", err)
+	}
+	if desc := e.Table("people"); desc.ColIndex("zip") >= 0 {
+		t.Fatal("refused ADD COLUMN left the column in the descriptor")
+	}
+
+	// The defaultless form is O(1) and rewrites nothing, so the cap
+	// must not touch it however low it is set.
+	e.SetBackfillLimit(1)
+	if err := e.AddColumn("people", Column{Name: "note", Type: TString}); err != nil {
+		t.Fatalf("defaultless ADD COLUMN must ignore the backfill limit: %v", err)
+	}
+
+	// 0 disables the guard entirely.
+	e.SetBackfillLimit(0)
+	if err := e.AddColumn("people", Column{Name: "zip", Type: TString, Default: "'10001'"}); err != nil {
+		t.Fatalf("disabled limit should allow the backfill: %v", err)
+	}
+	if row, _, _ := e.Get("people", 4); row.Col("zip") != "10001" {
+		t.Fatalf("zip = %v; want 10001", row.Col("zip"))
+	}
+}
+
+// TestDefaultBackfillLimitIsSet guards the wiring: a freshly opened
+// engine carries the documented default rather than a zero value,
+// which would silently disable the guard for every embedder.
+func TestDefaultBackfillLimitIsSet(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	if got := e.BackfillLimit(); got != DefaultBackfillLimit {
+		t.Fatalf("BackfillLimit() = %d; want %d", got, DefaultBackfillLimit)
+	}
+}

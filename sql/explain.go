@@ -639,13 +639,18 @@ func exprText(e Expr) string {
 		var b strings.Builder
 		b.WriteString("CASE")
 		if n.Operand != nil {
-			b.WriteString(" " + exprText(n.Operand))
+			b.WriteString(" ")
+			b.WriteString(exprText(n.Operand))
 		}
 		for _, w := range n.Whens {
-			b.WriteString(" WHEN " + exprText(w.When) + " THEN " + exprText(w.Then))
+			b.WriteString(" WHEN ")
+			b.WriteString(exprText(w.When))
+			b.WriteString(" THEN ")
+			b.WriteString(exprText(w.Then))
 		}
 		if n.Else != nil {
-			b.WriteString(" ELSE " + exprText(n.Else))
+			b.WriteString(" ELSE ")
+			b.WriteString(exprText(n.Else))
 		}
 		b.WriteString(" END")
 		return b.String()

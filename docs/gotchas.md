@@ -161,6 +161,12 @@ Three semantic notes that surprise people (all Postgres-faithful):
   +0.7–1 KB of transient heap *per row* (on top of the table itself) for a
   ~60-byte row. The batched path bounds that by the chunk size, and
   `SET NOT NULL`'s validating scan rewrites nothing at all.
+- The engine **refuses** a one-shot backfill over `DefaultBackfillLimit`
+  (1M rows) rather than letting it run into an OOM kill part-way through
+  the migration. The error names the batched recipe above. Raise or
+  disable the cap with `Engine.SetBackfillLimit(n)` — `0` or less means no
+  limit. The defaultless `ADD COLUMN` rewrites nothing and is never
+  capped, however low the limit is set.
 - `DROP COLUMN` cannot drop a primary-key, indexed, or foreign-key column
   (drop the index/constraint first).
 - Dropped-column data is not rewritten out of existing rows — it lingers under

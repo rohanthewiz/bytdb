@@ -2,6 +2,7 @@ package bytdb
 
 import (
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/rohanthewiz/btypedb"
@@ -228,6 +229,18 @@ func (e *Engine) AddColumn(table string, col Column) error {
 			return nil, notNullValueErr(table, col.Name)
 		}
 		if fill != nil {
+			// Refuse before rewriting anything. The backfill's cost is
+			// live memory held to the commit, so a table far over the
+			// cap does not fail slowly — it OOM-kills the process
+			// part-way through. Counting stops at limit+1, so the
+			// guard costs a bounded scan even on a huge table, and the
+			// "+1" is what distinguishes "exactly at the cap" (allowed)
+			// from "over it".
+			if limit := e.backfillLimit.Load(); limit > 0 {
+				if n := countRowsUpTo(tx, desc.ID, limit+1); n > limit {
+					return nil, backfillTooLargeErr(table, col.Name, limit)
+				}
+			}
 			if err := backfillColumn(tx, desc, col.ID, fill); err != nil {
 				return nil, err
 			}
@@ -283,12 +296,32 @@ func backfillColumn(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint3
 // hasRows reports whether the table's primary index holds any row in
 // tx's view.
 func hasRows(tx *btypedb.Tx[string, []byte], tableID uint64) bool {
+	return countRowsUpTo(tx, tableID, 1) > 0
+}
+
+// countRowsUpTo counts the table's rows in tx's view, stopping as soon
+// as the count reaches limit. The early exit is the whole point: both
+// callers only need to compare the count against a bound (is it
+// non-empty? is it over the backfill cap?), so neither should pay for
+// a full scan of a table that is obviously past the bound.
+//
+// A limit of 0 or less counts nothing and returns 0.
+func countRowsUpTo(tx *btypedb.Tx[string, []byte], tableID uint64, limit int64) int64 {
+	if limit <= 0 {
+		return 0
+	}
 	prefix := tablePrefix(tableID)
 	end := string(tuple.PrefixEnd(prefix))
+	var n int64
 	for k := range tx.Ascend(string(prefix)) {
-		return k < end
+		if k >= end {
+			break
+		}
+		if n++; n >= limit {
+			break
+		}
 	}
-	return false
+	return n
 }
 
 // DropColumn removes a column from a table. No rows are rewritten:
@@ -523,6 +556,24 @@ func (e *Engine) DropColumnNotNull(table, column string) error {
 		return serr.Wrap(err, "op", "drop not null", "table", table, "column", column)
 	}
 	return nil
+}
+
+// backfillTooLargeErr refuses a one-shot ADD COLUMN ... DEFAULT that
+// would rewrite more rows than the engine's backfill cap allows.
+//
+// The message names the alternative rather than only the refusal: the
+// batched path (ADD COLUMN without a DEFAULT, then SET DEFAULT, then
+// an UPDATE in chunks, then SET NOT NULL) reaches the same end state
+// with memory bounded by the chunk size, and SET NOT NULL's validating
+// scan rewrites nothing at all. A caller who means it raises the cap
+// with Engine.SetBackfillLimit.
+func backfillTooLargeErr(table, column string, limit int64) error {
+	return serr.New("adding a column with a DEFAULT would rewrite more rows "+
+		"than the backfill limit allows in one transaction; add the column "+
+		"without a DEFAULT, then ALTER COLUMN SET DEFAULT, UPDATE in batches, "+
+		"and ALTER COLUMN SET NOT NULL — or raise Engine.SetBackfillLimit",
+		"table", table, "column", column,
+		"backfillLimit", strconv.FormatInt(limit, 10))
 }
 
 // notNullValueErr is the "existing rows violate the new constraint"

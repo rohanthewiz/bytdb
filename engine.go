@@ -288,12 +288,7 @@ func (d *TableDesc) buildOrdByID() {
 }
 
 func (d *TableDesc) isPK(ordinal int) bool {
-	for _, p := range d.PKCols {
-		if p == ordinal {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(d.PKCols, ordinal)
 }
 
 // Engine is a relational store in a single btypedb file. It is safe
@@ -341,6 +336,14 @@ type Engine struct {
 	// permanent, server-wide deadlock. The guard turns that programming
 	// error into an error return (see checkReentrantWrite).
 	writerGID atomic.Uint64
+
+	// backfillLimit caps how many rows ALTER TABLE ADD COLUMN with a
+	// DEFAULT will rewrite in one transaction; 0 or less disables the
+	// guard. Atomic rather than a plain field because it is a knob a
+	// caller may flip between DDL statements (raise it for one known
+	// migration, drop it back) from a different goroutine than the one
+	// running the ALTER. See SetBackfillLimit.
+	backfillLimit atomic.Int64
 
 	// testCommitErr, when non-nil, replaces a successful DDL commit's
 	// result (see updateDDL). Only tests set it, to simulate a WAL
@@ -538,6 +541,7 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 		seqAllocs:    map[string]*counterAlloc{},
 		seqObjAllocs: map[string]*seqObjAlloc{},
 	}
+	e.backfillLimit.Store(DefaultBackfillLimit)
 	if err := e.loadCatalog(); err != nil {
 		kv.Close()
 		return nil, err
@@ -554,6 +558,35 @@ func (e *Engine) Close() error { return e.kv.Close() }
 // read tracking where the single-writer default already guarantees
 // serializability for free.
 func (e *Engine) ConcurrentWrites() bool { return e.occ }
+
+// DefaultBackfillLimit is how many rows ALTER TABLE ADD COLUMN with a
+// DEFAULT will rewrite in a single transaction before refusing.
+//
+// The guard exists because the one-shot form's cost is *live* memory,
+// not time. The backfill is atomic, so every rewritten row is retained
+// until the commit — measured at roughly +0.7-1 KB of heap per row for
+// a ~60-byte row, which GOMEMLIMIT cannot cap because the memory is
+// reachable. A 100M-row table therefore needs ~71 GB and dies by OOM
+// kill part-way through a migration rather than returning an error.
+// Refusing up front turns that into a message naming the batched
+// alternative, which bounds memory by the chunk size.
+//
+// One million rows is ~0.7-1 GB by the same figures: high enough that
+// no ordinary migration trips it, low enough to catch the shape the
+// guard was written for.
+const DefaultBackfillLimit = 1_000_000
+
+// SetBackfillLimit changes the row cap enforced by ALTER TABLE ADD
+// COLUMN with a DEFAULT (see DefaultBackfillLimit). A value of 0 or
+// less disables the guard entirely — the same "negative means no
+// limit" idiom the pgwire server uses for MaxConns.
+//
+// Safe to call at any time, including concurrently with DDL: the
+// limit is read once at the start of each backfill.
+func (e *Engine) SetBackfillLimit(n int64) { e.backfillLimit.Store(n) }
+
+// BackfillLimit reports the current ADD COLUMN backfill row cap.
+func (e *Engine) BackfillLimit() int64 { return e.backfillLimit.Load() }
 
 // Backup writes a consistent point-in-time copy of the database to
 // destPath without blocking readers or writers: every transaction

@@ -79,10 +79,12 @@ func windowText(w *ExWindow) string {
 	case w.Arg != nil:
 		b.WriteString(exprText(w.Arg))
 		if w.Offset != nil {
-			b.WriteString(", " + exprText(w.Offset))
+			b.WriteString(", ")
+			b.WriteString(exprText(w.Offset))
 		}
 		if w.Default != nil {
-			b.WriteString(", " + exprText(w.Default))
+			b.WriteString(", ")
+			b.WriteString(exprText(w.Default))
 		}
 	}
 	b.WriteString(") OVER (")
@@ -92,7 +94,8 @@ func windowText(w *ExWindow) string {
 		for i, e := range w.Partition {
 			txts[i] = exprText(e)
 		}
-		b.WriteString("PARTITION BY " + strings.Join(txts, ", "))
+		b.WriteString("PARTITION BY ")
+		b.WriteString(strings.Join(txts, ", "))
 		sep = " "
 	}
 	if len(w.OrderBy) > 0 {
@@ -103,16 +106,23 @@ func windowText(w *ExWindow) string {
 				txts[i] += " DESC"
 			}
 		}
-		b.WriteString(sep + "ORDER BY " + strings.Join(txts, ", "))
+		b.WriteString(sep)
+		b.WriteString("ORDER BY ")
+		b.WriteString(strings.Join(txts, ", "))
 		sep = " "
 	}
 	if w.Frame != nil {
 		// Always the canonical BETWEEN form; the single-bound shorthand
 		// already normalized to it at parse.
-		b.WriteString(sep + w.Frame.Mode.name() + " BETWEEN " +
-			boundText(w.Frame.Start) + " AND " + boundText(w.Frame.End))
+		b.WriteString(sep)
+		b.WriteString(w.Frame.Mode.name())
+		b.WriteString(" BETWEEN ")
+		b.WriteString(boundText(w.Frame.Start))
+		b.WriteString(" AND ")
+		b.WriteString(boundText(w.Frame.End))
 		if w.Frame.Exclude != ExcludeNoOthers {
-			b.WriteString(" " + w.Frame.Exclude.name())
+			b.WriteString(" ")
+			b.WriteString(w.Frame.Exclude.name())
 		}
 	}
 	b.WriteByte(')')

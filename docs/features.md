@@ -79,8 +79,11 @@ CREATE TABLE items (
   and via `INSERT ... DEFAULT VALUES`. General expression defaults stay
   rejected. `ADD COLUMN ... DEFAULT` backfills existing rows; a default the
   engine cannot evaluate to a constant fails the statement rather than
-  leaving old rows reading NULL.
-  *(verified in `sql/default_test.go`)*
+  leaving old rows reading NULL. The backfill is capped at
+  `DefaultBackfillLimit` (1M) rows, since its cost is live memory held to the
+  commit — over the cap the statement is refused with a pointer to the batched
+  recipe below, and `Engine.SetBackfillLimit(n)` raises it (`0` disables).
+  *(verified in `sql/default_test.go`, `default_backfill_test.go`)*
 - `ALTER TABLE t ALTER [COLUMN] c SET DEFAULT expr | DROP DEFAULT` changes the
   descriptor only — later inserts get the new default, stored rows are left
   alone (Postgres semantics; use `ADD COLUMN ... DEFAULT` or an `UPDATE` to

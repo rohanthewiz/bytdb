@@ -207,7 +207,8 @@ func exprKey(sc *scope, e Expr) (string, error) {
 
 func writeExprKey(b *strings.Builder, sc *scope, e Expr) error {
 	list := func(op string, subs ...Expr) error {
-		b.WriteString(op + "(")
+		b.WriteString(op)
+		b.WriteString("(")
 		for _, sub := range subs {
 			if err := writeExprKey(b, sc, sub); err != nil {
 				return err

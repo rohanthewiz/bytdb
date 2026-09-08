@@ -2,6 +2,7 @@ package sql
 
 import (
 	"math"
+	"slices"
 	"strconv"
 
 	"github.com/rohanthewiz/bytdb"
@@ -145,7 +146,9 @@ func applySeqOptions(d *bytdb.SeqDesc, o SeqOptions) error {
 }
 
 func (d *DB) execCreateSequence(s *CreateSequence) (*Result, error) {
-	if s.IfNotExists && d.e.Sequence(s.Name) != nil {
+	// Any relation of any kind holding the name makes this a no-op —
+	// see relationExists for why the check is not sequence-only.
+	if s.IfNotExists && d.relationExists(s.Name) {
 		return &Result{Notice: `relation "` + s.Name + `" already exists, skipping`}, nil
 	}
 	desc, err := buildSeqDesc(s)
@@ -280,17 +283,9 @@ func boolWritesSequences(b BoolExpr) bool {
 	case *Not:
 		return boolWritesSequences(n.Expr)
 	case *And:
-		for _, sub := range n.Exprs {
-			if boolWritesSequences(sub) {
-				return true
-			}
-		}
+		return slices.ContainsFunc(n.Exprs, boolWritesSequences)
 	case *Or:
-		for _, sub := range n.Exprs {
-			if boolWritesSequences(sub) {
-				return true
-			}
-		}
+		return slices.ContainsFunc(n.Exprs, boolWritesSequences)
 	}
 	return false
 }
