@@ -658,7 +658,8 @@ Auth is trust by default (user/database accepted and ignored); with a
 credentials registry set, SCRAM-SHA-256 runs for real — RFC 5802 with
 channel binding (SCRAM-SHA-256-PLUS) over TLS. `bytdbd` adds
 `-max-conns` (a connection cap), `-sync always|never` (WAL fsync
-policy), and query logging. Transaction blocks work as in Postgres:
+policy), query logging, and `-metrics-addr` (a Prometheus `/metrics`
+endpoint, see Monitoring memory). Transaction blocks work as in Postgres:
 each connection is a `sql.Session`, `ReadyForQuery` reports the real
 status (idle / in transaction / failed), redundant `BEGIN`/`COMMIT`
 raise `NoticeResponse` warnings, and a dropped connection rolls back
@@ -775,6 +776,38 @@ would leak through `ps`): `-encryption-key-file <path>` or
 or base64 of 32 bytes.
 
 More in [docs/security.md](docs/security.md).
+
+## Monitoring memory
+
+bytdb holds every row on the Go heap, so "is the database running low
+on RAM" means "is this process's heap approaching what the host can
+give it". `Engine.Stats()` answers that in one call: store size (keys,
+tables, log bytes) next to the runtime's live heap, GC goal, memory
+limit, GC cycle count and GC CPU time. It reads `runtime/metrics`, not
+`runtime.ReadMemStats`, so it does not stop the world and is cheap
+enough to poll from a health check.
+
+```go
+s := e.Stats()
+if s.HeapFraction() > 0.8 { // heap_live / GOMEMLIMIT; 0 when no limit is set
+    log.Printf("bytdb near memory limit: %d of %d bytes, %d keys", s.HeapLive, s.MemLimit, s.Keys)
+}
+```
+
+Set `GOMEMLIMIT` to roughly 80% of what the process may use and watch
+two things: `HeapFraction` climbing past 0.8, and `GCCPUSeconds`
+rising fast while `HeapLive` stays flat — the collector thrashing to
+hold the limit, which is the last warning before an OOM kill.
+Reachable memory (rows, and every write of an open transaction) cannot
+be freed by any amount of GC, which is why large single-transaction
+rewrites should be batched (see the ADD COLUMN note in the SQL
+section).
+
+`bytdb.MetricsHandler(e, nil)` serves the same figures over HTTP in
+the Prometheus text format (JSON with `Accept: application/json`), and
+`bytdbd -metrics-addr 127.0.0.1:9090` exposes it at `/metrics` with an
+added `bytdb_pgwire_connections` gauge. The endpoint is unauthenticated,
+so bind it to a private address.
 
 ## Design notes
 

@@ -284,6 +284,14 @@ bytes, 64 hex chars, or base64 of 32).
 - Not implemented: RIGHT/FULL joins, triggers, NUMERIC(p,s), arrays
   beyond `text[]`, jsonb indexing, COPY, live HA/failover (replication
   is async recovery, see above). Datasets must fit in RAM.
+- **Watching RAM:** `e.Stats()` returns keys, tables, log bytes and
+  the runtime's live heap / GOMEMLIMIT / GC figures without stopping
+  the world; `Stats.HeapFraction() > 0.8` is the practical low-memory
+  alarm (0 when no limit is set — set `GOMEMLIMIT` to ~80% of the
+  process budget). `bytdb.MetricsHandler(e, nil)` serves the same as
+  Prometheus text (JSON on `Accept: application/json`), and `bytdbd
+  -metrics-addr 127.0.0.1:9090` exposes it at `/metrics` plus a
+  `bytdb_pgwire_connections` gauge. Unauthenticated: bind privately.
 
 ## Verifying changes
 

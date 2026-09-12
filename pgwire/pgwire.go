@@ -278,6 +278,17 @@ func NewServer(db *sql.DB) *Server {
 	return s
 }
 
+// ConnCount reports the number of accepted client connections currently
+// open, including those still in startup or over the MaxConns cap and
+// about to be refused. It is the figure a metrics endpoint wants next
+// to the engine's memory stats: connection growth is the usual reason
+// a server's memory climbs while its dataset does not.
+func (s *Server) ConnCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
 // activity snapshots every live backend for pg_stat_activity, sorted
 // by PID so the view reads stably.
 func (s *Server) activity() []sql.Activity {

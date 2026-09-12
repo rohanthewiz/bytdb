@@ -23,7 +23,9 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -57,6 +59,8 @@ func main() {
 		"encrypt the WAL at rest with the AES-256 key in this file (32 raw bytes, 64 hex chars, or base64 of 32 bytes)")
 	encKeyEnv := flag.String("encryption-key-env", "",
 		"encrypt the WAL at rest with the AES-256 key in this environment variable (hex or base64 of 32 bytes)")
+	metricsAddr := flag.String("metrics-addr", "",
+		"serve Prometheus metrics (engine size, heap, GC, connections) at http://<addr>/metrics (empty = disabled)")
 	flag.Parse()
 	if *dbPath == "" {
 		log.Fatal("bytdbd: -db is required")
@@ -121,6 +125,32 @@ func main() {
 		}
 	}
 
+	// The metrics listener is separate from the wire-protocol one so a
+	// scraper never competes with clients for the connection cap, and
+	// so it can be bound to a private interface on its own. It is
+	// unauthenticated by design — the figures are operational, not
+	// data — which is why the flag has no default address: the
+	// operator chooses where it is reachable from.
+	var metricsSrv *http.Server
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", bytdb.MetricsHandler(e, func(w io.Writer) {
+			// Appended after the engine's own gauges; same exposition
+			// format, same prefix, so one scrape config covers both.
+			fmt.Fprintf(w, "# HELP bytdb_pgwire_connections Open client connections.\n"+
+				"# TYPE bytdb_pgwire_connections gauge\nbytdb_pgwire_connections %d\n", srv.ConnCount())
+		}))
+		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				// Metrics are an aid, not the service: log and carry on
+				// rather than take the database down with them.
+				log.Printf("bytdbd: metrics listener: %v", err)
+			}
+		}()
+		fmt.Printf("bytdbd: metrics on http://%s/metrics\n", *metricsAddr)
+	}
+
 	// A signal must not kill the process outright: under a relaxed
 	// sync policy the engine buffers acknowledged writes, and only
 	// Close guarantees they reach disk. Closing the server makes
@@ -131,6 +161,9 @@ func main() {
 	go func() {
 		s := <-sig
 		fmt.Printf("bytdbd: %s received, shutting down\n", s)
+		if metricsSrv != nil {
+			metricsSrv.Close()
+		}
 		srv.Close()
 	}()
 
