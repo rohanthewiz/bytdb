@@ -838,3 +838,7 @@ The `docs/` site goes deeper on everything here:
 [security](docs/security.md) ·
 [testing](docs/testing.md) ·
 [gotchas](docs/gotchas.md)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
