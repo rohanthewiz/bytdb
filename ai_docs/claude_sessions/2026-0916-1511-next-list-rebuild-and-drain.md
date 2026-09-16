@@ -124,6 +124,18 @@ two-action ALTER. Built that:
 `README.md` grammar, `docs/features.md` (three new bullets), `docs/gotchas.md`
 (rejection table + whole-table rewrite note), and the bytdb skill.
 
+### Release v0.14.0 (item 2 of the post-work list)
+
+- Commit `0ed0420` tagged **`v0.14.0`**; `pgwire/go.mod` pin bump `ca809cb`
+  tagged **`pgwire/v0.14.0`** — the same two-commit lockstep as v0.13.0.
+  Both annotated, pushed, and resolved through the Go module proxy.
+- Pre-release run: all root packages in the workspace and with `GOWORK=off`
+  (pinned btypedb v0.7.0), pgwire in the workspace and `GOWORK=off`, and
+  `-race` on root, sql and pgwire — all green. No btypedb change, so no
+  btypedb tag.
+- `bench/` builds but reports `go.mod` needs a tidy: its bytdb pin is
+  stale again. Cosmetic (`replace => ../`), recorded in Next.
+
 ## Files touched
 
 `alter.go` (new), `alter_rebuild_test.go` (new), `ddl.go`,
@@ -131,8 +143,8 @@ two-action ALTER. Built that:
 `sql/ast.go`, `sql/check.go`, `sql/default_test.go`, `sql/describe.go`,
 `sql/parser.go`, `sql/session.go`, `sql/sql.go`, `sql/sql_test.go`,
 `sql/syscat.go`, `pgwire/errors.go`, `README.md`, `docs/features.md`,
-`docs/gotchas.md`, `.claude/skills/bytdb-fast-memory-based-db/SKILL.md`.
-Nothing committed or tagged.
+`docs/gotchas.md`, `.claude/skills/bytdb-fast-memory-based-db/SKILL.md`,
+`pgwire/go.mod`.
 
 ## Next
 
@@ -151,21 +163,19 @@ something that does not exist.*
    wrapped-DEK header first, because `Compact`'s raw tail-copy is invalid
    across keys. **Low until a deployment needs to rotate a key.** Kept open
    by decision this session.
-2. **Release this session's DDL** **(age 0 · value medium)**: new SQL
-   surface plus changed error text and SQLSTATEs (a lone `ADD PRIMARY KEY`,
-   `DROP CONSTRAINT t_pkey`, and the ALTER COLUMN messages all changed), so
-   it needs a minor bump — `v0.14.0`, tag root first, then pgwire in
-   lockstep. Blocks any consumer using the features outside the workspace.
-3. **pgwire SQLSTATE gaps seen during the wire check** **(age 0 · value
+2. **pgwire SQLSTATE gaps seen during the wire check** **(age 0 · value
    low)**: `invalid input syntax for type ...` maps to XX000 (Postgres:
    22P02) and `cannot drop constraint "t_pkey"` to XX000 (Postgres: 42P16).
    Both predate this session.
-4. **`information_schema.table_constraints` does not exist** **(age 0 ·
+3. **`information_schema.table_constraints` does not exist** **(age 0 ·
    value low)**: the wire check's query returned `no such table` (42P01).
    ORMs that introspect constraints this way would miss them; nobody has
    reported one.
+4. **`bench/go.mod` pin is stale again** **(age 0 · value low)**: pinned
+   below v0.14.0, so `go build` asks for a tidy. `replace => ../` means the
+   build already uses the tree; tidy it when the benchmarks are next run.
 
-Read by value instead: **high** none · **medium** 2 · **low** 1, 3, 4.
+Read by value instead: **high** none · **medium** none · **low** 1, 2, 3, 4.
 
 ### Deliberate non-goals (declined, not dropped)
 
