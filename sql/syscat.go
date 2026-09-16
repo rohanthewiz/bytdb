@@ -719,6 +719,96 @@ var sysTables = map[string]*sysTableDef{
 			return rows
 		},
 	},
+	// table_constraints and key_column_usage are the standard pair
+	// ORMs join to introspect keys: the first names each constraint and
+	// its kind, the second lists its columns in key order.
+	//
+	// Deliberate differences from Postgres:
+	//   - Every unique index reports as a UNIQUE constraint. bytdb's
+	//     UNIQUE (cols) is sugar for a unique index, so the two cannot be
+	//     told apart; Postgres lists only constraint-backed ones.
+	//   - NOT NULL columns do not appear as synthetic CHECK constraints
+	//     (Postgres < 18 lists them as "<oid>_<oid>_<n>_not_null");
+	//     nullability is already in information_schema.columns.
+	"information_schema.table_constraints": {
+		desc: sysDesc("table_constraints",
+			sysCol("constraint_catalog", bytdb.TString), sysCol("constraint_schema", bytdb.TString),
+			sysCol("constraint_name", bytdb.TString), sysCol("table_catalog", bytdb.TString),
+			sysCol("table_schema", bytdb.TString), sysCol("table_name", bytdb.TString),
+			sysCol("constraint_type", bytdb.TString), sysCol("is_deferrable", bytdb.TString),
+			sysCol("initially_deferred", bytdb.TString), sysCol("enforced", bytdb.TString),
+			sysCol("nulls_distinct", bytdb.TString)),
+		rows: func(d *DB) [][]any {
+			var rows [][]any
+			// nullsDistinct is only meaningful for UNIQUE; Postgres
+			// reports NULL on the other kinds. bytdb unique indexes treat
+			// NULLs as distinct (the Postgres default).
+			add := func(desc *bytdb.TableDesc, name, kind string, nullsDistinct any) {
+				rows = append(rows, []any{
+					sysDatabase, "public", name, sysDatabase, "public", desc.Name,
+					kind, "NO", "NO", "YES", nullsDistinct,
+				})
+			}
+			// Kind order mirrors the key_column_usage rows below so a
+			// join reads naturally without an ORDER BY.
+			for _, desc := range d.userDescs() {
+				add(desc, bytdb.PKConstraintName(desc.Name), "PRIMARY KEY", nil)
+				for _, ix := range desc.Indexes {
+					if ix.Unique {
+						add(desc, ix.Name, "UNIQUE", "YES")
+					}
+				}
+				for _, fk := range desc.ForeignKeys {
+					add(desc, fk.Name, "FOREIGN KEY", nil)
+				}
+				for _, ck := range desc.Checks {
+					add(desc, ck.Name, "CHECK", nil)
+				}
+			}
+			return rows
+		},
+	},
+	"information_schema.key_column_usage": {
+		desc: sysDesc("key_column_usage",
+			sysCol("constraint_catalog", bytdb.TString), sysCol("constraint_schema", bytdb.TString),
+			sysCol("constraint_name", bytdb.TString), sysCol("table_catalog", bytdb.TString),
+			sysCol("table_schema", bytdb.TString), sysCol("table_name", bytdb.TString),
+			sysCol("column_name", bytdb.TString), sysCol("ordinal_position", bytdb.TInt),
+			sysCol("position_in_unique_constraint", bytdb.TInt)),
+		rows: func(d *DB) [][]any {
+			// Only key-shaped constraints (PRIMARY KEY, UNIQUE, FOREIGN
+			// KEY) have rows; CHECK columns are not key columns.
+			// position_in_unique_constraint is set on FK rows only: the
+			// 1-based position of the referenced column in the parent's
+			// key. RefCols are stored in the same order as the child
+			// columns, so it equals ordinal_position.
+			var rows [][]any
+			add := func(desc *bytdb.TableDesc, name string, ords []int, isFK bool) {
+				for i, o := range ords {
+					var posInUnique any
+					if isFK {
+						posInUnique = int64(i + 1)
+					}
+					rows = append(rows, []any{
+						sysDatabase, "public", name, sysDatabase, "public", desc.Name,
+						desc.Columns[o].Name, int64(i + 1), posInUnique,
+					})
+				}
+			}
+			for _, desc := range d.userDescs() {
+				add(desc, bytdb.PKConstraintName(desc.Name), desc.PKCols, false)
+				for _, ix := range desc.Indexes {
+					if ix.Unique {
+						add(desc, ix.Name, ix.Cols, false)
+					}
+				}
+				for _, fk := range desc.ForeignKeys {
+					add(desc, fk.Name, fk.Cols, true)
+				}
+			}
+			return rows
+		},
+	},
 	"information_schema.columns": {
 		desc: sysDesc("columns",
 			sysCol("table_catalog", bytdb.TString), sysCol("table_schema", bytdb.TString),

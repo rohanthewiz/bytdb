@@ -783,10 +783,17 @@ Tested against real clients, not just protocol specs:
 - **`database/sql`** via the pgx stdlib adapter — or, without a server at all,
   through the embedded [`bytdb/stdlib` driver](stdlib.md)
 
+Constraints introspect through `information_schema.table_constraints`
+joined to `key_column_usage`: primary keys in key order, foreign keys with
+`position_in_unique_constraint`. Every unique index reports as a `UNIQUE`
+constraint, since `UNIQUE (cols)` is an index in bytdb, and NOT NULL
+columns do not appear as synthetic CHECK rows.
+
 Errors carry Postgres SQLSTATEs (42P01 undefined_table, 23505
-unique_violation, 23503 foreign_key_violation, 25P02
-in_failed_sql_transaction, ...) and 1-based statement positions, so client
-error handling behaves as against Postgres.
+unique_violation, 23503 foreign_key_violation, 22P02
+invalid_text_representation, 25P02 in_failed_sql_transaction, ...) and
+1-based statement positions, so client error handling behaves as against
+Postgres.
 
 TLS, SCRAM-SHA-256(-PLUS) authentication, out-of-band query cancellation,
 `statement_timeout`, connection caps, and idle timeouts are covered in

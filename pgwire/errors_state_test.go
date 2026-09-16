@@ -36,6 +36,21 @@ func TestSQLStateMapping(t *testing.T) {
 		{"constraint chk_age already exists", false, "42710"},
 		{"constraint chk_age does not exist", false, "42704"},
 
+		// Literal parse failures, whatever the type.
+		{"invalid input syntax for type int", false, "22P02"},
+		{"invalid input syntax for type uuid", false, "22P02"},
+
+		// Bind-parameter decoding: text vs binary representation.
+		{"bad integer parameter", false, "22P02"},
+		{"bad bytea parameter", false, "22P02"},
+		{"bad binary int8 parameter", false, "22P03"},
+		{"bad binary array parameter", false, "22P03"},
+		{"bad parameter format code", false, "XX000"},
+
+		// Both primary-key invariant refusals.
+		{`multiple primary keys for table "t" are not allowed`, false, "42P16"},
+		{`cannot drop constraint "t_pkey" of relation "t"`, false, "42P16"},
+
 		{"wrong number of parameters", false, "08P01"},
 		{"current transaction is aborted, commands ignored", false, "25P02"},
 		{"cannot execute INSERT in a read-only transaction", false, "25006"},

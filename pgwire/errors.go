@@ -37,8 +37,26 @@ func sqlstate(msg string, hasPos bool) string {
 		return "23505" // unique_violation
 	case strings.Contains(msg, "cannot be cast automatically"):
 		return "42804" // datatype_mismatch
-	case strings.Contains(msg, "multiple primary keys for table"):
+	// Both refusals protect the one-primary-key-per-table invariant:
+	// a second key, or dropping the only one (bytdb requires a key
+	// where Postgres would allow a keyless table).
+	case strings.Contains(msg, "multiple primary keys for table"),
+		strings.Contains(msg, "cannot drop constraint"):
 		return "42P16" // invalid_table_definition
+	// Every per-type literal parse failure (int, float, bool, bytea,
+	// date, timestamp, uuid, json) shares this wording, as in Postgres.
+	case strings.Contains(msg, "invalid input syntax for type"):
+		return "22P02" // invalid_text_representation
+	// Bind-time parameter decoding (values.go). A malformed binary value
+	// is Postgres's 22P03; a malformed text value is the same 22P02 as a
+	// bad literal. The space count pins the text form to "bad <type>
+	// parameter", so no other "bad ..." message can fall into it
+	// ("bad parameter format code" does not end in "parameter" anyway).
+	case strings.HasPrefix(msg, "bad binary ") && strings.HasSuffix(msg, " parameter"):
+		return "22P03" // invalid_binary_representation
+	case strings.HasPrefix(msg, "bad ") && strings.HasSuffix(msg, " parameter") &&
+		strings.Count(msg, " ") == 2:
+		return "22P02" // invalid_text_representation
 	case strings.Contains(msg, "violates not-null constraint"),
 		strings.Contains(msg, "primary key column may not be NULL"),
 		strings.Contains(msg, "contains null values"):

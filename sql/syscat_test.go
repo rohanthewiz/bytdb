@@ -164,3 +164,65 @@ func TestOrderByOrdinal(t *testing.T) {
 		}
 	}
 }
+
+// TestInfoSchemaConstraints pins the information_schema constraint
+// pair ORMs join to introspect keys: table_constraints lists each
+// constraint with its kind; key_column_usage lists key columns in key
+// order, with the parent-key position on foreign-key rows.
+func TestInfoSchemaConstraints(t *testing.T) {
+	d := openDB(t)
+	for _, q := range []string{
+		`create table orgs (id int, region text, code text, primary key (region, id))`,
+		`create unique index orgs_code on orgs (code)`,
+		`create index orgs_plain on orgs (code)`,
+		`create table users (id int primary key, org_region text, org_id int,
+			age int constraint users_age_chk check (age >= 0),
+			constraint users_org_fk foreign key (org_region, org_id) references orgs (region, id))`,
+	} {
+		exec(t, d, q)
+	}
+
+	res := exec(t, d, `select table_name, constraint_name, constraint_type, nulls_distinct
+		from information_schema.table_constraints
+		where table_schema = 'public' order by table_name, constraint_name`)
+	want := [][]any{
+		{"orgs", "orgs_code", "UNIQUE", "YES"},
+		{"orgs", "orgs_pkey", "PRIMARY KEY", nil},
+		{"users", "users_age_chk", "CHECK", nil},
+		{"users", "users_org_fk", "FOREIGN KEY", nil},
+		{"users", "users_pkey", "PRIMARY KEY", nil},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("table_constraints: %v", res.Rows)
+	}
+
+	// The canonical ORM join: primary-key columns, in key order.
+	res = exec(t, d, `select kcu.column_name, kcu.ordinal_position
+		from information_schema.table_constraints tc
+		join information_schema.key_column_usage kcu
+		  on kcu.constraint_name = tc.constraint_name and kcu.table_name = tc.table_name
+		where tc.table_name = 'orgs' and tc.constraint_type = 'PRIMARY KEY'
+		order by kcu.ordinal_position`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"region", int64(1)}, {"id", int64(2)}}) {
+		t.Fatalf("pk columns: %v", res.Rows)
+	}
+
+	// Foreign-key columns carry their position in the parent key; the
+	// CHECK constraint contributes no key columns.
+	res = exec(t, d, `select constraint_name, column_name, ordinal_position, position_in_unique_constraint
+		from information_schema.key_column_usage where table_name = 'users'
+		order by constraint_name, ordinal_position`)
+	want = [][]any{
+		{"users_org_fk", "org_region", int64(1), int64(1)},
+		{"users_org_fk", "org_id", int64(2), int64(2)},
+		{"users_pkey", "id", int64(1), nil},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("key_column_usage: %v", res.Rows)
+	}
+
+	// Both names are reserved like the rest of the catalog.
+	if _, err := d.Exec(`delete from information_schema.table_constraints`); err == nil {
+		t.Fatal("write to table_constraints accepted")
+	}
+}

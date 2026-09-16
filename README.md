@@ -550,7 +550,8 @@ For introspection there is a virtual system catalog:
 `pg_am`, `pg_database`, `pg_roles`, and `pg_stat_activity` with real
 rows, a set of always-empty tables psql probes (`pg_policy`, the
 `pg_publication` family, ...), plus `information_schema.tables`,
-`columns`, and `sequences`, all synthesized from the engine catalog
+`columns`, `sequences`, `table_constraints`, and `key_column_usage`
+(primary keys, unique indexes, foreign keys, and checks), all synthesized from the engine catalog
 on the fly and queryable like any tables — WHERE, joins, and
 aggregates included — but read-only. Table names may be
 schema-qualified (`public.t` is `t`; bare `pg_class` resolves because
