@@ -32,8 +32,13 @@ func sqlstate(msg string, hasPos bool) string {
 	case strings.Contains(msg, "ambiguous"):
 		return "42702" // ambiguous_column
 	case strings.Contains(msg, "duplicate primary key"),
-		strings.Contains(msg, "unique index violation"):
+		strings.Contains(msg, "unique index violation"),
+		strings.Contains(msg, "could not create unique index"):
 		return "23505" // unique_violation
+	case strings.Contains(msg, "cannot be cast automatically"):
+		return "42804" // datatype_mismatch
+	case strings.Contains(msg, "multiple primary keys for table"):
+		return "42P16" // invalid_table_definition
 	case strings.Contains(msg, "violates not-null constraint"),
 		strings.Contains(msg, "primary key column may not be NULL"),
 		strings.Contains(msg, "contains null values"):

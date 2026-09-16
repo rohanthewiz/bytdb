@@ -59,8 +59,18 @@ func resolveChecks(ct *CreateTable, cols []bytdb.Column) ([]bytdb.CheckDesc, err
 // columns of its own table, literals, and row-level operations — no
 // aggregates, subqueries, or placeholders.
 func validateCheckExpr(sc *scope, ex Expr) error {
+	return validateRowExpr(sc, ex, "check constraints", "check constraint")
+}
+
+// validateRowExpr is the shared rule for expressions evaluated against
+// one stored row with no statement around them — CHECK constraints and
+// ALTER COLUMN TYPE's USING: own-table columns, literals, and row-level
+// operations only. plural and singular name the construct in messages
+// the way Postgres does ("... not allowed in check constraints",
+// "cannot use subquery in check constraint").
+func validateRowExpr(sc *scope, ex Expr, plural, singular string) error {
 	if fn := findAgg(ex); fn != AggNone {
-		return serr.New("aggregate functions are not allowed in check constraints",
+		return serr.New("aggregate functions are not allowed in "+plural,
 			"function", fn.name())
 	}
 	var fail error
@@ -70,11 +80,11 @@ func validateCheckExpr(sc *scope, ex Expr) error {
 		}
 		switch n := sub.(type) {
 		case *ExSub:
-			fail = serr.New("cannot use subquery in check constraint")
+			fail = serr.New("cannot use subquery in " + singular)
 			return false
 		case *ExLit:
 			if _, ok := n.Val.(Param); ok {
-				fail = serr.New("placeholders are not allowed in check constraints")
+				fail = serr.New("placeholders are not allowed in " + plural)
 				return false
 			}
 		case *ExCol:
@@ -180,7 +190,8 @@ func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
 
 // execDropConstraint handles ALTER TABLE ... DROP CONSTRAINT for
 // CHECK and FOREIGN KEY constraints (they share a namespace, as in
-// Postgres). The primary key is structural in bytdb, and unique
+// Postgres). The primary key is structural in bytdb — it can be
+// replaced (ReplacePrimaryKey) but never dropped alone — and unique
 // constraints are indexes (DROP INDEX).
 func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	desc := d.e.Table(s.Table)
@@ -199,7 +210,8 @@ func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	if !existed {
 		if s.Name == s.Table+"_pkey" {
 			return nil, serr.New(`cannot drop constraint "`+s.Name+`" of relation "`+s.Table+`"`,
-				"hint", "a bytdb table keeps its primary key for life")
+				"hint", "a bytdb table always has a primary key; replace it with DROP CONSTRAINT "+
+					s.Name+", ADD PRIMARY KEY (...)")
 		}
 		if s.IfExists {
 			return &Result{Notice: `constraint "` + s.Name + `" of relation "` +

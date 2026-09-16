@@ -1394,7 +1394,13 @@ func (p *parser) alterTable() (Statement, error) {
 			}
 			return &AddConstraint{Table: table, Check: CheckDef{Name: cname, Ex: ex, Text: text}}, nil
 		case p.acceptKw("primary"):
-			return nil, serr.New("ADD PRIMARY KEY is not supported", "table", table)
+			// Every bytdb table has a primary key from birth, so a lone
+			// ADD PRIMARY KEY is always a second one — Postgres's error
+			// for that case. Replacing the key is the two-action form
+			// handled under DROP CONSTRAINT below.
+			return nil, serr.New(`multiple primary keys for table "`+table+`" are not allowed`,
+				"hint", "replace the key with ALTER TABLE "+table+" DROP CONSTRAINT "+
+					bytdb.PKConstraintName(table)+", ADD PRIMARY KEY (...)")
 		case p.acceptKw("unique"):
 			return nil, serr.New("ADD UNIQUE is not supported; use CREATE UNIQUE INDEX",
 				"table", table)
@@ -1443,8 +1449,39 @@ func (p *parser) alterTable() (Statement, error) {
 			return nil, err
 		}
 		switch {
+		case p.acceptKw("type"):
+			return p.alterColumnType(table, col)
 		case p.acceptKw("set"):
 			switch {
+			case p.acceptKw("data"):
+				// SET DATA TYPE is the SQL-standard spelling of TYPE.
+				if err := p.expectKw("type"); err != nil {
+					return nil, err
+				}
+				return p.alterColumnType(table, col)
+			case p.acceptKw("storage"), p.acceptKw("compression"):
+				// Physical-storage knobs for Postgres's TOAST. bytdb keeps
+				// every value inline in its row, so there is nothing to
+				// configure; pg_dump emits these for non-default columns,
+				// so they parse and execute as no-ops, like OWNER TO.
+				what, err := p.ident("a storage mode")
+				if err != nil {
+					return nil, err
+				}
+				return &AlterColumnNoop{Table: table, Col: col, What: "SET STORAGE " + what}, nil
+			case p.acceptKw("statistics"):
+				// Planner sampling target; bytdb collects no statistics.
+				// SET STATISTICS -1 restores the default target.
+				n := ""
+				if p.acceptOp("-") {
+					n = "-"
+				}
+				if p.cur().kind != tNumber {
+					return nil, p.unexpected("a statistics target")
+				}
+				n += p.cur().text
+				p.advance()
+				return &AlterColumnNoop{Table: table, Col: col, What: "SET STATISTICS " + n}, nil
 			case p.acceptKw("default"):
 				v, err := p.defaultLiteral(col)
 				if err != nil {
@@ -1459,7 +1496,8 @@ func (p *parser) alterTable() (Statement, error) {
 				}
 				return &AlterColumnNotNull{Table: table, Col: col, NotNull: true}, nil
 			}
-			return nil, serr.New("only SET DEFAULT and SET NOT NULL are supported by ALTER COLUMN",
+			return nil, serr.New("only SET DEFAULT, SET NOT NULL, SET DATA TYPE, SET STORAGE, "+
+				"and SET STATISTICS are supported by ALTER COLUMN",
 				"table", table, "column", col)
 		case p.acceptKw("drop"):
 			switch {
@@ -1474,7 +1512,7 @@ func (p *parser) alterTable() (Statement, error) {
 			return nil, serr.New("only DROP DEFAULT and DROP NOT NULL are supported by ALTER COLUMN",
 				"table", table, "column", col)
 		}
-		return nil, p.unexpected("SET or DROP of DEFAULT or NOT NULL")
+		return nil, p.unexpected("TYPE, or SET or DROP of DEFAULT or NOT NULL")
 	case p.acceptKw("rename"):
 		// RENAME TO t | RENAME [COLUMN] c TO d.
 		if p.acceptKw("to") {
@@ -1509,6 +1547,14 @@ func (p *parser) alterTable() (Statement, error) {
 			if dc.Name, err = p.ident("a constraint name"); err != nil {
 				return nil, err
 			}
+			if p.acceptOp(",") {
+				// Multi-action ALTER TABLE is supported for one pairing
+				// only: DROP CONSTRAINT <pkey>, ADD [CONSTRAINT n] PRIMARY
+				// KEY (cols) — Postgres's way to replace a primary key,
+				// which bytdb (where a table cannot exist keyless) must
+				// run as one atomic re-key.
+				return p.replacePrimaryKey(table, dc)
+			}
 			return dc, nil
 		}
 		p.acceptKw("column")
@@ -1532,6 +1578,58 @@ func (p *parser) alterTable() (Statement, error) {
 		return &AlterOwner{Table: table, Owner: owner}, nil
 	}
 	return nil, p.unexpected("ADD, ALTER, DROP, RENAME, or OWNER")
+}
+
+// alterColumnType parses the tail of ALTER [COLUMN] c [SET DATA] TYPE:
+// the new type, then an optional USING expression computing each
+// row's new value. COLLATE is not accepted — bytdb has one collation.
+func (p *parser) alterColumnType(table, col string) (Statement, error) {
+	typ, maxLen, err := p.typeName()
+	if err != nil {
+		return nil, err
+	}
+	st := &AlterColumnType{Table: table, Col: col, Type: typ, MaxLen: maxLen}
+	if p.acceptKw("using") {
+		start := p.cur().pos
+		if st.Using, err = p.expression(); err != nil {
+			return nil, err
+		}
+		st.UsingText = strings.TrimSpace(p.src[start:p.cur().pos])
+	}
+	return st, nil
+}
+
+// replacePrimaryKey parses the second action of
+// DROP CONSTRAINT name, ADD [CONSTRAINT n] PRIMARY KEY (cols). The
+// dropped name is checked at execution against the table's primary-key
+// constraint name, since the parser does not know the table.
+func (p *parser) replacePrimaryKey(table string, dc *DropConstraint) (Statement, error) {
+	if dc.IfExists {
+		// IF EXISTS would make the pair "add a second key" when the drop
+		// skips — not a state a bytdb table can reach.
+		return nil, serr.New("DROP CONSTRAINT IF EXISTS cannot be combined with ADD PRIMARY KEY",
+			"table", table)
+	}
+	if err := p.expectKw("add"); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("constraint") {
+		// The key's name is not stored: bytdb always reports <table>_pkey.
+		if _, err := p.ident("a constraint name"); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectKw("primary"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("key"); err != nil {
+		return nil, err
+	}
+	cols, err := p.identList("a primary key column")
+	if err != nil {
+		return nil, err
+	}
+	return &ReplacePrimaryKey{Table: table, Dropped: dc.Name, Cols: cols}, nil
 }
 
 // --- DML ---

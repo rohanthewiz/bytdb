@@ -297,9 +297,9 @@ func TestAlterColumnDefault(t *testing.T) {
 		{`alter table t alter column n set default now()`, "requires a timestamp or date column"},
 		{`alter table t alter column nope set default 1`, "does not exist"},
 		{`alter table ghosts alter column n set default 1`, "no such table"},
-		{`alter table t alter column n set unique`, "only SET DEFAULT and SET NOT NULL"},
+		{`alter table t alter column n set unique`, "only SET DEFAULT, SET NOT NULL, SET DATA TYPE"},
 		{`alter table t alter column n drop unique`, "only DROP DEFAULT and DROP NOT NULL"},
-		{`alter table t alter column n type text`, ""}, // parse error is enough
+		{`alter table t alter column n type text using`, ""}, // parse error is enough
 	} {
 		err := execErr(t, d, tc.q)
 		if tc.want != "" && !strings.Contains(err, tc.want) {
@@ -358,7 +358,7 @@ func TestAlterColumnNotNull(t *testing.T) {
 		{`alter table t alter column id drop not null`, "primary key"},
 		{`alter table t alter column nope set not null`, "no such column"},
 		{`alter table ghosts alter column body set not null`, "no such table"},
-		{`alter table t alter column body set unique`, "only SET DEFAULT and SET NOT NULL"},
+		{`alter table t alter column body set unique`, "only SET DEFAULT, SET NOT NULL, SET DATA TYPE"},
 		{`alter table t alter column body drop unique`, "only DROP DEFAULT and DROP NOT NULL"},
 		{`alter table t alter column body set not`, ""}, // truncated: parse error
 	} {

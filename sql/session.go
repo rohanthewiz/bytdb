@@ -537,6 +537,7 @@ func isDDL(st Statement) bool {
 	switch st.(type) {
 	case *CreateTable, *DropTable, *AddColumn, *DropColumn,
 		*RenameTable, *RenameColumn, *AlterColumnDefault, *AlterColumnNotNull,
+		*AlterColumnType, *ReplacePrimaryKey,
 		*AddConstraint, *AddFK, *DropConstraint, *CreateIndex, *DropIndex,
 		*CreateSequence, *DropSequence, *AlterSequence,
 		*CreateView, *DropView:

@@ -195,9 +195,16 @@ func (e *Engine) AddColumn(table string, col Column) error {
 		return serr.New("unknown column type", "table", table, "column", col.Name, "type", string(col.Type))
 	}
 	if col.Identity {
-		// Existing rows would need backfilled values; defer until there
-		// is a story for that.
-		return serr.New("adding an identity column is not supported", "table", table, "column", col.Name)
+		// Same rules CreateTable applies: the counter is an int64
+		// source, and it is the column's only value source.
+		if col.Type != TInt {
+			return serr.New("identity column must be an int column",
+				"table", table, "column", col.Name, "type", string(col.Type))
+		}
+		if col.Default != "" {
+			return serr.New("conflicting DEFAULT for identity column",
+				"table", table, "column", col.Name)
+		}
 	}
 	if err := validMaxLen(col); err != nil {
 		return serr.Wrap(err, "table", table)
@@ -210,6 +217,12 @@ func (e *Engine) AddColumn(table string, col Column) error {
 		col.ID = desc.NextColID
 		desc.NextColID++
 		desc.Columns = append(desc.Columns, col)
+		if col.Identity {
+			if err := e.backfillIdentity(tx, desc, &col); err != nil {
+				return nil, err
+			}
+			return desc, nil
+		}
 		// The default's value is wanted twice over: to decide whether
 		// existing rows can satisfy NOT NULL, and to write into them.
 		// A default the engine cannot evaluate (see default.go) fails
@@ -291,6 +304,58 @@ func backfillColumn(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint3
 		}
 	}
 	return nil
+}
+
+// backfillIdentity numbers the existing rows of a table for a newly
+// added identity column and leaves its counter just past the last
+// number, so the next insert draws n+1 — Postgres's ADD COLUMN ...
+// GENERATED AS IDENTITY, which fills existing rows from the new
+// sequence. Rows are numbered 1..n in primary-key order, bytdb's
+// physical order (Postgres uses heap order, which is no more stable).
+//
+// Each row gets the (column ID, value) pair appended to its stored
+// value, as backfillColumn does: the column ID is fresh, so no row can
+// already carry it, and no index can cover a column that did not exist.
+//
+// The counter is written straight into tx in both modes. Under
+// concurrent writes, identity draws normally go through the in-memory
+// allocators (seqalloc.go), but none can exist yet for this key — it
+// is (tableID, fresh column ID), and column IDs are never reused — and
+// DDL commits exclusively, so the first allocator to load the key sees
+// this committed value.
+func (e *Engine) backfillIdentity(tx *btypedb.Tx[string, []byte], desc *TableDesc, col *Column) error {
+	if limit := e.backfillLimit.Load(); limit > 0 {
+		if n := countRowsUpTo(tx, desc.ID, limit+1); n > limit {
+			return serr.New("adding an identity column would rewrite more rows than the backfill "+
+				"limit allows in one transaction; raise Engine.SetBackfillLimit",
+				"table", desc.Name, "column", col.Name,
+				"backfillLimit", strconv.FormatInt(limit, 10))
+		}
+	}
+	prefix := tablePrefix(desc.ID)
+	end := string(tuple.PrefixEnd(prefix))
+	var keys []string
+	var vals [][]byte
+	for k, v := range tx.Ascend(string(prefix)) {
+		if k >= end {
+			break
+		}
+		keys = append(keys, k)
+		vals = append(vals, v)
+	}
+	for i, k := range keys {
+		buf, err := tuple.Append(append([]byte(nil), vals[i]...), int64(col.ID), int64(i+1))
+		if err != nil {
+			return serr.Wrap(err, "op", "backfill identity column", "table", desc.Name)
+		}
+		if err := tx.Set(k, buf); err != nil {
+			return serr.Wrap(err, "op", "backfill identity column", "table", desc.Name)
+		}
+	}
+	// bumpCounterTo treats a target of 1 (an empty table) as the
+	// counter's implicit start and writes nothing.
+	return bumpCounterTo(tx, identitySeqKey(desc.ID, col.ID), uint64(len(keys))+1,
+		desc.Name+"."+col.Name)
 }
 
 // hasRows reports whether the table's primary index holds any row in

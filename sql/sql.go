@@ -883,6 +883,22 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 			return nil, err
 		}
 		return &Result{}, nil
+	case *AlterColumnType:
+		return d.execAlterColumnType(s)
+	case *ReplacePrimaryKey:
+		return d.execReplacePrimaryKey(s)
+	case *AlterColumnNoop:
+		// Unlike OWNER TO, the column is named, so a typo in it is
+		// reported rather than silently accepted — Postgres checks it too.
+		desc := d.e.Table(s.Table)
+		if desc == nil {
+			return nil, serr.New("no such table", "table", s.Table)
+		}
+		if desc.ColIndex(s.Col) < 0 {
+			return nil, serr.New(`column "`+s.Col+`" of relation "`+s.Table+`" does not exist`,
+				"table", s.Table, "column", s.Col)
+		}
+		return &Result{}, nil
 	case *AlterOwner:
 		// No roles in bytdb; the statement exists only so Postgres DDL
 		// (pg_dump output, goose migrations) runs unmodified. Succeed

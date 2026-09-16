@@ -138,9 +138,11 @@ func TestIdentityValidation(t *testing.T) {
 	}
 
 	idTable(t, e)
-	err = e.AddColumn("t", Column{Name: "n2", Type: TInt, Identity: true})
-	if err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("ADD identity COLUMN: got %v, want unsupported", err)
+	// ADD COLUMN of an identity column is supported (see
+	// alter_rebuild_test.go); the int-only rule still applies to it.
+	err = e.AddColumn("t", Column{Name: "n2", Type: TFloat, Identity: true})
+	if err == nil || !strings.Contains(err.Error(), "identity column must be an int") {
+		t.Fatalf("ADD float identity COLUMN: got %v, want a type error", err)
 	}
 }
 

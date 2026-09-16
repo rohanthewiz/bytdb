@@ -120,6 +120,12 @@ func writeTarget(st Statement) string {
 		return s.Table
 	case *AlterColumnNotNull:
 		return s.Table
+	case *AlterColumnType:
+		return s.Table
+	case *ReplacePrimaryKey:
+		return s.Table
+	case *AlterColumnNoop:
+		return s.Table
 	case *DropConstraint:
 		return s.Table
 	case *CreateIndex:

@@ -314,7 +314,7 @@ func TestSQLAddDropConstraint(t *testing.T) {
 		t.Fatalf("duplicate name: %v", err)
 	}
 	for q, want := range map[string]string{
-		`alter table items add primary key (id)`:                    "ADD PRIMARY KEY is not supported",
+		`alter table items add primary key (id)`:                    `multiple primary keys for table "items" are not allowed`,
 		`alter table items add constraint u unique (price)`:         "ADD UNIQUE is not supported",
 		`alter table items add foreign key (id) references o (id)`:  "no such table",
 		`alter table nosuch add check (a > 0)`:                      "no such table",

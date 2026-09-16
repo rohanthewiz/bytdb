@@ -94,12 +94,16 @@ Postgres-flavored and deliberately small.
 
 Full DDL: tables, ASC/DESC indexes, sequences, views, `ALTER ...
 ADD/DROP COLUMN / RENAME / constraints`, `ALTER COLUMN SET|DROP
-DEFAULT`, `ALTER COLUMN SET|DROP NOT NULL`, `IF NOT EXISTS` on CREATE
+DEFAULT`, `ALTER COLUMN SET|DROP NOT NULL`, `ALTER COLUMN [SET DATA] TYPE t
+[USING expr]`, `ADD COLUMN` of an identity/`SERIAL` column (existing
+rows numbered 1..n), primary-key replacement via `DROP CONSTRAINT
+t_pkey, ADD PRIMARY KEY (...)`, `IF NOT EXISTS` on CREATE
 TABLE/INDEX/SEQUENCE and `IF EXISTS` on DROP
 TABLE/INDEX/SEQUENCE/VIEW/CONSTRAINT (views take `CREATE OR REPLACE`
-instead). `ALTER TABLE ... OWNER TO` is accepted as a no-op — bytdb
-has no roles, so pg_dump/goose migration DDL runs unmodified, even
-inside transaction blocks.
+instead). `ALTER TABLE ... OWNER TO` and `ALTER COLUMN SET
+STORAGE|STATISTICS` are accepted as no-ops — bytdb has no roles,
+TOAST, or planner statistics, so pg_dump/goose migration DDL runs
+unmodified, even inside transaction blocks.
 
 Then: INSERT with `ON CONFLICT` upsert and RETURNING,
 SELECT/UPDATE/DELETE with a planner that pushes WHERE conjuncts to
@@ -258,6 +262,13 @@ bytes, 64 hex chars, or base64 of 32).
   — a constant, `now()`, or `current_date`. Anything else (an
   expression, a cast, `gen_random_uuid()`) *fails the ALTER* rather
   than leaving old rows NULL while new inserts get a value.
+- **`ALTER COLUMN TYPE` and the primary-key replacement rewrite the
+  whole table** (rows, keys, every index) in one transaction, under the
+  same 1M-row `DefaultBackfillLimit`. Without `USING` only Postgres's
+  automatic casts apply (int↔float, date↔timestamp, anything→text,
+  varchar length); text→int and friends need `USING c::int`. A column
+  in a foreign key (either side) is refused — drop the constraint
+  first. A lone `ADD PRIMARY KEY` errors: every table already has one.
 - `ALTER COLUMN SET DEFAULT` never touches existing rows, as in
   Postgres; only `ADD COLUMN ... DEFAULT` backfills.
 - `ON UPDATE CASCADE` and `SET NULL/DEFAULT` FK actions are rejected

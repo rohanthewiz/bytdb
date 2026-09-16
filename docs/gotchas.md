@@ -68,8 +68,9 @@ Parse-time rejections with pointed errors:
 
 | Not supported | Use instead / note |
 |---|---|
-| `ALTER TABLE ... ADD PRIMARY KEY / ADD UNIQUE` | Declare PK at create; unique via `CREATE UNIQUE INDEX` or the `UNIQUE` constraint sugar at create |
-| `ALTER TABLE ... ALTER COLUMN` other than `SET`/`DROP DEFAULT` and `SET`/`DROP NOT NULL` (`TYPE`, `SET STORAGE`, ...) | Recreate the column, or the table, with the shape you want |
+| `ALTER TABLE ... ADD UNIQUE` | `CREATE UNIQUE INDEX`, or the `UNIQUE` constraint sugar at create |
+| A lone `ALTER TABLE ... ADD PRIMARY KEY` (every table already has one) | Replace it: `DROP CONSTRAINT t_pkey, ADD PRIMARY KEY (...)` — the only multi-action `ALTER TABLE` accepted |
+| `ALTER COLUMN TYPE` on a foreign-key column (either side) | Drop the constraint, change the type on both sides, re-add it |
 | `RIGHT` / `FULL` / `NATURAL` joins | Rewrite as `LEFT`/`INNER` |
 | `WITH RECURSIVE`; `WITH` on INSERT/UPDATE/DELETE; data-modifying CTEs | CTEs are SELECT-only and non-recursive |
 | Writable or materialized views; `WITH CHECK OPTION` | Views are read-only, materialized per statement |
@@ -154,6 +155,11 @@ Three semantic notes that surprise people (all Postgres-faithful):
   O(rows), unlike the O(1) defaultless `ADD COLUMN`).
 - `ALTER COLUMN ... SET DEFAULT` does **not** touch existing rows (as in
   Postgres). Only `ADD COLUMN ... DEFAULT` backfills.
+- `ALTER COLUMN TYPE`, the primary-key replacement, and `ADD COLUMN` of an
+  identity column **rewrite the whole table in one transaction** (the type
+  change and key replacement also rebuild every index). They share the
+  one-shot backfill's memory profile and its `DefaultBackfillLimit` refusal;
+  on a table over the cap, copy into a new table in batches instead.
 - On a **large** table, prefer `ADD COLUMN` (no DEFAULT) + `ALTER COLUMN SET
   DEFAULT` + a batched `UPDATE` + `ALTER COLUMN SET NOT NULL` over the one-shot
   `ADD COLUMN ... NOT NULL DEFAULT x`. The one-shot form is atomic, so every

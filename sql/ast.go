@@ -709,6 +709,34 @@ type AlterColumnNotNull struct {
 	NotNull bool
 }
 
+// AlterColumnType is ALTER TABLE t ALTER [COLUMN] c [SET DATA] TYPE
+// type [USING expr]. Using is nil without the clause; UsingText keeps
+// its source for EXPLAIN-style rendering.
+type AlterColumnType struct {
+	Table     string
+	Col       string
+	Type      bytdb.ColType
+	MaxLen    int
+	Using     Expr
+	UsingText string
+}
+
+// AlterColumnNoop is an ALTER COLUMN form that configures something
+// bytdb does not have — SET STORAGE / SET COMPRESSION (TOAST) and SET
+// STATISTICS (planner sampling). Accepted so pg_dump output and
+// migration tools run unmodified; What records the requested setting.
+type AlterColumnNoop struct{ Table, Col, What string }
+
+// ReplacePrimaryKey is ALTER TABLE t DROP CONSTRAINT t_pkey,
+// ADD [CONSTRAINT n] PRIMARY KEY (cols): Postgres's two-action spelling
+// of replacing a primary key, executed as one atomic re-key. Dropped is
+// the constraint name the statement drops, checked at execution.
+type ReplacePrimaryKey struct {
+	Table   string
+	Dropped string
+	Cols    []string
+}
+
 // AlterOwner is ALTER TABLE t OWNER TO role. bytdb has no roles or
 // ownership, but pg_dump output and migration tools (goose, etc.) emit
 // these routinely, so the statement is parsed and executed as a no-op
@@ -1025,6 +1053,9 @@ func (*DropConstraint) stmt()     {}
 func (*AlterColumnDefault) stmt() {}
 func (*AlterColumnNotNull) stmt() {}
 func (*AlterOwner) stmt()         {}
+func (*AlterColumnType) stmt()    {}
+func (*AlterColumnNoop) stmt()    {}
+func (*ReplacePrimaryKey) stmt()  {}
 func (*CreateIndex) stmt()        {}
 func (*DropIndex) stmt()          {}
 func (*CreateSequence) stmt()     {}
