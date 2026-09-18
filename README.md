@@ -12,6 +12,39 @@ pgx, `database/sql`, and GORM connect and just work.
 It occupies the SQLite niche — one file, one process, zero ops — but
 speaks the Postgres dialect your tools already know.
 
+## The niche
+
+bytdb is for **a single Go process that owns a memory-sized relational
+dataset** and wants Postgres semantics without operating Postgres.
+
+| if you need…                                              | reach for        |
+|-----------------------------------------------------------|------------------|
+| embedded SQL, Postgres dialect, pure Go, data fits in RAM | **bytdb**        |
+| embedded SQL over data larger than RAM                    | SQLite           |
+| embedded analytics over big columnar scans                | DuckDB           |
+| an embedded ordered KV store, no SQL                      | btypedb, Bolt, Badger |
+| many processes or hosts writing one database, failover    | Postgres         |
+
+It fits best when:
+
+- **The app and the database ship as one binary** — services, CLIs,
+  desktop and edge deployments, tests that want a real SQL database
+  with no container to start.
+- **The workload is OLTP-shaped and read-heavy** — point lookups, index
+  scans, and joins inside transactions, where skipping the socket and
+  the driver round trip is the win (see the benchmarks below).
+- **You want a Postgres exit ramp** — the dialect, SQLSTATE codes,
+  catalogs, and wire protocol match, so pgx/GORM code written against
+  bytdb moves to a Postgres server (or the reverse, for tests) with
+  little change.
+
+It is the wrong tool when the working set outgrows RAM (the whole
+keyspace is memory-resident; the file is a log, not a page store), when
+several processes must open the same file, or when you need synchronous
+replicas and automatic failover — replication here is asynchronous,
+litestream-style disaster recovery. See [gotchas](docs/gotchas.md) for
+the sizing details.
+
 ## Key features
 
 - **Embedded and pure Go** — `go get` it, open a file, query. No cgo,
