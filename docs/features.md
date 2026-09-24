@@ -789,6 +789,12 @@ joined to `key_column_usage`: primary keys in key order, foreign keys with
 constraint, since `UNIQUE (cols)` is an index in bytdb, and NOT NULL
 columns do not appear as synthetic CHECK rows.
 
+Views introspect like tables: `pg_attribute` and `information_schema.columns`
+list a view's output columns, and `information_schema.tables` lists the view
+as `VIEW`. The columns come from describing the stored query, so listing them
+never runs it. They are always nullable with no default, as in Postgres. A
+view whose base table was dropped still lists in `pg_class`, with no columns.
+
 Errors carry Postgres SQLSTATEs (42P01 undefined_table, 23505
 unique_violation, 23503 foreign_key_violation, 22P02
 invalid_text_representation, 25P02 in_failed_sql_transaction, ...) and

@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -224,5 +225,94 @@ func TestInfoSchemaConstraints(t *testing.T) {
 	// Both names are reserved like the rest of the catalog.
 	if _, err := d.Exec(`delete from information_schema.table_constraints`); err == nil {
 		t.Fatal("write to table_constraints accepted")
+	}
+}
+
+// Views list their output columns in pg_attribute and
+// information_schema.columns, derived from the stored query's shape,
+// and list as 'VIEW' in information_schema.tables.
+func TestSystemCatalogViews(t *testing.T) {
+	d := openDB(t)
+	seedUsers(t, d)
+	exec(t, d, `create view adults as select id, name, age from users where age > 30`)
+	exec(t, d, `create view by_city as select city, count(*) as n, avg(age) as mean from users group by city`)
+	// A view over a view: its shape resolves through the inner view.
+	exec(t, d, `create view adult_names as select name from adults`)
+
+	attrs := `select a.attname, t.typname, a.attnotnull
+		from pg_attribute a
+		join pg_class c on c.oid = a.attrelid
+		join pg_type t on t.oid = a.atttypid
+		where c.relname = '%s' and c.relkind = 'v' order by a.attnum`
+	for view, want := range map[string][][]any{
+		// Postgres never marks a view column NOT NULL, even over a PK.
+		"adults":      {{"id", "int8", false}, {"name", "text", false}, {"age", "int8", false}},
+		"by_city":     {{"city", "text", false}, {"n", "int8", false}, {"mean", "float8", false}},
+		"adult_names": {{"name", "text", false}},
+	} {
+		res := exec(t, d, fmt.Sprintf(attrs, view))
+		if !reflect.DeepEqual(res.Rows, want) {
+			t.Fatalf("pg_attribute %s: %v", view, res.Rows)
+		}
+	}
+
+	res := exec(t, d, `select column_name, ordinal_position, data_type, is_nullable, column_default
+		from information_schema.columns where table_name = 'by_city' order by ordinal_position`)
+	want := [][]any{
+		{"city", int64(1), "text", "YES", nil},
+		{"n", int64(2), "bigint", "YES", nil},
+		{"mean", int64(3), "double precision", "YES", nil},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("info columns for view: %v", res.Rows)
+	}
+
+	res = exec(t, d, `select table_name, table_type from information_schema.tables order by 1`)
+	want = [][]any{
+		{"adult_names", "VIEW"}, {"adults", "VIEW"}, {"by_city", "VIEW"}, {"users", "BASE TABLE"},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("info tables: %v", res.Rows)
+	}
+
+	// A statement's CTE must not shadow the names a view's body uses:
+	// the view resolves against the catalog, not the reading query.
+	res = exec(t, d, `with users as (select 1 as one)
+		select a.attname from pg_attribute a join pg_class c on c.oid = a.attrelid
+		where c.relname = 'adults' order by a.attnum`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"id"}, {"name"}, {"age"}}) {
+		t.Fatalf("CTE shadowing a view's base table: %v", res.Rows)
+	}
+
+	// A view over pg_attribute is described from inside pg_attribute's
+	// own row builder. It must list its columns, not recurse.
+	exec(t, d, `create view attr_names as select attname, attnum from pg_attribute`)
+	res = exec(t, d, `select a.attname from pg_attribute a join pg_class c on c.oid = a.attrelid
+		where c.relname = 'attr_names' order by a.attnum`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"attname"}, {"attnum"}}) {
+		t.Fatalf("view over pg_attribute: %v", res.Rows)
+	}
+	// And reading the view itself still materializes real catalog rows.
+	res = exec(t, d, `select count(*) from attr_names where attname = 'mean'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(1)}}) {
+		t.Fatalf("select from view over pg_attribute: %v", res.Rows)
+	}
+}
+
+// A view whose base table is gone keeps its pg_class row, gets no
+// attributes, and leaves the rest of the catalog readable.
+func TestSystemCatalogBrokenView(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table tmp (id int primary key, v text)`)
+	exec(t, d, `create view tv as select v from tmp`)
+	exec(t, d, `create table keep (id int primary key)`)
+	if _, err := d.Exec(`drop table tmp`); err != nil {
+		t.Skipf("drop table under a view is refused (%v); nothing to test", err)
+	}
+	res := exec(t, d, `select c.relname, count(a.attname) from pg_class c
+		left join pg_attribute a on a.attrelid = c.oid
+		where c.relkind in ('r', 'v') group by c.relname order by 1`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{"keep", int64(1)}, {"tv", int64(0)}}) {
+		t.Fatalf("broken view: %v", res.Rows)
 	}
 }

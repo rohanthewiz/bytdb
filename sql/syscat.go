@@ -55,7 +55,7 @@ func (d *DB) lookup(base func(string) *bytdb.TableDesc) tableLookup {
 		}
 		if st := sysLookup(name); st != nil {
 			var rows [][]any
-			if st.rows != nil {
+			if st.rows != nil && !d.catalogShapes {
 				rows = st.rows(d)
 			}
 			if rows == nil {
@@ -280,6 +280,74 @@ func (d *DB) userDescs() []*bytdb.TableDesc {
 	return descs
 }
 
+// viewShape is one view's name and its derived output columns.
+type viewShape struct {
+	name string
+	cols []bytdb.Column
+}
+
+// viewColumns is each view's output columns, in Views() order so index
+// i pairs with viewOID(i). Names come back with the columns so callers
+// never read Views() a second time and risk a list that shifted in
+// between. A view stores only its SELECT text,
+// so the columns are derived from that text's static shape. This is
+// the describe path (staticView) that EXPLAIN and wire Describe use:
+// nothing executes, so listing a view's columns never scans the
+// tables behind it.
+//
+// The shapes come from a private copy of the DB:
+//   - vtabs cleared: the running statement's CTEs must not shadow the
+//     names a view's body refers to. A view resolves against the
+//     catalog, not against the query that happens to be reading it.
+//   - catalogShapes set: system tables in a view body resolve with no
+//     rows (see the field's comment for the recursion this prevents).
+//
+// staticView registers every view it describes, including the views a
+// body references, and the copy is threaded through the loop. So a
+// view that others depend on is described once, not once per
+// dependent.
+//
+// A view whose body no longer describes (a referenced table was
+// dropped; bytdb has no dependency tracking to refuse that) gets nil
+// columns. It still lists in pg_class, as it did before, just with no
+// attributes, and the rest of the catalog is unaffected.
+func (d *DB) viewColumns() []viewShape {
+	return viewColumnsFn(d)
+}
+
+// viewColumnsFn holds viewColumnsImpl. The indirection exists only for
+// Go's initialization-order check: sysTables' row builders call
+// viewColumns, which reaches lookup and then sysLookup, which reads
+// sysTables. A direct reference makes the map literal depend on
+// itself, which the compiler rejects. Binding the function in init
+// breaks the static edge. At run time the cycle is harmless, because
+// catalogShapes stops row builders from running inside it.
+var viewColumnsFn func(*DB) []viewShape
+
+func init() { viewColumnsFn = (*DB).viewColumnsImpl }
+
+func (d *DB) viewColumnsImpl() []viewShape {
+	views := d.e.Views()
+	if len(views) == 0 {
+		return nil
+	}
+	sd := *d
+	sd.vtabs = nil
+	sd.catalogShapes = true
+	dw := &sd
+	out := make([]viewShape, len(views))
+	for i, vd := range views {
+		out[i].name = vd.Name
+		next, err := dw.staticView(vd.Name, 0)
+		if err != nil {
+			continue
+		}
+		dw = next
+		out[i].cols = next.vtabs[vd.Name].desc.Columns
+	}
+	return out
+}
+
 // indexOID is a secondary index's oid; the primary key's synthetic
 // index is id 0.
 func indexOID(tableID uint64, indexID uint64) int64 { return int64(tableID*1000 + indexID) }
@@ -414,6 +482,14 @@ var sysTables = map[string]*sysTableDef{
 					for i, o := range ix.Cols {
 						attr(indexOID(desc.ID, ix.ID), i+1, desc.Columns[o], false)
 					}
+				}
+			}
+			// View columns join to the synthetic view oids pg_class
+			// lists. attnotnull stays false, as in Postgres, which never
+			// marks a view column NOT NULL whatever its source.
+			for i, v := range d.viewColumns() {
+				for j, c := range v.cols {
+					attr(viewOID(i), j+1, c, false)
 				}
 			}
 			return rows
@@ -691,6 +767,14 @@ var sysTables = map[string]*sysTableDef{
 			for _, desc := range d.userDescs() {
 				rows = append(rows, []any{sysDatabase, "public", desc.Name, "BASE TABLE"})
 			}
+			// Views list as 'VIEW', as in Postgres, so a tool that
+			// discovers relations here finds the same set that has rows
+			// in information_schema.columns. Probes that filter on
+			// table_type = 'BASE TABLE' (GORM's HasTable) still see only
+			// tables.
+			for _, vd := range d.e.Views() {
+				rows = append(rows, []any{sysDatabase, "public", vd.Name, "VIEW"})
+			}
 			return rows
 		},
 	},
@@ -848,6 +932,19 @@ var sysTables = map[string]*sysTableDef{
 						sysDatabase, "public", desc.Name, c.Name,
 						int64(i + 1), dflt, nullable, sqlTypeName(c.Type), udtName(c.Type),
 						maxLen,
+					})
+				}
+			}
+			// Views list their output columns too, as in Postgres. The
+			// columns are always nullable with no default. There is no
+			// length limit either, because a derived shape carries
+			// only the type.
+			for _, v := range d.viewColumns() {
+				for j, c := range v.cols {
+					rows = append(rows, []any{
+						sysDatabase, "public", v.name, c.Name,
+						int64(j + 1), nil, "YES", sqlTypeName(c.Type), udtName(c.Type),
+						nil,
 					})
 				}
 			}

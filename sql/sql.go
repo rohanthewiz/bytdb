@@ -215,7 +215,9 @@
 // always-empty tables psql probes (pg_collation, pg_inherits,
 // pg_policy, pg_statistic_ext, the pg_publication family,
 // pg_auth_members; pg_constraint lists CHECK constraints), plus
-// information_schema.tables, columns, and sequences — all synthesized
+// information_schema.tables, columns, and sequences (views list in
+// pg_class, pg_attribute, and information_schema tables/columns, their
+// columns described from the stored query) — all synthesized
 // from the engine catalog and queryable like any tables (read-only;
 // their names are reserved). psql's \dt, \d, \d <table>, \d <index>, \di,
 // \dn, \du, and \l render against it. Table names may be
@@ -482,6 +484,15 @@ type DB struct {
 	// — in the single-writer default the plain path is already
 	// serializable, so tracking reads would be pure overhead.
 	serial bool
+
+	// catalogShapes makes virtual system tables resolve to their
+	// descriptors with no rows. It is set only on the private copy that
+	// derives view shapes for the catalog (viewColumns), which needs
+	// column names and types, never data. Besides skipping wasted row
+	// builds, it breaks a cycle: a view defined over pg_attribute is
+	// described from inside pg_attribute's own row builder, and building
+	// those rows again there would recurse without end.
+	catalogShapes bool
 }
 
 // Activity is one backend's pg_stat_activity row, reported by the
