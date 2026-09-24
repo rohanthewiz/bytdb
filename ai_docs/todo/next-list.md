@@ -110,14 +110,14 @@ arrives.
 ## Closed
 
 - **N-002** · raised `2026-0805-1820-benchmark-rerun-m1pro-doc-refresh` ·
-  closed 2026-09-24. **`bench/go.mod` pin goes stale on every release.**
+  closed 2026-09-24, `2026-0924-1522-next-list-seed-view-catalog-v0.16.0`. **`bench/go.mod` pin goes stale on every release.**
   Tidied from v0.14.0 to v0.16.0, and bench now builds with and without
   `GOWORK=off`. The lasting fix is the new `/release` skill
   (`.claude/skills/release/SKILL.md`). It is the first written release
   routine, and step 5 tidies bench right after pgwire's pin bump, so the pin
   follows every release.
 - **N-017** · raised in dbc, `2026-09-24` (no bytdb session doc) · closed
-  2026-09-24. **Views have no columns in the catalog.** Fixed:
+  2026-09-24, `2026-0924-1522-next-list-seed-view-catalog-v0.16.0`. **Views have no columns in the catalog.** Fixed:
   `pg_attribute` and `information_schema.columns` now list each view's
   output columns, and `information_schema.tables` lists views as `VIEW`. The
   columns come from describing the stored query with `staticView`, the same
@@ -129,7 +129,7 @@ arrives.
   table query (`dbc/db/catalog.go:49`) can now fall back to the generic
   `information_schema.tables` one if wanted.
 - **N-016** · raised `2026-0805-1854-occ-truncate-insert-race-flake-fix` ·
-  closed 2026-09-24. **Use Go 1.25's `WaitGroup.Go` for the
+  closed 2026-09-24, `2026-0924-1522-next-list-seed-view-catalog-v0.16.0`. **Use Go 1.25's `WaitGroup.Go` for the
   `wg.Add(1)`/`go func` pairs in `seq_occ_test.go`.** gopls suggested it, and
   the item never reached a Next list. The rebuild found it already done:
   `seq_occ_test.go` has six `wg.Go(` calls and no `wg.Add(1)` left. They came in with
