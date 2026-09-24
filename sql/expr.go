@@ -1254,10 +1254,35 @@ func indexdef(d *DB, oid int64, colNo int64) any {
 	return nil
 }
 
-// constraintdef renders pg_get_constraintdef for a check constraint's
-// oid, in Postgres's shape: CHECK ((expr)).
+// constraintdef renders pg_get_constraintdef for a pg_constraint oid,
+// in Postgres's shape:
+//
+//	p  PRIMARY KEY (a, b)
+//	u  UNIQUE (a)
+//	c  CHECK ((expr))
+//	f  FOREIGN KEY (a) REFERENCES t(b) [ON DELETE CASCADE]
+//
+// Key constraints share their backing index's oid (see pg_constraint
+// in syscat.go), so the p/u arms match on indexOID. Only unique indexes
+// qualify: a plain index's oid is not a constraint and renders NULL,
+// as an unknown oid does in Postgres.
 func constraintdef(d *DB, oid int64) any {
+	colList := func(desc *bytdb.TableDesc, ords []int) string {
+		names := make([]string, len(ords))
+		for i, o := range ords {
+			names[i] = desc.Columns[o].Name
+		}
+		return strings.Join(names, ", ")
+	}
 	for _, desc := range d.userDescs() {
+		if oid == indexOID(desc.ID, 0) {
+			return "PRIMARY KEY (" + colList(desc, desc.PKCols) + ")"
+		}
+		for _, ix := range desc.Indexes {
+			if ix.Unique && oid == indexOID(desc.ID, ix.ID) {
+				return "UNIQUE (" + colList(desc, ix.Cols) + ")"
+			}
+		}
 		for i, ck := range desc.Checks {
 			if oid == checkOID(desc.ID, i) {
 				return "CHECK ((" + ck.Expr + "))"

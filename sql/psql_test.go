@@ -119,6 +119,14 @@ ORDER BY i.indisprimary DESC, c2.relname`, oid))
 		!strings.Contains(res.Rows[1][5].(string), "INDEX users_age ON public.users USING btree (age)") {
 		t.Fatalf("index row %v", res.Rows[1])
 	}
+	// The LEFT JOIN now finds the key constraint behind the pkey index;
+	// a plain index still joins to nothing.
+	if res.Rows[0][6] != "PRIMARY KEY (id)" || res.Rows[0][7] != "p" || res.Rows[0][8] != false {
+		t.Fatalf("pkey constraint cols %v", res.Rows[0])
+	}
+	if res.Rows[1][6] != nil || res.Rows[1][7] != nil {
+		t.Fatalf("plain index constraint cols %v", res.Rows[1])
+	}
 
 	// Publications: the three-arm UNION with never-evaluated exotica
 	// (generate_series in FROM, array subscripts, string_agg).

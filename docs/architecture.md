@@ -421,8 +421,8 @@ sequenceDiagram
 
 What makes ORMs work is less the protocol than the **system catalog emulation**:
 `pg_class` (tables, indexes, sequences, and views), `pg_attribute`,
-`pg_attrdef`, `pg_type`, `pg_index`, `pg_constraint` (checks and foreign
-keys), `pg_sequence`, `pg_stat_activity`, `information_schema.tables` /
+`pg_attrdef`, `pg_type`, `pg_index`, `pg_constraint` (primary keys,
+unique constraints, checks, and foreign keys), `pg_sequence`, `pg_stat_activity`, `information_schema.tables` /
 `columns` / `sequences` / `table_constraints` / `key_column_usage`, and a dozen more are synthesized on the fly from
 table descriptors (`sql/syscat.go`), enough for `psql`'s `\dt` and `\d`,
 GORM's `HasTable`, and SQLAlchemy/ActiveRecord introspection queries to run

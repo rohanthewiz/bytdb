@@ -214,7 +214,8 @@
 // an embedded DB) with real rows, a set of
 // always-empty tables psql probes (pg_collation, pg_inherits,
 // pg_policy, pg_statistic_ext, the pg_publication family,
-// pg_auth_members; pg_constraint lists CHECK constraints), plus
+// pg_auth_members; pg_constraint lists primary keys, unique
+// constraints, checks, and foreign keys), plus
 // information_schema.tables, columns, and sequences (views list in
 // pg_class, pg_attribute, and information_schema tables/columns, their
 // columns described from the stored query) — all synthesized

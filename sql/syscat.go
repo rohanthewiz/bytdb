@@ -16,6 +16,7 @@ package sql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -352,6 +353,40 @@ func (d *DB) viewColumnsImpl() []viewShape {
 // index is id 0.
 func indexOID(tableID uint64, indexID uint64) int64 { return int64(tableID*1000 + indexID) }
 
+// attnumArray renders 0-based column ordinals as the int2[] text
+// literal pg_constraint.conkey carries ({1,2}). This is the array form,
+// unlike pg_index.indkey, which is an int2vector and space-separated.
+// Clients that unnest it or test attnum = ANY(conkey) get what they
+// expect.
+func attnumArray(ords []int) string {
+	parts := make([]string, len(ords))
+	for i, o := range ords {
+		parts[i] = strconv.Itoa(o + 1)
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// refAttnums maps an FK's referenced column names to the parent's
+// attnums, in FK column order, for confkey. A name the parent no
+// longer has yields NULL rather than a partial array. That can only
+// happen if the parent changed underneath the FK.
+func refAttnums(parent *bytdb.TableDesc, names []string) any {
+	ords := make([]int, len(names))
+	for i, n := range names {
+		ords[i] = -1
+		for j, c := range parent.Columns {
+			if c.Name == n {
+				ords[i] = j
+				break
+			}
+		}
+		if ords[i] < 0 {
+			return nil
+		}
+	}
+	return attnumArray(ords)
+}
+
 // checkOID is the oid of a table's i-th check constraint, placed high
 // in the table's oid block, above any realistic index ID.
 func checkOID(tableID uint64, i int) int64 { return int64(tableID*1000+900) + int64(i) }
@@ -561,8 +596,8 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	// Most tables below exist so psql's probes parse, bind, and return
-	// zero rows (pg_constraint lists CHECK constraints and pg_attrdef
-	// column defaults): bytdb has no collations, inheritance, policies,
+	// zero rows (pg_constraint and pg_attrdef, among them, do carry
+	// real rows): bytdb has no collations, inheritance, policies,
 	// extended statistics, or publications.
 	"pg_catalog.pg_am": {
 		desc: sysDesc("pg_am",
@@ -629,10 +664,52 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("confupdtype", bytdb.TString), sysCol("confdeltype", bytdb.TString),
 			sysCol("conkey", bytdb.TString), sysCol("confkey", bytdb.TString)),
 		rows: func(d *DB) [][]any {
-			// CHECK and FOREIGN KEY constraints; keys surface through
-			// pg_index.
+			// All four kinds: PRIMARY KEY (p), UNIQUE (u), CHECK (c)
+			// and FOREIGN KEY (f).
+			//
+			// Key rows reuse their backing index's oid as the
+			// constraint oid, and point conindid at the same index.
+			// Postgres gives the constraint its own oid, but a table's
+			// oid block has no free slice (indexes, attrdefs, checks,
+			// FKs fill it). The reuse is safe because an index oid
+			// (tableID*1000 + index ID) never lands in the check or FK
+			// slices, so oids stay unique within pg_constraint. The
+			// join psql's \d uses (conindid = indexrelid) never
+			// compares con.oid to a pg_class oid.
+			//
+			// Every unique index reports as a UNIQUE constraint, as in
+			// table_constraints (see the note there): bytdb's UNIQUE
+			// (cols) is sugar for a unique index, so the two cannot be
+			// told apart.
+			//
+			// conkey holds the constrained columns' attnums as an int2[]
+			// literal ({1,2}) for key and FK rows, and confkey the
+			// referenced parent's attnums for FK rows. CHECK rows leave
+			// conkey NULL. Postgres lists the columns the expression
+			// mentions, which would mean parsing the stored text here.
 			var rows [][]any
 			for _, desc := range d.userDescs() {
+				pkOID := indexOID(desc.ID, 0)
+				rows = append(rows, []any{
+					pkOID, bytdb.PKConstraintName(desc.Name), oidPublic, "p",
+					false, false, true, int64(desc.ID),
+					int64(0), pkOID, int64(0), int64(0),
+					" ", " ",
+					attnumArray(desc.PKCols), nil,
+				})
+				for _, ix := range desc.Indexes {
+					if !ix.Unique {
+						continue
+					}
+					ixOID := indexOID(desc.ID, ix.ID)
+					rows = append(rows, []any{
+						ixOID, ix.Name, oidPublic, "u",
+						false, false, true, int64(desc.ID),
+						int64(0), ixOID, int64(0), int64(0),
+						" ", " ",
+						attnumArray(ix.Cols), nil,
+					})
+				}
 				for i, ck := range desc.Checks {
 					rows = append(rows, []any{
 						checkOID(desc.ID, i), ck.Name, oidPublic, "c",
@@ -645,8 +722,10 @@ var sysTables = map[string]*sysTableDef{
 				for i := range desc.ForeignKeys {
 					fk := &desc.ForeignKeys[i]
 					confrelid := int64(0)
+					var confkey any
 					if p := d.e.Table(fk.RefTable); p != nil {
 						confrelid = int64(p.ID)
+						confkey = refAttnums(p, fk.RefCols)
 					}
 					deltype := "a" // NO ACTION
 					if fk.OnDelete == bytdb.FKCascade {
@@ -657,7 +736,7 @@ var sysTables = map[string]*sysTableDef{
 						false, false, true, int64(desc.ID),
 						int64(0), int64(0), int64(0), confrelid,
 						"a", deltype,
-						nil, nil,
+						attnumArray(fk.Cols), confkey,
 					})
 				}
 			}

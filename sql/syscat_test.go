@@ -316,3 +316,64 @@ func TestSystemCatalogBrokenView(t *testing.T) {
 		t.Fatalf("broken view: %v", res.Rows)
 	}
 }
+
+// pg_constraint lists key constraints next to CHECK and FK rows (N-003):
+// a p row per table, a u row per unique index, each pointing conindid at
+// its backing index, with conkey/confkey as int2[] literals.
+func TestSystemCatalogKeyConstraints(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table orgs (id int, code text, name text,
+		primary key (id, code), unique (name))`)
+	exec(t, d, `create index orgs_code_plain on orgs (code)`) // not a constraint
+	exec(t, d, `create table members (id int primary key, org_id int, org_code text,
+		email text unique, foreign key (org_id, org_code) references orgs (id, code))`)
+
+	res := exec(t, d, `select conname, contype, conkey, confkey, pg_get_constraintdef(oid)
+		from pg_constraint where contype in ('p', 'u', 'f') order by 1`)
+	want := [][]any{
+		{"members_email_key", "u", "{4}", nil, "UNIQUE (email)"},
+		{"members_org_id_fkey", "f", "{2,3}", "{1,2}",
+			"FOREIGN KEY (org_id, org_code) REFERENCES orgs(id, code)"},
+		{"members_pkey", "p", "{1}", nil, "PRIMARY KEY (id)"},
+		{"orgs_name_key", "u", "{3}", nil, "UNIQUE (name)"},
+		{"orgs_pkey", "p", "{1,2}", nil, "PRIMARY KEY (id, code)"},
+	}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("pg_constraint: %v", res.Rows)
+	}
+
+	// The usual introspection join: key columns via attnum = ANY(conkey),
+	// in the order the tool sorts them.
+	res = exec(t, d, `select c.conname, a.attname from pg_constraint c
+		join pg_attribute a on a.attrelid = c.conrelid and a.attnum = any(c.conkey)
+		where c.conrelid = 'orgs'::regclass and c.contype in ('p', 'u') order by 1, a.attnum`)
+	want = [][]any{{"orgs_name_key", "name"}, {"orgs_pkey", "id"}, {"orgs_pkey", "code"}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("conkey join: %v", res.Rows)
+	}
+
+	// conindid names the backing index, as pg_class and pg_index list it.
+	res = exec(t, d, `select con.conname, ic.relname, i.indisprimary
+		from pg_constraint con
+		join pg_class ic on ic.oid = con.conindid
+		join pg_index i on i.indexrelid = con.conindid
+		where con.conrelid = 'orgs'::regclass order by 1`)
+	want = [][]any{{"orgs_name_key", "orgs_name_key", false}, {"orgs_pkey", "orgs_pkey", true}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("conindid: %v", res.Rows)
+	}
+
+	// A plain index's oid is not a constraint oid.
+	res = exec(t, d, `select pg_get_constraintdef(oid) from pg_class where relname = 'orgs_code_plain'`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{nil}}) {
+		t.Fatalf("plain index constraintdef: %v", res.Rows)
+	}
+
+	// pg_constraint and table_constraints agree on the key constraints.
+	res = exec(t, d, `select constraint_name from information_schema.table_constraints
+		where constraint_type in ('PRIMARY KEY', 'UNIQUE') order by 1`)
+	want = [][]any{{"members_email_key"}, {"members_pkey"}, {"orgs_name_key"}, {"orgs_pkey"}}
+	if !reflect.DeepEqual(res.Rows, want) {
+		t.Fatalf("table_constraints: %v", res.Rows)
+	}
+}

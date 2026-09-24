@@ -789,6 +789,14 @@ joined to `key_column_usage`: primary keys in key order, foreign keys with
 constraint, since `UNIQUE (cols)` is an index in bytdb, and NOT NULL
 columns do not appear as synthetic CHECK rows.
 
+`pg_constraint` lists the same keys. Each table has one `p` row, and each
+unique index has one `u` row, next to the `c` (CHECK) and `f` (FOREIGN KEY)
+rows. `conkey` holds the constrained columns' attnums as an array literal
+(`{1,2}`), so `attnum = ANY(conkey)` joins to `pg_attribute`. FK rows also
+carry `confkey`, the parent's attnums. A key row's `conindid` names its
+backing index. `pg_get_constraintdef` renders `PRIMARY KEY (...)` and
+`UNIQUE (...)`. Unlike Postgres, a key constraint's oid is its index's oid.
+
 Views introspect like tables: `pg_attribute` and `information_schema.columns`
 list a view's output columns, and `information_schema.tables` lists the view
 as `VIEW`. The columns come from describing the stored query, so listing them

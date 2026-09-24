@@ -236,7 +236,7 @@ func TestSQLCheckValidation(t *testing.T) {
 
 	// Default names dedup with numeric suffixes, as in Postgres.
 	exec(t, d, `create table t (a int primary key check (a > 0) check (a < 100), check (a != 13))`)
-	res := exec(t, d, `select conname from pg_constraint where conrelid = 't'::regclass order by 1`)
+	res := exec(t, d, `select conname from pg_constraint where conrelid = 't'::regclass and contype = 'c' order by 1`)
 	want := [][]any{{"t_a_check"}, {"t_a_check1"}, {"t_check"}}
 	if !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("default names: got %v", res.Rows)
@@ -265,14 +265,14 @@ func TestSQLAddDropConstraint(t *testing.T) {
 		!strings.Contains(err.Error(), `violates check constraint "qty_sane"`) {
 		t.Fatalf("update after add: %v", err)
 	}
-	res := exec(t, d, `select conname from pg_constraint where conrelid = 'items'::regclass order by 1`)
+	res := exec(t, d, `select conname from pg_constraint where conrelid = 'items'::regclass and contype = 'c' order by 1`)
 	if want := [][]any{{"items_check"}, {"qty_sane"}}; !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("pg_constraint: got %v", res.Rows)
 	}
 
 	// Default names dedup against existing constraints.
 	exec(t, d, `alter table items add check (qty < 1000)`)
-	res = exec(t, d, `select conname from pg_constraint where conrelid = 'items'::regclass order by 1`)
+	res = exec(t, d, `select conname from pg_constraint where conrelid = 'items'::regclass and contype = 'c' order by 1`)
 	if want := [][]any{{"items_check"}, {"items_check1"}, {"qty_sane"}}; !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("after dedup add: got %v", res.Rows)
 	}

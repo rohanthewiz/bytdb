@@ -243,7 +243,7 @@ func TestFKCascadeCatalog(t *testing.T) {
 
 	res := exec(t, d, `select conname, confdeltype, confupdtype,
 		pg_get_constraintdef(oid) from pg_constraint
-		where conrelid = 'c'::regclass order by 1`)
+		where conrelid = 'c'::regclass and contype = 'f' order by 1`)
 	want := [][]any{
 		{"c_cas_fkey", "c", "a", "FOREIGN KEY (cas) REFERENCES p(id) ON DELETE CASCADE"},
 		{"c_noact_fkey", "a", "a", "FOREIGN KEY (noact) REFERENCES p(id)"},

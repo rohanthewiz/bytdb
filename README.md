@@ -579,7 +579,8 @@ stops early), including fully-reversed matches run as backward scans.
 For introspection there is a virtual system catalog:
 `pg_catalog.pg_namespace`, `pg_class` (sequences and views included),
 `pg_attribute` (view columns included), `pg_attrdef`, `pg_type`, `pg_index`, `pg_sequence`,
-`pg_constraint` (checks and foreign keys, `confdeltype` included),
+`pg_constraint` (primary keys, unique constraints, checks, and foreign keys, with
+`conkey`/`confkey` and `confdeltype`),
 `pg_am`, `pg_database`, `pg_roles`, and `pg_stat_activity` with real
 rows, a set of always-empty tables psql probes (`pg_policy`, the
 `pg_publication` family, ...), plus `information_schema.tables` (views as `VIEW`),

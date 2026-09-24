@@ -31,22 +31,24 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-018
+**Next ID:** N-019
 
 ## Open
 
-- **N-003** · raised `2026-0916-1557-sqlstate-gaps-constraint-catalog` · value low
-  **`pg_constraint` omits primary keys and unique constraints.** It lists only
-  CHECK (`c`) and FK (`f`) rows (`sql/syscat.go:545-590`). Keys show up through
-  `pg_index` instead. `information_schema.table_constraints` lists all four
-  kinds. Tools that read `contype IN ('p','u')` would miss keys. Nobody has
-  reported this.
 - **N-004** · raised `2026-0916-1557-sqlstate-gaps-constraint-catalog` · value low
   **`bad parameter format code` maps to XX000.** Postgres treats an invalid Bind
   format code as a protocol violation (08P01). The error comes from
   `pgwire/values.go:244`, and no case in `pgwire/errors.go` matches it (the
   comment at `errors.go:54` says it is kept out of the `bad <type> parameter`
   rule on purpose). This predates the SQLSTATE work.
+- **N-018** · raised `2026-0924-1559-pg-constraint-key-rows` · value low
+  **`DROP CONSTRAINT` refuses a unique constraint's name.** Both
+  `pg_constraint` (`u` rows, since N-003) and `table_constraints` list every
+  unique index as a UNIQUE constraint. But `execDropConstraint`
+  (`sql/check.go:196`) only knows checks, FKs, and the pkey, so
+  `ALTER TABLE t DROP CONSTRAINT t_name_key` fails with "does not exist" and
+  only `DROP INDEX` works. A migration tool that diffs `pg_constraint` would
+  emit the DROP CONSTRAINT form. Nobody has hit this yet.
 
 ## Roadmap
 
@@ -109,6 +111,16 @@ arrives.
   imports it.
 ## Closed
 
+- **N-003** · raised `2026-0916-1557-sqlstate-gaps-constraint-catalog` ·
+  closed 2026-09-24, `2026-0924-1559-pg-constraint-key-rows`. **`pg_constraint` omits primary
+  keys and unique constraints.** Fixed: one `p` row per table and one `u` row
+  per unique index, each with `conindid` set to the backing index and its oid
+  reused as the constraint oid (`sql/syscat.go`). `conkey` and `confkey`
+  (FK rows) are now filled as `{1,2}` literals; before, they were NULL on
+  every row. `pg_get_constraintdef` renders `PRIMARY KEY (...)` and
+  `UNIQUE (...)`. psql's `\d` index listing now joins the pkey to its
+  constraint. Tests: `TestSystemCatalogKeyConstraints`, plus a new assertion
+  in `TestPsqlDescribeTable`.
 - **N-002** · raised `2026-0805-1820-benchmark-rerun-m1pro-doc-refresh` ·
   closed 2026-09-24, `2026-0924-1522-next-list-seed-view-catalog-v0.16.0`. **`bench/go.mod` pin goes stale on every release.**
   Tidied from v0.14.0 to v0.16.0, and bench now builds with and without
