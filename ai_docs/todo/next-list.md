@@ -31,24 +31,11 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-019
+**Next ID:** N-021
 
 ## Open
 
-- **N-004** · raised `2026-0916-1557-sqlstate-gaps-constraint-catalog` · value low
-  **`bad parameter format code` maps to XX000.** Postgres treats an invalid Bind
-  format code as a protocol violation (08P01). The error comes from
-  `pgwire/values.go:244`, and no case in `pgwire/errors.go` matches it (the
-  comment at `errors.go:54` says it is kept out of the `bad <type> parameter`
-  rule on purpose). This predates the SQLSTATE work.
-- **N-018** · raised `2026-0924-1559-pg-constraint-key-rows` · value low
-  **`DROP CONSTRAINT` refuses a unique constraint's name.** Both
-  `pg_constraint` (`u` rows, since N-003) and `table_constraints` list every
-  unique index as a UNIQUE constraint. But `execDropConstraint`
-  (`sql/check.go:196`) only knows checks, FKs, and the pkey, so
-  `ALTER TABLE t DROP CONSTRAINT t_name_key` fails with "does not exist" and
-  only `DROP INDEX` works. A migration tool that diffs `pg_constraint` would
-  emit the DROP CONSTRAINT form. Nobody has hit this yet.
+None.
 
 ## Roadmap
 
@@ -111,6 +98,60 @@ arrives.
   imports it.
 ## Closed
 
+- **N-020** · raised `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate` ·
+  closed 2026-09-24, `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate`.
+  **`cannot drop a primary key column` maps to XX000.** Fixed, with the rest
+  of the primary-key DDL errors. A wire probe found seven more that were
+  mis-mapped:
+  - **42P16** (the one-key invariant) now also covers a key column's
+    DROP NOT NULL, ADD COLUMN ... PRIMARY KEY, CREATE TABLE with no key,
+    and the parser's short "multiple primary keys".
+  - **42703** covers a key naming an undeclared column
+    (`primary key column not declared`) and Postgres's
+    `column "x" of relation "t" does not exist` (ADD PRIMARY KEY, ALTER
+    COLUMN).
+  - **42701** covers a column named twice in a key and a RENAME onto a
+    taken name. `duplicate primary key column` used to come back as 23505,
+    because it contains the data-conflict wording "duplicate primary key".
+    A client would have read a DDL typo as a unique violation. The 42701
+    case now comes before 23505.
+
+  Tests: new `TestSQLStateMapping` rows, including one pinning that a
+  constraint's "does not exist" stays 42704. `TestPrimaryKeyDDLErrors`
+  (`pgwire/server_test.go`) runs 11 statements over pgx.
+- **N-019** · raised `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate` ·
+  closed 2026-09-24, `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate`.
+  **Dependency refusals map to XX000.** Fixed: `sqlstate`
+  (`pgwire/errors.go`) maps every dependency refusal to 2BP01. When filed,
+  the item named four. The code has eleven: the two "because other objects
+  depend on it" wordings (DROP TABLE, DROP/RENAME COLUMN blocked by a
+  CHECK), the two "a foreign key depends on" ones (unique index, PK
+  replace), dropping an indexed column or an FK column, and the "referenced
+  by a foreign key" refusals (drop/rename column, rename table, alter type).
+  All eleven get 2BP01, even where Postgres would allow the change, because
+  the remedy is the same in every case: remove the dependent object, then
+  retry. TRUNCATE of a referenced table keeps Postgres's 0A000. Tests: 13
+  new `TestSQLStateMapping` rows, and `TestDependencyRefusals`
+  (`pgwire/server_test.go`), which triggers the refusals from real SQL over
+  pgx. "Drop a column referenced by a foreign key" (`ddl.go:438`) is covered
+  by a mapping row only. From SQL, an earlier check always fires first: a
+  referenced column is always in the primary key ("cannot drop a primary key
+  column") or in a unique index ("cannot drop an indexed column").
+- **N-018** · raised `2026-0924-1559-pg-constraint-key-rows` · closed
+  2026-09-24, `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate`.
+  **`DROP CONSTRAINT` refuses a unique constraint's name.** Fixed:
+  `execDropConstraint` (`sql/check.go`) now tries unique indexes after
+  checks and FKs, and drops a match through `Engine.DropIndex`, so it keeps
+  DROP INDEX's refusal when an FK depends on the index. A plain index is not
+  a constraint and still gets "does not exist". Test:
+  `TestDropConstraintUnique`.
+- **N-004** · raised `2026-0916-1557-sqlstate-gaps-constraint-catalog` ·
+  closed 2026-09-24, `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate`.
+  **`bad parameter format code` maps to XX000.** Fixed: `sqlstate`
+  (`pgwire/errors.go`) now maps it to 08P01 next to "wrong number of
+  parameters". Tests: the `TestSQLStateMapping` row now expects 08P01, and a
+  new case 3 in `TestBindFormatCountMismatchIsProtocolError` sends a Bind with
+  format code 2 over the wire and checks the ErrorResponse's `C` field.
 - **N-003** · raised `2026-0916-1557-sqlstate-gaps-constraint-catalog` ·
   closed 2026-09-24, `2026-0924-1559-pg-constraint-key-rows`. **`pg_constraint` omits primary
   keys and unique constraints.** Fixed: one `p` row per table and one `u` row

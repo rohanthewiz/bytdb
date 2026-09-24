@@ -189,10 +189,13 @@ func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
 }
 
 // execDropConstraint handles ALTER TABLE ... DROP CONSTRAINT for
-// CHECK and FOREIGN KEY constraints (they share a namespace, as in
-// Postgres). The primary key is structural in bytdb — it can be
-// replaced (ReplacePrimaryKey) but never dropped alone — and unique
-// constraints are indexes (DROP INDEX).
+// CHECK, FOREIGN KEY and UNIQUE constraints (they share a namespace,
+// as in Postgres). The primary key is structural in bytdb — it can be
+// replaced (ReplacePrimaryKey) but never dropped alone.
+//
+// Lookup order is check → FK → unique index → pkey hint. Each kind
+// drops in its own engine transaction; only the first match runs, so
+// no statement ever touches two kinds.
 func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	desc := d.e.Table(s.Table)
 	if desc == nil {
@@ -205,6 +208,23 @@ func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	if !existed {
 		if existed, err = d.e.DropForeignKey(s.Table, s.Name); err != nil {
 			return nil, err
+		}
+	}
+	// A unique constraint is a unique index in bytdb: UNIQUE (cols) is
+	// sugar for one, and pg_constraint / table_constraints list every
+	// unique index as a UNIQUE constraint (N-013). The name those
+	// catalogs show must therefore be droppable here, or a migration
+	// tool diffing pg_constraint would emit a DROP CONSTRAINT that
+	// fails. A plain index is not a constraint (the catalogs give it no
+	// row), so it still falls through to "does not exist", as in
+	// Postgres. Engine.DropIndex refuses when a foreign key depends on
+	// the index's uniqueness, the same guard DROP INDEX gets.
+	if !existed {
+		if ix := desc.Index(s.Name); ix != nil && ix.Unique {
+			if err := d.e.DropIndex(s.Table, s.Name); err != nil {
+				return nil, err
+			}
+			existed = true
 		}
 	}
 	if !existed {

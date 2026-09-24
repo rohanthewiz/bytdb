@@ -9,6 +9,7 @@ package pgwire
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net"
@@ -148,6 +149,34 @@ func TestBindFormatCountMismatchIsProtocolError(t *testing.T) {
 		t.Fatalf("result-format mismatch produced no ErrorResponse (saw %v)", seen)
 	}
 
+	// Case 3: a format code that is neither text (0) nor binary (1).
+	// The count is fine, so this reaches decodeParam, whose error must
+	// reach the client as 08P01 (protocol_violation), as in Postgres.
+	parse = parse[:0]
+	parse = append(parse, 0)
+	parse = append(parse, "select $1::int"...)
+	parse = append(parse, 0)
+	parse = binary.BigEndian.AppendUint16(parse, 0)
+
+	bind = bind[:0]
+	bind = append(bind, 0, 0)
+	bind = binary.BigEndian.AppendUint16(bind, 1) // one param format code...
+	bind = binary.BigEndian.AppendUint16(bind, 2) // ...that is invalid
+	bind = binary.BigEndian.AppendUint16(bind, 1) // one param
+	bind = binary.BigEndian.AppendUint32(bind, 1)
+	bind = append(bind, '7')
+	bind = binary.BigEndian.AppendUint16(bind, 0) // no result formats
+
+	msg = frameMsg(msgParse, parse)
+	msg = append(msg, frameMsg(msgBind, bind)...)
+	msg = append(msg, frameMsg(msgSync, nil)...)
+	if _, err := nc.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	if code := errorCodeUntilReady(t, r); code != "08P01" {
+		t.Fatalf("bad format code: SQLSTATE %q, want 08P01", code)
+	}
+
 	// The connection must still work — a panic would have killed it.
 	q := append([]byte("select 42"), 0)
 	if _, err := nc.Write(frameMsg(msgQuery, q)); err != nil {
@@ -155,5 +184,45 @@ func TestBindFormatCountMismatchIsProtocolError(t *testing.T) {
 	}
 	if seen := collectUntilReady(t, r); seen[msgDataRow] != 1 || seen[msgErrorResponse] != 0 {
 		t.Fatalf("connection unhealthy after format-code errors (saw %v)", seen)
+	}
+}
+
+// errorCodeUntilReady reads backend messages through ReadyForQuery and
+// returns the SQLSTATE (the 'C' field) of the first ErrorResponse, or
+// "" if none arrived. ErrorResponse bodies are a run of
+// <field byte><cstring> pairs ended by a zero byte.
+func errorCodeUntilReady(t *testing.T, r *bufio.Reader) string {
+	t.Helper()
+	code := ""
+	for {
+		typ, err := r.ReadByte()
+		if err != nil {
+			t.Fatalf("read frame type: %v (connection died?)", err)
+		}
+		var lb [4]byte
+		if _, err := io.ReadFull(r, lb[:]); err != nil {
+			t.Fatalf("read frame length: %v", err)
+		}
+		body := make([]byte, int(binary.BigEndian.Uint32(lb[:]))-4)
+		if _, err := io.ReadFull(r, body); err != nil {
+			t.Fatalf("read frame body: %v", err)
+		}
+		if typ == msgErrorResponse && code == "" {
+			for len(body) > 1 {
+				field := body[0]
+				end := bytes.IndexByte(body[1:], 0)
+				if end < 0 {
+					break
+				}
+				if field == 'C' {
+					code = string(body[1 : 1+end])
+					break
+				}
+				body = body[2+end:]
+			}
+		}
+		if typ == msgReadyForQuery {
+			return code
+		}
 	}
 }

@@ -327,6 +327,63 @@ func TestSQLAddDropConstraint(t *testing.T) {
 	}
 }
 
+// TestDropConstraintUnique: every unique index is listed as a UNIQUE
+// constraint in pg_constraint, so DROP CONSTRAINT must accept the
+// name the catalog shows — whichever way the index was created —
+// while a plain index, which the catalog omits, stays refused.
+func TestDropConstraintUnique(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table acct (id int primary key, email text unique, a int, b int, tag text,
+		unique (a, b))`)
+	exec(t, d, `create unique index acct_tag_u on acct (tag)`)
+	exec(t, d, `create index acct_plain on acct (b)`)
+	exec(t, d, `insert into acct values (1, 'x@y', 1, 1, 't')`)
+
+	uniques := func() [][]any {
+		t.Helper()
+		return exec(t, d, `select conname from pg_constraint
+			where conrelid = 'acct'::regclass and contype = 'u' order by 1`).Rows
+	}
+	if want := [][]any{{"acct_a_b_key"}, {"acct_email_key"}, {"acct_tag_u"}}; !reflect.DeepEqual(uniques(), want) {
+		t.Fatalf("before: got %v", uniques())
+	}
+
+	// Column-level, table-level and CREATE UNIQUE INDEX all drop by name,
+	// and uniqueness is lifted with them.
+	wantErr(t, d, `insert into acct values (2, 'x@y', 2, 2, 'u')`, "unique index violation")
+	exec(t, d, `alter table acct drop constraint acct_email_key`)
+	exec(t, d, `alter table acct drop constraint acct_a_b_key`)
+	exec(t, d, `alter table acct drop constraint acct_tag_u`)
+	exec(t, d, `insert into acct values (2, 'x@y', 1, 1, 't')`)
+	if got := uniques(); len(got) != 0 {
+		t.Fatalf("after: got %v", got)
+	}
+	// The index is gone too, not just hidden from the catalog.
+	if desc := d.e.Table("acct"); desc.Index("acct_email_key") != nil || desc.Index("acct_tag_u") != nil {
+		t.Fatal("unique index survived DROP CONSTRAINT")
+	}
+
+	// A plain index is not a constraint: refused, and left in place.
+	// IF EXISTS turns that into the usual notice.
+	wantErr(t, d, `alter table acct drop constraint acct_plain`,
+		`constraint "acct_plain" of relation "acct" does not exist`)
+	if res := exec(t, d, `alter table acct drop constraint if exists acct_plain`); !strings.Contains(res.Notice, "skipping") {
+		t.Fatalf("IF EXISTS notice: %q", res.Notice)
+	}
+	if d.e.Table("acct").Index("acct_plain") == nil {
+		t.Fatal("plain index dropped by DROP CONSTRAINT")
+	}
+
+	// A unique index an FK depends on keeps DROP INDEX's guard.
+	exec(t, d, `create table parent (id int primary key, code text unique)`)
+	exec(t, d, `create table child (id int primary key, pc text references parent (code))`)
+	wantErr(t, d, `alter table parent drop constraint parent_code_key`,
+		"cannot drop the unique index a foreign key depends on")
+	if d.e.Table("parent").Index("parent_code_key") == nil {
+		t.Fatal("FK-backing index dropped")
+	}
+}
+
 func TestSQLPointGetAndMisses(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)

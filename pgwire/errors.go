@@ -27,21 +27,45 @@ func sqlstate(msg string, hasPos bool) string {
 		return "42601" // syntax_error
 	case strings.Contains(msg, "no such table"):
 		return "42P01" // undefined_table
-	case strings.Contains(msg, "no such column"):
+	// Also Postgres's wording for ALTER COLUMN / ADD PRIMARY KEY naming
+	// a missing column, and CREATE TABLE's key naming an undeclared one.
+	// The `column "` prefix keeps a constraint's "does not exist"
+	// (42704, below) out of this case.
+	case strings.Contains(msg, "no such column"),
+		strings.Contains(msg, "primary key column not declared"),
+		strings.HasPrefix(msg, `column "`) && strings.HasSuffix(msg, `" does not exist`):
 		return "42703" // undefined_column
 	case strings.Contains(msg, "ambiguous"):
 		return "42702" // ambiguous_column
+	// A column named twice in a key, or a RENAME onto a taken name.
+	// This must precede the 23505 case: "duplicate primary key column"
+	// is a DDL mistake, but it contains "duplicate primary key", the
+	// data-conflict wording, and used to be reported as unique_violation.
+	case strings.Contains(msg, "duplicate primary key column"),
+		strings.Contains(msg, "appears twice in primary key"),
+		strings.HasPrefix(msg, `column "`) && strings.HasSuffix(msg, `" already exists`):
+		return "42701" // duplicate_column
 	case strings.Contains(msg, "duplicate primary key"),
 		strings.Contains(msg, "unique index violation"),
 		strings.Contains(msg, "could not create unique index"):
 		return "23505" // unique_violation
 	case strings.Contains(msg, "cannot be cast automatically"):
 		return "42804" // datatype_mismatch
-	// Both refusals protect the one-primary-key-per-table invariant:
-	// a second key, or dropping the only one (bytdb requires a key
-	// where Postgres would allow a keyless table).
-	case strings.Contains(msg, "multiple primary keys for table"),
-		strings.Contains(msg, "cannot drop constraint"):
+	// Every refusal here protects the one-primary-key-per-table
+	// invariant. Postgres itself uses 42P16 for a second key (in CREATE
+	// TABLE, ALTER TABLE ADD PRIMARY KEY, or ADD COLUMN ... PRIMARY KEY)
+	// and for DROP NOT NULL on a key column. The rest exist because
+	// bytdb requires a key where Postgres would allow a keyless table:
+	// CREATE TABLE without one, dropping the pkey constraint, or
+	// dropping a key column (Postgres would drop the key with it).
+	// "multiple primary keys" matches both the parser's short form and
+	// the ALTER form ("... for table "t" are not allowed").
+	case strings.Contains(msg, "multiple primary keys"),
+		strings.Contains(msg, "cannot add a primary key column"),
+		strings.Contains(msg, "cannot drop constraint"),
+		strings.Contains(msg, "cannot drop a primary key column"),
+		strings.Contains(msg, "a primary key is required"),
+		strings.HasSuffix(msg, `" is in a primary key`):
 		return "42P16" // invalid_table_definition
 	// Every per-type literal parse failure (int, float, bool, bytea,
 	// date, timestamp, uuid, json) shares this wording, as in Postgres.
@@ -51,7 +75,8 @@ func sqlstate(msg string, hasPos bool) string {
 	// is Postgres's 22P03; a malformed text value is the same 22P02 as a
 	// bad literal. The space count pins the text form to "bad <type>
 	// parameter", so no other "bad ..." message can fall into it
-	// ("bad parameter format code" does not end in "parameter" anyway).
+	// ("bad parameter format code" does not end in "parameter" anyway;
+	// it is a protocol violation, mapped below).
 	case strings.HasPrefix(msg, "bad binary ") && strings.HasSuffix(msg, " parameter"):
 		return "22P03" // invalid_binary_representation
 	case strings.HasPrefix(msg, "bad ") && strings.HasSuffix(msg, " parameter") &&
@@ -65,6 +90,30 @@ func sqlstate(msg string, hasPos bool) string {
 		return "23503" // foreign_key_violation
 	case strings.Contains(msg, "truncate a table referenced in a foreign key"):
 		return "0A000" // feature_not_supported (Postgres's code for it sans CASCADE)
+	// Schema changes refused because another object depends on the
+	// target: a foreign key, a CHECK, or an index. Postgres reports its
+	// own such refusals (DROP without CASCADE) as 2BP01, and the remedy
+	// is the same for all of bytdb's: remove the dependent object first,
+	// then retry. That holds even where Postgres would have allowed the
+	// change (it tracks dependencies by oid, bytdb by name): renaming a
+	// referenced table or column, changing a FK column's type, renaming
+	// a column a CHECK mentions, or dropping an indexed or FK column,
+	// which Postgres would cascade. 0A000 would tell a client the change
+	// can never work, and it can once the dependent object is gone.
+	// The wordings covered, by origin:
+	//   "... because other objects depend on it"      DROP TABLE, DROP/RENAME COLUMN (CHECK)
+	//   "... a foreign key depends on"                 DROP INDEX / DROP CONSTRAINT, PK replace
+	//   "... referenced by a foreign key"             DROP/RENAME COLUMN, RENAME TABLE, ALTER TYPE
+	//   "cannot drop|change the type of a foreign key column"
+	//   "cannot drop an indexed column"
+	// The truncate case above says "referenced in", not "by", so it
+	// keeps Postgres's 0A000.
+	case strings.Contains(msg, "because other objects depend on it"),
+		strings.Contains(msg, "a foreign key depends on"),
+		strings.HasPrefix(msg, "cannot ") && (strings.Contains(msg, "referenced by a foreign key") ||
+			strings.Contains(msg, "a foreign key column") ||
+			strings.Contains(msg, "an indexed column")):
+		return "2BP01" // dependent_objects_still_exist
 	case strings.Contains(msg, "violates check constraint"),
 		strings.Contains(msg, "is violated by some row"):
 		return "23514" // check_violation
@@ -77,7 +126,14 @@ func sqlstate(msg string, hasPos bool) string {
 	case strings.Contains(msg, "too many prepared statements"),
 		strings.Contains(msg, "too many portals"):
 		return "54000" // program_limit_exceeded
-	case strings.Contains(msg, "wrong number of parameters"):
+	// Both are malformed Bind messages rather than bad data: a
+	// parameter count that disagrees with the statement, or a format
+	// code other than 0 (text) / 1 (binary). Postgres reports the
+	// latter as "unsupported format code" under 08P01 too. The format
+	// code case cannot reach the "bad <type> parameter" rules above:
+	// its message does not end in "parameter".
+	case strings.Contains(msg, "wrong number of parameters"),
+		strings.Contains(msg, "bad parameter format code"):
 		return "08P01" // protocol_violation
 	// A negative bound count surfaces at execution (a negative literal
 	// is caught at parse and reports 42601 like any syntax error).

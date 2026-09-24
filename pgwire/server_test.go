@@ -190,6 +190,71 @@ func TestErrors(t *testing.T) {
 	}
 }
 
+// TestDependencyRefusals: every schema change refused because another
+// object depends on its target reaches the client as 2BP01
+// (dependent_objects_still_exist), whichever object is in the way. The
+// message fragment pins which refusal each statement actually hit, so
+// a reordered check can't silently route one through another's text.
+func TestDependencyRefusals(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table p (id int primary key, code text unique, note text)`)
+	mustExec(t, c, `create table c (id int primary key, pid int references p (id),
+		pcode text references p (code), n int check (n > 0), k int)`)
+	mustExec(t, c, `create index c_k on c (k)`)
+
+	for _, tc := range []struct{ q, frag string }{
+		{`drop table p`, "because other objects depend on it"},
+		{`alter table c drop column n`, "because other objects depend on it"},
+		{`alter table c rename column n to m`, "because other objects depend on it"},
+		{`alter table p drop constraint p_code_key`, "a foreign key depends on"},
+		{`drop index p_code_key`, "a foreign key depends on"},
+		{`alter table p drop constraint p_pkey, add primary key (id, note)`, "a foreign key depends on"},
+		{`alter table c drop column k`, "an indexed column"},
+		{`alter table c drop column pid`, "a foreign key column"},
+		{`alter table p rename to p2`, "referenced by a foreign key"},
+		{`alter table p rename column code to code2`, "referenced by a foreign key"},
+		{`alter table c alter column pid type text`, "a foreign key column"},
+		{`alter table p alter column code type varchar(20)`, "referenced by a foreign key"},
+	} {
+		var pgErr *pgconn.PgError
+		_, err := c.Exec(ctx, tc.q)
+		if !errors.As(err, &pgErr) || pgErr.Code != "2BP01" || !strings.Contains(pgErr.Message, tc.frag) {
+			t.Errorf("%s\n  got: %+v\n  want: 2BP01 containing %q", tc.q, err, tc.frag)
+		}
+	}
+}
+
+// TestPrimaryKeyDDLErrors: DDL that would break the one-primary-key
+// invariant is 42P16, a key naming a missing column is 42703, and a key
+// naming a column twice is 42701, never 23505, which a client would
+// read as a data conflict.
+func TestPrimaryKeyDDLErrors(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table t (id int primary key, a int)`)
+
+	for _, tc := range []struct{ q, code, frag string }{
+		{`alter table t drop column id`, "42P16", "cannot drop a primary key column"},
+		{`alter table t alter column id drop not null`, "42P16", "is in a primary key"},
+		{`alter table t add column b int primary key`, "42P16", "cannot add a primary key column"},
+		{`alter table t add primary key (a)`, "42P16", "multiple primary keys"},
+		{`create table k (a int)`, "42P16", "a primary key is required"},
+		{`create table m (a int primary key, b int primary key)`, "42P16", "multiple primary keys"},
+		{`create table n (a int, primary key (zz))`, "42703", "primary key column not declared"},
+		{`alter table t drop constraint t_pkey, add primary key (zz)`, "42703", `column "zz" of relation "t" does not exist`},
+		{`create table d (a int, primary key (a, a))`, "42701", "duplicate primary key column"},
+		{`alter table t drop constraint t_pkey, add primary key (a, a)`, "42701", "appears twice in primary key"},
+		{`alter table t rename column a to id`, "42701", "already exists"},
+	} {
+		var pgErr *pgconn.PgError
+		_, err := c.Exec(ctx, tc.q)
+		if !errors.As(err, &pgErr) || pgErr.Code != tc.code || !strings.Contains(pgErr.Message, tc.frag) {
+			t.Errorf("%s\n  got: %+v\n  want: %s containing %q", tc.q, err, tc.code, tc.frag)
+		}
+	}
+}
+
 func TestConstraintsAndExplain(t *testing.T) {
 	ctx := context.Background()
 	c := connect(t, startServer(t))

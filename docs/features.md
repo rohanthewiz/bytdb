@@ -51,7 +51,10 @@ CREATE TABLE items (
 - Composite primary keys: `PRIMARY KEY (a, b)`.
 - `NOT NULL` columns; NULL rejected with Postgres-worded errors (SQLSTATE 23502).
 - `UNIQUE` column and table constraints are sugar for a unique index named
-  `table_cols_key`, as in Postgres.
+  `table_cols_key`, as in Postgres. Either `DROP INDEX` or
+  `ALTER TABLE t DROP CONSTRAINT table_cols_key` removes it. `DROP CONSTRAINT`
+  accepts any unique index's name, because the catalogs list every unique
+  index as a UNIQUE constraint. A plain index's name is refused.
 - `CHECK` constraints, column-level or table-level, named or auto-named,
   enforced on INSERT and UPDATE with Postgres wording:
   `new row for relation "items" violates check constraint "items_price_check"`
@@ -70,7 +73,8 @@ CREATE TABLE items (
 - `ALTER TABLE t DROP COLUMN c` — also O(1); data stays under a retired column
   ID and is skipped on decode.
 - `ALTER TABLE t ADD CONSTRAINT n CHECK (...)` validates existing rows;
-  `DROP CONSTRAINT [IF EXISTS] n`.
+  `DROP CONSTRAINT [IF EXISTS] n` drops a CHECK, a FOREIGN KEY, or a UNIQUE
+  constraint (unique index) by name.
 - `ALTER TABLE t RENAME TO t2` and `RENAME [COLUMN] c TO c2` are
   descriptor-only (rows are keyed by IDs, so indexes and identity counters
   follow); renames that would break a foreign key or a CHECK are refused.
@@ -194,8 +198,11 @@ ALTER TABLE child DROP CONSTRAINT IF EXISTS child_p_fkey;
   transaction that publishes the constraint — as two scans (parent keys
   materialize into a set), not a probe per row.
 - Schema guards: you cannot drop a referenced table, drop an FK column, drop
-  the unique index an FK depends on, or rename a referenced table out from
-  under its children.
+  the unique index an FK depends on (by `DROP INDEX` or `DROP CONSTRAINT`), or
+  rename a referenced table out from under its children. Over the wire, every
+  such refusal is SQLSTATE 2BP01 (dependent_objects_still_exist), as are the
+  CHECK and index guards on dropping or renaming a column: drop the dependent
+  object first, then retry.
 
 How a parent DELETE resolves:
 
@@ -805,7 +812,8 @@ view whose base table was dropped still lists in `pg_class`, with no columns.
 
 Errors carry Postgres SQLSTATEs (42P01 undefined_table, 23505
 unique_violation, 23503 foreign_key_violation, 22P02
-invalid_text_representation, 25P02 in_failed_sql_transaction, ...) and
+invalid_text_representation, 25P02 in_failed_sql_transaction, 2BP01
+dependent_objects_still_exist, 08P01 protocol_violation, ...) and
 1-based statement positions, so client error handling behaves as against
 Postgres.
 

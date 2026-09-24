@@ -246,11 +246,13 @@
 // a check on an existing table after verifying every existing row
 // satisfies it — in the transaction that publishes it, so no write
 // slips in between — and ALTER TABLE DROP CONSTRAINT removes one by
-// name (checks and foreign keys: the primary key is structural, and
-// unique constraints are indexes here). A UNIQUE constraint — on a
-// column or table-level over a column list — is sugar for CREATE
-// UNIQUE INDEX, creating an index named t_cols_key that DROP INDEX
-// removes.
+// name (checks, foreign keys and unique constraints: the primary key
+// is structural). A UNIQUE constraint — on a column or table-level
+// over a column list — is sugar for CREATE UNIQUE INDEX, creating an
+// index named t_cols_key that DROP INDEX or DROP CONSTRAINT removes.
+// DROP CONSTRAINT takes any unique index's name, since the catalogs
+// list every unique index as a UNIQUE constraint; a plain index is
+// not a constraint and is refused.
 //
 // Foreign keys: column-level REFERENCES parent [(col)] and
 // table-level [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent
