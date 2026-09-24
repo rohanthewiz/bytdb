@@ -35,14 +35,6 @@ through all 74 docs.
 
 ## Open
 
-- **N-002** · raised `2026-0805-1820-benchmark-rerun-m1pro-doc-refresh` · value low
-  **`bench/go.mod` pin goes stale on every release.** It is at `v0.14.0`, but
-  `v0.15.0` is tagged. In the workspace the build still works (`replace => ../`),
-  but `GOWORK=off go build ./...` fails with "updates to go.mod needed" (checked
-  2026-09-24). This has been tidied twice: v0.8.0 → v0.11.0 at
-  `2026-0907-2325`, then v0.11.0 → v0.14.0 at `2026-0916-1557`. Each release
-  breaks it again. The lasting fix is a `cd bench && go mod tidy` step in the
-  release procedure. Tidying it once more only resets the clock.
 - **N-003** · raised `2026-0916-1557-sqlstate-gaps-constraint-catalog` · value low
   **`pg_constraint` omits primary keys and unique constraints.** It lists only
   CHECK (`c`) and FK (`f`) rows (`sql/syscat.go:545-590`). Keys show up through
@@ -117,6 +109,13 @@ arrives.
   imports it.
 ## Closed
 
+- **N-002** · raised `2026-0805-1820-benchmark-rerun-m1pro-doc-refresh` ·
+  closed 2026-09-24. **`bench/go.mod` pin goes stale on every release.**
+  Tidied from v0.14.0 to v0.16.0, and bench now builds with and without
+  `GOWORK=off`. The lasting fix is the new `/release` skill
+  (`.claude/skills/release/SKILL.md`). It is the first written release
+  routine, and step 5 tidies bench right after pgwire's pin bump, so the pin
+  follows every release.
 - **N-017** · raised in dbc, `2026-09-24` (no bytdb session doc) · closed
   2026-09-24. **Views have no columns in the catalog.** Fixed:
   `pg_attribute` and `information_schema.columns` now list each view's
