@@ -323,7 +323,7 @@ var (
 // already open on that path.
 func acquire(cfg *Config) (*shared, error) {
 	// Two DSNs spelling one file differently must land on the same engine, or
-	// the second open fails on btypedb's file lock.
+	// the second open fails on bytdb's file lock (ErrLocked).
 	abs, err := filepath.Abs(cfg.Path)
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "resolve bytdb path", "path", cfg.Path)

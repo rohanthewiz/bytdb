@@ -73,6 +73,13 @@ func TestEncryptedServerEndToEnd(t *testing.T) {
 		t.Fatalf("plaintext value found in on-disk log")
 	}
 
+	// Without the key the file cannot be opened at all. Checked here, while
+	// no server holds the engine: with one live, Open is refused earlier
+	// with ErrLocked, before the key is ever looked at.
+	if _, err := bytdb.Open(dbPath); !errors.Is(err, btypedb.ErrKeyRequired) {
+		t.Fatalf("no-key open: got %v, want ErrKeyRequired", err)
+	}
+
 	// Second session: reopen the same encrypted file and read the rows back
 	// over the wire — proving replay-decrypt works through the full stack.
 	conn2, stop2 := serve()
@@ -96,10 +103,5 @@ func TestEncryptedServerEndToEnd(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("got %d rows, want 2", n)
-	}
-
-	// Without the key the file cannot be opened at all.
-	if _, err := bytdb.Open(dbPath); !errors.Is(err, btypedb.ErrKeyRequired) {
-		t.Fatalf("no-key open: got %v, want ErrKeyRequired", err)
 	}
 }

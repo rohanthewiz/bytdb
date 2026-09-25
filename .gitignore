@@ -1,5 +1,6 @@
 *.db
 *.db.compact
+*.db.lock
 
 # docs build output and bench artifacts
 site/

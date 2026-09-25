@@ -37,8 +37,9 @@ its consequences. `stdlib.ParseDSN` exposes the parse for tooling.
 
 ## One engine per file
 
-btypedb takes the database file for itself, so one path is one engine per
-process. Every `*sql.DB` on a path shares that engine, and every pooled
+`bytdb.Open` locks the database file (see
+[Gotchas](gotchas.md#operational-notes)), so one path is one engine — a second
+open fails with `bytdb.ErrLocked`, from this process or any other. Every `*sql.DB` on a path shares that engine, and every pooled
 connection gets its own bytdb Session — one engine, many sessions, the same
 shape the wire server serves:
 

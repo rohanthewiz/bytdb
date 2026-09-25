@@ -216,10 +216,18 @@ Easy to confuse:
   `Compact()` yourself). Startup replays the whole file; a huge uncompacted log
   means a slow open. Compaction also rolls the replication generation — see
   [Replication & Backup](replication.md).
-- **One process per file.** There is no file locking for multi-process access;
-  the wire server is the intended way to share a database across processes.
-  Within one process, sharing is free: every `*sql.DB` the
-  [`stdlib` driver](stdlib.md) opens on a path reuses the same engine.
+- **One engine per file, enforced.** `Open` takes an exclusive lock on a
+  `<path>.lock` sidecar and fails fast with `bytdb.ErrLocked` (carrying the
+  holder's `holder_pid`) if another engine — in another process, or an
+  unclosed one in this process — already has the file. `Close` releases it,
+  and the OS releases it if the holder dies, so a crash never leaves a stale
+  lock to clean up; the sidecar file itself stays on disk by design (deleting
+  it would race a concurrent `Open`). The wire server is the intended way to
+  share a database across processes. Within one process, sharing is free:
+  every `*sql.DB` the [`stdlib` driver](stdlib.md) opens on a path reuses the
+  same engine. The lock is advisory `flock` (share-mode on Windows): it does
+  not stop a raw `btypedb.Open` or a copy tool, and on network filesystems
+  without working `flock` (older NFS) it may not exclude other hosts.
 - **Online backup**: `Engine.Backup(destPath)` writes a consistent
   point-in-time copy without blocking readers or writers;
   `Engine.BackupTo(w)` streams the same bytes. Restoring is just `Open` on

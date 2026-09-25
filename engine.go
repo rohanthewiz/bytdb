@@ -304,6 +304,12 @@ func (d *TableDesc) isPK(ordinal int) bool {
 type Engine struct {
 	kv *btypedb.DB[string, []byte]
 
+	// lock is the exclusive sidecar lock that keeps a second engine —
+	// another process, or a forgotten one in this process — off the
+	// same file. Taken before kv opens, released after it closes; see
+	// lock.go.
+	lock *fileLock
+
 	// occ mirrors the kv store's concurrent-writes mode. It never
 	// changes after Open, so it is read without synchronization. When
 	// set, sequence and identity allocation route through the in-memory
@@ -529,13 +535,27 @@ func WithConcurrentWrites() btypedb.Option {
 
 // Open opens (creating if necessary) the database at path and
 // validates the catalog.
+//
+// Open takes an exclusive lock on a "<path>.lock" sidecar first and
+// fails with ErrLocked if another engine holds the database. The lock
+// comes before btypedb.Open touches anything, because that open is not
+// read-only even when it succeeds: it deletes a leftover compaction
+// temp file (which, with another engine live, is that engine's
+// in-flight compaction) and may truncate what it takes for a torn tail
+// (which may be the other engine's half-written append).
 func Open(path string, opts ...btypedb.Option) (*Engine, error) {
+	lock, err := acquireFileLock(path)
+	if err != nil {
+		return nil, err
+	}
 	kv, err := btypedb.Open(path, btypedb.StringCodec, btypedb.BytesCodec, opts...)
 	if err != nil {
+		lock.release()
 		return nil, serr.Wrap(err, "op", "open kv store")
 	}
 	e := &Engine{
 		kv:           kv,
+		lock:         lock,
 		occ:          kv.ConcurrentWrites(),
 		descCache:    map[string]descCacheEntry{},
 		seqAllocs:    map[string]*counterAlloc{},
@@ -544,13 +564,20 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 	e.backfillLimit.Store(DefaultBackfillLimit)
 	if err := e.loadCatalog(); err != nil {
 		kv.Close()
+		lock.release()
 		return nil, err
 	}
 	return e, nil
 }
 
-// Close closes the underlying store.
-func (e *Engine) Close() error { return e.kv.Close() }
+// Close closes the underlying store, then releases the file lock. The
+// order matters: kv.Close does the final WAL fsync, and until it
+// returns the file still belongs to this engine — unlocking first would
+// let a new engine replay a log that is still being written. Close is
+// idempotent, as kv.Close and the lock release both are.
+func (e *Engine) Close() error {
+	return errors.Join(e.kv.Close(), e.lock.release())
+}
 
 // ConcurrentWrites reports whether the engine was opened with
 // WithConcurrentWrites. Layers above use it to describe isolation
