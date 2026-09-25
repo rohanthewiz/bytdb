@@ -3,7 +3,7 @@ module github.com/rohanthewiz/bytdb
 go 1.26.1
 
 require (
-	github.com/rohanthewiz/btypedb v0.7.0
+	github.com/rohanthewiz/btypedb v0.8.0
 	github.com/rohanthewiz/serr v1.4.0
 )
 

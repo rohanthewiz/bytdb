@@ -304,12 +304,6 @@ func (d *TableDesc) isPK(ordinal int) bool {
 type Engine struct {
 	kv *btypedb.DB[string, []byte]
 
-	// lock is the exclusive sidecar lock that keeps a second engine —
-	// another process, or a forgotten one in this process — off the
-	// same file. Taken before kv opens, released after it closes; see
-	// lock.go.
-	lock *fileLock
-
 	// occ mirrors the kv store's concurrent-writes mode. It never
 	// changes after Open, so it is read without synchronization. When
 	// set, sequence and identity allocation route through the in-memory
@@ -536,26 +530,19 @@ func WithConcurrentWrites() btypedb.Option {
 // Open opens (creating if necessary) the database at path and
 // validates the catalog.
 //
-// Open takes an exclusive lock on a "<path>.lock" sidecar first and
-// fails with ErrLocked if another engine holds the database. The lock
-// comes before btypedb.Open touches anything, because that open is not
-// read-only even when it succeeds: it deletes a leftover compaction
-// temp file (which, with another engine live, is that engine's
-// in-flight compaction) and may truncate what it takes for a torn tail
-// (which may be the other engine's half-written append).
+// Open fails with ErrLocked if another engine (or any btypedb.DB)
+// holds the database. btypedb.Open takes an exclusive lock on a
+// "<path>.lock" sidecar before it touches the file and holds it until
+// Close, so the engine needs no lock of its own — and must not take
+// one: the lock is not reentrant, so a second acquisition from this
+// engine would refuse its own open.
 func Open(path string, opts ...btypedb.Option) (*Engine, error) {
-	lock, err := acquireFileLock(path)
-	if err != nil {
-		return nil, err
-	}
 	kv, err := btypedb.Open(path, btypedb.StringCodec, btypedb.BytesCodec, opts...)
 	if err != nil {
-		lock.release()
 		return nil, serr.Wrap(err, "op", "open kv store")
 	}
 	e := &Engine{
 		kv:           kv,
-		lock:         lock,
 		occ:          kv.ConcurrentWrites(),
 		descCache:    map[string]descCacheEntry{},
 		seqAllocs:    map[string]*counterAlloc{},
@@ -563,20 +550,18 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 	}
 	e.backfillLimit.Store(DefaultBackfillLimit)
 	if err := e.loadCatalog(); err != nil {
-		kv.Close()
-		lock.release()
+		kv.Close() // also releases the file lock
 		return nil, err
 	}
 	return e, nil
 }
 
-// Close closes the underlying store, then releases the file lock. The
-// order matters: kv.Close does the final WAL fsync, and until it
-// returns the file still belongs to this engine — unlocking first would
-// let a new engine replay a log that is still being written. Close is
-// idempotent, as kv.Close and the lock release both are.
+// Close closes the underlying store, which does the final WAL fsync and
+// only then releases the file lock (unlocking first would let a new
+// engine replay a log that is still being written). Close is
+// idempotent, as kv.Close is.
 func (e *Engine) Close() error {
-	return errors.Join(e.kv.Close(), e.lock.release())
+	return e.kv.Close()
 }
 
 // ConcurrentWrites reports whether the engine was opened with
@@ -621,6 +606,11 @@ func (e *Engine) BackfillLimit() int64 { return e.backfillLimit.Load() }
 // alike, since both live in the one kv keyspace. The copy lands
 // atomically (temp file + fsync + rename), and restoring is just Open
 // on the backup file.
+//
+// Backup fails with ErrLocked when destPath is a live database — this
+// engine's own path, or one another engine holds — rather than rename
+// the copy over a file whose holder would keep appending to the
+// unlinked original and lose every later write at its next open.
 func (e *Engine) Backup(destPath string) error {
 	if err := e.kv.Backup(destPath); err != nil {
 		return serr.Wrap(err, "op", "engine backup")

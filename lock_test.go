@@ -112,6 +112,75 @@ func TestLockReleasedOnFailedOpen(t *testing.T) {
 	e.Close()
 }
 
+// TestLockRawKVOpen: the lock is btypedb's, so a raw btypedb.Open of a
+// file an engine holds — the gap when bytdb took the lock itself — is
+// refused too, and the error matches both ErrLocked names.
+func TestLockRawKVOpen(t *testing.T) {
+	if !lockingSupported() {
+		t.Skip("no file locking on " + runtime.GOOS)
+	}
+	path := filepath.Join(t.TempDir(), "db.bytdb")
+	e, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	_, err = btypedb.Open(path, btypedb.StringCodec, btypedb.BytesCodec)
+	if !errors.Is(err, ErrLocked) || !errors.Is(err, btypedb.ErrLocked) {
+		t.Fatalf("raw btypedb.Open of a live engine's file: want ErrLocked, got %v", err)
+	}
+}
+
+// TestLockBackupDestination: Engine.Backup refuses to land on a live
+// database — another engine's file, or its own — and the refused
+// destination keeps every row, including ones written after the attempt.
+func TestLockBackupDestination(t *testing.T) {
+	if !lockingSupported() {
+		t.Skip("no file locking on " + runtime.GOOS)
+	}
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.bytdb")
+	src, err := Open(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	usersTable(t, src)
+
+	destPath := filepath.Join(dir, "dest.bytdb")
+	dest, err := Open(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usersTable(t, dest)
+	if err := dest.Insert("users", 1, "a", 1.0, true, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := src.Backup(destPath); !errors.Is(err, ErrLocked) {
+		t.Fatalf("Backup onto a live engine: want ErrLocked, got %v", err)
+	}
+	if err := src.Backup(srcPath); !errors.Is(err, ErrLocked) {
+		t.Fatalf("Backup onto its own path: want ErrLocked, got %v", err)
+	}
+
+	if err := dest.Insert("users", 2, "b", 2.0, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := dest.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err := Open(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if n := len(collect(t, e.Scan("users"))); n != 2 {
+		t.Fatalf("dest rows after refused Backup = %d, want 2", n)
+	}
+}
+
 // lockHelperEnv switches TestLockHelperProcess from a no-op into the
 // child side of the cross-process tests; its value is the database path.
 const lockHelperEnv = "BYTDB_LOCK_HELPER_DB"

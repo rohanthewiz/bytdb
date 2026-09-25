@@ -200,6 +200,11 @@ The guarantees this flow encodes:
 - **Torn tails are fine.** The chain may extend *past* the certified size —
   extra tail chunks are valid appends, and WAL replay handles any torn final
   record exactly as it would locally.
+- **Never over a live database.** Restore takes the database lock on
+  `destPath` first and fails with `ErrLocked` if an engine has it open,
+  before downloading anything. Renaming the restored file over a live one
+  would leave that engine appending to the unlinked original. Stop the
+  engine (or restore to a new path) first.
 
 Restoring a database that was opened with `WithEncryptionKey` requires the
 same key at `Open` — see [Encryption & Security](security.md). Chunks of an

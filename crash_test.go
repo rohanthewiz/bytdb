@@ -19,8 +19,9 @@ import (
 // A "kill" is simulated by copying the database file while the engine
 // is open (or after writes, before Close): the copy is exactly the
 // on-disk state a process death would leave — no final Close fsync, no
-// clean shutdown. bytdb's lock is advisory and on a sidecar file (see
-// lock.go), so reading the live file is safe at a quiescent point.
+// clean shutdown. The database lock is advisory and on a sidecar file
+// (btypedb's lock.go), so reading the live file is safe at a quiescent
+// point.
 
 // snapshotFile copies the live database file into a fresh path,
 // simulating a kill at this instant.

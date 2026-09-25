@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -63,7 +64,22 @@ type RestoreInfo struct {
 //     manifests, or one where nothing has caught up yet), Restore falls
 //     back to the legacy best-effort rule: the newest contiguous-from-zero
 //     chain, which offers no completeness guarantee.
+//
+// destPath must not be a live database: Restore takes the database lock
+// on it (btypedb.AcquireLock — the same lock Open holds) and fails with
+// btypedb.ErrLocked (== bytdb.ErrLocked) if an engine has it open.
+// Renaming the restored file over a live one would leave that engine
+// appending to the unlinked original, so everything it wrote afterwards
+// would vanish at its next open. The lock is taken before anything is
+// downloaded, so a refusal is immediate, and held until the rename, so
+// no engine can open destPath mid-restore and be swapped out from under.
 func Restore(ctx context.Context, store Storage, prefix, destPath string) (*RestoreInfo, error) {
+	lock, err := btypedb.AcquireLock(destPath)
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "restore")
+	}
+	defer lock.Close()
+
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}

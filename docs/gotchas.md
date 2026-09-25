@@ -225,14 +225,19 @@ Easy to confuse:
   it would race a concurrent `Open`). The wire server is the intended way to
   share a database across processes. Within one process, sharing is free:
   every `*sql.DB` the [`stdlib` driver](stdlib.md) opens on a path reuses the
-  same engine. The lock is advisory `flock` (share-mode on Windows): it does
-  not stop a raw `btypedb.Open` or a copy tool, and on network filesystems
-  without working `flock` (older NFS) it may not exclude other hosts.
+  same engine. The lock is btypedb's, so a raw `btypedb.Open` of the file is
+  refused too (`bytdb.ErrLocked` and `btypedb.ErrLocked` are the same error).
+  It is advisory `flock` (share-mode on Windows): it does not stop a copy
+  tool, and on network filesystems without working `flock` (older NFS) it
+  may not exclude other hosts.
 - **Online backup**: `Engine.Backup(destPath)` writes a consistent
   point-in-time copy without blocking readers or writers;
   `Engine.BackupTo(w)` streams the same bytes. Restoring is just `Open` on
   the copy. Never copy the live file by hand while the process runs — a raw
-  copy can catch a torn tail mid-append.
+  copy can catch a torn tail mid-append. `Backup` and `replicate.Restore`
+  refuse with `ErrLocked` to write over a live database (the engine's own
+  path included): the holder would keep appending to the replaced file and
+  lose those writes at its next open. Close the engine first.
 - **The log refuses to open past mid-file corruption.** A torn tail
   (crash mid-append) is repaired silently, as always; but if an intact
   record survives *after* a corrupt one (bitrot), `Open` fails with
