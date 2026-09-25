@@ -40,7 +40,7 @@ Nothing open.
 ## Closed
 
 - **N-022** · raised `2026-0925-1542-file-lock-release-v0.17.0` · closed
-  2026-09-25, bytdb `100aafa`, btypedb `49d0e36`. **The file lock covers only
+  2026-09-25, `2026-0925-1607-lock-in-btypedb-v0.18.0`. **The file lock covers only
   `bytdb.Open`.** Closed ahead of its trigger. The lock moved into btypedb
   v0.8.0 (`lock.go` there): `btypedb.Open` takes it, so raw opens are covered
   for every btypedb user. It sits on a new `fsys.Lock` seam, not
