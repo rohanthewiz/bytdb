@@ -31,11 +31,20 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-021
+**Next ID:** N-023
 
 ## Open
 
-None.
+- **N-022** · raised `2026-0925-1542-file-lock-release-v0.17.0` · value low
+  **The file lock covers only `bytdb.Open`.** The lock added for N-021 is
+  advisory and taken in bytdb (`lock.go`), so it does not exclude a raw
+  `btypedb.Open` on the same file, a `replicate` restore written over a
+  live database's path, or `Engine.Backup` aimed at another engine's live
+  file. Moving the lock down into btypedb (its `realFS.OpenFile`) would
+  cover the raw opens for every btypedb user; the restore/backup
+  destinations would each still need a lock check. **Trigger:** a second
+  consumer opens bytdb files through btypedb directly, or a restore
+  clobbers a live file.
 
 ## Roadmap
 
@@ -98,6 +107,16 @@ arrives.
   imports it.
 ## Closed
 
+- **N-021** · raised in dbc, `2026-09-25` (no bytdb session doc) · closed
+  2026-09-25, `2026-0925-1542-file-lock-release-v0.17.0`. **bytdb takes no file lock.** Two dbc processes
+  (two TUIs, or a TUI and `dbc web`) opened the same `demo.bytdb` and both
+  wrote its WAL without a word. Fixed: `Open` takes a non-blocking
+  exclusive lock on a `<path>.lock` sidecar before btypedb touches the
+  file, and fails with the new `bytdb.ErrLocked` (with `holder_pid`); `Close`
+  releases it after the final fsync (`lock.go`, `lock_flock.go`,
+  `lock_windows.go`, `lock_other.go`). Released in `v0.17.0`. dbc still has
+  to bump to v0.17.0 and match `errors.Is(err, bytdb.ErrLocked)`. Tests:
+  `lock_test.go`, including a real second process and a `kill -9` holder.
 - **N-020** · raised `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate` ·
   closed 2026-09-24, `2026-0924-1717-drop-unique-constraint-bind-format-sqlstate`.
   **`cannot drop a primary key column` maps to XX000.** Fixed, with the rest
