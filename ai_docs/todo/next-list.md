@@ -35,77 +35,25 @@ through all 74 docs.
 
 ## Open
 
-- **N-022** · raised `2026-0925-1542-file-lock-release-v0.17.0` · value low
-  **The file lock covers only `bytdb.Open`.** The lock added for N-021 is
-  advisory and taken in bytdb (`lock.go`), so it does not exclude a raw
-  `btypedb.Open` on the same file, a `replicate` restore written over a
-  live database's path, or `Engine.Backup` aimed at another engine's live
-  file. Moving the lock down into btypedb (its `realFS.OpenFile`) would
-  cover the raw opens for every btypedb user; the restore/backup
-  destinations would each still need a lock check. **Trigger:** a second
-  consumer opens bytdb files through btypedb directly, or a restore
-  clobbers a live file.
+Nothing open.
 
-## Roadmap
-
-Wanted, but not soon. Promote an item to Open when the thing it waits for
-arrives.
-
-- **N-001** · raised `2026-0722-1303-wal-encryption-at-rest` · value low
-  **btypedb encryption deferred set:** online key rotation, a
-  plaintext↔encrypted migration helper, key+value scope, and
-  ChaCha20-Poly1305. None of these exist yet. `btypedb/encrypt.go:40-41`
-  reserves flag bits 1..4, and `compact.go:138-139` names the re-encrypt seam.
-  Rotation first needs a v3 wrapped-DEK header, because `Compact`'s raw
-  tail-copy is invalid across keys. Restated at `2026-0730-1924`,
-  `2026-0907-2325`, `2026-0907-2339`, `2026-0916-1511`, `2026-0916-1557` and
-  `2026-0916-1611`, and kept open by decision each time. **Trigger:** a
-  deployment needs to rotate a key.
-
-## Non-goals
-
-- **N-005** · declined `2026-0730-2350-occ-stage2-sequences`: **Embedded
-  Engine one-shot writes surface `ErrTxConflict` raw.** The caller writes the
-  retry loop, the same contract as `WriteTxn`. Documented in
-  `docs/concurrency.md`.
-- **N-006** · declined `2026-0805-1603-correlated-subquery-index-pushdown`:
-  **Correlated ON conjuncts and function-wrapped correlated predicates
-  evaluate per row.** Full Postgres-style decorrelation was considered and
-  rejected. For large outer sets, rewrite as a JOIN.
-- **N-007** · declined `2026-0805-1603-correlated-subquery-index-pushdown`:
-  **Statement paths that never seed a `subMemo` re-prepare correlated
-  subqueries on each invocation.** This errs on the safe side, and they still
-  get pushdown within one invocation. It was recorded as "known remaining
-  (deliberate)" and never appeared in a Next list. Filed here so it stays
-  visibly declined.
-- **N-008** · declined `2026-0907-2325-next-list-rebuild-backlog-drain`:
-  **Unindexed FK columns scan the child table on each check.** FK enforcement
-  is planner-driven and doesn't require an index. The skill's gotchas document
-  the workaround ("index the child FK columns").
-- **N-009** · declined `2026-0907-2325-next-list-rebuild-backlog-drain`:
-  **`WriteString` lint hints in test files.** Test readability is worth more
-  than the allocation.
-- **N-010** · declined `2026-0916-1511-next-list-rebuild-and-drain`:
-  **General multi-action `ALTER TABLE`.** Only the `DROP CONSTRAINT t_pkey,
-  ADD PRIMARY KEY` pairing is accepted, because it is the one pairing that must
-  be atomic in bytdb. Other actions can run as separate statements.
-- **N-011** · declined `2026-0916-1511-next-list-rebuild-and-drain`:
-  **`ALTER COLUMN TYPE` on foreign-key columns.** Both sides would have to
-  change together. Instead, drop the constraint, alter both columns, and re-add
-  it.
-- **N-012** · declined `2026-0916-1511-next-list-rebuild-and-drain`:
-  **pgwire `v0.10.0` / `v0.11.0` tags stay unbackfilled.** The lockstep tag
-  line resumes at `v0.12.0`.
-- **N-013** · declined `2026-0916-1557-sqlstate-gaps-constraint-catalog`:
-  **Unique indexes vs UNIQUE constraints in `table_constraints`.** bytdb can't
-  tell them apart, so every unique index reports as UNIQUE.
-- **N-014** · declined `2026-0916-1557-sqlstate-gaps-constraint-catalog`:
-  **Synthetic NOT NULL CHECK rows in `table_constraints`.** Nullability is
-  already in `information_schema.columns`.
-- **N-015** · declined `2026-0916-1611-license-and-release-v0.15.0`:
-  **License file in `bench/`.** It is an internal harness module and nothing
-  imports it.
 ## Closed
+
+- **N-022** · raised `2026-0925-1542-file-lock-release-v0.17.0` · closed
+  2026-09-25, bytdb `100aafa`, btypedb `49d0e36`. **The file lock covers only
+  `bytdb.Open`.** Closed ahead of its trigger. The lock moved into btypedb
+  v0.8.0 (`lock.go` there): `btypedb.Open` takes it, so raw opens are covered
+  for every btypedb user. It sits on a new `fsys.Lock` seam, not
+  `realFS.OpenFile` as first suggested, because locking the database file
+  itself stops working after the first compaction rename. `Backup` locks its
+  destination, and the new `btypedb.AcquireLock` guards `replicate.Restore`'s
+  `destPath` through the rename. Both refuse a live file with `ErrLocked`.
+  bytdb dropped its own copy (the lock is not reentrant) and aliases
+  `ErrLocked = btypedb.ErrLocked`. Released in btypedb `v0.8.0` and bytdb /
+  pgwire `v0.18.0`. Other btypedb consumers (cats, gonotes, grmob, …) get
+  `ErrLocked` on a double open once they bump. Tests: btypedb `lock_test.go`,
+  bytdb `TestLockRawKVOpen` / `TestLockBackupDestination`,
+  `replicate/restore_lock_test.go`.
 
 - **N-021** · raised in dbc, `2026-09-25` (no bytdb session doc) · closed
   2026-09-25, `2026-0925-1542-file-lock-release-v0.17.0`. **bytdb takes no file lock.** Two dbc processes
