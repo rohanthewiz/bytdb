@@ -714,7 +714,7 @@ COMMIT;
 - Every bare statement is atomic — a multi-row `INSERT` that fails on row 900
   leaves nothing behind.
 
-## TRUNCATE, SET, SHOW
+## TRUNCATE, VACUUM, SET, SHOW
 
 ```sql
 TRUNCATE TABLE t;
@@ -724,6 +724,10 @@ TRUNCATE parent, child;            -- FK-aware: a referenced table truncates onl
                                    -- together with every table referencing it,
                                    -- else 0A000 with a HINT naming the missing tables
 
+VACUUM;                            -- compact the storage log now (Engine.Compact)
+VACUUM (VERBOSE, ANALYZE) users;   -- options parse and are ignored; any named
+                                   -- table compacts the whole file
+
 SET search_path TO public, other;  -- SESSION/LOCAL both scope to session
 SET time zone 'UTC';
 SET statement_timeout = '5s';      -- bounds every statement (57014 on expiry)
@@ -732,7 +736,12 @@ SHOW server_version;               -- 16.0 (bytdb)
 SHOW ALL;
 ```
 
-TRUNCATE is transactional (it can roll back). `SET`/`SHOW` overlay session
+TRUNCATE is transactional (it can roll back). VACUUM is not: like Postgres it
+refuses to run inside a transaction block (25001). bytdb keeps one log file,
+so there is no per-table vacuum — a table list is only validated (views and
+sequences draw Postgres's "skipping" warning, unknown names 42P01). On a
+replicated database each VACUUM rolls the replication generation, re-shipping
+the compacted file. `SET`/`SHOW` overlay session
 values on Postgres-shaped defaults; an unknown, never-set parameter gets
 Postgres's `unrecognized configuration parameter` error, and everything but
 `statement_timeout`, `search_path`, and `time zone` is accepted and ignored.

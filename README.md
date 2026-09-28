@@ -344,6 +344,7 @@ SELECT * | items FROM tables [WHERE ...] [GROUP BY ...] [HAVING ...]
 UPDATE t SET c = v, ... [WHERE ...] [RETURNING items]
 DELETE FROM t [WHERE ...] [RETURNING items]
 TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY | CONTINUE IDENTITY]
+VACUUM [FULL] [VERBOSE] [ANALYZE] [t, ...] | VACUUM (options) [t, ...]
 SET [SESSION|LOCAL] name {=|TO} value | RESET name | SHOW name | SHOW ALL
 EXPLAIN statement
 BEGIN | START TRANSACTION ... COMMIT | END | ROLLBACK | ABORT

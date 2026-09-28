@@ -113,7 +113,7 @@ GROUP BY/HAVING, window functions with full frame support, WITH CTEs,
 derived tables, UNION, `SELECT DISTINCT`, `LIKE`/`ILIKE`, `BETWEEN`,
 `ANY`/`ALL`, regex operators,
 CASE, casts, correlated subqueries, EXISTS, EXPLAIN, transaction blocks
-with savepoints, TRUNCATE, SET/SHOW. Uncorrelated subqueries evaluate
+with savepoints, TRUNCATE, VACUUM (on-demand compaction), SET/SHOW. Uncorrelated subqueries evaluate
 once per statement (Postgres InitPlan semantics), so
 `WHERE x >= (SELECT min(x) FROM t)` costs one inner scan, not one per
 outer row. `$n` placeholders bind in

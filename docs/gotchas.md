@@ -212,8 +212,9 @@ Easy to confuse:
 ## Operational notes
 
 - **The WAL grows until compaction.** Auto-compaction triggers at ≥32 MB *and*
-  ≥100% growth since the last compaction (both tunable, or disable and call
-  `Compact()` yourself). Startup replays the whole file; a huge uncompacted log
+  ≥100% growth since the last compaction (both tunable via
+  `btypedb.WithAutoCompact`, or disable with `btypedb.WithAutoCompactDisabled`
+  and run `Engine.Compact()` / SQL `VACUUM` yourself). Startup replays the whole file; a huge uncompacted log
   means a slow open. Compaction also rolls the replication generation — see
   [Replication & Backup](replication.md).
 - **One engine per file, enforced.** `Open` takes an exclusive lock on a
