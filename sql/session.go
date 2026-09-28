@@ -193,6 +193,13 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 	// writer lock (each engine schema change is its own transaction),
 	// so refuse it up front; refuse writes in a read-only block
 	// likewise. Any error — these included — fails the block.
+	// VACUUM is not DDL but is refused for the same kind of reason, with
+	// Postgres's wording: compaction rewrites the file beneath every
+	// open snapshot, and there is nothing a ROLLBACK could undo.
+	if _, ok := st.(*Vacuum); ok {
+		s.aborted = true
+		return nil, serr.New("VACUUM cannot run inside a transaction block")
+	}
 	if isDDL(st) {
 		s.aborted = true
 		return nil, serr.New(command(st)+" cannot run inside a transaction block",

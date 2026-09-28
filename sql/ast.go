@@ -629,6 +629,23 @@ type Truncate struct {
 	RestartIdentity bool // RESTART IDENTITY: identity counters draw from 1 again
 }
 
+// Vacuum is VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table [, ...]]
+// or VACUUM (option [value] [, ...]) [table [, ...]]: reclaim the space
+// held by overwritten and deleted rows by compacting the storage log
+// (bytdb.Engine.Compact).
+//
+// bytdb keeps one log file for the whole database, so there is no
+// per-table vacuum: naming tables only validates them, and any named
+// table triggers the same whole-file compaction. The options are
+// Postgres's knobs for its heap/visibility-map machinery, none of which
+// bytdb has — they parse (so pg_dump scripts, migration tools, and
+// maintenance jobs run unmodified) and are ignored. Like Postgres,
+// VACUUM cannot run inside a transaction block: compaction rewrites
+// the file under every open snapshot and cannot be rolled back.
+type Vacuum struct {
+	Tables []string // nil: the whole database (the only granularity there is)
+}
+
 // ShowVar is SHOW name (or SHOW ALL): report a configuration
 // parameter as a one-row result. A Session answers from its SET state
 // over the built-in defaults; a bare DB reports the defaults.
@@ -1040,6 +1057,7 @@ func (*CreateTable) stmt()        {}
 func (*Explain) stmt()            {}
 func (*DropTable) stmt()          {}
 func (*Truncate) stmt()           {}
+func (*Vacuum) stmt()             {}
 func (*ShowVar) stmt()            {}
 func (*CreateView) stmt()         {}
 func (*DropView) stmt()           {}

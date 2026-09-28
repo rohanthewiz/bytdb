@@ -8,6 +8,7 @@ import (
 	"iter"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
@@ -1599,6 +1600,51 @@ func (d *DB) execTruncate(s *Truncate) (*Result, error) {
 		return nil, err
 	}
 	return &Result{}, nil
+}
+
+// execVacuum compacts the storage log. Named relations are resolved
+// first, with Postgres's outcomes: a table (user or system catalog) is
+// vacuumable, a view or sequence draws a "skipping" warning, and an
+// unknown name fails the whole statement before any work is done.
+// Compaction is whole-file (see Vacuum), so the table list decides only
+// whether to compact at all — a list of nothing but skipped relations
+// compacts nothing, as it vacuums nothing in Postgres.
+func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
+	// Sessions refuse VACUUM inside a block before it gets here; this
+	// guards a DB bound to a transaction by any other route, since
+	// compacting under an open write transaction would not be undone by
+	// its rollback.
+	if d.tx != nil {
+		return nil, serr.New("VACUUM cannot run inside a transaction block")
+	}
+	var notices []string
+	vacuumable := len(s.Tables) == 0
+	for _, t := range s.Tables {
+		switch {
+		case d.e.Table(t) != nil, sysLookup(t) != nil:
+			vacuumable = true
+		case d.e.View(t) != nil, d.e.Sequence(t) != nil:
+			notices = append(notices, `skipping "`+t+`" --- cannot vacuum non-tables or special system tables`)
+		default:
+			return nil, serr.New("no such table", "table", t)
+		}
+	}
+	res := &Result{Notice: strings.Join(notices, "\n")}
+	if !vacuumable {
+		return res, nil
+	}
+	// Compaction cannot be interrupted once started, so a statement the
+	// client already canceled (or whose timeout already fired) should
+	// not begin one.
+	if d.ctx != nil {
+		if err := d.ctx.Err(); err != nil {
+			return nil, serr.Wrap(err, "state", "statement canceled")
+		}
+	}
+	if err := d.e.Compact(); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {

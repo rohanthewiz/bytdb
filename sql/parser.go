@@ -250,6 +250,8 @@ func (p *parser) statement() (Statement, error) {
 		return p.alterTable()
 	case p.acceptKw("truncate"):
 		return p.truncateStmt()
+	case p.acceptKw("vacuum"):
+		return p.vacuumStmt()
 	case p.acceptKw("show"):
 		return p.showStmt()
 	case p.acceptKw("insert"):
@@ -2439,6 +2441,64 @@ func (p *parser) tableName() (string, error) {
 		return first + "." + name, nil
 	}
 	return "", serr.New("no such schema", "schema", first)
+}
+
+// vacuumStmt parses the rest of VACUUM. Both of Postgres's option
+// spellings are accepted:
+//
+//	VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table [, ...]]   (legacy)
+//	VACUUM ( option [value] [, ...] ) [table [, ...]]            (current)
+//
+// Options are discarded (see Vacuum). A parenthesized option's value is
+// at most one token — a boolean word, a number like PARALLEL 4, or a
+// string like BUFFER_USAGE_LIMIT '256kB' — so it is skipped as one
+// token rather than parsed per option; that keeps options Postgres adds
+// later working without a parser change. The legacy keywords must come
+// in Postgres's fixed order, which acceptKw in sequence enforces: an
+// out-of-order keyword is left for the table list and fails there as
+// an unknown table rather than being silently misread.
+//
+// Postgres's per-table column list (VACUUM ANALYZE t (a, b)) is not
+// accepted: it only scopes ANALYZE's statistics, which bytdb doesn't
+// gather, and leaving it out keeps "(" after a table unambiguous.
+func (p *parser) vacuumStmt() (Statement, error) {
+	v := &Vacuum{}
+	if p.acceptOp("(") {
+		for {
+			if _, err := p.ident("a VACUUM option"); err != nil {
+				return nil, err
+			}
+			if t := p.cur(); t.kind != tEOF && !(t.kind == tOp && (t.text == "," || t.text == ")")) {
+				p.advance() // the option's value
+			}
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	} else {
+		for _, kw := range []string{"full", "freeze", "verbose", "analyze"} {
+			p.acceptKw(kw)
+		}
+	}
+	// No table list: the statement ends here (optionally with ";",
+	// which Parse consumes).
+	if t := p.cur(); t.kind == tEOF || (t.kind == tOp && t.text == ";") {
+		return v, nil
+	}
+	for {
+		name, err := p.tableName()
+		if err != nil {
+			return nil, err
+		}
+		v.Tables = append(v.Tables, name)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return v, nil
 }
 
 // tokAt is the token n places ahead (saturating at EOF).

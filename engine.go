@@ -631,6 +631,31 @@ func (e *Engine) BackupTo(w io.Writer) (int64, error) {
 	return n, nil
 }
 
+// Compact rewrites the storage log on demand as a minimal snapshot of
+// the live dataset, dropping overwritten and deleted records — the same
+// pass btypedb runs in the background once the log outgrows its
+// auto-compact threshold (see btypedb.WithAutoCompact). Calling it
+// directly is for when the caller knows better than the growth
+// heuristic: right after a bulk delete or a DROP TABLE of a large
+// table, before a Backup to ship the smallest file, or when auto
+// compaction was turned off with btypedb.WithAutoCompactDisabled.
+//
+// Readers and writers keep running; btypedb only pauses writers twice,
+// briefly (snapshot, then splice-and-rename), and a crash at any point
+// leaves either the old or the new complete log. Catalog and rows share
+// the one kv keyspace, so no engine-level state needs coordinating.
+//
+// A successful compaction bumps the log epoch (Stats.LogEpoch,
+// LogState), which is how the replicate package notices it and rolls
+// to a new generation — so on a replicated database each call costs a
+// full re-ship of the compacted file.
+func (e *Engine) Compact() error {
+	if err := e.kv.Compact(); err != nil {
+		return serr.Wrap(err, "op", "engine compact")
+	}
+	return nil
+}
+
 // LogState exposes the storage log's replication cursor: the current
 // file epoch and byte size. Together with ReadLogRange it is the whole
 // surface the replicate package needs to ship the database

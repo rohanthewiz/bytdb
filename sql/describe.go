@@ -324,6 +324,8 @@ func command(st Statement) string {
 		return "DROP TABLE"
 	case *Truncate:
 		return "TRUNCATE TABLE"
+	case *Vacuum:
+		return "VACUUM"
 	case *ShowVar:
 		return "SHOW"
 	case *CreateView:

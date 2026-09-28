@@ -943,6 +943,8 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		return d.execDropIndex(s)
 	case *Truncate:
 		return d.execTruncate(s)
+	case *Vacuum:
+		return d.execVacuum(s)
 	case *ShowVar:
 		// A bare DB has no SET state; SHOW reports the defaults, with
 		// the isolation parameters describing the engine's actual mode.
