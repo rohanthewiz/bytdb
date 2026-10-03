@@ -37,6 +37,72 @@ through all 74 docs.
 
 Nothing open.
 
+## Roadmap
+
+Wanted, but not soon. Promote an item to Open when the thing it waits for
+arrives.
+
+- **N-001** · raised `2026-0722-1303-wal-encryption-at-rest` · value low
+  **btypedb encryption deferred set:** online key rotation, a
+  plaintext↔encrypted migration helper, key+value scope, and
+  ChaCha20-Poly1305. None of these exist yet. `btypedb/encrypt.go:40-41`
+  reserves flag bits 1..4, and `compact.go:138-139` names the re-encrypt seam.
+  Rotation first needs a v3 wrapped-DEK header, because `Compact`'s raw
+  tail-copy is invalid across keys. Restated at `2026-0730-1924`,
+  `2026-0907-2325`, `2026-0907-2339`, `2026-0916-1511`, `2026-0916-1557` and
+  `2026-0916-1611`, and kept open by decision each time. **Trigger:** a
+  deployment needs to rotate a key. *Restored 2026-10-03 by `/next-list`:
+  commit `dd7a25d` (closing N-022) deleted the whole Roadmap and Non-goals
+  sections with no closing line. Premise re-checked against btypedb then:
+  still absent, and both citations still hold.*
+
+## Non-goals
+
+*Restored 2026-10-03 by `/next-list` after commit `dd7a25d` deleted this
+section. The entries below are the text as of `3b603e9`, unchanged.*
+
+- **N-005** · declined `2026-0730-2350-occ-stage2-sequences`: **Embedded
+  Engine one-shot writes surface `ErrTxConflict` raw.** The caller writes the
+  retry loop, the same contract as `WriteTxn`. Documented in
+  `docs/concurrency.md`.
+- **N-006** · declined `2026-0805-1603-correlated-subquery-index-pushdown`:
+  **Correlated ON conjuncts and function-wrapped correlated predicates
+  evaluate per row.** Full Postgres-style decorrelation was considered and
+  rejected. For large outer sets, rewrite as a JOIN.
+- **N-007** · declined `2026-0805-1603-correlated-subquery-index-pushdown`:
+  **Statement paths that never seed a `subMemo` re-prepare correlated
+  subqueries on each invocation.** This errs on the safe side, and they still
+  get pushdown within one invocation. It was recorded as "known remaining
+  (deliberate)" and never appeared in a Next list. Filed here so it stays
+  visibly declined.
+- **N-008** · declined `2026-0907-2325-next-list-rebuild-backlog-drain`:
+  **Unindexed FK columns scan the child table on each check.** FK enforcement
+  is planner-driven and doesn't require an index. The skill's gotchas document
+  the workaround ("index the child FK columns").
+- **N-009** · declined `2026-0907-2325-next-list-rebuild-backlog-drain`:
+  **`WriteString` lint hints in test files.** Test readability is worth more
+  than the allocation.
+- **N-010** · declined `2026-0916-1511-next-list-rebuild-and-drain`:
+  **General multi-action `ALTER TABLE`.** Only the `DROP CONSTRAINT t_pkey,
+  ADD PRIMARY KEY` pairing is accepted, because it is the one pairing that must
+  be atomic in bytdb. Other actions can run as separate statements.
+- **N-011** · declined `2026-0916-1511-next-list-rebuild-and-drain`:
+  **`ALTER COLUMN TYPE` on foreign-key columns.** Both sides would have to
+  change together. Instead, drop the constraint, alter both columns, and re-add
+  it.
+- **N-012** · declined `2026-0916-1511-next-list-rebuild-and-drain`:
+  **pgwire `v0.10.0` / `v0.11.0` tags stay unbackfilled.** The lockstep tag
+  line resumes at `v0.12.0`.
+- **N-013** · declined `2026-0916-1557-sqlstate-gaps-constraint-catalog`:
+  **Unique indexes vs UNIQUE constraints in `table_constraints`.** bytdb can't
+  tell them apart, so every unique index reports as UNIQUE.
+- **N-014** · declined `2026-0916-1557-sqlstate-gaps-constraint-catalog`:
+  **Synthetic NOT NULL CHECK rows in `table_constraints`.** Nullability is
+  already in `information_schema.columns`.
+- **N-015** · declined `2026-0916-1611-license-and-release-v0.15.0`:
+  **License file in `bench/`.** It is an internal harness module and nothing
+  imports it.
+
 ## Closed
 
 - **N-022** · raised `2026-0925-1542-file-lock-release-v0.17.0` · closed
