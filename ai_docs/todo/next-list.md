@@ -31,11 +31,35 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-023
+**Next ID:** N-025
 
 ## Open
 
-Nothing open.
+- **N-023** · raised `2026-1003-0815-next-list-restore-sess-save-guard` · value medium
+  **Compaction's writer pause grows with database size.** `Engine.Compact`'s
+  doc (`engine.go:643-644`) says btypedb "only pauses writers twice,
+  briefly". But btypedb's `writeSnapshot` only flushes its buffer to the OS
+  (`compact.go:149`), so the `tmp.Sync()` at `compact.go:89` runs under
+  `db.mu` in phase B and writes the whole snapshot to disk while writers
+  wait. Measured on an M-series Mac (darwin `Sync` is `F_FULLFSYNC`), with
+  1 KB values and a writer looping `Set`: worst writer stall 18 ms at
+  58 MB, 38 ms at 220 MB, 117–185 ms at ~920 MB. A probe that syncs the
+  snapshot right after `writeSnapshot`, before phase B, cut the ~900 MB
+  stall to 56 ms (what's left is the tail copy and its fsync). **Fix:**
+  that early sync in btypedb, which leaves the phase-B sync covering only
+  the tail. Then release btypedb, bump bytdb, and correct the doc comment.
+  Every compaction pays this: auto-compaction, `Engine.Compact` and
+  `VACUUM`.
+- **N-024** · raised `2026-1003-0815-next-list-restore-sess-save-guard` · value low
+  **Nothing tells you whether a VACUUM is worth running, or what it
+  reclaimed.** `Stats` has `LogBytes` and `LogEpoch` but no garbage
+  estimate. btypedb keeps `baseSize` (the log size after the last
+  compaction) privately, and its auto-compaction runs on growth past it,
+  but nothing exposes it. `Engine.Compact` returns only an error, and
+  `VACUUM VERBOSE` is parsed and discarded (`sql/parser.go:2449-2452`).
+  The cheap version: expose the post-compaction size as a `Stats` field
+  (and in `/metrics`), and have `VACUUM VERBOSE` send a notice with the
+  before and after log size. Nobody has asked for it.
 
 ## Roadmap
 

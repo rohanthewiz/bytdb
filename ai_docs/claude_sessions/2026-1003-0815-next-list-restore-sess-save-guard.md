@@ -6,7 +6,9 @@
   because `ai_docs/todo/next-list.md` already exists. They then ran
   `/next-list 30` (living-list mode, with the transition check over the last
   30 session docs). That run found 12 items deleted from the list, and the
-  user then asked for a check in `/sess-save` so it can't recur.
+  user then asked for a check in `/sess-save` so it can't recur. With Open
+  empty, the user then asked for gaps in v0.19.0's Compact/VACUUM; two were
+  filed (section 4).
 
 ## 1. The lapse: `dd7a25d` deleted Roadmap and Non-goals
 
@@ -94,17 +96,49 @@ the bottom because the command has no frontmatter and its menu description
 comes from the first line. This session's own `/sess-save` ran the new check
 on itself before committing.
 
+## 4. Gaps in Compact/VACUUM (after the first commit)
+
+The list was empty, and the user asked for gaps in v0.19.0's Compact and
+VACUUM. Filed two:
+
+- **N-023 (medium):** compaction's writer pause grows with database size,
+  because btypedb fsyncs the whole snapshot inside phase B under `db.mu`.
+  Measured with a scratch probe (scratchpad only, not committed): worst
+  writer stall 18 ms at 58 MB, 38 ms at 220 MB, 117–185 ms at ~920 MB.
+  Syncing the snapshot before phase B brought the last one to 56 ms.
+- **N-024 (low):** nothing says whether a VACUUM is worth running or what it
+  reclaimed: no garbage estimate in `Stats`, and `VACUUM VERBOSE` is
+  discarded.
+
+Checked and not filed:
+
+- VACUUM in a `BEGIN` block or a read-only transaction is already refused
+  (25001).
+- Concurrent compactions, and compaction against `Backup`, are serialized
+  by btypedb's `compactMu`.
+- A failed compaction removes its temp file, and `Open` removes one left by
+  a crash (`db.go:276`).
+- `VACUUM; SELECT 1` as one simple Query runs the VACUUM, where Postgres
+  refuses it in an implicit transaction. bytdb has no implicit transaction
+  for multi-statement queries at all, so this is that broader, deliberate
+  behavior, not a VACUUM gap.
+- Compaction can't be interrupted once started (documented).
+- On a replicated database each VACUUM re-ships the whole file
+  (documented).
+- The v0.19.0 README on pkg.go.dev lacks the VACUUM grammar line. The next
+  tag fixes that.
+
 ## Files touched
 
 - `ai_docs/todo/next-list.md`: Roadmap (N-001) and Non-goals (N-005–N-015)
-  restored.
+  restored; N-023 and N-024 added to Open.
 - `~/.claude/commands/sess-save.md`: ID-loss guard and modification date.
   Outside this repo, not committed here.
 - This doc.
 
 ## Next
 
-Closed: None. Declined: None. Raised: None.
+Closed: None. Declined: None. Raised: N-023, N-024.
 Deferred: None. Promoted: None.
 Updated: N-001 (restore note). Restored after `dd7a25d` deleted them: N-001
 (Roadmap), N-005–N-015 (Non-goals). Full list: `ai_docs/todo/next-list.md`.
