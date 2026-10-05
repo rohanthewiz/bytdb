@@ -35,42 +35,8 @@ through all 74 docs.
 
 ## Open
 
-- **N-023** · raised `2026-1003-0815-next-list-restore-sess-save-guard` · value medium
-  **Compaction's writer pause grows with database size.** `Engine.Compact`'s
-  doc (`engine.go:643-644`) says btypedb "only pauses writers twice,
-  briefly". But btypedb's `writeSnapshot` only flushes its buffer to the OS
-  (`compact.go:149`), so the `tmp.Sync()` at `compact.go:89` runs under
-  `db.mu` in phase B and writes the whole snapshot to disk while writers
-  wait. Measured on an M-series Mac (darwin `Sync` is `F_FULLFSYNC`), with
-  1 KB values and a writer looping `Set`: worst writer stall 18 ms at
-  58 MB, 38 ms at 220 MB, 117–185 ms at ~920 MB. A probe that syncs the
-  snapshot right after `writeSnapshot`, before phase B, cut the ~900 MB
-  stall to 56 ms (what's left is the tail copy and its fsync). **Fix:**
-  that early sync in btypedb, which leaves the phase-B sync covering only
-  the tail. Then release btypedb, bump bytdb, and correct the doc comment.
-  Every compaction pays this: auto-compaction, `Engine.Compact` and
-  `VACUUM`.
-- **N-024** · raised `2026-1003-0815-next-list-restore-sess-save-guard` · value low
-  **Nothing tells you whether a VACUUM is worth running, or what it
-  reclaimed.** `Stats` has `LogBytes` and `LogEpoch` but no garbage
-  estimate. btypedb keeps `baseSize` (the log size after the last
-  compaction) privately, and its auto-compaction runs on growth past it,
-  but nothing exposes it. `Engine.Compact` returns only an error, and
-  `VACUUM VERBOSE` is parsed and discarded (`sql/parser.go:2449-2452`).
-  The cheap version: expose the post-compaction size as a `Stats` field
-  (and in `/metrics`), and have `VACUUM VERBOSE` send a notice with the
-  before and after log size. Nobody has asked for it.
-- **N-025** · raised `2026-1005-1022-add-column-if-not-exists-v0.20.0` · value low
-  **Skip notices go out at WARNING severity with SQLSTATE 01000.**
-  pgwire's `noticeBody` (`pgwire/errors.go:217-240`) sends every statement
-  notice as `WARNING`/`01000` unless it names a transaction state. Postgres
-  sends the IF [NOT] EXISTS skips (`relation "t" already exists, skipping`,
-  `column "c" of relation "t" already exists, skipping`, `table "t" does
-  not exist, skipping`) at `NOTICE` severity, with the matching SQLSTATE
-  (42P07, 42701, 00000). Seen over pgx while verifying ADD COLUMN IF NOT
-  EXISTS. A client that logs or filters by severity shows these as
-  warnings. **Fix:** map the "skipping" notices to `NOTICE` and their codes
-  in `noticeBody`. Nobody has hit it.
+*Empty since 2026-10-05: N-023, N-024 and N-025 closed in
+`2026-1005-1107-compaction-stall-vacuum-verbose-notices`.*
 
 ## Roadmap
 
@@ -140,6 +106,65 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-025** · raised `2026-1005-1022-add-column-if-not-exists-v0.20.0` ·
+  closed 2026-10-05, `2026-1005-1107-compaction-stall-vacuum-verbose-notices`. **Skip notices go out at
+  WARNING severity with SQLSTATE 01000.** Fixed: `noticeBody`
+  (`pgwire/errors.go`) now sends:
+  - `... already exists, skipping` as NOTICE 42P07, or 42701 for a column;
+  - `... does not exist, skipping` as NOTICE 00000;
+  - VACUUM VERBOSE's report as INFO 00000.
+
+  VACUUM's `skipping "v" --- cannot vacuum non-tables` stays WARNING
+  01000, because it is a WARNING in Postgres too. `sendNotice`
+  (`pgwire/conn.go`) now sends a multi-line `Result.Notice` as one
+  NoticeResponse per line. Before, VACUUM's joined skip warnings went out
+  as a single message. Tests: `TestNoticeSeverities`
+  (`pgwire/notice_test.go`) runs 13 statements over pgx and checks
+  severity, code and message for each. Checked over the wire with
+  bytdbd. Commit `5722154`.
+- **N-024** · raised `2026-1003-0815-next-list-restore-sess-save-guard` ·
+  closed 2026-10-05, `2026-1005-1107-compaction-stall-vacuum-verbose-notices`. **Nothing tells you whether a
+  VACUUM is worth running, or what it reclaimed.** Fixed with the cheap
+  version the item described:
+  - btypedb v0.9.0 adds `LogStats()`, which returns epoch, size and
+    `BaseSize` read under one lock.
+  - bytdb's `Stats` gains `LogBaseBytes`, and `/metrics` gains
+    `bytdb_log_base_bytes`.
+  - VERBOSE is now kept rather than discarded (`(VERBOSE false)` turns it
+    off), and `VACUUM VERBOSE` appends an INFO line:
+    `compacted the storage log: B bytes before, A after (R reclaimed)`.
+
+  `LogBytes - LogBaseBytes` is the growth auto-compaction measures. After
+  a restart, the base is the whole file as found, so the growth
+  understates the garbage until the first compaction. The `Stats` doc
+  says so. `Engine.Compact` still returns only an error: VACUUM reads
+  `LogState` on either side of it. Tests: `TestParseVacuum` (verbose
+  cases), `TestVacuumVerbose`, `TestEngineCompact` (base assertions),
+  `TestMetricsHandler`, and btypedb's `TestLogStats`. Commit `b841789`.
+- **N-023** · raised `2026-1003-0815-next-list-restore-sess-save-guard` ·
+  closed 2026-10-05, `2026-1005-1107-compaction-stall-vacuum-verbose-notices`. **Compaction's writer pause grows
+  with database size.** The proposed fix (an early snapshot sync) wasn't
+  enough on its own. Measured with a fast writer (`SyncNever`, 1 KB values),
+  phase B's copy of the *tail* also grew with the database: ~400 MB of
+  tail at 900 MB, because the tail is every append made while the snapshot
+  streamed. With only the early sync, the worst stall got *worse*.
+  btypedb v0.9.0 (`902e317`) runs an unlocked catch-up loop instead. It
+  copies the tail so far and fsyncs, up to 4 rounds, until at most 1 MiB
+  is left. Phase B then splices and syncs only that residue, and skips
+  the sync when there is none. Measured phase-B lock hold at ~900 MB:
+  v0.8.0 340–540 ms, v0.9.0 16–32 ms. Two follow-on fixes keep the
+  auto-compaction policy unchanged:
+  - `baseSize` excludes appends made after the snapshot streamed.
+  - A successful run re-checks the policy, because a burst that ends
+    during the catch-up has no later append to trigger it.
+
+  Writers can still stall outside the lock when they outrun the disk (a
+  `SyncNever` writer at memory speed saw 100–450 ms), probably from the
+  kernel throttling writes. Under `SyncAlways`, each write pays its own
+  F_FULLFSYNC, and old and new behave about the same. Tests: btypedb
+  `TestCompactSyncsSnapshotBeforePausingWriters` (no tail, small tail,
+  tail over the slack) and `TestAutoCompact` (now waits for chained runs).
+  bytdb bumped to v0.9.0, `Engine.Compact`'s doc corrected (`d9631d3`).
 - **N-022** · raised `2026-0925-1542-file-lock-release-v0.17.0` · closed
   2026-09-25, `2026-0925-1607-lock-in-btypedb-v0.18.0`. **The file lock covers only
   `bytdb.Open`.** Closed ahead of its trigger. The lock moved into btypedb
