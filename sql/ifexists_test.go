@@ -181,3 +181,62 @@ func TestIfNotExistsCrossRelationKind(t *testing.T) {
 		t.Fatalf("view v no longer usable: %v", res.Rows)
 	}
 }
+
+// TestAddColumnIfNotExists exercises ALTER TABLE ADD [COLUMN] IF NOT
+// EXISTS: an existing column name turns the add into a notice (the
+// stored column untouched, even when the requested definition
+// differs), a free name adds normally, a missing table still errors,
+// and a column literally named "if" still parses as a plain add.
+func TestAddColumnIfNotExists(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, name text)`)
+	exec(t, d, `insert into t values (1, 'ada')`)
+
+	// Taken name, different type and a DEFAULT: skipped with
+	// Postgres's notice, and no backfill or type change happens.
+	res := exec(t, d, `alter table t add column if not exists name int default 7`)
+	if !strings.Contains(res.Notice, `column "name" of relation "t" already exists, skipping`) {
+		t.Fatalf("add column notice: %q", res.Notice)
+	}
+	if res := exec(t, d, `select name from t where id = 1`); !reflect.DeepEqual(res.Rows, [][]any{{"ada"}}) {
+		t.Fatalf("existing column disturbed: %v", res.Rows)
+	}
+
+	// The COLUMN keyword is optional in the guarded form too.
+	res = exec(t, d, `alter table t add if not exists name text`)
+	if !strings.Contains(res.Notice, `already exists, skipping`) {
+		t.Fatalf("add (no COLUMN) notice: %q", res.Notice)
+	}
+
+	// The unguarded duplicate still errors.
+	if _, err := d.Exec(`alter table t add column name text`); err == nil ||
+		!strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("duplicate add column: %v", err)
+	}
+
+	// A free name adds normally (no notice), DEFAULT backfill included.
+	res = exec(t, d, `alter table t add column if not exists score int default 5`)
+	if res.Notice != "" {
+		t.Fatalf("fresh add: unexpected notice %q", res.Notice)
+	}
+	if res := exec(t, d, `select score from t where id = 1`); !reflect.DeepEqual(res.Rows, [][]any{{int64(5)}}) {
+		t.Fatalf("added column: %v", res.Rows)
+	}
+
+	// The clause guards the column, not the table.
+	if _, err := d.Exec(`alter table ghost add column if not exists c int`); err == nil {
+		t.Fatal("add column if not exists on a missing table should error")
+	}
+
+	// A column named "if" is still a plain add: the lookahead only
+	// claims IF when NOT follows.
+	exec(t, d, `alter table t add column if int`)
+	if res := exec(t, d, `select "if" from t where id = 1`); !reflect.DeepEqual(res.Rows, [][]any{{nil}}) {
+		t.Fatalf(`column "if": %v`, res.Rows)
+	}
+
+	// IF NOT followed by anything but EXISTS is a parse error.
+	if _, err := d.Exec(`alter table t add column if not c int`); err == nil {
+		t.Fatal("IF NOT without EXISTS should error")
+	}
+}

@@ -211,7 +211,11 @@ func (e *Engine) AddColumn(table string, col Column) error {
 	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		if old.ColIndex(col.Name) >= 0 {
-			return nil, serr.New("column already exists", "table", table, "column", col.Name)
+			// Postgres's wording, shared with RenameColumn: pgwire keys
+			// SQLSTATE 42701 (duplicate_column) off this shape, which is
+			// what a migration catching the duplicate checks for.
+			return nil, serr.New(`column "`+col.Name+`" of relation "`+table+`" already exists`,
+				"table", table, "column", col.Name)
 		}
 		desc := old.clone()
 		col.ID = desc.NextColID

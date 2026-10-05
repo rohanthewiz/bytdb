@@ -1427,6 +1427,22 @@ func (p *parser) alterTable() (Statement, error) {
 			return nil, p.unexpected("CHECK after CONSTRAINT name")
 		}
 		p.acceptKw("column")
+		// ADD [COLUMN] IF NOT EXISTS c type. Two tokens of lookahead
+		// ("if" then "not") keep a column literally named "if" legal
+		// — ADD COLUMN if int still parses as a plain add — since a
+		// real column definition can never continue with NOT where
+		// the type belongs. The check itself is the executor's, same
+		// split as CREATE TABLE IF NOT EXISTS.
+		ifNotExists := false
+		if t, nx := p.cur(), p.tokAt(1); t.kind == tIdent && t.text == "if" &&
+			nx.kind == tIdent && nx.text == "not" {
+			p.advance()
+			p.advance()
+			if err := p.expectKw("exists"); err != nil {
+				return nil, err
+			}
+			ifNotExists = true
+		}
 		col, pk, checks, err := p.colDef()
 		if err != nil {
 			return nil, err
@@ -1438,7 +1454,7 @@ func (p *parser) alterTable() (Statement, error) {
 			return nil, serr.New("ADD COLUMN with a CHECK constraint is not supported",
 				"table", table, "column", col.Name)
 		}
-		return &AddColumn{Table: table, Col: col}, nil
+		return &AddColumn{Table: table, Col: col, IfNotExists: ifNotExists}, nil
 	case p.acceptKw("alter"):
 		// ALTER [COLUMN] c SET DEFAULT expr | DROP DEFAULT. The other
 		// Postgres column alterations (SET/DROP NOT NULL, TYPE, and the

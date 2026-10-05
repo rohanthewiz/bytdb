@@ -246,6 +246,7 @@ func TestPrimaryKeyDDLErrors(t *testing.T) {
 		{`create table d (a int, primary key (a, a))`, "42701", "duplicate primary key column"},
 		{`alter table t drop constraint t_pkey, add primary key (a, a)`, "42701", "appears twice in primary key"},
 		{`alter table t rename column a to id`, "42701", "already exists"},
+		{`alter table t add column a text`, "42701", `column "a" of relation "t" already exists`},
 	} {
 		var pgErr *pgconn.PgError
 		_, err := c.Exec(ctx, tc.q)

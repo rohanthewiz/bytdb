@@ -98,7 +98,7 @@ DEFAULT`, `ALTER COLUMN SET|DROP NOT NULL`, `ALTER COLUMN [SET DATA] TYPE t
 [USING expr]`, `ADD COLUMN` of an identity/`SERIAL` column (existing
 rows numbered 1..n), primary-key replacement via `DROP CONSTRAINT
 t_pkey, ADD PRIMARY KEY (...)`, `IF NOT EXISTS` on CREATE
-TABLE/INDEX/SEQUENCE and `IF EXISTS` on DROP
+TABLE/INDEX/SEQUENCE and ADD COLUMN, and `IF EXISTS` on DROP
 TABLE/INDEX/SEQUENCE/VIEW/CONSTRAINT (views take `CREATE OR REPLACE`
 instead). `ALTER TABLE ... OWNER TO` and `ALTER COLUMN SET
 STORAGE|STATISTICS` are accepted as no-ops — bytdb has no roles,

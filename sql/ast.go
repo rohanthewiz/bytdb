@@ -668,10 +668,14 @@ type DropView struct {
 	IfExists bool
 }
 
-// AddColumn is ALTER TABLE t ADD [COLUMN] col type.
+// AddColumn is ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] col type.
+// IfNotExists makes the statement a no-op (with a notice) when the
+// table already has a column of that name; the table itself must
+// still exist, as in Postgres.
 type AddColumn struct {
-	Table string
-	Col   ColDef
+	Table       string
+	Col         ColDef
+	IfNotExists bool
 }
 
 // DropColumn is ALTER TABLE t DROP [COLUMN] col.
