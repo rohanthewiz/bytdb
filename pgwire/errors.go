@@ -214,12 +214,44 @@ func conflictBody() wbuf {
 	return b
 }
 
-// noticeBody builds a NoticeResponse body for a statement warning —
-// the same field format as ErrorResponse, at WARNING severity, with
-// the code Postgres uses for the same notice.
+// noticeBody builds a NoticeResponse body for one line of a statement's
+// notice: the same field format as ErrorResponse, with the severity and
+// code Postgres uses for the same message.
+//
+//	message                                     severity  code
+//	──────────────────────────────────────────  ────────  ──────────────────────
+//	relation "x" already exists, skipping       NOTICE    42P07 duplicate_table
+//	column "c" of relation "t" already
+//	  exists, skipping                          NOTICE    42701 duplicate_column
+//	… does not exist, skipping                  NOTICE    00000
+//	compacted the storage log: … (VERBOSE)      INFO      00000
+//	there is already a transaction in progress  WARNING   25001
+//	there is no transaction in progress,
+//	  SET TRANSACTION outside a block           WARNING   25P01
+//	anything else, e.g. VACUUM's
+//	  skipping "v" --- cannot vacuum …          WARNING   01000
+//
+// The IF [NOT] EXISTS skips used to go out as WARNING/01000 too. A client
+// that logs or filters by severity showed them as warnings, though
+// Postgres treats them as routine. VACUUM's non-table skip is a real
+// WARNING in Postgres and stays one: it doesn't end in ", skipping".
 func noticeBody(msg string) wbuf {
-	code := "01000" // warning
+	severity, code := "WARNING", "01000" // warning
 	switch {
+	case strings.HasSuffix(msg, " already exists, skipping"):
+		severity, code = "NOTICE", "42P07" // duplicate_table
+		if strings.HasPrefix(msg, "column ") {
+			code = "42701" // duplicate_column
+		}
+	case strings.HasSuffix(msg, " does not exist, skipping"):
+		// Postgres's DROP ... IF EXISTS skips carry no errcode, so they
+		// get the NOTICE default, successful_completion.
+		severity, code = "NOTICE", "00000"
+	case strings.HasPrefix(msg, "compacted the storage log: "):
+		// VACUUM VERBOSE's report (sql.vacuumReport). Postgres sends
+		// VERBOSE output at INFO, which clients always receive, whatever
+		// client_min_messages says.
+		severity, code = "INFO", "00000"
 	case strings.Contains(msg, "already a transaction"):
 		code = "25001" // active_sql_transaction
 	case strings.Contains(msg, "no transaction"):
@@ -229,9 +261,9 @@ func noticeBody(msg string) wbuf {
 	}
 	var b wbuf
 	b.byte('S')
-	b.cstr("WARNING")
+	b.cstr(severity)
 	b.byte('V')
-	b.cstr("WARNING")
+	b.cstr(severity)
 	b.byte('C')
 	b.cstr(code)
 	b.byte('M')

@@ -851,10 +851,16 @@ func (c *conn) sendError(err error, query string, base int) {
 	c.inErr = true
 }
 
-// sendNotice sends a statement's warning (a redundant BEGIN, a stray
-// COMMIT) as a NoticeResponse.
+// sendNotice sends a statement's notice (a redundant BEGIN, a stray
+// COMMIT, an IF [NOT] EXISTS skip, VACUUM's report) as NoticeResponses,
+// one per line. A statement can raise several: VACUUM joins a skip
+// warning per non-table with "\n", then its VERBOSE report. Postgres
+// sends each as its own message, and they can differ in severity, so
+// each line is classified on its own.
 func (c *conn) sendNotice(msg string) {
-	c.send(msgNoticeResponse, noticeBody(msg))
+	for line := range strings.SplitSeq(msg, "\n") {
+		c.send(msgNoticeResponse, noticeBody(line))
+	}
 }
 
 func (c *conn) protoError(msg string) {
