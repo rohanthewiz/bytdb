@@ -4,7 +4,8 @@
 - **Date:** 2026-10-05
 - **Scope:** The user asked for next-list N-023 and the rest of Open
   (N-024, N-025). All three closed. N-023 needed a btypedb release,
-  **v0.9.0**, which also carries the API N-024 needed.
+  **v0.9.0**, which also carries the API N-024 needed. Released as bytdb
+  and pgwire **v0.21.0**.
 
 ## 1. N-023: compaction's writer pause (btypedb `902e317`)
 
@@ -109,11 +110,28 @@ bytdbd on a scratch db with `-metrics-addr`, driven by a pgx v5.10.0 client:
 `/metrics` showed `bytdb_log_base_bytes 16` → `837` across the compaction,
 with `bytdb_log_bytes` 689991 → 837.
 
-## Not done
+## 6. Release v0.21.0
 
-- **No bytdb release.** The work since v0.20.0 adds behavior (Stats field,
-  VERBOSE, notice severities), so the next tag would be **v0.21.0** via the
-  `release` skill.
+The user asked for the release after the work above landed. Minor bump: the
+release adds behavior (a `Stats` field and metric, VERBOSE, notice
+severities). Followed the `release` skill:
+
+- `go vet` and `go test ./...` passed at the root and in `pgwire/`.
+- Root tag **`v0.21.0`** on `26091ee`. Message: "btypedb v0.9.0
+  (compaction's writer pause no longer grows with the database);
+  Stats.LogBaseBytes and /metrics bytdb_log_base_bytes; VACUUM VERBOSE
+  reports bytes reclaimed". Pushed with the four commits above; resolves
+  on proxy.golang.org.
+- `pgwire/go.mod` pin `v0.20.0` → `v0.21.0`, then `bench` `go mod tidy`
+  raised its pin to `v0.21.0`. Both build with and without `GOWORK=off`,
+  and pgwire tests pass. Committed as `7a52e9e` "pgwire, bench: bump bytdb
+  to v0.21.0".
+- pgwire tag **`pgwire/v0.21.0`** on `7a52e9e`. Message names the notice
+  severity change. Pushed; resolves on the proxy.
+- No next-list item was waiting on this release.
+
+Consumers that want the shorter compaction pause (dbc, cats, gonotes, …)
+get it by bumping to bytdb v0.21.0, or btypedb v0.9.0 directly.
 
 ## Files touched
 
@@ -124,7 +142,8 @@ with `bytdb_log_bytes` 689991 → 837.
   `pgwire/errors.go`, `pgwire/conn.go`, `pgwire/notice_test.go`,
   `README.md`, `docs/features.md`, `docs/gotchas.md`,
   `.claude/skills/bytdb-fast-memory-based-db/SKILL.md`,
-  `ai_docs/todo/next-list.md`.
+  `ai_docs/todo/next-list.md`; `pgwire/go.mod` and `bench/go.mod` again for
+  the v0.21.0 pin.
 
 ## Next
 
