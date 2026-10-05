@@ -642,8 +642,15 @@ func (e *Engine) BackupTo(w io.Writer) (int64, error) {
 //
 // Readers and writers keep running; btypedb only pauses writers twice,
 // briefly (snapshot, then splice-and-rename), and a crash at any point
-// leaves either the old or the new complete log. Catalog and rows share
-// the one kv keyspace, so no engine-level state needs coordinating.
+// leaves either the old or the new complete log. Neither pause grows
+// with the database: since btypedb v0.9.0 the snapshot, and the log
+// tail that piled up while it streamed, are copied and fsynced before
+// writers are paused, so the second pause covers only a residue of at
+// most ~1 MB (unless writers outrun the disk). Before that, the whole
+// snapshot was fsynced under the lock, and on darwin (F_FULLFSYNC) a
+// ~900 MB database stalled writers for hundreds of milliseconds. Catalog
+// and rows share the one kv keyspace, so no engine-level state needs
+// coordinating.
 //
 // A successful compaction bumps the log epoch (Stats.LogEpoch,
 // LogState), which is how the replicate package notices it and rolls

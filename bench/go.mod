@@ -8,7 +8,7 @@ require (
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/redis/go-redis/v9 v9.21.0
-	github.com/rohanthewiz/btypedb v0.8.0
+	github.com/rohanthewiz/btypedb v0.9.0
 	github.com/rohanthewiz/bytdb v0.20.0
 	github.com/rohanthewiz/bytdb/pgwire v0.0.0
 	go.etcd.io/bbolt v1.5.0
