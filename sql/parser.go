@@ -2465,8 +2465,8 @@ func (p *parser) tableName() (string, error) {
 //	VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table [, ...]]   (legacy)
 //	VACUUM ( option [value] [, ...] ) [table [, ...]]            (current)
 //
-// Options are discarded (see Vacuum). A parenthesized option's value is
-// at most one token — a boolean word, a number like PARALLEL 4, or a
+// Options are discarded (see Vacuum), except VERBOSE. A parenthesized
+// option's value is at most one token — a boolean word, a number like PARALLEL 4, or a
 // string like BUFFER_USAGE_LIMIT '256kB' — so it is skipped as one
 // token rather than parsed per option; that keeps options Postgres adds
 // later working without a parser change. The legacy keywords must come
@@ -2481,11 +2481,25 @@ func (p *parser) vacuumStmt() (Statement, error) {
 	v := &Vacuum{}
 	if p.acceptOp("(") {
 		for {
-			if _, err := p.ident("a VACUUM option"); err != nil {
+			opt, err := p.ident("a VACUUM option")
+			if err != nil {
 				return nil, err
 			}
+			// An option with no value means true, as in Postgres.
+			on := true
 			if t := p.cur(); t.kind != tEOF && !(t.kind == tOp && (t.text == "," || t.text == ")")) {
+				// Postgres's boolean spellings for false. Anything else
+				// counts as true, which only matters for VERBOSE; Postgres
+				// would reject a non-boolean, but the other options' values
+				// are skipped unchecked too.
+				switch strings.ToLower(t.text) {
+				case "false", "off", "0", "no":
+					on = false
+				}
 				p.advance() // the option's value
+			}
+			if strings.ToLower(opt) == "verbose" {
+				v.Verbose = on
 			}
 			if !p.acceptOp(",") {
 				break
@@ -2496,7 +2510,9 @@ func (p *parser) vacuumStmt() (Statement, error) {
 		}
 	} else {
 		for _, kw := range []string{"full", "freeze", "verbose", "analyze"} {
-			p.acceptKw(kw)
+			if p.acceptKw(kw) && kw == "verbose" {
+				v.Verbose = true
+			}
 		}
 	}
 	// No table list: the statement ends here (optionally with ";",

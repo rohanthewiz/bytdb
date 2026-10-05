@@ -562,7 +562,10 @@ type Result struct {
 	Tag string
 	// Notice is a warning the statement raised without failing:
 	// BEGIN inside a transaction block, COMMIT or ROLLBACK outside
-	// one. Wire servers forward it as a NoticeResponse.
+	// one, an IF [NOT] EXISTS skip, VACUUM's report. A statement that
+	// raises several joins them with "\n" (VACUUM: a skip warning per
+	// non-table, then the VERBOSE report). Wire servers forward each
+	// line as its own NoticeResponse.
 	Notice string
 }
 

@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -8,23 +9,30 @@ import (
 )
 
 // TestParseVacuum covers both of Postgres's option spellings and the
-// table list. Options are discarded, so only the table list survives
-// into the AST.
+// table list. Options are discarded except VERBOSE, so the table list
+// and the Verbose flag are all that survive into the AST.
 func TestParseVacuum(t *testing.T) {
 	for _, tc := range []struct {
-		src    string
-		tables []string
+		src     string
+		tables  []string
+		verbose bool
 	}{
-		{`vacuum`, nil},
-		{`VACUUM;`, nil},
-		{`vacuum full`, nil},
-		{`vacuum full freeze verbose analyze`, nil},
-		{`vacuum verbose users`, []string{"users"}},
-		{`vacuum users, public.orders`, []string{"users", "orders"}},
-		{`vacuum (full)`, nil},
-		{`vacuum (verbose, analyze) users`, []string{"users"}},
-		{`vacuum (full true, index_cleanup off, parallel 4, buffer_usage_limit '256kB') users`, []string{"users"}},
-		{`vacuum pg_catalog.pg_class`, []string{"pg_catalog.pg_class"}},
+		{`vacuum`, nil, false},
+		{`VACUUM;`, nil, false},
+		{`vacuum full`, nil, false},
+		{`vacuum full freeze verbose analyze`, nil, true},
+		{`vacuum verbose users`, []string{"users"}, true},
+		{`vacuum users, public.orders`, []string{"users", "orders"}, false},
+		{`vacuum (full)`, nil, false},
+		{`vacuum (verbose, analyze) users`, []string{"users"}, true},
+		{`vacuum (VERBOSE true)`, nil, true},
+		{`vacuum (verbose on)`, nil, true},
+		{`vacuum (verbose 1)`, nil, true},
+		{`vacuum (verbose false)`, nil, false},
+		{`vacuum (verbose off, full)`, nil, false},
+		{`vacuum (verbose '0')`, nil, false},
+		{`vacuum (full true, index_cleanup off, parallel 4, buffer_usage_limit '256kB') users`, []string{"users"}, false},
+		{`vacuum pg_catalog.pg_class`, []string{"pg_catalog.pg_class"}, false},
 	} {
 		v, ok := mustParse(t, tc.src).(*Vacuum)
 		if !ok {
@@ -32,6 +40,9 @@ func TestParseVacuum(t *testing.T) {
 		}
 		if !reflect.DeepEqual(v.Tables, tc.tables) {
 			t.Fatalf("Parse(%q) tables = %v; want %v", tc.src, v.Tables, tc.tables)
+		}
+		if v.Verbose != tc.verbose {
+			t.Fatalf("Parse(%q) verbose = %v; want %v", tc.src, v.Verbose, tc.verbose)
 		}
 	}
 
@@ -87,6 +98,47 @@ func TestVacuumCompacts(t *testing.T) {
 	}
 	if st.Command() != "VACUUM" {
 		t.Fatalf("Command() = %q; want VACUUM", st.Command())
+	}
+}
+
+// TestVacuumVerbose checks the report line: the log's sizes on either
+// side of the compaction, matching Stats, after any skip warnings. With
+// no other session writing, "after" is exactly the compacted size.
+func TestVacuumVerbose(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key, v text)`)
+	exec(t, d, `create view w as select id from t`)
+	for i := range 200 {
+		exec(t, d, `insert into t values (`+strconv.Itoa(i)+`, 'row')`)
+	}
+	exec(t, d, `delete from t where id > 1`)
+
+	before := d.e.Stats().LogBytes
+	res := exec(t, d, `vacuum verbose w, t`)
+	after := d.e.Stats().LogBytes
+
+	lines := strings.Split(res.Notice, "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], `skipping "w"`) {
+		t.Fatalf("notice = %q; want the skip warning, then the report", res.Notice)
+	}
+	want := fmt.Sprintf("compacted the storage log: %d bytes before, %d after (%d reclaimed)",
+		before, after, before-after)
+	if lines[1] != want {
+		t.Fatalf("report = %q; want %q", lines[1], want)
+	}
+
+	// A plain VACUUM stays silent; nothing vacuumable means no report.
+	if res := exec(t, d, `vacuum (verbose false) t`); res.Notice != "" {
+		t.Fatalf("VERBOSE false notice = %q", res.Notice)
+	}
+	if res := exec(t, d, `vacuum verbose w`); strings.Contains(res.Notice, "compacted") {
+		t.Fatalf("VACUUM VERBOSE of only a view reported a compaction: %q", res.Notice)
+	}
+
+	// Writes landing between the two size reads can leave the log no
+	// smaller; the report then drops "reclaimed" rather than going negative.
+	if got := vacuumReport(100, 120); got != "compacted the storage log: 100 bytes before, 120 after" {
+		t.Fatalf("vacuumReport(100, 120) = %q", got)
 	}
 }
 

@@ -50,6 +50,21 @@ type Stats struct {
 	LogEpoch uint64 `json:"log_epoch"`
 	LogBytes int64  `json:"log_bytes"`
 
+	// LogBaseBytes is the log's size right after the last compaction,
+	// or at Open if none has run since: the base btypedb's
+	// auto-compaction measures growth from. LogBytes - LogBaseBytes is
+	// that growth, and it is the cheap answer to "is a VACUUM worth
+	// running": right after a compaction the base is close to the live
+	// data, so on an update- or delete-heavy workload most of the growth
+	// is garbage a compaction would drop. On an insert-only workload it
+	// is new data, and compacting reclaims nothing.
+	//
+	// After a restart the base is the whole file as it was found,
+	// garbage included, so the growth understates what a compaction
+	// would reclaim until the first one runs. VACUUM VERBOSE reports
+	// the exact before and after sizes.
+	LogBaseBytes int64 `json:"log_base_bytes"`
+
 	// HeapLive is the bytes occupied by live (reachable or not yet
 	// swept) objects on the Go heap — the closest thing to "how much
 	// memory the dataset takes".
@@ -142,8 +157,11 @@ func (e *Engine) Stats() Stats {
 	s.Keys = e.kv.Len()
 	s.Tables = len(e.Tables())
 	// A closed store returns ErrClosed here; the zero values are the
-	// honest answer, so the error is deliberately dropped.
-	s.LogEpoch, s.LogBytes, _ = e.kv.LogState()
+	// honest answer, so the error is deliberately dropped. LogStats reads
+	// all three under one lock, so a compaction can't pair the new,
+	// smaller base with the old file's size.
+	ls, _ := e.kv.LogStats()
+	s.LogEpoch, s.LogBytes, s.LogBaseBytes = ls.Epoch, ls.Size, ls.BaseSize
 
 	samples := runtimeSamples()
 	metrics.Read(samples)
@@ -179,6 +197,7 @@ func (s Stats) promMetrics() []promMetric {
 		{"bytdb_tables", "User tables in the catalog.", "gauge", fmt.Sprint(s.Tables)},
 		{"bytdb_log_epoch", "Write-ahead log file generation; bumped by compaction.", "gauge", u(s.LogEpoch)},
 		{"bytdb_log_bytes", "Write-ahead log size on disk.", "gauge", fmt.Sprint(s.LogBytes)},
+		{"bytdb_log_base_bytes", "Write-ahead log size after the last compaction (or at open); log_bytes minus this is the growth auto-compaction measures.", "gauge", fmt.Sprint(s.LogBaseBytes)},
 		{"bytdb_heap_live_bytes", "Live Go heap; the dataset's memory footprint.", "gauge", u(s.HeapLive)},
 		{"bytdb_heap_goal_bytes", "Heap size that triggers the next GC cycle.", "gauge", u(s.HeapGoal)},
 		{"bytdb_runtime_total_bytes", "All memory mapped by the Go runtime.", "gauge", u(s.RuntimeTotal)},

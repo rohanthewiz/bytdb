@@ -97,6 +97,7 @@ func TestMetricsHandler(t *testing.T) {
 		"# TYPE bytdb_tables gauge\nbytdb_tables 1\n",
 		"# TYPE bytdb_gc_cycles_total counter\n",
 		"bytdb_heap_live_bytes ",
+		"# TYPE bytdb_log_base_bytes gauge\n",
 		"extra_gauge 7\n",
 	} {
 		if !strings.Contains(body, want) {

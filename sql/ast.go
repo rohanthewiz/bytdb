@@ -639,11 +639,14 @@ type Truncate struct {
 // table triggers the same whole-file compaction. The options are
 // Postgres's knobs for its heap/visibility-map machinery, none of which
 // bytdb has — they parse (so pg_dump scripts, migration tools, and
-// maintenance jobs run unmodified) and are ignored. Like Postgres,
-// VACUUM cannot run inside a transaction block: compaction rewrites
-// the file under every open snapshot and cannot be rolled back.
+// maintenance jobs run unmodified) and are ignored, except VERBOSE,
+// which reports the log's size before and after as an INFO notice.
+// Like Postgres, VACUUM cannot run inside a transaction block:
+// compaction rewrites the file under every open snapshot and cannot be
+// rolled back.
 type Vacuum struct {
-	Tables []string // nil: the whole database (the only granularity there is)
+	Tables  []string // nil: the whole database (the only granularity there is)
+	Verbose bool     // VERBOSE, or (VERBOSE [true|on|1]): report what the compaction reclaimed
 }
 
 // ShowVar is SHOW name (or SHOW ALL): report a configuration

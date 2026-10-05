@@ -729,8 +729,10 @@ TRUNCATE parent, child;            -- FK-aware: a referenced table truncates onl
                                    -- else 0A000 with a HINT naming the missing tables
 
 VACUUM;                            -- compact the storage log now (Engine.Compact)
-VACUUM (VERBOSE, ANALYZE) users;   -- options parse and are ignored; any named
+VACUUM (FULL, ANALYZE) users;      -- options parse and are ignored; any named
                                    -- table compacts the whole file
+VACUUM VERBOSE;                    -- INFO: compacted the storage log:
+                                   --   1048576 bytes before, 262144 after (786432 reclaimed)
 
 SET search_path TO public, other;  -- SESSION/LOCAL both scope to session
 SET time zone 'UTC';
@@ -743,9 +745,13 @@ SHOW ALL;
 TRUNCATE is transactional (it can roll back). VACUUM is not: like Postgres it
 refuses to run inside a transaction block (25001). bytdb keeps one log file,
 so there is no per-table vacuum — a table list is only validated (views and
-sequences draw Postgres's "skipping" warning, unknown names 42P01). On a
-replicated database each VACUUM rolls the replication generation, re-shipping
-the compacted file. `SET`/`SHOW` overlay session
+sequences draw Postgres's "skipping" warning, unknown names 42P01). VERBOSE
+(or `(VERBOSE true)`) is the one option that does something: it reports the
+log's size before and after as an INFO notice, in place of Postgres's
+per-table page counts. To judge whether a VACUUM is worth running at all,
+compare `Stats().LogBytes` with `LogBaseBytes` (see Monitoring memory in the
+README). On a replicated database each VACUUM rolls the replication
+generation, re-shipping the compacted file. `SET`/`SHOW` overlay session
 values on Postgres-shaped defaults; an unknown, never-set parameter gets
 Postgres's `unrecognized configuration parameter` error, and everything but
 `statement_timeout`, `search_path`, and `time zone` is accepted and ignored.

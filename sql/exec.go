@@ -1609,6 +1609,9 @@ func (d *DB) execTruncate(s *Truncate) (*Result, error) {
 // Compaction is whole-file (see Vacuum), so the table list decides only
 // whether to compact at all — a list of nothing but skipped relations
 // compacts nothing, as it vacuums nothing in Postgres.
+//
+// VERBOSE adds one more notice line after any skip warnings, with the
+// log's size before and after (see vacuumReport).
 func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
 	// Sessions refuse VACUUM inside a block before it gets here; this
 	// guards a DB bound to a transaction by any other route, since
@@ -1629,9 +1632,8 @@ func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
 			return nil, serr.New("no such table", "table", t)
 		}
 	}
-	res := &Result{Notice: strings.Join(notices, "\n")}
 	if !vacuumable {
-		return res, nil
+		return &Result{Notice: strings.Join(notices, "\n")}, nil
 	}
 	// Compaction cannot be interrupted once started, so a statement the
 	// client already canceled (or whose timeout already fired) should
@@ -1641,10 +1643,47 @@ func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
 			return nil, serr.Wrap(err, "state", "statement canceled")
 		}
 	}
+	// The sizes are read on either side of the compaction rather than
+	// returned by it: Engine.Compact returns only an error. Writes from
+	// other sessions can land in between, which only ever adds to
+	// "after", so the reported saving can understate but never inflate.
+	var before int64
+	if s.Verbose {
+		var err error
+		if _, before, err = d.e.LogState(); err != nil {
+			return nil, err
+		}
+	}
 	if err := d.e.Compact(); err != nil {
 		return nil, err
 	}
-	return res, nil
+	if s.Verbose {
+		_, after, err := d.e.LogState()
+		if err != nil {
+			return nil, err
+		}
+		notices = append(notices, vacuumReport(before, after))
+	}
+	return &Result{Notice: strings.Join(notices, "\n")}, nil
+}
+
+// vacuumReportPrefix starts the VACUUM VERBOSE notice. pgwire matches it
+// to send the line at INFO severity, as Postgres sends VERBOSE output.
+const vacuumReportPrefix = "compacted the storage log: "
+
+// vacuumReport renders VACUUM VERBOSE's one line, for example
+//
+//	compacted the storage log: 1048576 bytes before, 262144 after (786432 reclaimed)
+//
+// bytdb compacts one file for the whole database, so this replaces
+// Postgres's per-table page and tuple counts. "reclaimed" is left out
+// when concurrent writes made the log end up no smaller.
+func vacuumReport(before, after int64) string {
+	msg := fmt.Sprintf("%s%d bytes before, %d after", vacuumReportPrefix, before, after)
+	if before > after {
+		msg += fmt.Sprintf(" (%d reclaimed)", before-after)
+	}
+	return msg
 }
 
 func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {

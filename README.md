@@ -701,7 +701,9 @@ policy), query logging, and `-metrics-addr` (a Prometheus `/metrics`
 endpoint, see Monitoring memory). Transaction blocks work as in Postgres:
 each connection is a `sql.Session`, `ReadyForQuery` reports the real
 status (idle / in transaction / failed), redundant `BEGIN`/`COMMIT`
-raise `NoticeResponse` warnings, and a dropped connection rolls back
+raise `NoticeResponse` warnings (IF [NOT] EXISTS skips arrive at
+Postgres's NOTICE severity, VACUUM VERBOSE's report at INFO), and a
+dropped connection rolls back
 its open block. Savepoints work over the wire too — pgx's nested
 transactions ride on them. Cancellation, portal suspension, and COPY
 are not implemented. The end-to-end tests drive a real pgx v5
@@ -841,6 +843,13 @@ Reachable memory (rows, and every write of an open transaction) cannot
 be freed by any amount of GC, which is why large single-transaction
 rewrites should be batched (see the ADD COLUMN note in the SQL
 section).
+
+The log figures say when compaction is worth running. `LogBaseBytes` is
+the log's size right after the last compaction (or at open), so
+`LogBytes - LogBaseBytes` is the growth btypedb's auto-compaction
+measures. On an update- or delete-heavy workload that growth is mostly
+garbage a `VACUUM` (or `Engine.Compact`) would drop, and `VACUUM VERBOSE`
+reports what it actually reclaimed.
 
 `bytdb.MetricsHandler(e, nil)` serves the same figures over HTTP in
 the Prometheus text format (JSON with `Accept: application/json`), and

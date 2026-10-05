@@ -49,6 +49,16 @@ func TestEngineCompact(t *testing.T) {
 	if after.LogEpoch == before.LogEpoch {
 		t.Fatalf("log epoch not bumped by compaction: still %d", after.LogEpoch)
 	}
+	// The churn was all growth past the base taken at Open; the
+	// compaction resets the base to the compacted file, with no writers
+	// running to put anything past it.
+	if before.LogBytes-before.LogBaseBytes <= 0 {
+		t.Fatalf("before compaction: log %d, base %d; want growth past the base",
+			before.LogBytes, before.LogBaseBytes)
+	}
+	if after.LogBaseBytes != after.LogBytes {
+		t.Fatalf("after compaction: log %d, base %d; want equal", after.LogBytes, after.LogBaseBytes)
+	}
 
 	if rows := collect(t, e.Scan("users")); len(rows) != 2 {
 		t.Fatalf("live engine has %d rows after compact, want 2", len(rows))
