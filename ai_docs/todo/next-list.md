@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-025
+**Next ID:** N-026
 
 ## Open
 
@@ -60,6 +60,17 @@ through all 74 docs.
   The cheap version: expose the post-compaction size as a `Stats` field
   (and in `/metrics`), and have `VACUUM VERBOSE` send a notice with the
   before and after log size. Nobody has asked for it.
+- **N-025** · raised `2026-1005-1022-add-column-if-not-exists-v0.20.0` · value low
+  **Skip notices go out at WARNING severity with SQLSTATE 01000.**
+  pgwire's `noticeBody` (`pgwire/errors.go:217-240`) sends every statement
+  notice as `WARNING`/`01000` unless it names a transaction state. Postgres
+  sends the IF [NOT] EXISTS skips (`relation "t" already exists, skipping`,
+  `column "c" of relation "t" already exists, skipping`, `table "t" does
+  not exist, skipping`) at `NOTICE` severity, with the matching SQLSTATE
+  (42P07, 42701, 00000). Seen over pgx while verifying ADD COLUMN IF NOT
+  EXISTS. A client that logs or filters by severity shows these as
+  warnings. **Fix:** map the "skipping" notices to `NOTICE` and their codes
+  in `noticeBody`. Nobody has hit it.
 
 ## Roadmap
 
