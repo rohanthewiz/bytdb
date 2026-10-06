@@ -16,7 +16,7 @@ Ten storage types, with the Postgres aliases you'd expect
 | `BOOL`, `BOOLEAN` | `bool` | |
 | `BYTEA`, `BYTES` | `[]byte` | |
 | `TIMESTAMP`, `TIMESTAMPTZ` | `int64` µs since epoch, UTC | one type: the `WITH/WITHOUT TIME ZONE` distinction parses and folds away; presents as `timestamptz` on the wire |
-| `DATE` | `int64` days since epoch | |
+| `DATE` | `int64` days since epoch | timestamp text is accepted as in Postgres: the date as written, time and zone dropped (`'2024-01-02 23:30:00-05'` is 2024-01-02); so a `time.Time` binds to a date column as its UTC day |
 | `UUID` | 16 bytes | dashed or 32-hex input; lowercase dashed output; `gen_random_uuid()` |
 | `JSONB` (`JSON` is an alias) | canonical document text | compact, keys sorted — one spelling per document, so `=` is document equality |
 | `TEXT[]` (`VARCHAR[]`) | canonical Postgres array-literal text | one-dimensional; OID 1009 in both wire formats |

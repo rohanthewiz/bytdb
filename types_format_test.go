@@ -91,6 +91,35 @@ func TestValueTextRoundTrip(t *testing.T) {
 			}
 		}
 	})
+	// Timestamp text is a date too: the date as written, time and zone
+	// dropped, not applied. Every expectation here is what Postgres 17
+	// returned for the same '…'::date.
+	t.Run("date from timestamp text", func(t *testing.T) {
+		cases := map[string]string{
+			"2024-01-02 15:04:05":              "2024-01-02",
+			"2024-01-02 23:30:00-05":           "2024-01-02", // 2024-01-03 04:30 UTC
+			"2024-01-02T23:30:00.123456+09:00": "2024-01-02",
+			"2024-01-02 00:00:00Z":             "2024-01-02",
+			"1969-12-31 23:59:59.5":            "1969-12-31",
+			" 2024-01-02 ":                     "2024-01-02",
+		}
+		for in, want := range cases {
+			days, err := ParseDate(in)
+			if err != nil {
+				t.Errorf("ParseDate(%q): %v", in, err)
+				continue
+			}
+			if got := FormatDate(days); got != want {
+				t.Errorf("ParseDate(%q) = %s, want %s", in, got, want)
+			}
+		}
+		// The time part is still checked, as Postgres checks it.
+		for _, bad := range []string{"2024-01-02 25:00:00", "2024-01-02 junk", "2024-13-40"} {
+			if _, err := ParseDate(bad); err == nil {
+				t.Errorf("ParseDate(%q) should fail", bad)
+			}
+		}
+	})
 	t.Run("uuid", func(t *testing.T) {
 		b := []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
 			0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}

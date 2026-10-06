@@ -463,6 +463,38 @@ func TestTimeParameter(t *testing.T) {
 	}
 }
 
+// A time.Time bound to a date column lands on its UTC day. CheckNamedValue
+// sends it as timestamp text, which ParseDate once refused ("invalid input
+// syntax for type date"), so dbc could not copy a date column into bytdb:
+// pgx reads Postgres dates as midnight-UTC time.Time values.
+func TestTimeParameterIntoDate(t *testing.T) {
+	db := open(t, tempDSN(t, ""))
+	exec(t, db, "CREATE TABLE ev (id int PRIMARY KEY, day date)")
+
+	east := time.FixedZone("UTC+9", 9*3600)
+	args := []time.Time{
+		time.Date(2024, 3, 5, 0, 0, 0, 0, time.UTC),            // what pgx yields for a date
+		time.Date(2024, 3, 5, 23, 59, 59, 999999000, time.UTC), // late in the day: not rounded up
+		time.Date(2024, 3, 5, 8, 0, 0, 0, east),                // 2024-03-04 23:00 UTC
+		time.Date(1969, 12, 31, 12, 0, 0, 0, time.UTC),         // pre-epoch
+	}
+	want := []string{"2024-03-05", "2024-03-05", "2024-03-04", "1969-12-31"}
+	for i, a := range args {
+		if _, err := db.Exec("INSERT INTO ev VALUES ($1, $2)", i, a); err != nil {
+			t.Fatalf("insert %v into a date column: %v", a, err)
+		}
+	}
+	for i, w := range want {
+		var got string
+		if err := db.QueryRow("SELECT day FROM ev WHERE id = $1", i).Scan(&got); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if got != w {
+			t.Errorf("date from %v = %s, want %s", args[i], got, w)
+		}
+	}
+}
+
 func TestTransaction(t *testing.T) {
 	db := open(t, tempDSN(t, ""))
 	exec(t, db, "CREATE TABLE t (n int PRIMARY KEY)")

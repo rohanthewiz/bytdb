@@ -65,14 +65,37 @@ func FormatTimestamp(micros int64) string {
 	return out + "+00"
 }
 
-// ParseDate reads 'YYYY-MM-DD' to days since the Unix epoch.
+// ParseDate reads 'YYYY-MM-DD' to days since the Unix epoch. Any
+// timestamp form ParseTimestamp accepts is a date too, as in Postgres
+// ('2024-01-02 23:30:00-05'::date is 2024-01-02): the date is the one
+// written, and the time and zone are checked for syntax, then dropped —
+// never applied, which could move the date across midnight. This is what
+// lets the database/sql driver bind a time.Time to a date column: it
+// sends every time.Time as '2006-01-02 15:04:05…' text in UTC, which
+// lands on the UTC day, the same day the Go API truncates a time.Time to.
 func ParseDate(s string) (int64, error) {
-	t, err := time.Parse("2006-01-02", strings.TrimSpace(s))
+	s = strings.TrimSpace(s)
+	// The bare date first: by far the common input, and otherwise it
+	// would be tried last, after every timestamp layout had failed.
+	t, err := time.Parse("2006-01-02", s)
 	if err != nil {
-		return 0, serr.New("invalid input syntax for type date", "value", s)
+		parsed := false
+		for _, layout := range tsLayouts {
+			if t, err = time.Parse(layout, s); err == nil {
+				parsed = true
+				break
+			}
+		}
+		if !parsed {
+			return 0, serr.New("invalid input syntax for type date", "value", s)
+		}
 	}
-	// Midnight UTC is exactly divisible, so this holds pre-1970 too.
-	return t.Unix() / 86400, nil
+	// t.Date() reads the fields in t's own (parsed, fixed-offset)
+	// location: the date as written, not the UTC date of that instant.
+	// Rebuilding midnight UTC from them keeps the division exact, so
+	// pre-1970 dates come out right too.
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400, nil
 }
 
 // FormatDate renders days-since-epoch as 'YYYY-MM-DD'.
