@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-026
+**Next ID:** N-027
 
 ## Open
 
@@ -105,6 +105,23 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   imports it.
 
 ## Closed
+
+- **N-026** · raised in dbc as its N-128 (dbc doc `2026-1006-1430-headless-dbc-copy`) · closed
+  2026-10-06, `2026-1006-1520-date-input-accepts-timestamp-text`. **A `time.Time` could not be bound to a date column.**
+  `stdlib.CheckNamedValue` sends every `time.Time` as `'2006-01-02
+  15:04:05…'` UTC text, and `ParseDate` took only `YYYY-MM-DD`, so the insert
+  failed with "invalid input syntax for type date". That blocked dbc's
+  `dbc copy` / `s.Copy` of any date column into bytdb, since pgx reads
+  Postgres dates as midnight-UTC `time.Time`. Fixed in `ParseDate` (`types.go`),
+  not the driver. It now accepts every `ParseTimestamp` form, and keeps the date
+  as written while dropping the time and zone, as Postgres does (checked
+  against Postgres 17: `'2024-01-02 23:30:00-05'::date` is 2024-01-02, and
+  `'2024-01-02 25:00:00'` is still an error). A bound `time.Time` therefore
+  lands on its UTC day, the same day the Go API (`coerce` in `dml.go`)
+  truncates one to. Tests: `TestValueTextRoundTrip/date_from_timestamp_text`,
+  and `stdlib.TestTimeParameterIntoDate`, which fails on the old `ParseDate`.
+  Released in `v0.21.1` and `pgwire/v0.21.1`. dbc still has to bump to
+  v0.21.1 to close its N-128.
 
 - **N-025** · raised `2026-1005-1022-add-column-if-not-exists-v0.20.0` ·
   closed 2026-10-05, `2026-1005-1107-compaction-stall-vacuum-verbose-notices`. **Skip notices go out at
