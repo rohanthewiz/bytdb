@@ -583,6 +583,28 @@ func coerce(v any, t ColType) (any, error) {
 		if b, ok := v.(bool); ok {
 			return b, nil
 		}
+		// An integer 0 or 1 also fills a bool column, the same rule as
+		// database/sql's driver.Bool converter. This exists for sources
+		// that have no boolean type: SQLite returns a BOOLEAN column as
+		// int64 0/1, so a table copied from SQLite (dbc's s.Copy) arrives
+		// as integers. The TInt arm normalizes every integer kind to int64,
+		// so the accepted kinds stay in one list. Any other integer is an
+		// error rather than C-style truthiness, because 2 or -1 in a bool
+		// column usually means the wrong column. One side effect: a SQL
+		// literal (INSERT ... VALUES (1)) is accepted too, where Postgres
+		// would refuse it (no implicit int-to-boolean cast). Bound
+		// parameters and literals reach this point looking the same, so
+		// the lenient rule covers both.
+		if n, err := coerce(v, TInt); err == nil {
+			switch n.(int64) {
+			case 0:
+				return false, nil
+			case 1:
+				return true, nil
+			}
+			return nil, serr.New("integer for a bool column must be 0 or 1",
+				"value", fmt.Sprint(n))
+		}
 	case TInt:
 		switch n := v.(type) {
 		case int:

@@ -495,6 +495,37 @@ func TestTimeParameterIntoDate(t *testing.T) {
 	}
 }
 
+// TestIntParameterIntoBool binds int64 0/1 into a bool column, which is
+// what database/sql yields when it reads a SQLite BOOLEAN, so copying a
+// SQLite table into bytdb depends on it. Any other integer is refused.
+func TestIntParameterIntoBool(t *testing.T) {
+	db := open(t, tempDSN(t, ""))
+	exec(t, db, "CREATE TABLE cats (id int PRIMARY KEY, adopted bool)")
+
+	for i, a := range []int64{0, 1} {
+		if _, err := db.Exec("INSERT INTO cats VALUES ($1, $2)", i, a); err != nil {
+			t.Fatalf("insert %d into a bool column: %v", a, err)
+		}
+	}
+	if _, err := db.Exec("UPDATE cats SET adopted = $1 WHERE id = 0", int64(1)); err != nil {
+		t.Fatalf("update a bool column to 1: %v", err)
+	}
+	for i, w := range []bool{true, true} {
+		var got bool
+		if err := db.QueryRow("SELECT adopted FROM cats WHERE id = $1", i).Scan(&got); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if got != w {
+			t.Errorf("id %d: adopted = %v, want %v", i, got, w)
+		}
+	}
+
+	_, err := db.Exec("INSERT INTO cats VALUES (2, $1)", int64(2))
+	if err == nil || !strings.Contains(err.Error(), "must be 0 or 1") {
+		t.Fatalf("insert 2 into a bool column: err = %v, want a 0-or-1 error", err)
+	}
+}
+
 func TestTransaction(t *testing.T) {
 	db := open(t, tempDSN(t, ""))
 	exec(t, db, "CREATE TABLE t (n int PRIMARY KEY)")

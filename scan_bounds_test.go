@@ -123,12 +123,36 @@ func TestCoerceWidthsAndMismatches(t *testing.T) {
 		}
 	}
 
+	// TBool accepts an integer 0 or 1 of any width (SQLite's boolean).
+	boolIns := []struct {
+		id     int
+		active any
+		want   bool
+	}{
+		{13, int64(0), false},
+		{14, int64(1), true},
+		{15, 1, true},
+		{16, uint8(0), false},
+	}
+	for _, c := range boolIns {
+		if err := e.Insert("users", c.id, "b", 0.0, c.active, nil); err != nil {
+			t.Fatalf("Insert(active=%T %v): %v", c.active, c.active, err)
+		}
+		row, ok, err := e.Get("users", c.id)
+		if err != nil || !ok || row.Col("active") != c.want {
+			t.Fatalf("Get(%d).active = %v (%v, %v); want %v", c.id, row.Col("active"), ok, err, c.want)
+		}
+	}
+
 	// Each column type rejects a value of the wrong Go type.
 	mismatches := []struct {
 		row   []any
 		descr string
 	}{
 		{[]any{20, "a", 1.0, "yes", nil}, "string into bool"},
+		{[]any{25, "a", 1.0, 2, nil}, "int 2 into bool"},
+		{[]any{26, "a", 1.0, int64(-1), nil}, "int -1 into bool"},
+		{[]any{27, "a", 1.0, 1.0, nil}, "float into bool"},
 		{[]any{21, 5, 1.0, true, nil}, "int into string"},
 		{[]any{22, "a", "high", true, nil}, "string into float"},
 		{[]any{23, "a", 1.0, true, "blob"}, "string into bytes"},
