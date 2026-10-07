@@ -13,7 +13,7 @@ Ten storage types, with the Postgres aliases you'd expect
 | `INT`, `INTEGER`, `BIGINT`, `INT2/4/8`, `SMALLINT` | `int64` | |
 | `FLOAT`, `FLOAT4/8`, `REAL`, `DOUBLE PRECISION` | `float64` | `numeric` casts land here — there is no decimal type |
 | `TEXT`, `STRING`, `VARCHAR(n)` | `string` | the `(n)` limit is **enforced** on every write, Postgres wording, SQLSTATE 22001 |
-| `BOOL`, `BOOLEAN` | `bool` | |
+| `BOOL`, `BOOLEAN` | `bool` | an integer `0`/`1` is also accepted (SQLite booleans, `database/sql`'s `driver.Bool` rule); any other integer is refused. Unlike Postgres, this includes a literal `VALUES (1)` |
 | `BYTEA`, `BYTES` | `[]byte` | |
 | `TIMESTAMP`, `TIMESTAMPTZ` | `int64` µs since epoch, UTC | one type: the `WITH/WITHOUT TIME ZONE` distinction parses and folds away; presents as `timestamptz` on the wire |
 | `DATE` | `int64` days since epoch | timestamp text is accepted as in Postgres: the date as written, time and zone dropped (`'2024-01-02 23:30:00-05'` is 2024-01-02); so a `time.Time` binds to a date column as its UTC day |

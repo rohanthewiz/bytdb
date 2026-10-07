@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-027
+**Next ID:** N-028
 
 ## Open
 
@@ -105,6 +105,22 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   imports it.
 
 ## Closed
+
+- **N-027** · raised in dbc as its N-131 (dbc doc `2026-1006-1855-scripts-dir-resolution`) · closed
+  2026-10-06, `2026-1006-1907-int-into-bool-coerce-v0.21.2`. **An integer 0/1 could not be stored in a bool column.** SQLite
+  has no boolean type and returns a BOOLEAN column as int64 0/1, so dbc's
+  `s.Copy("demo-sqlite", "demo-bytdb", "cats", …)` failed on `adopted` with
+  "value does not fit column type" (`coerce` in `dml.go`). Fixed in `coerce`,
+  so the Go API, `database/sql` and pgwire all accept it. An integer of any
+  width that is 0 or 1 becomes false/true, the same rule as `database/sql`'s
+  `driver.Bool`. Any other integer is refused with "integer for a bool column
+  must be 0 or 1". Side effect: the SQL literal `INSERT … VALUES (1)` into a
+  bool column is now accepted, where Postgres refuses it. Bound parameters and
+  literals look the same by the time they reach `coerce`. Tests:
+  `stdlib.TestIntParameterIntoBool` (INSERT and UPDATE via `$n`, plus the 2
+  rejection) and new cases in `TestCoerceWidthsAndMismatches`. Both fail on
+  the old `coerce`. `docs/features.md` notes the rule on the `BOOL` row. Released in `v0.21.2` (`38e193a`) and `pgwire/v0.21.2`
+  (`b958b26`). dbc still has to bump to v0.21.2 to close its N-131.
 
 - **N-026** · raised in dbc as its N-128 (dbc doc `2026-1006-1430-headless-dbc-copy`) · closed
   2026-10-06, `2026-1006-1520-date-input-accepts-timestamp-text`. **A `time.Time` could not be bound to a date column.**
