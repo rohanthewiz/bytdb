@@ -25,9 +25,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -61,6 +63,11 @@ func main() {
 		"encrypt the WAL at rest with the AES-256 key in this environment variable (hex or base64 of 32 bytes)")
 	metricsAddr := flag.String("metrics-addr", "",
 		"serve Prometheus metrics (engine size, heap, GC, connections) at http://<addr>/metrics (empty = disabled)")
+	maxResultRows := flag.Int64("max-result-rows", bytdb.DefaultMaxResultRows,
+		"maximum rows one query may hold in memory (0 or negative = no cap); larger queries fail with 54000")
+	memCeiling := flag.String("memory-ceiling", "auto",
+		"refuse inserts, updates and large results with 53200 once the live heap passes this: "+
+			"auto (90% of GOMEMLIMIT; inactive without it), off, or a size like 6GiB")
 	flag.Parse()
 	if *dbPath == "" {
 		log.Fatal("bytdbd: -db is required")
@@ -98,6 +105,10 @@ func main() {
 	if encKey != nil {
 		engineOpts = append(engineOpts, bytdb.WithEncryptionKey(encKey))
 	}
+	ceiling, err := parseMemCeiling(*memCeiling)
+	if err != nil {
+		log.Fatalf("bytdbd: %s", serr.StringFromErr(err))
+	}
 
 	e, err := bytdb.Open(*dbPath, engineOpts...)
 	if err != nil {
@@ -106,6 +117,8 @@ func main() {
 	// Closed on the way out of main — which the signal path below
 	// reaches too — so the engine's final flush and fsync always run.
 	defer e.Close()
+	e.SetMaxResultRows(*maxResultRows)
+	e.SetMemoryCeiling(ceiling)
 
 	srv := pgwire.NewServer(sql.New(e))
 	srv.IdleTxTimeout = *idleTx
@@ -275,4 +288,39 @@ func loadAuthFile(path string) (*pgwire.Credentials, error) {
 		return nil, serr.Wrap(err, "reading auth file")
 	}
 	return creds, nil
+}
+
+// parseMemCeiling maps the -memory-ceiling flag onto
+// Engine.SetMemoryCeiling's encoding: "auto" is 0, "off" is -1, and a
+// size is a positive byte count. Sizes take the same unit suffixes as
+// GOMEMLIMIT (B, KiB, MiB, GiB, TiB — binary multiples), so an operator
+// can write both settings in one vocabulary: GOMEMLIMIT=7GiB with
+// -memory-ceiling 6GiB.
+func parseMemCeiling(v string) (int64, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "auto":
+		return 0, nil
+	case "off":
+		return -1, nil
+	}
+	units := []struct {
+		suffix string
+		mult   int64
+	}{
+		// Longest suffixes first: "B" would otherwise match "GiB".
+		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1},
+	}
+	num, mult := v, int64(1)
+	for _, u := range units {
+		if strings.HasSuffix(v, u.suffix) {
+			num, mult = strings.TrimSuffix(v, u.suffix), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
+	if err != nil || n <= 0 || n > math.MaxInt64/mult {
+		return 0, serr.New("-memory-ceiling must be auto, off, or a positive size such as 6GiB",
+			"value", v)
+	}
+	return n * mult, nil
 }

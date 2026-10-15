@@ -345,6 +345,14 @@ type Engine struct {
 	// running the ALTER. See SetBackfillLimit.
 	backfillLimit atomic.Int64
 
+	// maxResultRows caps the rows one SQL query may materialize; 0 or
+	// less disables it. Atomic for the same reason as backfillLimit.
+	// See SetMaxResultRows.
+	maxResultRows atomic.Int64
+
+	// mem is the memory-ceiling admission control; see memguard.go.
+	mem memGuard
+
 	// testCommitErr, when non-nil, replaces a successful DDL commit's
 	// result (see updateDDL). Only tests set it, to simulate a WAL
 	// append or fsync failing after the transaction closure ran.
@@ -549,6 +557,7 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 		seqObjAllocs: map[string]*seqObjAlloc{},
 	}
 	e.backfillLimit.Store(DefaultBackfillLimit)
+	e.maxResultRows.Store(DefaultMaxResultRows)
 	if err := e.loadCatalog(); err != nil {
 		kv.Close() // also releases the file lock
 		return nil, err

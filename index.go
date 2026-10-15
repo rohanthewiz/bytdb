@@ -47,6 +47,11 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 	if len(cols) == 0 {
 		return nil, serr.New("at least one indexed column is required", "table", table, "index", name)
 	}
+	// The backfill below holds every entry of the new index in memory
+	// until commit; refuse before starting it rather than part-way.
+	if err := e.CheckMemory(); err != nil {
+		return nil, serr.Wrap(err, "op", "create index", "table", table, "index", name)
+	}
 	var created *IndexDesc
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		if old.Index(name) != nil {

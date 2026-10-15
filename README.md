@@ -697,8 +697,9 @@ Auth is trust by default (user/database accepted and ignored); with a
 credentials registry set, SCRAM-SHA-256 runs for real — RFC 5802 with
 channel binding (SCRAM-SHA-256-PLUS) over TLS. `bytdbd` adds
 `-max-conns` (a connection cap), `-sync always|never` (WAL fsync
-policy), query logging, and `-metrics-addr` (a Prometheus `/metrics`
-endpoint, see Monitoring memory). Transaction blocks work as in Postgres:
+policy), query logging, `-metrics-addr` (a Prometheus `/metrics`
+endpoint), and `-memory-ceiling` / `-max-result-rows` (OOM guards). The
+last two are covered under Monitoring memory. Transaction blocks work as in Postgres:
 each connection is a `sql.Session`, `ReadyForQuery` reports the real
 status (idle / in transaction / failed), redundant `BEGIN`/`COMMIT`
 raise `NoticeResponse` warnings (IF [NOT] EXISTS skips arrive at
@@ -843,6 +844,34 @@ Reachable memory (rows, and every write of an open transaction) cannot
 be freed by any amount of GC, which is why large single-transaction
 rewrites should be batched (see the ADD COLUMN note in the SQL
 section).
+
+Two guards turn "about to be OOM-killed" into ordinary statement errors:
+
+- **Memory ceiling.** Once the heap the last GC found reachable
+  (`Stats.HeapMarked`) passes the ceiling (`Stats.MemCeiling`), inserts,
+  updates, index builds, table rewrites and large result
+  materializations fail with `bytdb.ErrOutOfMemory` (SQLSTATE 53200 over
+  the wire). DELETE, DROP and TRUNCATE are never refused, since they are
+  how you get back under it. By default the ceiling is 90% of
+  `GOMEMLIMIT` and stays inactive while no `GOMEMLIMIT` is set. Change it
+  with `Engine.SetMemoryCeiling(bytes)`: `0` means automatic, a negative
+  value turns the guard off. `Engine.CheckMemory()` exposes the same
+  check to your own memory-hungry code.
+- **Result row cap.** No query may hold more than
+  `DefaultMaxResultRows` (10M) rows in memory at once. That covers its
+  result and each intermediate row set: view and CTE materializations,
+  subquery value sets, hash-join build tables, GROUP BY groups, window
+  inputs and RETURNING lists. A query over the cap fails with SQLSTATE
+  54000. Streaming aggregates (`COUNT(*)` over any number of rows) and
+  LIMITs the scan can stop at are unaffected. An unindexed
+  `ORDER BY … LIMIT n` still sorts every matching row, so it counts them
+  all. Change the cap with `Engine.SetMaxResultRows(n)`; `0` or less
+  disables it.
+
+`bytdbd` exposes both as `-memory-ceiling auto|off|6GiB` and
+`-max-result-rows N`. A sound production setup: `GOMEMLIMIT` at about
+80% of the container limit, the ceiling left on `auto`, and an alert on
+`bytdb_heap_marked_bytes / bytdb_mem_ceiling_bytes` above 0.8.
 
 The log figures say when compaction is worth running. `LogBaseBytes` is
 the log's size right after the last compaction (or at open), so

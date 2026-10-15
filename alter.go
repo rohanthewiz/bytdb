@@ -82,6 +82,12 @@ func (e *Engine) AlterColumnType(table, column string, ch ColumnTypeChange) erro
 	if !validTypes[ch.Type] {
 		return serr.New("unknown column type", "table", table, "column", column, "type", string(ch.Type))
 	}
+	// A type change rewrites the whole table and rebuilds its indexes,
+	// all held live until commit (see rebuildTable); refuse it up front
+	// while the heap is over the ceiling. See CheckMemory.
+	if err := e.CheckMemory(); err != nil {
+		return serr.Wrap(err, "op", "alter column type", "table", table, "column", column)
+	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(column)
 		if ord < 0 {
@@ -164,6 +170,10 @@ func (e *Engine) AlterColumnType(table, column string, ch ColumnTypeChange) erro
 func (e *Engine) SetPrimaryKey(table string, cols ...string) error {
 	if len(cols) == 0 {
 		return serr.New("a primary key is required", "table", table)
+	}
+	// Re-keying rewrites every row, like a type change; same refusal.
+	if err := e.CheckMemory(); err != nil {
+		return serr.Wrap(err, "op", "set primary key", "table", table)
 	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ords := make([]int, 0, len(cols))

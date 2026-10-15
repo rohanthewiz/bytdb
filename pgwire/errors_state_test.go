@@ -1,6 +1,14 @@
 package pgwire
 
-import "testing"
+import (
+	"bytes"
+	"path/filepath"
+	"runtime"
+	"testing"
+
+	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/sql"
+)
 
 // TestSQLStateMapping pins every message-text -> SQLSTATE branch.
 // bytdb errors carry no code, so sqlstate keys off stable message
@@ -12,6 +20,11 @@ func TestSQLStateMapping(t *testing.T) {
 		hasPos bool
 		want   string
 	}{
+		// Resource refusals: the engine's result row cap and memory
+		// ceiling (bytdb.SetMaxResultRows / ErrOutOfMemory).
+		{"query would hold more rows in memory than the result row limit allows; narrow it", false, "54000"},
+		{"out of memory", false, "53200"},
+
 		// A position always means the parser rejected the text,
 		// regardless of the message wording.
 		{"unexpected token", true, "42601"},
@@ -99,4 +112,47 @@ func TestSQLStateMapping(t *testing.T) {
 			t.Errorf("sqlstate(%q, %v) = %s; want %s", c.msg, c.hasPos, got, c.want)
 		}
 	}
+}
+
+// TestResourceErrorsEndToEnd renders the real errors, wrapped the way
+// the engine and executor wrap them, so a reworded message or an
+// extra wrapping layer cannot silently drop them to XX000.
+func TestResourceErrorsEndToEnd(t *testing.T) {
+	e, err := bytdb.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	d := sql.New(e)
+	if _, err := d.Exec(`create table t (id int primary key)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`insert into t values (1), (2), (3)`); err != nil {
+		t.Fatal(err)
+	}
+
+	e.SetMaxResultRows(2)
+	_, err = d.Exec(`select * from t`)
+	if got := codeOf(errorBody(err, "", 0)); got != "54000" {
+		t.Errorf("row cap: SQLSTATE %q (err %v), want 54000", got, err)
+	}
+	e.SetMaxResultRows(0)
+
+	runtime.GC() // populate the marked-heap figure the ceiling reads
+	e.SetMemoryCeiling(1)
+	_, err = d.Exec(`insert into t values (4)`)
+	if got := codeOf(errorBody(err, "", 0)); got != "53200" {
+		t.Errorf("memory ceiling: SQLSTATE %q (err %v), want 53200", got, err)
+	}
+}
+
+// codeOf extracts the 'C' (SQLSTATE) field from an ErrorResponse body.
+func codeOf(b wbuf) string {
+	fields := bytes.Split(b, []byte{0})
+	for _, f := range fields {
+		if len(f) > 1 && f[0] == 'C' {
+			return string(f[1:])
+		}
+	}
+	return ""
 }

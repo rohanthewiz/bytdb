@@ -484,6 +484,9 @@ func runSubColumn(env *exEnv, sel *Select) ([]any, error) {
 	sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
 	var vals []any
 	var evalErr error
+	// The subquery's value set is held in memory while the outer query
+	// probes it, so it is charged like any row set (see rowbudget.go).
+	budget := env.d.budget()
 	if !empty {
 		err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
 			rowEnv := *sub
@@ -493,7 +496,8 @@ func runSubColumn(env *exEnv, sel *Select) ([]any, error) {
 				return false
 			}
 			vals = append(vals, v)
-			return true
+			evalErr = budget.check(len(vals))
+			return evalErr == nil
 		})
 	}
 	if err != nil {
@@ -1503,6 +1507,9 @@ func runArraySub(env *exEnv, sel *Select) (any, error) {
 	sub := &exEnv{d: env.d, tx: env.tx, sc: fp.sc, outer: env}
 	var vals []any
 	var evalErr error
+	// The subquery's value set is held in memory while the outer query
+	// probes it, so it is charged like any row set (see rowbudget.go).
+	budget := env.d.budget()
 	if !empty {
 		err = runJoin(env.tx, fp, sub, func(rowVals []any) bool {
 			rowEnv := *sub
@@ -1512,7 +1519,8 @@ func runArraySub(env *exEnv, sel *Select) (any, error) {
 				return false
 			}
 			vals = append(vals, v)
-			return true
+			evalErr = budget.check(len(vals))
+			return evalErr == nil
 		})
 	}
 	if err != nil {

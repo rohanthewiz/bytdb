@@ -225,11 +225,17 @@ func (d *DB) execSelectWindow(s *Select) (*Result, error) {
 		// join columns are kept — window values and select expressions
 		// are computed after all rows are known.
 		var base [][]any
+		budget := d.budget() // see rowbudget.go
+		var capErr error
 		if err = runJoin(tx, fp, env, func(vals []any) bool {
 			base = append(base, append([]any(nil), vals[:sc.width]...))
-			return true
+			capErr = budget.check(len(base))
+			return capErr == nil
 		}); err != nil {
 			return err
+		}
+		if capErr != nil {
+			return capErr
 		}
 
 		// Rewrite window calls in a shallow copy of the select list and

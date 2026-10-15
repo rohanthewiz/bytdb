@@ -94,6 +94,14 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 // serialized mode, roll back with the transaction anyway if it aborts
 // (in concurrent-writes mode they are engine-level and always stand).
 func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]any, error) {
+	// Every insert path (one-shot, Txn, SQL single and multi-row,
+	// INSERT ... SELECT, ON CONFLICT's insert arm) funnels through
+	// here, so this one check refuses growth for all of them — and,
+	// being per row, stops a long INSERT ... SELECT part-way when the
+	// heap crosses the ceiling mid-statement, not only at its start.
+	if err := e.CheckMemory(); err != nil {
+		return nil, err
+	}
 	vals, drawn, err := fillIdentity(e, tx, desc, vals)
 	if err != nil {
 		return nil, err
@@ -166,6 +174,12 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, error) {
 	if err := e.checkReentrantWrite("update"); err != nil {
 		return false, err
+	}
+	// An update grows the heap too: copy-on-write clones the touched
+	// tree nodes, and the old version stays reachable until every
+	// snapshot holding it is released. See CheckMemory.
+	if err := e.CheckMemory(); err != nil {
+		return false, serr.Wrap(err, "op", "update", "table", table)
 	}
 	updated := false
 	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {

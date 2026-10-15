@@ -496,6 +496,15 @@ type DB struct {
 	// described from inside pg_attribute's own row builder, and building
 	// those rows again there would recurse without end.
 	catalogShapes bool
+
+	// freeing marks a statement that releases memory (DELETE): its
+	// materializations — views it reads, subquery key sets in its
+	// WHERE, its RETURNING rows — skip the memory-ceiling poll and keep
+	// only the result row cap. Deleting is how an operator gets back
+	// under the ceiling, so refusing a DELETE for the memory its own
+	// bookkeeping takes would block exactly that recovery. Set by
+	// dispatch on a copy, per the copy-the-DB convention.
+	freeing bool
 }
 
 // Activity is one backend's pg_stat_activity row, reported by the
@@ -1028,7 +1037,9 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		}
 		return dv.execUpdate(s)
 	case *Delete:
-		dv, err := d.withViews(s)
+		df := *d
+		df.freeing = true
+		dv, err := df.withViews(s)
 		if err != nil {
 			return nil, err
 		}

@@ -375,6 +375,11 @@ func (t *Txn) Update(table string, pkVals []any, set map[string]any) (bool, erro
 // values instead of re-applying the SET map itself so it can never
 // drift from the engine's own coercion.
 func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (Row, bool, error) {
+	// Checked here rather than in updateRow, which has no engine handle;
+	// Engine.Update makes the same check. See CheckMemory.
+	if err := t.e.CheckMemory(); err != nil {
+		return Row{}, false, serr.Wrap(err, "op", "update", "table", table)
+	}
 	desc, err := t.desc(table)
 	if err != nil {
 		return Row{}, false, err

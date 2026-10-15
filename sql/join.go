@@ -558,12 +558,28 @@ func (j *joinRun) hashStep(k int, partial []any) {
 				j.err = err
 				return
 			}
+			// The build table holds the inner side's matching rows in
+			// memory for the whole join, so it is charged like any other
+			// row set (see rowbudget.go). A virtual table's rows (the branch
+			// above) were already charged when they were materialized.
+			var d *DB
+			if j.env != nil {
+				d = j.env.d
+			}
+			budget := d.budget()
+			var capErr error
+			n := 0
 			// Static conjuncts are plain Preds (conjuncts() only yields
 			// those), so the residual filter needs no environment.
 			err = scanPlan(j.ctx, j.tx, step.it.Table, pl, nil, func(r bytdb.Row) bool {
 				add(r.Vals)
-				return true
+				n++
+				capErr = budget.check(n)
+				return capErr == nil
 			})
+			if err == nil {
+				err = capErr
+			}
 			if err != nil {
 				j.err = err
 				return

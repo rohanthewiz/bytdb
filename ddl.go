@@ -209,6 +209,14 @@ func (e *Engine) AddColumn(table string, col Column) error {
 	if err := validMaxLen(col); err != nil {
 		return serr.Wrap(err, "table", table)
 	}
+	// Only the backfilling forms grow the heap (a DEFAULT rewrites every
+	// row, an identity column draws a value for every row); a bare ADD
+	// COLUMN is a descriptor change and stays allowed at any heap size.
+	if col.Default != "" || col.Identity {
+		if err := e.CheckMemory(); err != nil {
+			return serr.Wrap(err, "op", "add column", "table", table, "column", col.Name)
+		}
+	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		if old.ColIndex(col.Name) >= 0 {
 			// Postgres's wording, shared with RenameColumn: pgwire keys

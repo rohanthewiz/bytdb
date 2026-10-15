@@ -707,6 +707,12 @@ func aggScanGroups(tx *bytdb.Txn, fp *fromPlan, q *aggQuery, env *exEnv) ([]*gro
 		groups[""] = q.newGroup(nil)
 	}
 	var scanErr error
+	// Groups are what an aggregate query holds in memory — its input
+	// rows stream through the accumulators — so the budget charges
+	// distinct groups, not scanned rows: COUNT(*) over a billion rows
+	// is one group and never trips the cap; GROUP BY a unique column
+	// over the same table does. See rowbudget.go.
+	budget := env.d.budget()
 	err := runJoin(tx, fp, env, func(vals []any) bool {
 		env.row = vals
 		keyVals := make([]any, len(q.keys))
@@ -731,6 +737,9 @@ func aggScanGroups(tx *bytdb.Txn, fp *fromPlan, q *aggQuery, env *exEnv) ([]*gro
 		if !ok {
 			g = q.newGroup(keyVals)
 			groups[string(kb)] = g
+			if scanErr = budget.check(len(groups)); scanErr != nil {
+				return false
+			}
 		}
 		for i := range g.accs {
 			if scanErr = g.accs[i].add(env, vals); scanErr != nil {

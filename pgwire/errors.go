@@ -124,8 +124,15 @@ func sqlstate(msg string, hasPos bool) string {
 	case strings.Contains(msg, "prepared statement already exists"):
 		return "42P05" // duplicate_prepared_statement
 	case strings.Contains(msg, "too many prepared statements"),
-		strings.Contains(msg, "too many portals"):
+		strings.Contains(msg, "too many portals"),
+		strings.Contains(msg, "result row limit"): // Engine.SetMaxResultRows
 		return "54000" // program_limit_exceeded
+	// The engine's memory ceiling (bytdb.ErrOutOfMemory). Postgres
+	// raises 53200 when an allocation fails; clients and pools treat
+	// the 53 class as "server resources", retryable later, rather than
+	// a fault in the statement.
+	case strings.Contains(msg, "out of memory"):
+		return "53200" // out_of_memory
 	// Both are malformed Bind messages rather than bad data: a
 	// parameter count that disagrees with the statement, or a format
 	// code other than 0 (text) / 1 (binary). Postgres reports the

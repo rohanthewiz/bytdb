@@ -11,6 +11,25 @@ from, and it means **your working set must fit in RAM**. There is no buffer
 pool, no spill-to-disk. Budget memory for the data plus a transient second
 copy of hot tree nodes during writes/snapshots.
 
+Two guards stand between a growing heap and an OOM kill. Both are on by
+default. The **memory ceiling** applies once `GOMEMLIMIT` is set: past it,
+inserts, updates, index builds and large reads fail with SQLSTATE 53200,
+while DELETE, DROP and TRUNCATE still work. The **result row cap** (10M
+rows) applies to every row set a single query holds in memory, and
+breaching it fails with SQLSTATE 54000. Edges worth knowing:
+
+- An unindexed `ORDER BY x LIMIT 10` sorts every matching row before the
+  LIMIT applies, so it counts all of them against the cap. An index on `x`
+  removes both the sort and the refusal.
+- The cap is per row set, not per statement. A query can hold several
+  capped sets at once, and the memory ceiling is what bounds their total.
+- The ceiling reads the heap as of the last GC. With an explicit
+  `SetMemoryCeiling` and no `GOMEMLIMIT`, the process can briefly hold up
+  to about twice that figure between collections (GOGC=100), so leave the
+  room.
+- One large write transaction has no row cap yet. A whole-table `UPDATE`
+  is stopped only by the ceiling, part-way through. Batch it.
+
 ## Concurrency model
 
 - **One writer at a time — by default.** Out of the box, a writable transaction

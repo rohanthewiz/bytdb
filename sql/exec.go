@@ -462,6 +462,10 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 		// for the call's duration). runJoin mutates env.row for join
 		// predicates, so the items get their own env rather than sharing.
 		rowEnv := *env
+		// The collected rows are this SELECT's whole materialization
+		// (ORDER BY sorts them in place), so they are what the result
+		// row cap and the memory ceiling police. See rowbudget.go.
+		budget := d.budget()
 		// With no ORDER BY the join order is the result order, so
 		// collection can end at OFFSET+LIMIT rows.
 		err = runJoin(tx, fp, env, func(vals []any) bool {
@@ -475,6 +479,9 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 				vals = append(vals, v)
 			}
 			rows = append(rows, vals)
+			if evalErr = budget.check(len(rows)); evalErr != nil {
+				return false
+			}
 			return len(keys) > 0 || s.Limit < 0 || int64(len(rows)) < satAdd(s.Offset, s.Limit)
 		})
 		if err != nil {
@@ -914,6 +921,9 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		// RETURNING accumulates one output row per affected row; it is
+		// a result set like any SELECT's and held to the same budget.
+		retBudget := d.budget()
 		// With a column list, unnamed columns insert as NULL.
 		var ords []int
 		if s.Cols != nil {
@@ -997,6 +1007,9 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 							return err
 						}
 						res.Rows = append(res.Rows, out)
+						if err := retBudget.check(len(res.Rows)); err != nil {
+							return err
+						}
 					}
 					continue
 				}
@@ -1044,6 +1057,9 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					return err
 				}
 				res.Rows = append(res.Rows, out)
+				if err := retBudget.check(len(res.Rows)); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -1067,6 +1083,9 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		// RETURNING accumulates one output row per affected row; it is
+		// a result set like any SELECT's and held to the same budget.
+		retBudget := d.budget()
 		pl, err := planScan(desc, s.Table, s.Where)
 		if err != nil {
 			return err
@@ -1199,6 +1218,9 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 						return err
 					}
 					res.Rows = append(res.Rows, out)
+					if err := retBudget.check(len(res.Rows)); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -1228,6 +1250,9 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		// RETURNING's rows are held to the row cap; the memory ceiling
+		// is skipped for the whole DELETE (DB.freeing, set by dispatch).
+		retBudget := d.budget()
 		pl, err := planScan(desc, s.Table, s.Where)
 		if err != nil {
 			return err
@@ -1266,6 +1291,9 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 						return err
 					}
 					res.Rows = append(res.Rows, out)
+					if err := retBudget.check(len(res.Rows)); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -1349,6 +1377,12 @@ func (d *DB) execUnion(s *Select) (*Result, error) {
 			return nil, serr.New("each UNION query must have the same number of columns")
 		}
 		rows = append(rows, armRes.Rows...)
+		// Each arm was charged as it ran; the concatenation is a new,
+		// larger row set and is held to the cap as a whole (see
+		// rowbudget.go). One check per arm is enough: arms arrive whole.
+		if err := d.budget().check(len(rows)); err != nil {
+			return nil, err
+		}
 		if !arm.All {
 			if rows, err = dedupRows(rows); err != nil {
 				return nil, err

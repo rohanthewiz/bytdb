@@ -23,6 +23,8 @@ import (
 // How to read it as a low-memory signal:
 //
 //	HeapLive / MemLimit  > 0.8   -> approaching the ceiling
+//	HeapMarked near MemCeiling   -> writes are about to be refused
+//	                                (ErrOutOfMemory); past it, they are
 //	GCCPUSeconds rising fast     -> the collector is thrashing to stay
 //	                                under MemLimit; an OOM kill is next
 //	HeapLive / Keys              -> bytes per key; multiply by expected
@@ -86,6 +88,21 @@ type Stats struct {
 	// debug.SetMemoryLimit), or zero when none is set.
 	MemLimit uint64 `json:"mem_limit_bytes"`
 
+	// HeapMarked is the heap the last GC cycle found reachable: rows,
+	// indexes, open transactions' writes, in-flight results — without
+	// the not-yet-collected garbage HeapLive also counts. It is the
+	// figure the memory ceiling compares against (see
+	// Engine.SetMemoryCeiling), and the steadier one to alert on: with
+	// GOGC=100, HeapLive swings up to 2x HeapMarked between cycles.
+	HeapMarked uint64 `json:"heap_marked_bytes"`
+
+	// MemCeiling is the effective memory ceiling in bytes — the
+	// explicit Engine.SetMemoryCeiling value, or the share of MemLimit
+	// the automatic mode derives — or zero when the guard is inactive.
+	// Once HeapMarked passes it, inserts, updates, index builds and
+	// large result materializations fail with ErrOutOfMemory.
+	MemCeiling uint64 `json:"mem_ceiling_bytes"`
+
 	// GCCycles counts completed garbage collections since process
 	// start; GCCPUSeconds is the CPU time the collector has consumed.
 	// Both are cumulative, so sample twice and diff for a rate.
@@ -121,6 +138,7 @@ func runtimeSamples() []metrics.Sample {
 		{Name: "/gc/cycles/total:gc-cycles"},
 		{Name: "/cpu/classes/gc/total:cpu-seconds"},
 		{Name: "/sched/goroutines:goroutines"},
+		{Name: "/gc/heap/live:bytes"},
 	}
 }
 
@@ -176,6 +194,11 @@ func (e *Engine) Stats() Stats {
 	s.GCCycles = sampleUint64(samples[4])
 	s.GCCPUSeconds = sampleFloat64(samples[5])
 	s.Goroutines = int(sampleUint64(samples[6]))
+	s.HeapMarked = sampleUint64(samples[7])
+	// Derived from the same GOMEMLIMIT reading as MemLimit (raw, so
+	// effectiveCeiling applies its own "unset" folding), so the two
+	// fields always agree within one snapshot.
+	s.MemCeiling = effectiveCeiling(e.mem.ceiling.Load(), sampleUint64(samples[3]))
 	return s
 }
 
@@ -203,6 +226,8 @@ func (s Stats) promMetrics() []promMetric {
 		{"bytdb_runtime_total_bytes", "All memory mapped by the Go runtime.", "gauge", u(s.RuntimeTotal)},
 		{"bytdb_mem_limit_bytes", "GOMEMLIMIT soft limit; 0 when unset.", "gauge", u(s.MemLimit)},
 		{"bytdb_heap_fraction", "heap_live / mem_limit; 0 when no limit is set.", "gauge", fmt.Sprintf("%g", s.HeapFraction())},
+		{"bytdb_heap_marked_bytes", "Heap the last GC found reachable; what the memory ceiling is compared against.", "gauge", u(s.HeapMarked)},
+		{"bytdb_mem_ceiling_bytes", "Effective memory ceiling; writes and large results are refused above it. 0 when inactive.", "gauge", u(s.MemCeiling)},
 		{"bytdb_gc_cycles_total", "Completed garbage collections.", "counter", u(s.GCCycles)},
 		{"bytdb_gc_cpu_seconds_total", "CPU time spent in the garbage collector.", "counter", fmt.Sprintf("%g", s.GCCPUSeconds)},
 		{"bytdb_goroutines", "Live goroutines.", "gauge", fmt.Sprint(s.Goroutines)},
