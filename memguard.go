@@ -136,8 +136,16 @@ type memGuard struct {
 	// the runtime; tests substitute a fake to drive the guard without
 	// actually exhausting memory or setting a tiny GOMEMLIMIT, which
 	// would make the whole test binary thrash.
-	sample func() (live, gomemlimit uint64)
+	//
+	// Atomic because resample also runs on the forced-GC goroutine,
+	// which can outlive the check that started it: a test swapping the
+	// fake while that goroutine reads it is a data race under -race,
+	// even though production never writes the hook after Open.
+	sample atomic.Pointer[sampleFunc]
 }
+
+// sampleFunc is the signature of memGuard.sample.
+type sampleFunc func() (live, gomemlimit uint64)
 
 // memVerdict is one heap reading and the ceiling in force when it was
 // taken. ceiling 0 means the guard was inactive (automatic mode with
@@ -200,9 +208,9 @@ func effectiveCeiling(cfg int64, gomemlimit uint64) uint64 {
 // runtime.GC blocks until the cycle finishes, and a refused statement
 // should fail fast rather than wait out a full collection.
 func (g *memGuard) resample(now int64) *memVerdict {
-	sample := g.sample
-	if sample == nil {
-		sample = runtimeMemSample
+	sample := runtimeMemSample
+	if f := g.sample.Load(); f != nil {
+		sample = *f
 	}
 	live, gml := sample()
 	v := &memVerdict{at: now, live: live, ceiling: effectiveCeiling(g.ceiling.Load(), gml)}

@@ -20,7 +20,8 @@ import (
 func fakeHeap(e *Engine, live, gomemlimit uint64) *atomic.Uint64 {
 	var l atomic.Uint64
 	l.Store(live)
-	e.mem.sample = func() (uint64, uint64) { return l.Load(), gomemlimit }
+	f := sampleFunc(func() (uint64, uint64) { return l.Load(), gomemlimit })
+	e.mem.sample.Store(&f)
 	e.mem.verdict.Store(nil)
 	return &l
 }
