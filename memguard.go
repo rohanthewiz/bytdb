@@ -1,7 +1,7 @@
 package bytdb
 
-// memguard.go: two admission controls that turn "the process is about
-// to be OOM-killed" into an ordinary, retryable statement error.
+// memguard.go: three admission controls that turn "the process is
+// about to be OOM-killed" into an ordinary, retryable statement error.
 //
 //   - The memory ceiling (CheckMemory) refuses work that grows the heap
 //     — row inserts and updates, index builds, table rewrites, and the
@@ -12,11 +12,19 @@ package bytdb
 //     query may materialize. The SQL layer enforces it; the engine only
 //     holds the knob, so every frontend sharing the engine (sql.DB,
 //     Sessions, database/sql, pgwire) is bound by the one setting.
+//   - The transaction write cap (MaxTxnWrites) bounds how many row
+//     inserts and updates one transaction may stage. Staged writes are
+//     reachable until commit, so no amount of GC reclaims them; the cap
+//     refuses a runaway whole-table UPDATE, huge multi-row INSERT or
+//     long BEGIN ... COMMIT block at a known size, whether or not
+//     GOMEMLIMIT is set.
 //
-// Neither control can make the process safe on its own: GOMEMLIMIT
-// keeps garbage from piling up, the ceiling keeps reachable data from
-// growing past the point where GC can help, and the row cap keeps one
-// query from allocating gigabytes between two ceiling checks.
+// No control can make the process safe on its own: GOMEMLIMIT keeps
+// garbage from piling up, the ceiling keeps reachable data from
+// growing past the point where GC can help, the row cap keeps one
+// query from allocating gigabytes between two ceiling checks, and the
+// write cap keeps one transaction's private copy from doing the same
+// on a host that never set a ceiling.
 
 import (
 	"errors"
@@ -58,6 +66,34 @@ const DefaultMemoryCeilingFraction = 0.9
 // genuinely need more should paginate (keyset on the primary key), or
 // raise the cap deliberately.
 const DefaultMaxResultRows = 10_000_000
+
+// ErrTxnTooLarge is the root of every transaction write cap refusal
+// (see SetMaxTxnWrites). Match it with errors.Is. pgwire reports it as
+// SQLSTATE 54000 (program_limit_exceeded), keyed off the error text,
+// so keep the wording stable.
+var ErrTxnTooLarge = errors.New("transaction write limit exceeded")
+
+// DefaultMaxTxnWrites is the cap on row inserts and updates one
+// transaction may stage (see SetMaxTxnWrites).
+//
+// Every staged write stays reachable until commit: the transaction's
+// private copy-on-write tree, its pending WAL records and, under
+// concurrent writes, its replayable op list. Measured at roughly
+// 350-400 bytes of heap per row for a narrow unindexed row, and
+// 0.7-1 KB once a secondary index or two are involved, ten million
+// writes is 3.5-10 GB held by one transaction.
+//
+// The value matches DefaultMaxResultRows rather than the much lower
+// DefaultBackfillLimit on purpose. A backfill is a side effect of one
+// DDL statement, so refusing it early costs nothing. Here, refusing a
+// legitimate bulk load is the failure the default must avoid. Loaders
+// such as dbc's sql.write copy a whole table in one transaction, and
+// a few million rows is an ordinary load. Ten million still catches
+// the accidents this exists for (a whole-table UPDATE of a big table,
+// a loader that never commits) before they take the process down.
+// A host with less memory than that lowers the cap, or sets
+// GOMEMLIMIT so the memory ceiling stops the transaction first.
+const DefaultMaxTxnWrites = 10_000_000
 
 // memSampleInterval is how long one heap reading is trusted. The check
 // sits on per-row write paths (every insert and update), where reading
@@ -278,3 +314,55 @@ func (e *Engine) SetMaxResultRows(n int64) { e.maxResultRows.Store(n) }
 
 // MaxResultRows reports the current result row cap (0 or less: none).
 func (e *Engine) MaxResultRows() int64 { return e.maxResultRows.Load() }
+
+// SetMaxTxnWrites changes the cap on row writes a single transaction
+// may stage before it commits. Each row inserted counts once, and each
+// row updated counts once per update (updating the same row twice
+// stages two writes' worth of WAL records). The write that would go
+// past the cap fails with ErrTxnTooLarge, which reaches clients as
+// SQLSTATE 54000. The refused write stages nothing, so an embedded
+// caller holding a Txn can commit what it has and carry on in a new
+// transaction; a SQL BEGIN block is aborted, as after any error, and
+// must be rolled back (or rolled back to a savepoint). A value of 0 or less
+// disables the cap, the same idiom as SetBackfillLimit and
+// SetMaxResultRows.
+//
+// What is counted, and why:
+//
+//	INSERT (every path)        counted   ~350 B-1 KB staged per row
+//	UPDATE (incl. ON CONFLICT  counted   about the same as an insert:
+//	  DO UPDATE, FK SET NULL)            a new row version plus index moves
+//	DELETE                     exempt    ~30 B per row (a tombstone record
+//	                                     and a shrinking tree), and it is how
+//	                                     an operator frees space
+//	TRUNCATE                   exempt    one range record, whatever the size
+//	DDL rewrites (ALTER)       exempt    bounded by SetBackfillLimit instead
+//
+// A rollback to a savepoint gives back the writes it discards, so a
+// SQL block that retries a failed batch after ROLLBACK TO is not
+// charged twice.
+//
+// The cap applies to the transactions behind every frontend: Txn from
+// Begin and WriteTxn, SQL statements and BEGIN ... COMMIT blocks, and
+// pgwire sessions. One-shot Engine.Insert and Engine.Update write a
+// single row and so can never reach it.
+//
+// Safe to call at any time; every write reads the current value, so a
+// change applies to transactions already open.
+func (e *Engine) SetMaxTxnWrites(n int64) { e.maxTxnWrites.Store(n) }
+
+// MaxTxnWrites reports the current transaction write cap (0 or less:
+// none).
+func (e *Engine) MaxTxnWrites() int64 { return e.maxTxnWrites.Load() }
+
+// txnTooLargeErr is the write cap refusal. The hint names the batching
+// recipe first, because it bounds memory by the batch size whatever
+// the table grows to; raising the cap only moves the cliff.
+func txnTooLargeErr(limit int64) error {
+	return serr.Wrap(ErrTxnTooLarge,
+		"maxTxnWrites", strconv.FormatInt(limit, 10),
+		"hint", "split the work into several transactions, committing every few "+
+			"hundred thousand rows (for an UPDATE, one statement per key range: "+
+			"UPDATE ... WHERE id >= $1 AND id < $2; for a load, COMMIT between chunks); "+
+			"or raise the limit: Engine.SetMaxTxnWrites, bytdbd -max-txn-writes")
+}

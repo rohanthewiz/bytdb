@@ -958,6 +958,16 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		// VALUES statement-snapshot semantics (evaluated once), matching
 		// Postgres rather than re-running per VALUES row.
 		venv := &exEnv{d: d, tx: tx, sc: &scope{}, subs: newSubMemo()}
+		// Without ON CONFLICT every row is exactly one write, so a batch
+		// that cannot fit under the transaction write cap is refused
+		// whole, before the first row is staged. With ON CONFLICT the
+		// row count is only an upper bound (DO NOTHING writes nothing),
+		// so the per-row charge in Txn.InsertReturning decides instead.
+		if up == nil {
+			if err := tx.CheckWrites(int64(len(s.Rows))); err != nil {
+				return serr.Wrap(err, "op", "insert", "table", s.Table)
+			}
+		}
 		for _, row := range s.Rows {
 			vals := row
 			// s.Cols (not ords) is the column-list signal: DEFAULT VALUES
@@ -1130,14 +1140,25 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		}
 		// Materialize matching rows before writing: updates move rows
 		// and index entries under a live scan.
+		//
+		// Every materialized row becomes exactly one write, so the
+		// transaction write cap (Engine.SetMaxTxnWrites) is charged as
+		// the set grows: an UPDATE that would go over it fails during
+		// the scan, before it has staged a single write or finished
+		// materializing a table it could never commit.
 		env := d.tableEnv(tx, s.Table, desc)
 		var rows [][]any
+		var capErr error
 		err = scanPlan(d.ctx, tx, s.Table, pl, env, func(r bytdb.Row) bool {
 			rows = append(rows, r.Vals)
-			return true
+			capErr = tx.CheckWrites(int64(len(rows)))
+			return capErr == nil
 		})
 		if err != nil {
 			return err
+		}
+		if capErr != nil {
+			return serr.Wrap(capErr, "op", "update", "table", s.Table)
 		}
 		// Inbound foreign keys: if any other table references this one,
 		// old row images whose referenced columns change must be

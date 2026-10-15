@@ -65,6 +65,9 @@ func main() {
 		"serve Prometheus metrics (engine size, heap, GC, connections) at http://<addr>/metrics (empty = disabled)")
 	maxResultRows := flag.Int64("max-result-rows", bytdb.DefaultMaxResultRows,
 		"maximum rows one query may hold in memory (0 or negative = no cap); larger queries fail with 54000")
+	maxTxnWrites := flag.Int64("max-txn-writes", bytdb.DefaultMaxTxnWrites,
+		"maximum row inserts and updates one transaction may stage before commit (0 or negative = no cap); "+
+			"the write past it fails with 54000")
 	memCeiling := flag.String("memory-ceiling", "auto",
 		"refuse inserts, updates and large results with 53200 once the live heap passes this: "+
 			"auto (90% of GOMEMLIMIT; inactive without it), off, or a size like 6GiB")
@@ -118,6 +121,7 @@ func main() {
 	// reaches too — so the engine's final flush and fsync always run.
 	defer e.Close()
 	e.SetMaxResultRows(*maxResultRows)
+	e.SetMaxTxnWrites(*maxTxnWrites)
 	e.SetMemoryCeiling(ceiling)
 
 	srv := pgwire.NewServer(sql.New(e))

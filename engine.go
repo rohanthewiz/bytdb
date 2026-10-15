@@ -350,6 +350,12 @@ type Engine struct {
 	// See SetMaxResultRows.
 	maxResultRows atomic.Int64
 
+	// maxTxnWrites caps the row inserts and updates one transaction may
+	// stage before commit; 0 or less disables it. Atomic for the same
+	// reason as backfillLimit. Counted per transaction in Txn.writes.
+	// See SetMaxTxnWrites.
+	maxTxnWrites atomic.Int64
+
 	// mem is the memory-ceiling admission control; see memguard.go.
 	mem memGuard
 
@@ -558,6 +564,7 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 	}
 	e.backfillLimit.Store(DefaultBackfillLimit)
 	e.maxResultRows.Store(DefaultMaxResultRows)
+	e.maxTxnWrites.Store(DefaultMaxTxnWrites)
 	if err := e.loadCatalog(); err != nil {
 		kv.Close() // also releases the file lock
 		return nil, err

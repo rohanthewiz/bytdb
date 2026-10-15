@@ -11,12 +11,15 @@ from, and it means **your working set must fit in RAM**. There is no buffer
 pool, no spill-to-disk. Budget memory for the data plus a transient second
 copy of hot tree nodes during writes/snapshots.
 
-Two guards stand between a growing heap and an OOM kill. Both are on by
+Three guards stand between a growing heap and an OOM kill. All are on by
 default. The **memory ceiling** applies once `GOMEMLIMIT` is set: past it,
 inserts, updates, index builds and large reads fail with SQLSTATE 53200,
 while DELETE, DROP and TRUNCATE still work. The **result row cap** (10M
 rows) applies to every row set a single query holds in memory, and
-breaching it fails with SQLSTATE 54000. Edges worth knowing:
+breaching it fails with SQLSTATE 54000. The **transaction write cap** (10M
+row inserts and updates) applies to everything one transaction stages
+before commit, and breaching it also fails with SQLSTATE 54000. Edges
+worth knowing:
 
 - An unindexed `ORDER BY x LIMIT 10` sorts every matching row before the
   LIMIT applies, so it counts all of them against the cap. An index on `x`
@@ -27,8 +30,15 @@ breaching it fails with SQLSTATE 54000. Edges worth knowing:
   `SetMemoryCeiling` and no `GOMEMLIMIT`, the process can briefly hold up
   to about twice that figure between collections (GOGC=100), so leave the
   room.
-- One large write transaction has no row cap yet. A whole-table `UPDATE`
-  is stopped only by the ceiling, part-way through. Batch it.
+- The write cap counts row writes, not distinct rows. Updating the same
+  row twice in one transaction counts twice, because each update stages
+  its own WAL record. DELETE and TRUNCATE are exempt. A delete stages
+  about a tenth of what an insert does, and it is how you free space.
+- A whole-table `UPDATE` over the write cap fails during its scan, before
+  it writes anything. Batch it by key range and commit between batches.
+  10M staged writes is still 3.5 to 10 GB, so on a smaller host either
+  set `GOMEMLIMIT` (the ceiling then stops the transaction first) or
+  lower the cap with `SetMaxTxnWrites` / `bytdbd -max-txn-writes`.
 
 ## Concurrency model
 

@@ -31,28 +31,21 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-029
+**Next ID:** N-030
 
 ## Open
 
-- **N-028** · raised `2026-1015-0809-memory-ceiling-result-row-cap` · value medium
-  **Cap the size of one write transaction.** Every staged write stays live
-  until commit, at roughly 0.7–1 KB of heap per row for a ~60-byte row.
-  Nothing bounds that outside the ALTER paths (`DefaultBackfillLimit`,
-  `ddl.go` / `alter.go` `checkRewriteLimit`). A whole-table `UPDATE big
-  SET …`, a large multi-row INSERT, or a long `BEGIN … COMMIT` block grows
-  without limit. The memory ceiling (`memguard.go`, `Engine.CheckMemory`)
-  stops it part-way only once the live heap passes the ceiling, and only
-  when `GOMEMLIMIT` or an explicit ceiling is set. Shape: an
-  `Engine.SetMaxTxnWrites(n)` knob (0 disables, as with `SetBackfillLimit`),
-  counted per transaction in `insertRow` / `updateRow` (and possibly the
-  `execUpdate` pre-write materialization in `sql/exec.go`). It would fail
-  with SQLSTATE 54000 and a message naming the batching recipe. DELETE
-  probably stays exempt, as it is for the ceiling, though a huge
-  single-transaction DELETE still stages tombstones and COW copies until
-  commit. Decide that when picking this up. *This is point 2 of the OOM
-  gap analysis. Points 1 and 3 shipped this session as the result row cap
-  and the memory ceiling.*
+- **N-029** · raised `2026-1015-1609-txn-write-cap` · value low
+  **UPDATE's pre-write materialization skips the result row budget.**
+  `execUpdate` in `sql/exec.go` collects every matching row into `rows`
+  before writing (so updates can move rows under a live scan), but unlike
+  every other in-memory row set it never calls `budget.check`, so neither
+  `MaxResultRows` nor the periodic `CheckMemory` poll applies there. Since
+  N-028 the transaction write cap bounds it (each collected row is charged
+  through `Txn.CheckWrites`), so it is no longer unbounded by default. It
+  is still the one materialization that ignores the row cap and the
+  ceiling poll while it grows. Check `execDelete` for the same pattern.
+  Fix: charge `d.budget()` in the scan callback next to `CheckWrites`.
 
 ## Roadmap
 
@@ -122,6 +115,33 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-028** · raised `2026-1015-0809-memory-ceiling-result-row-cap` · closed
+  2026-10-15, `2026-1015-1609-txn-write-cap`. **Cap the size of one write transaction.**
+  `Engine.SetMaxTxnWrites(n)` / `MaxTxnWrites()` in `memguard.go`, default
+  `DefaultMaxTxnWrites` = 10M (0 or less disables). The write past the cap
+  fails with `bytdb.ErrTxnTooLarge` ("transaction write limit exceeded"),
+  which pgwire maps to SQLSTATE 54000. The hint names the batching recipe.
+  Counted on `Txn` (`Txn.writes`, charged in `InsertReturning` /
+  `UpdateReturning` once a write is staged), not in `insertRow` /
+  `updateRow`, because only `Txn` lives as long as a transaction. One-shot
+  `Engine.Insert` / `Update` write a single row and cannot reach any cap.
+  `Txn.Savepoint` / `RollbackTo` / `Release` mirror the kv savepoint stack
+  with the count at each mark, so `ROLLBACK TO` gives writes back.
+  `Txn.CheckWrites(n)` lets the SQL layer refuse early: `execUpdate`
+  charges its pre-write materialization row by row, and a plain multi-row
+  INSERT (no ON CONFLICT) checks its row count, so both fail before
+  staging anything. **Decisions:** DELETE and TRUNCATE are exempt. A delete
+  stages about 32 B/row against about 350–380 B/row for insert and update
+  (measured, 200k rows, 3-column unindexed table), and it is how an
+  operator frees space. The default is 10M rather than the backfill cap's 1M because dbc's
+  `sql.write` loads a whole table in one transaction, so a few million rows
+  is an ordinary load. `bytdbd -max-txn-writes`. Tests: `txnwrites_test.go`
+  (counting, exemptions, savepoints, WriteTxn, disabled), `sql/txnwrites_test.go`
+  (UPDATE / INSERT refused whole, ON CONFLICT DO NOTHING not over-charged,
+  DELETE exempt, BEGIN block accumulation and ROLLBACK TO give-back), and
+  `pgwire` `TestSQLStateMapping` / `TestResourceErrorsEndToEnd` (54000). Docs:
+  README Monitoring memory, `docs/gotchas.md` Sizing, `docs/security.md`
+  flag table. Needs a release (pgwire's `bytdbd` uses the new symbols).
 - **N-027** · raised in dbc as its N-131 (dbc doc `2026-1006-1855-scripts-dir-resolution`) · closed
   2026-10-06, `2026-1006-1907-int-into-bool-coerce-v0.21.2`. **An integer 0/1 could not be stored in a bool column.** SQLite
   has no boolean type and returns a BOOLEAN column as int64 0/1, so dbc's

@@ -209,6 +209,7 @@ returns XX000 instead of killing the process.
 | `-idle-tx-timeout` | `0` (= 5 min) | Negative disables |
 | `-max-conns` | `0` (= 100) | Connection cap |
 | `-max-result-rows` | `10000000` | Rows one query may hold in memory; `0` disables (54000 when exceeded) |
+| `-max-txn-writes` | `10000000` | Row inserts and updates one transaction may stage; `0` disables (54000 when exceeded) |
 | `-memory-ceiling` | `auto` | Refuse inserts, updates and large results past this live heap: `auto` (90% of `GOMEMLIMIT`), `off`, or a size like `6GiB` (53200 when exceeded) |
 | `-log-queries` | false | Log SQL, duration, and outcome per statement |
 

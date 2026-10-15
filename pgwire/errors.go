@@ -125,7 +125,8 @@ func sqlstate(msg string, hasPos bool) string {
 		return "42P05" // duplicate_prepared_statement
 	case strings.Contains(msg, "too many prepared statements"),
 		strings.Contains(msg, "too many portals"),
-		strings.Contains(msg, "result row limit"): // Engine.SetMaxResultRows
+		strings.Contains(msg, "result row limit"),                 // Engine.SetMaxResultRows
+		strings.Contains(msg, "transaction write limit exceeded"): // bytdb.ErrTxnTooLarge
 		return "54000" // program_limit_exceeded
 	// The engine's memory ceiling (bytdb.ErrOutOfMemory). Postgres
 	// raises 53200 when an allocation fails; clients and pools treat

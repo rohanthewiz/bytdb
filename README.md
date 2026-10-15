@@ -698,8 +698,8 @@ credentials registry set, SCRAM-SHA-256 runs for real — RFC 5802 with
 channel binding (SCRAM-SHA-256-PLUS) over TLS. `bytdbd` adds
 `-max-conns` (a connection cap), `-sync always|never` (WAL fsync
 policy), query logging, `-metrics-addr` (a Prometheus `/metrics`
-endpoint), and `-memory-ceiling` / `-max-result-rows` (OOM guards). The
-last two are covered under Monitoring memory. Transaction blocks work as in Postgres:
+endpoint), and `-memory-ceiling` / `-max-result-rows` / `-max-txn-writes`
+(OOM guards). The last three are covered under Monitoring memory. Transaction blocks work as in Postgres:
 each connection is a `sql.Session`, `ReadyForQuery` reports the real
 status (idle / in transaction / failed), redundant `BEGIN`/`COMMIT`
 raise `NoticeResponse` warnings (IF [NOT] EXISTS skips arrive at
@@ -845,7 +845,7 @@ be freed by any amount of GC, which is why large single-transaction
 rewrites should be batched (see the ADD COLUMN note in the SQL
 section).
 
-Two guards turn "about to be OOM-killed" into ordinary statement errors:
+Three guards turn "about to be OOM-killed" into ordinary statement errors:
 
 - **Memory ceiling.** Once the heap the last GC found reachable
   (`Stats.HeapMarked`) passes the ceiling (`Stats.MemCeiling`), inserts,
@@ -867,9 +867,21 @@ Two guards turn "about to be OOM-killed" into ordinary statement errors:
   `ORDER BY … LIMIT n` still sorts every matching row, so it counts them
   all. Change the cap with `Engine.SetMaxResultRows(n)`; `0` or less
   disables it.
+- **Transaction write cap.** No transaction may stage more than
+  `DefaultMaxTxnWrites` (10M) row inserts and updates before it commits.
+  At roughly 350 B to 1 KB of heap per staged row, that is 3.5 to 10 GB.
+  The write past the cap fails with `bytdb.ErrTxnTooLarge` (SQLSTATE
+  54000). A SQL UPDATE or multi-row INSERT that cannot fit is refused
+  before it writes anything. The count spans a whole `BEGIN … COMMIT`
+  block, and `ROLLBACK TO SAVEPOINT` gives back the writes it discards.
+  DELETE (about 30 B staged per row) and TRUNCATE are exempt. The remedy
+  is to commit in batches, for example one `UPDATE … WHERE id >= $1 AND
+  id < $2` per key range. Change the cap with `Engine.SetMaxTxnWrites(n)`;
+  `0` or less disables it. Unlike the ceiling, it works without
+  `GOMEMLIMIT`, so on a small host without one, lower it to fit.
 
-`bytdbd` exposes both as `-memory-ceiling auto|off|6GiB` and
-`-max-result-rows N`. A sound production setup: `GOMEMLIMIT` at about
+`bytdbd` exposes all three as `-memory-ceiling auto|off|6GiB`,
+`-max-result-rows N` and `-max-txn-writes N`. A sound production setup: `GOMEMLIMIT` at about
 80% of the container limit, the ceiling left on `auto`, and an alert on
 `bytdb_heap_marked_bytes / bytdb_mem_ceiling_bytes` above 0.8.
 

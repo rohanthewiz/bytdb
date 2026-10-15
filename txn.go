@@ -47,7 +47,48 @@ type Txn struct {
 	// re-reads stored state), so a savepoint rollback that undoes the
 	// truncate needs no compensating bookkeeping.
 	dirtySeqPrefixes []string
+	// writes counts the row inserts and updates staged so far, for the
+	// engine's transaction write cap (see SetMaxTxnWrites). A plain
+	// int64 is enough: a Txn is single-goroutine, like the kv Tx under
+	// it.
+	writes int64
+	// saveWrites mirrors the kv layer's savepoint stack, pairing each
+	// outstanding savepoint with the write count at its mark. RollbackTo
+	// restores the count with the state, so writes a rollback discards
+	// stop counting against the cap. The kv Savepoint is an alias for
+	// btypedb's type, so the count cannot ride on it as a field.
+	//
+	//	writes:  0 ── 40 ──[SAVEPOINT a]── 90 ──[SAVEPOINT b]── 120
+	//	stack:            {a, 40}                 {b, 90}
+	//	ROLLBACK TO a  →  writes = 40, stack = [{a, 40}]
+	//	RELEASE a      →  writes kept, stack = []
+	saveWrites []savepointMark
 }
+
+// savepointMark is one saveWrites entry.
+type savepointMark struct {
+	sp     *Savepoint
+	writes int64
+}
+
+// CheckWrites returns an ErrTxnTooLarge error when staging n more row
+// writes would take the transaction past the engine's write cap, and
+// nil otherwise (including when the cap is disabled). Insert and
+// Update charge themselves; this is for a caller that knows a batch's
+// size before writing any of it, such as the SQL layer's UPDATE, which
+// materializes the rows it will change first. Refusing there fails the
+// statement before it has staged anything.
+func (t *Txn) CheckWrites(n int64) error {
+	limit := t.e.maxTxnWrites.Load()
+	if limit <= 0 || t.writes+n <= limit {
+		return nil
+	}
+	return txnTooLargeErr(limit)
+}
+
+// Writes reports how many row inserts and updates the transaction has
+// staged (net of savepoint rollbacks) toward the write cap.
+func (t *Txn) Writes() int64 { return t.writes }
 
 // flushSeqInvalidations discards allocators for every counter range
 // the just-committed transaction deleted. Called only after a
@@ -293,15 +334,56 @@ type Savepoint = btypedb.Savepoint[string, []byte]
 // nest; rolling back to or releasing an earlier one destroys the
 // later ones, and any still outstanding at Commit or Rollback are
 // cleaned up with the transaction.
-func (t *Txn) Savepoint() (*Savepoint, error) { return t.tx.Savepoint() }
+func (t *Txn) Savepoint() (*Savepoint, error) {
+	sp, err := t.tx.Savepoint()
+	if err != nil {
+		return nil, err
+	}
+	t.saveWrites = append(t.saveWrites, savepointMark{sp, t.writes})
+	return sp, nil
+}
 
 // RollbackTo restores the transaction to the state sp captured,
-// discarding every change made after it. sp itself stays valid.
-func (t *Txn) RollbackTo(sp *Savepoint) error { return t.tx.RollbackTo(sp) }
+// discarding every change made after it. sp itself stays valid. The
+// write count rolls back with the state (see saveWrites).
+func (t *Txn) RollbackTo(sp *Savepoint) error {
+	if err := t.tx.RollbackTo(sp); err != nil {
+		return err
+	}
+	// The kv layer validated sp, so it is on the mirror stack too.
+	// Later marks are gone from the kv stack, so they go here as well.
+	if i := t.saveMark(sp); i >= 0 {
+		t.writes = t.saveWrites[i].writes
+		clear(t.saveWrites[i+1:])
+		t.saveWrites = t.saveWrites[:i+1]
+	}
+	return nil
+}
 
 // Release discards sp — and every savepoint created after it — while
-// keeping all of the transaction's changes.
-func (t *Txn) Release(sp *Savepoint) error { return t.tx.Release(sp) }
+// keeping all of the transaction's changes (and their write count).
+func (t *Txn) Release(sp *Savepoint) error {
+	if err := t.tx.Release(sp); err != nil {
+		return err
+	}
+	if i := t.saveMark(sp); i >= 0 {
+		clear(t.saveWrites[i:])
+		t.saveWrites = t.saveWrites[:i]
+	}
+	return nil
+}
+
+// saveMark finds sp on the saveWrites stack, or -1. The search runs
+// from the top: the savepoint being rolled back to or released is
+// usually the most recent one.
+func (t *Txn) saveMark(sp *Savepoint) int {
+	for i := len(t.saveWrites) - 1; i >= 0; i-- {
+		if t.saveWrites[i].sp == sp {
+			return i
+		}
+	}
+	return -1
+}
 
 // Table returns the descriptor for a table name in the transaction's
 // view, or nil if absent. A corrupt stored descriptor also reads as
@@ -351,6 +433,13 @@ func (t *Txn) Insert(table string, vals ...any) error {
 // party that knows a drawn identity value, so it must hand the final
 // row back rather than have callers reconstruct it.
 func (t *Txn) InsertReturning(table string, vals ...any) (Row, error) {
+	// The write cap is enforced here, not in insertRow, because the
+	// count is per transaction and only Txn carries one. The one-shot
+	// Engine.Insert paths that call insertRow directly write a single
+	// row, which no cap of 1 or more can refuse.
+	if err := t.CheckWrites(1); err != nil {
+		return Row{}, serr.Wrap(err, "op", "insert", "table", table)
+	}
 	desc, err := t.desc(table)
 	if err != nil {
 		return Row{}, err
@@ -359,6 +448,8 @@ func (t *Txn) InsertReturning(table string, vals ...any) (Row, error) {
 	if err != nil {
 		return Row{}, serr.Wrap(err, "op", "insert", "table", table)
 	}
+	// Counted only once staged: a failed insert writes nothing.
+	t.writes++
 	return Row{Desc: desc, Vals: stored}, nil
 }
 
@@ -380,6 +471,13 @@ func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (R
 	if err := t.e.CheckMemory(); err != nil {
 		return Row{}, false, serr.Wrap(err, "op", "update", "table", table)
 	}
+	// Checked before updateRow looks the row up, so at the cap even an
+	// update that would match nothing is refused. Checking after the
+	// lookup would need updateRow split in two; the transaction is at
+	// its limit either way, and its next real write would fail.
+	if err := t.CheckWrites(1); err != nil {
+		return Row{}, false, serr.Wrap(err, "op", "update", "table", table)
+	}
 	desc, err := t.desc(table)
 	if err != nil {
 		return Row{}, false, err
@@ -391,6 +489,7 @@ func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (R
 	if !updated {
 		return Row{}, false, nil
 	}
+	t.writes++
 	return Row{Desc: desc, Vals: newVals}, true, nil
 }
 

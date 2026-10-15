@@ -20,9 +20,11 @@ func TestSQLStateMapping(t *testing.T) {
 		hasPos bool
 		want   string
 	}{
-		// Resource refusals: the engine's result row cap and memory
-		// ceiling (bytdb.SetMaxResultRows / ErrOutOfMemory).
+		// Resource refusals: the engine's result row cap, transaction
+		// write cap and memory ceiling (bytdb.SetMaxResultRows /
+		// ErrTxnTooLarge / ErrOutOfMemory).
 		{"query would hold more rows in memory than the result row limit allows; narrow it", false, "54000"},
+		{"transaction write limit exceeded", false, "54000"},
 		{"out of memory", false, "53200"},
 
 		// A position always means the parser rejected the text,
@@ -137,6 +139,13 @@ func TestResourceErrorsEndToEnd(t *testing.T) {
 		t.Errorf("row cap: SQLSTATE %q (err %v), want 54000", got, err)
 	}
 	e.SetMaxResultRows(0)
+
+	e.SetMaxTxnWrites(2)
+	_, err = d.Exec(`update t set id = id + 10`)
+	if got := codeOf(errorBody(err, "", 0)); got != "54000" {
+		t.Errorf("write cap: SQLSTATE %q (err %v), want 54000", got, err)
+	}
+	e.SetMaxTxnWrites(0)
 
 	runtime.GC() // populate the marked-heap figure the ceiling reads
 	e.SetMemoryCeiling(1)
