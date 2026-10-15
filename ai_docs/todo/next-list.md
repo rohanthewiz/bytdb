@@ -31,12 +31,28 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-028
+**Next ID:** N-029
 
 ## Open
 
-*Empty since 2026-10-05: N-023, N-024 and N-025 closed in
-`2026-1005-1107-compaction-stall-vacuum-verbose-notices`.*
+- **N-028** · raised `2026-1015-0809-memory-ceiling-result-row-cap` · value medium
+  **Cap the size of one write transaction.** Every staged write stays live
+  until commit, at roughly 0.7–1 KB of heap per row for a ~60-byte row.
+  Nothing bounds that outside the ALTER paths (`DefaultBackfillLimit`,
+  `ddl.go` / `alter.go` `checkRewriteLimit`). A whole-table `UPDATE big
+  SET …`, a large multi-row INSERT, or a long `BEGIN … COMMIT` block grows
+  without limit. The memory ceiling (`memguard.go`, `Engine.CheckMemory`)
+  stops it part-way only once the live heap passes the ceiling, and only
+  when `GOMEMLIMIT` or an explicit ceiling is set. Shape: an
+  `Engine.SetMaxTxnWrites(n)` knob (0 disables, as with `SetBackfillLimit`),
+  counted per transaction in `insertRow` / `updateRow` (and possibly the
+  `execUpdate` pre-write materialization in `sql/exec.go`). It would fail
+  with SQLSTATE 54000 and a message naming the batching recipe. DELETE
+  probably stays exempt, as it is for the ceiling, though a huge
+  single-transaction DELETE still stages tombstones and COW copies until
+  commit. Decide that when picking this up. *This is point 2 of the OOM
+  gap analysis. Points 1 and 3 shipped this session as the result row cap
+  and the memory ceiling.*
 
 ## Roadmap
 
