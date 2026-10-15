@@ -7,3 +7,4 @@ site/
 bench/bench
 .claude/settings.local.json
 .cats-todo/
+.ced/

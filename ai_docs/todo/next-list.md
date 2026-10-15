@@ -35,17 +35,7 @@ through all 74 docs.
 
 ## Open
 
-- **N-029** · raised `2026-1015-1609-txn-write-cap` · value low
-  **UPDATE's pre-write materialization skips the result row budget.**
-  `execUpdate` in `sql/exec.go` collects every matching row into `rows`
-  before writing (so updates can move rows under a live scan), but unlike
-  every other in-memory row set it never calls `budget.check`, so neither
-  `MaxResultRows` nor the periodic `CheckMemory` poll applies there. Since
-  N-028 the transaction write cap bounds it (each collected row is charged
-  through `Txn.CheckWrites`), so it is no longer unbounded by default. It
-  is still the one materialization that ignores the row cap and the
-  ceiling poll while it grows. Check `execDelete` for the same pattern.
-  Fix: charge `d.budget()` in the scan callback next to `CheckWrites`.
+*(none)*
 
 ## Roadmap
 
@@ -65,6 +55,24 @@ arrives.
   commit `dd7a25d` (closing N-022) deleted the whole Roadmap and Non-goals
   sections with no closing line. Premise re-checked against btypedb then:
   still absent, and both citations still hold.*
+- **N-029** · raised `2026-1015-1609-txn-write-cap` · value low
+  **UPDATE's pre-write materialization skips the result row budget.**
+  `execUpdate` in `sql/exec.go` collects every matching row into `rows`
+  before writing (so updates can move rows under a live scan), but unlike
+  every other in-memory row set it never calls `budget.check`, so neither
+  `MaxResultRows` nor the periodic `CheckMemory` poll applies there. Since
+  N-028 the transaction write cap bounds it (each collected row is charged
+  through `Txn.CheckWrites`), so it is no longer unbounded by default. It
+  is still the one materialization that ignores the row cap and the
+  ceiling poll while it grows. Fix: charge `d.budget()` in the scan
+  callback next to `CheckWrites`. With both defaults at 10M, the row cap
+  adds nothing there by default. The gain is the `CheckMemory` poll while
+  the set grows, on hosts with `GOMEMLIMIT` set. *`/next-list`
+  2026-10-15: checked `execDelete` as this item asked. `collectPKs` is
+  unbudgeted too, but leave it: charging the row cap there would refuse a
+  `DELETE FROM big` of more than 10M rows, against DELETE's deliberate
+  exemptions (`DB.freeing` skips the ceiling, and the write cap doesn't
+  count deletes). Scope is UPDATE only.*
 
 ## Non-goals
 
