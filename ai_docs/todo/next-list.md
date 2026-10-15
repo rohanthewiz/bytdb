@@ -141,7 +141,8 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   DELETE exempt, BEGIN block accumulation and ROLLBACK TO give-back), and
   `pgwire` `TestSQLStateMapping` / `TestResourceErrorsEndToEnd` (54000). Docs:
   README Monitoring memory, `docs/gotchas.md` Sizing, `docs/security.md`
-  flag table. Needs a release (pgwire's `bytdbd` uses the new symbols).
+  flag table. Released in `v0.22.0` (`3b2efdc`) and `pgwire/v0.22.0`
+  (`bb7f808`).
 - **N-027** · raised in dbc as its N-131 (dbc doc `2026-1006-1855-scripts-dir-resolution`) · closed
   2026-10-06, `2026-1006-1907-int-into-bool-coerce-v0.21.2`. **An integer 0/1 could not be stored in a bool column.** SQLite
   has no boolean type and returns a BOOLEAN column as int64 0/1, so dbc's
