@@ -162,6 +162,14 @@ func sqlstate(msg string, hasPos bool) string {
 		return "3B001" // invalid_savepoint_specification
 	case strings.Contains(msg, "not yet defined in this session"):
 		return "55000" // object_not_in_prerequisite_state (lastval/currval)
+	// ALTER COLUMN ... RESTART on a column with no counter: Postgres's
+	// wording and code.
+	case strings.HasSuffix(msg, "is not an identity column"):
+		return "55000" // object_not_in_prerequisite_state
+	// A RESTART value outside the counter's bounds, from ALTER SEQUENCE
+	// or ALTER COLUMN ... RESTART. Postgres reports both as 22023.
+	case strings.HasPrefix(msg, "RESTART value ("):
+		return "22023" // invalid_parameter_value
 	}
 	return "XX000"
 }

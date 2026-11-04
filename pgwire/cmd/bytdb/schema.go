@@ -14,10 +14,18 @@ package main
 //	1. CREATE SEQUENCE + setval   column DEFAULTs may call nextval()
 //	2. CREATE TABLE               with PK, NOT NULL, DEFAULT, CHECK
 //	3. INSERT (in BEGIN/COMMIT)   rows satisfy the inline checks
+//	   ALTER COLUMN ... RESTART   per identity column, after its rows
 //	4. CREATE [UNIQUE] INDEX      built once over the loaded rows
 //	5. ALTER TABLE ADD FOREIGN KEY  every parent row now exists
 //	6. CREATE VIEW                views can reference views, so ordered
 //	                              by dependency
+//
+// The RESTART line has to follow the rows: each restored explicit id
+// bumps the counter past itself, so a RESTART placed before them would
+// be overwritten whenever the counter was ahead of the largest stored
+// id (a drawn value since deleted). Placed after, it sets the counter to
+// exactly what the source held, and a replayed dump dumps back to the
+// same text.
 //
 // Foreign keys are deferred to step 5 because table order cannot always
 // satisfy them (a self-reference, or two tables referencing each other),
@@ -27,6 +35,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
@@ -301,6 +310,9 @@ func writeDump(w io.Writer, e *bytdb.Engine, names []string) error {
 			if err := dumpRows(w, tx, desc); err != nil {
 				return err
 			}
+			if err := dumpIdentityCounters(w, tx, desc); err != nil {
+				return err
+			}
 		}
 		for _, desc := range descs {
 			for i := range desc.Indexes {
@@ -392,6 +404,45 @@ func dumpRows(w io.Writer, tx *bytdb.Txn, desc *bytdb.TableDesc) error {
 		b.WriteString("COMMIT;\n")
 	}
 	return flush()
+}
+
+// dumpIdentityCounters writes one ALTER TABLE ... RESTART WITH line per
+// identity column whose counter exists, so a restored serial column
+// resumes where the source's would have (N-032). Without it, the
+// restored counter would sit just past the largest restored id, and a
+// value that was drawn and then deleted before the dump could be handed
+// out a second time.
+//
+// A column with no counter yet (nothing drawn or inserted since the
+// table was created or truncated with RESTART IDENTITY) gets no line:
+// the restored table has none either, and both draw 1 first. An
+// exhausted counter (past math.MaxInt64) cannot be expressed as a
+// RESTART value, so it gets a comment instead; the restored column then
+// resumes after its largest stored id.
+func dumpIdentityCounters(w io.Writer, tx *bytdb.Txn, desc *bytdb.TableDesc) error {
+	for _, c := range desc.Columns {
+		if !c.Identity {
+			continue
+		}
+		next, ok, err := tx.PeekIdentity(desc.Name, c.Name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if next > math.MaxInt64 {
+			_, err = fmt.Fprintf(w, "-- identity %s.%s is exhausted; its counter is not restored\n",
+				quoteIdent(desc.Name), quoteIdent(c.Name))
+		} else {
+			_, err = fmt.Fprintf(w, "ALTER TABLE %s ALTER COLUMN %s RESTART WITH %d;\n",
+				quoteIdent(desc.Name), quoteIdent(c.Name), next)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // describeTable builds DESCRIBE's result for a table, shaped like

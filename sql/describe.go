@@ -335,7 +335,7 @@ func command(st Statement) string {
 	case *AddColumn, *DropColumn, *RenameTable, *RenameColumn,
 		*AddConstraint, *AddFK, *DropConstraint, *AlterOwner,
 		*AlterColumnDefault, *AlterColumnNotNull, *AlterColumnType,
-		*AlterColumnNoop, *ReplacePrimaryKey:
+		*AlterColumnNoop, *AlterColumnRestart, *ReplacePrimaryKey:
 		return "ALTER TABLE"
 	case *CreateIndex:
 		return "CREATE INDEX"

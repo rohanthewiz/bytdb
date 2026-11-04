@@ -193,9 +193,11 @@ during replay:
    data, so self-references and mutual references load cleanly.
 6. views, ordered so that each view comes after the views it reads
 
-Identity (`serial`) counters resume after the highest restored value.
-The one exception is a value that was drawn and then deleted before the
-dump: it can be handed out again after a restore.
+Each identity (`serial`) column's counter follows its table's rows as
+`ALTER TABLE … ALTER COLUMN … RESTART WITH n`, so a restored table draws
+exactly what the original would have drawn next, even when the last values
+drawn were deleted before the dump. A counter that has never been used
+gets no line, because the restored table draws 1 first anyway.
 
 ## `.import`: CSV and TSV
 

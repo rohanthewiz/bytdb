@@ -156,6 +156,8 @@ INSERT INTO orders (cust, total, items, meta, ts, d, u, raw, paid) VALUES
   (2, 1e20, '{}', 'null', NULL, NULL, NULL, '\x', false),
   (1, -0.000001234, NULL, '"str"', NULL, NULL, NULL, NULL, NULL);
 INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2);
+INSERT INTO orders (cust) VALUES (2);
+DELETE FROM orders WHERE id = 4;
 CREATE VIEW big_orders AS SELECT * FROM orders WHERE total > 10;
 CREATE VIEW a_view AS SELECT id FROM big_orders;
 `, "-batch", src)
@@ -174,6 +176,17 @@ CREATE VIEW a_view AS SELECT id FROM big_orders;
 	if i, j := strings.Index(dump, "CREATE VIEW big_orders"), strings.Index(dump, "CREATE VIEW a_view"); i < 0 || j < i {
 		t.Errorf("a_view depends on big_orders and must follow it:\n%s", dump)
 	}
+	// The identity counter rides along after the rows (N-032). id 4 was
+	// drawn and deleted, so the counter (5) is ahead of the largest
+	// stored id (3) and only the RESTART line can carry it.
+	restart := "ALTER TABLE orders ALTER COLUMN id RESTART WITH 5;"
+	if i, j := strings.LastIndex(dump, "INSERT INTO orders"), strings.Index(dump, restart); j < 0 || j < i {
+		t.Errorf("want %q after the orders rows:\n%s", restart, dump)
+	}
+	// Tables without an identity column get no RESTART line.
+	if n := strings.Count(dump, "RESTART"); n != 1 {
+		t.Errorf("%d RESTART lines, want 1:\n%s", n, dump)
+	}
 
 	if _, errOut, code = runShell(t, dump, "-batch", dst); code != 0 {
 		t.Fatalf("restore: code %d stderr %s", code, errOut)
@@ -184,7 +197,8 @@ CREATE VIEW a_view AS SELECT id FROM big_orders;
 	}
 
 	// The restored database behaves like the original: the sequence
-	// continues, identity counters continue, cascades fire.
+	// continues, the identity counter continues past the deleted 4
+	// rather than re-issuing it, and cascades fire.
 	out, errOut, code := runShell(t, "", "-list", "-noheader", dst,
 		"SELECT nextval('order_no')",
 		"INSERT INTO orders (cust) VALUES (2) RETURNING id",
@@ -193,7 +207,7 @@ CREATE VIEW a_view AS SELECT id FROM big_orders;
 	if code != 0 {
 		t.Fatalf("code %d stderr %s", code, errOut)
 	}
-	if want := "105\n4\n2\n"; out != want {
+	if want := "105\n5\n2\n"; out != want {
 		t.Errorf("restored behavior %q, want %q", out, want)
 	}
 

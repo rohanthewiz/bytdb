@@ -106,6 +106,13 @@ func TestSQLStateMapping(t *testing.T) {
 		// Postgres's own code for TRUNCATE of a referenced table stays.
 		{"cannot truncate a table referenced in a foreign key constraint", false, "0A000"},
 
+		// Identity counters (N-032): RESTART on a plain column, and a
+		// RESTART value out of range, from ALTER COLUMN or ALTER
+		// SEQUENCE alike.
+		{`column "name" of relation "t" is not an identity column`, false, "55000"},
+		{"RESTART value (0) cannot be less than MINVALUE (1)", false, "22023"},
+		{"RESTART value (11) cannot be greater than MAXVALUE (10)", false, "22023"},
+
 		// Anything unrecognized is internal_error.
 		{"disk exploded", false, "XX000"},
 	}

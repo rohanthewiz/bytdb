@@ -555,10 +555,12 @@ func isDDL(st Statement) bool {
 
 // isWrite reports whether st writes at all (DML or DDL). TRUNCATE is
 // deliberately DML here — like Postgres, it runs inside transaction
-// blocks (and rolls back with them), unlike bytdb DDL.
+// blocks (and rolls back with them), unlike bytdb DDL. ALTER COLUMN
+// ... RESTART is the same kind of write: it moves an identity counter
+// in the statement's transaction and leaves the schema alone.
 func isWrite(st Statement) bool {
 	switch st.(type) {
-	case *Insert, *Update, *Delete, *Truncate:
+	case *Insert, *Update, *Delete, *Truncate, *AlterColumnRestart:
 		return true
 	}
 	return isDDL(st)

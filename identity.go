@@ -1,6 +1,8 @@
 package bytdb
 
 import (
+	"encoding/binary"
+	"fmt"
 	"math"
 	"slices"
 
@@ -15,7 +17,10 @@ import (
 // identity columns before coercion: NULL draws the next value,
 // starting at 1; an explicit non-negative value bumps the counter
 // past itself so later draws cannot collide (an explicit negative
-// value never touches the counter).
+// value never touches the counter). RestartIdentity sets a counter
+// outright (ALTER TABLE ... ALTER COLUMN ... RESTART) and PeekIdentity
+// reads it without drawing; the shell's .dump pairs the two to carry
+// counters across a dump and restore.
 //
 // In the default (serialized) mode draws are transactional: values
 // drawn inside a rolled-back transaction are returned to the counter.
@@ -126,4 +131,122 @@ func drawnRaced(e *Engine, cols, drawn []int) bool {
 		}
 	}
 	return false
+}
+
+// identityCol resolves table.column to its descriptor and ordinal,
+// refusing a column that is not an identity column with Postgres's
+// wording (SQLSTATE 55000 over the wire).
+func identityCol(desc *TableDesc, table, column string) (*Column, error) {
+	ord := desc.ColIndex(column)
+	if ord < 0 {
+		return nil, serr.New(`column "`+column+`" of relation "`+table+`" does not exist`,
+			"table", table, "column", column)
+	}
+	c := &desc.Columns[ord]
+	if !c.Identity {
+		return nil, serr.New(`column "`+column+`" of relation "`+table+`" is not an identity column`,
+			"table", table, "column", column)
+	}
+	return c, nil
+}
+
+// RestartIdentity sets the value the identity column column of table
+// draws next: ALTER TABLE t ALTER COLUMN c RESTART [WITH next]. next
+// must lie in 1..math.MaxInt64, the range an identity column draws
+// from (it starts at 1 and its values are int64). As with SetSeq,
+// restarting below values already in the table makes later draws
+// collide with them; that is the caller's contract (it exists for
+// restore, where .dump replays the counter after the rows).
+//
+// The write is part of the transaction in both write modes, so a
+// rollback (or ROLLBACK TO a savepoint before it) undoes it, the same
+// as TRUNCATE ... RESTART IDENTITY, which this mirrors. In
+// concurrent-writes mode the engine's cached allocator for the counter
+// is discarded when the transaction commits (see dirtySeqPrefixes),
+// so the next draw re-anchors on the stored value. The race that
+// leaves open is Truncate's: a draw served from the old cache between
+// the commit and the flush can repeat a restarted value, and the
+// uniqueness probe turns that into a retryable conflict (drawnRaced).
+func (t *Txn) RestartIdentity(table, column string, next int64) error {
+	desc, err := t.desc(table)
+	if err != nil {
+		return err
+	}
+	c, err := identityCol(desc, table, column)
+	if err != nil {
+		return err
+	}
+	// MINVALUE is always 1 for a bytdb identity, and int64 caps the
+	// top, so only the bottom can be violated here.
+	if next < 1 {
+		return serr.New("RESTART value ("+fmtInt(next)+") cannot be less than MINVALUE (1)",
+			"table", table, "column", column)
+	}
+	key := identitySeqKey(desc.ID, c.ID)
+	if err := t.tx.Set(key, binary.BigEndian.AppendUint64(nil, uint64(next))); err != nil {
+		return serr.Wrap(err, "op", "restart identity", "table", table, "column", column)
+	}
+	if t.e.occ {
+		// A full key works as a prefix: invalidation is always safe,
+		// so matching a neighbour's key too would only burn its cache.
+		t.dirtySeqPrefixes = append(t.dirtySeqPrefixes, key)
+	}
+	return nil
+}
+
+// PeekIdentity reports the value the identity column column of table
+// would draw next, without drawing it. ok is false when the counter
+// does not exist yet: nothing has been drawn or inserted explicitly
+// since the table was created (or truncated with RESTART IDENTITY), so
+// the next draw is 1. next can be math.MaxInt64+1 for a counter that
+// has handed out its last value; the next draw then fails with
+// "identity column exhausted".
+//
+// In concurrent-writes mode the answer comes from the live allocator
+// when one is loaded, as for PeekSeq: the stored record is a high
+// watermark there, ahead of the next draw by the unhanded cache. That
+// state is engine-wide, not this transaction's snapshot, so it can be
+// later than the snapshot. A reader that pairs it with a snapshot of
+// the rows (.dump) gets a counter at or past every value those rows
+// hold, which is the safe direction.
+func (t *Txn) PeekIdentity(table, column string) (next uint64, ok bool, err error) {
+	desc, err := t.desc(table)
+	if err != nil {
+		return 0, false, err
+	}
+	c, err := identityCol(desc, table, column)
+	if err != nil {
+		return 0, false, err
+	}
+	key := identitySeqKey(desc.ID, c.ID)
+	if t.e.occ {
+		if v, ok, handled := t.e.peekCounterOCC(key); handled {
+			return v, ok, nil
+		}
+		// No live allocator: nothing is cached, so the stored value is
+		// exactly the next draw.
+	}
+	raw, ok := t.tx.Get(key)
+	if !ok {
+		return 0, false, nil
+	}
+	if len(raw) != 8 {
+		return 0, false, serr.New("sequence value is corrupt",
+			"sequence", table+"."+column, "len", fmt.Sprint(len(raw)))
+	}
+	return binary.BigEndian.Uint64(raw), true, nil
+}
+
+// RestartIdentity is Txn.RestartIdentity in its own write transaction.
+func (e *Engine) RestartIdentity(table, column string, next int64) error {
+	return e.WriteTxn(func(tx *Txn) error { return tx.RestartIdentity(table, column, next) })
+}
+
+// PeekIdentity is Txn.PeekIdentity in its own read transaction.
+func (e *Engine) PeekIdentity(table, column string) (next uint64, ok bool, err error) {
+	err = e.ReadTxn(func(tx *Txn) error {
+		next, ok, err = tx.PeekIdentity(table, column)
+		return err
+	})
+	return next, ok, err
 }

@@ -35,15 +35,6 @@ through all 74 docs.
 
 ## Open
 
-- **N-032** · raised `2026-1104-1337-bytdb-cli-shell` · value low
-  **`.dump` cannot carry identity counters.** A restored `serial` column
-  resumes after the highest restored value, because explicit inserts bump
-  the counter past themselves. A value that was drawn and then deleted
-  before the dump can therefore be handed out again after a restore.
-  bytdb has no SQL to set an identity counter (no `ALTER TABLE ... ALTER
-  COLUMN ... RESTART WITH`, and `setval` only reaches sequence objects),
-  so the shell cannot emit one. Fix needs that SQL surface first, then a
-  line per identity column in `writeDump` (`pgwire/cmd/bytdb/schema.go`).
 - **N-034** · raised `2026-1104-1351-n030-n031-estring-split-pgwire-replace` · value low
   **The lexer does not nest block comments.** `lex` (`sql/lexer.go`) ends a
   `/* */` comment at the first `*/`, but Postgres nests them, and so do
@@ -173,6 +164,32 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-032** · raised `2026-1104-1337-bytdb-cli-shell` · closed 2026-11-04,
+  `2026-1104-1424-n032-n034-identity-restart-nested-comments`. **`.dump` could not carry identity counters.** Fixed in two
+  parts. First, the SQL: `ALTER TABLE t ALTER [COLUMN] c RESTART [[WITH] n]`
+  (Postgres's identity syntax; a bare `RESTART` means 1), backed by
+  `Txn.RestartIdentity` / `Txn.PeekIdentity` and Engine wrappers
+  (`identity.go`). It moves a counter, not the schema, so it runs in the
+  statement's transaction like `TRUNCATE … RESTART IDENTITY`: allowed in a
+  block, undone by ROLLBACK, refused in a read-only block. In
+  concurrent-writes mode the commit discards the cached allocator through
+  `dirtySeqPrefixes`. Errors use Postgres's wording: `column "c" of
+  relation "t" is not an identity column` → 55000, `RESTART value (0)
+  cannot be less than MINVALUE (1)` → 22023. The 22023 row also covers
+  ALTER SEQUENCE's RESTART errors, which were XX000. Second, the dump:
+  `writeDump` (`pgwire/cmd/bytdb/schema.go`) emits one `RESTART WITH`
+  line per identity column whose counter exists, right after that table's
+  rows. Tests: `TestRestartIdentity` (both write modes: allocator
+  invalidation, rollback, reopen, refusals), `sql.TestAlterColumnRestart`
+  (spellings, BEGIN/ROLLBACK, read-only, refusals, tag), pgwire
+  `TestAlterColumnRestartWire` and `TestSQLStateMapping` rows. In the shell,
+  `TestSchemaAndDumpRoundTrip` now draws and deletes id 4 before the dump.
+  The restore draws 5, and without the new line it re-issues 4. Docs:
+  README grammar, `docs/features.md` Auto-increment, `docs/cli.md`
+  `.dump`. **Release note:** the shell now uses unreleased root API, so
+  pgwire's `GOWORK=off` build fails until the next root tag and pin bump
+  (the N-031 trade-off). The workspace build is green. That release
+  should be a minor one, since it adds SQL and API.
 - **N-030** · raised `2026-1104-1337-bytdb-cli-shell` · closed 2026-11-04,
   `2026-1104-1351-n030-n031-estring-split-pgwire-replace`. **pgwire's simple-query splitter mis-split `E'...'`
   strings.** Fixed: `splitStatements` (`pgwire/split.go`) now hands each

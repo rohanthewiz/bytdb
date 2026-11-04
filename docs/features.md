@@ -252,6 +252,15 @@ INSERT INTO users (name) VALUES ('edsger');          -- id 11, no collision
 - Identity implies NOT NULL; `information_schema.columns` reports the column
   non-nullable with a serial-style `column_default`, which is what
   introspecting ORMs key "omit on insert" off.
+- `ALTER TABLE t ALTER [COLUMN] c RESTART [[WITH] n]` sets the value the
+  identity column draws next (bare `RESTART` goes back to 1), with Postgres's
+  errors: 55000 for a column that is not an identity, 22023 for `n` below 1.
+  Unlike other `ALTER TABLE` forms it changes no schema, so it runs inside a
+  transaction block and rolls back with it, like `TRUNCATE ... RESTART
+  IDENTITY`. Restarting below stored values makes later draws collide with
+  them, as in Postgres. The shell's `.dump` emits one per identity column so a
+  restore resumes where the source would have.
+  *(verified in `sql/identity_test.go`, `identity_restart_test.go`)*
 - `lastval()` and `currval('t_col_seq')` read back this session's identity
   draws (the probe some drivers send instead of `RETURNING`), with Postgres's
   55000 "not yet defined in this session" before the first draw. Draws are

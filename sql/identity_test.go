@@ -98,3 +98,94 @@ func TestSerialIdentityNotNull(t *testing.T) {
 		t.Fatalf("column_default type %v", res.Types[1])
 	}
 }
+
+// TestAlterColumnRestart covers ALTER TABLE t ALTER [COLUMN] c RESTART
+// [[WITH] n] (N-032): every spelling, transactional behavior inside a
+// block, and the refusals. The engine half (both write modes, reopen)
+// is TestRestartIdentity in the root package.
+func TestAlterColumnRestart(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table users (id serial primary key, name text)`)
+	exec(t, d, `insert into users (name) values ('ada'), ('grace')`)
+
+	// draw inserts one row into table and returns the id it drew.
+	draw := func(table string) int64 {
+		t.Helper()
+		res := exec(t, d, `insert into `+table+` (name) values ('x') returning id`)
+		return res.Rows[0][0].(int64)
+	}
+
+	// COLUMN and WITH are both optional, as in Postgres.
+	for _, c := range []struct {
+		stmt string
+		want int64
+	}{
+		{`alter table users alter column id restart with 100`, 100},
+		{`ALTER TABLE users ALTER id RESTART 200`, 200},
+	} {
+		if res := exec(t, d, c.stmt); res.RowsAffected != 0 || res.Cols != nil {
+			t.Fatalf("%s: unexpected result %+v", c.stmt, res)
+		}
+		if got := draw("users"); got != c.want {
+			t.Fatalf("after %q: drew %d, want %d", c.stmt, got, c.want)
+		}
+	}
+
+	// Bare RESTART goes back to the start value, 1. Emptied first, so
+	// the re-issued 1 does not collide with a stored row.
+	exec(t, d, `create table logs (id serial primary key, name text)`)
+	exec(t, d, `insert into logs (name) values ('a'), ('b'), ('c')`)
+	exec(t, d, `delete from logs`)
+	exec(t, d, `alter table logs alter column id restart`)
+	if got := draw("logs"); got != 1 {
+		t.Fatalf("after bare RESTART: drew %d, want 1", got)
+	}
+
+	// Inside a block the restart is part of the transaction: ROLLBACK
+	// undoes it along with the draw it fed.
+	s := d.NewSession()
+	sessExec(t, s, `begin`)
+	sessExec(t, s, `alter table users alter column id restart with 500`)
+	if got := sessExec(t, s, `insert into users (name) values ('y') returning id`).Rows[0][0]; got != int64(500) {
+		t.Fatalf("in block: drew %v, want 500", got)
+	}
+	sessExec(t, s, `rollback`)
+	if got := draw("users"); got != 201 {
+		t.Fatalf("after rolled-back restart: drew %d, want 201", got)
+	}
+	// A read-only block refuses it: it writes, even though it is not DDL.
+	sessExec(t, s, `begin read only`)
+	if _, err := s.Exec(`alter table users alter column id restart with 900`); err == nil ||
+		!strings.Contains(err.Error(), "read-only transaction") {
+		t.Fatalf("read-only block: got %v, want a read-only refusal", err)
+	}
+	sessExec(t, s, `rollback`)
+
+	for _, c := range []struct{ stmt, want string }{
+		{`alter table users alter column name restart`, `column "name" of relation "users" is not an identity column`},
+		{`alter table users alter column nope restart`, `column "nope" of relation "users" does not exist`},
+		{`alter table users alter column id restart with 0`, "RESTART value (0) cannot be less than MINVALUE (1)"},
+		{`alter table users alter column id restart with -3`, "RESTART value (-3) cannot be less than MINVALUE (1)"},
+		{`alter table nope alter column id restart`, "no such table"},
+		{`alter table users alter column id restart with x`, "syntax error"},
+		{`alter table users alter column id restart with 99999999999999999999`, "RESTART requires an integer"},
+		{`alter table pg_class alter column oid restart`, "system catalog is read-only"},
+	} {
+		if _, err := d.Exec(c.stmt); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", c.stmt, err, c.want)
+		}
+	}
+
+	// It reports as ALTER TABLE, and is a write but not DDL, so a block
+	// runs it instead of refusing it like the schema changes.
+	st, err := Parse(`alter table users alter column id restart with 5`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := command(st); got != "ALTER TABLE" {
+		t.Errorf("command tag %q, want ALTER TABLE", got)
+	}
+	if isDDL(st) || !isWrite(st) {
+		t.Errorf("isDDL=%v isWrite=%v, want false, true", isDDL(st), isWrite(st))
+	}
+}

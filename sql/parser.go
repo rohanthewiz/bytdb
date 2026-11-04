@@ -1460,7 +1460,9 @@ func (p *parser) alterTable() (Statement, error) {
 		// Postgres column alterations (SET/DROP NOT NULL, TYPE, and the
 		// storage/statistics knobs) are rejected by name below rather
 		// than as a bare parse error, so the message says what bytdb
-		// does support.
+		// does support. RESTART [[WITH] n] sets an identity column's
+		// counter; of Postgres's identity options it is the only one,
+		// because bytdb identities have no other settings to change.
 		p.acceptKw("column")
 		col, err := p.ident("a column name")
 		if err != nil {
@@ -1469,6 +1471,21 @@ func (p *parser) alterTable() (Statement, error) {
 		switch {
 		case p.acceptKw("type"):
 			return p.alterColumnType(table, col)
+		case p.acceptKw("restart"):
+			// RESTART [[WITH] n], parsed as ALTER SEQUENCE's RESTART
+			// is (seqOptions): WITH is optional before the number, and
+			// a bare RESTART restarts at the start value. The range
+			// check is the engine's (Txn.RestartIdentity).
+			st := &AlterColumnRestart{Table: table, Col: col}
+			if p.acceptKw("with") || p.cur().kind == tNumber ||
+				(p.cur().kind == tOp && p.cur().text == "-") {
+				n, err := p.signedInt("RESTART")
+				if err != nil {
+					return nil, err
+				}
+				st.With = &n
+			}
+			return st, nil
 		case p.acceptKw("set"):
 			switch {
 			case p.acceptKw("data"):
@@ -1530,7 +1547,7 @@ func (p *parser) alterTable() (Statement, error) {
 			return nil, serr.New("only DROP DEFAULT and DROP NOT NULL are supported by ALTER COLUMN",
 				"table", table, "column", col)
 		}
-		return nil, p.unexpected("TYPE, or SET or DROP of DEFAULT or NOT NULL")
+		return nil, p.unexpected("TYPE, RESTART, or SET or DROP of DEFAULT or NOT NULL")
 	case p.acceptKw("rename"):
 		// RENAME TO t | RENAME [COLUMN] c TO d.
 		if p.acceptKw("to") {

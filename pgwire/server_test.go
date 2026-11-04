@@ -257,6 +257,34 @@ func TestPrimaryKeyDDLErrors(t *testing.T) {
 	}
 }
 
+// TestAlterColumnRestartWire runs ALTER TABLE ... ALTER COLUMN ...
+// RESTART over pgx (N-032): the command tag, the restarted draw, and
+// Postgres's SQLSTATEs for its two refusals.
+func TestAlterColumnRestartWire(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table t (id serial primary key, a int)`)
+
+	if tag := mustExec(t, c, `alter table t alter column id restart with 42`); tag.String() != "ALTER TABLE" {
+		t.Errorf("command tag %q, want ALTER TABLE", tag.String())
+	}
+	var id int64
+	if err := c.QueryRow(ctx, `insert into t (a) values (1) returning id`).Scan(&id); err != nil || id != 42 {
+		t.Fatalf("draw after restart: %d, %v; want 42", id, err)
+	}
+
+	for _, tc := range []struct{ q, code, frag string }{
+		{`alter table t alter column a restart`, "55000", `column "a" of relation "t" is not an identity column`},
+		{`alter table t alter column id restart with 0`, "22023", "RESTART value (0) cannot be less than MINVALUE (1)"},
+	} {
+		var pgErr *pgconn.PgError
+		_, err := c.Exec(ctx, tc.q)
+		if !errors.As(err, &pgErr) || pgErr.Code != tc.code || !strings.Contains(pgErr.Message, tc.frag) {
+			t.Errorf("%s\n  got: %+v\n  want: %s containing %q", tc.q, err, tc.code, tc.frag)
+		}
+	}
+}
+
 func TestConstraintsAndExplain(t *testing.T) {
 	ctx := context.Background()
 	c := connect(t, startServer(t))

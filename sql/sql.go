@@ -17,6 +17,7 @@
 //	ALTER TABLE t ALTER [COLUMN] c SET DEFAULT expr
 //	ALTER TABLE t ALTER [COLUMN] c DROP DEFAULT
 //	ALTER TABLE t ALTER [COLUMN] c SET NOT NULL | DROP NOT NULL
+//	ALTER TABLE t ALTER [COLUMN] c RESTART [[WITH] n]  (identity columns)
 //	ALTER TABLE t ADD [CONSTRAINT name] CHECK (expr)
 //	ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
 //	ALTER TABLE t OWNER TO role       (accepted and ignored; no roles)
@@ -925,6 +926,21 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		return &Result{}, nil
 	case *AlterColumnType:
 		return d.execAlterColumnType(s)
+	case *AlterColumnRestart:
+		// A counter write, not a schema change: it rides the statement's
+		// transaction (the block's, inside BEGIN), so it commits or
+		// rolls back with it. Bare RESTART means the start value, 1.
+		next := int64(1)
+		if s.With != nil {
+			next = *s.With
+		}
+		err := d.write(func(tx *bytdb.Txn) error {
+			return tx.RestartIdentity(s.Table, s.Col, next)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
 	case *ReplacePrimaryKey:
 		return d.execReplacePrimaryKey(s)
 	case *AlterColumnNoop:

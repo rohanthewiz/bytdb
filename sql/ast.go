@@ -745,6 +745,19 @@ type AlterColumnType struct {
 	UsingText string
 }
 
+// AlterColumnRestart is ALTER TABLE t ALTER [COLUMN] c RESTART
+// [[WITH] n]: set the next value identity column c draws. With is nil
+// for bare RESTART, which restarts at the column's start value (1 for
+// every bytdb identity). Unlike the other ALTER COLUMN forms it moves
+// counter state, not the schema, so it runs as a write in the
+// statement's transaction (like TRUNCATE ... RESTART IDENTITY) and is
+// allowed inside a transaction block.
+type AlterColumnRestart struct {
+	Table string
+	Col   string
+	With  *int64
+}
+
 // AlterColumnNoop is an ALTER COLUMN form that configures something
 // bytdb does not have — SET STORAGE / SET COMPRESSION (TOAST) and SET
 // STATISTICS (planner sampling). Accepted so pg_dump output and
@@ -1080,6 +1093,7 @@ func (*AlterColumnNotNull) stmt() {}
 func (*AlterOwner) stmt()         {}
 func (*AlterColumnType) stmt()    {}
 func (*AlterColumnNoop) stmt()    {}
+func (*AlterColumnRestart) stmt() {}
 func (*ReplacePrimaryKey) stmt()  {}
 func (*CreateIndex) stmt()        {}
 func (*DropIndex) stmt()          {}
