@@ -102,7 +102,7 @@ already speak — no server, no socket. See
 ### As a server
 
 ```sh
-go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd -db app.db -addr 127.0.0.1:5433
+go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@latest -db app.db -addr 127.0.0.1:5433
 psql "postgres://any@127.0.0.1:5433/any?sslmode=disable"
 ```
 

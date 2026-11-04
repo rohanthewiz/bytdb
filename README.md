@@ -234,9 +234,14 @@ err := pgwire.NewServer(bsql.New(e)).ListenAndServe("127.0.0.1:5433")
 or as a standalone server:
 
 ```sh
-go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd -db app.db -addr 127.0.0.1:5433
+go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@latest -db app.db -addr 127.0.0.1:5433
 psql "postgres://any@127.0.0.1:5433/any?sslmode=disable"
 ```
+
+Installing with `@latest` or `@vX.Y.Z` needs a pgwire release newer
+than v0.22.0, because those older releases carry a `replace` directive in
+their `go.mod`, which the Go toolchain refuses for `@version` installs.
+From a checkout, drop the `@latest` and the command works with any version.
 
 psql's `\dt`, `\d <table>`, `\di`, `\du`, and `\l` render for real;
 pgx works in both simple and extended protocol modes, text and binary
@@ -252,7 +257,7 @@ you already know. It also adds `.dump` for a replayable SQL snapshot and
 `.import` for loading CSV files.
 
 ```sh
-cd pgwire && go install ./cmd/bytdb
+go install github.com/rohanthewiz/bytdb/pgwire/cmd/bytdb@latest
 bytdb app.db                                      # interactive
 bytdb -csv app.db -c "SELECT * FROM users" > users.csv
 bytdb app.db .dump > backup.sql && bytdb copy.db < backup.sql

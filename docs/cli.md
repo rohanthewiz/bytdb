@@ -28,18 +28,22 @@ COMMIT
 
 ## Install
 
-The shell lives in the pgwire module, next to `bytdbd`. Build it from a
-checkout:
+The shell lives in the pgwire module, next to `bytdbd`:
+
+```sh
+go install github.com/rohanthewiz/bytdb/pgwire/cmd/bytdb@latest   # → $(go env GOPATH)/bin/bytdb
+```
+
+`@latest` and `@vX.Y.Z` installs need a pgwire release newer than
+v0.22.0. Up to v0.22.0, pgwire's `go.mod` carried a `replace` directive,
+and the Go toolchain refuses `@version` installs of a module that has one.
+`bytdbd` installs the same way. To build from a checkout instead, at any
+version:
 
 ```sh
 git clone https://github.com/rohanthewiz/bytdb && cd bytdb/pgwire
-go install ./cmd/bytdb        # → $(go env GOPATH)/bin/bytdb
+go install ./cmd/bytdb
 ```
-
-`go install …/cmd/bytdb@version` does not work yet. The pgwire module's
-`go.mod` carries a `replace` directive, and the Go toolchain refuses
-`@version` installs of modules that have one. `bytdbd` has the same
-limitation.
 
 ## Running it
 

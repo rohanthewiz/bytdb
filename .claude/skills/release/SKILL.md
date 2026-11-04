@@ -13,11 +13,26 @@ The repo holds three Go modules. Each one is released differently:
 | `github.com/rohanthewiz/bytdb/pgwire` | `pgwire/` | tagged `pgwire/vX.Y.Z`, in lockstep with root |
 | `github.com/rohanthewiz/bytdb/bench` | `bench/` | never tagged, but its pin must follow the release |
 
-pgwire and bench both `require` bytdb at a version and `replace` it with
-`../`. The `replace` keeps workspace builds on the working tree, so a stale
-pin doesn't show up locally. It does show up outside the workspace
-(`GOWORK=off`) and in `bench/run.sh`, whose `go run` under `set -e` fails
-with "updates to go.mod needed". Release steps 5–7 exist for that reason.
+pgwire and bench both `require` bytdb at a version. Inside a workspace
+(the root `go.work`, and bench's nested one), every build uses the working
+tree whatever the pins say, so a stale pin doesn't show up locally. Outside
+it (`GOWORK=off`), the pins decide:
+
+- **pgwire has no `replace`, on purpose** (next-list N-031). pgwire ships
+  the `bytdbd` and `bytdb` commands, and the Go toolchain refuses
+  `go install …@version` and `go run …@version` of a module whose go.mod
+  carries a `replace`. A `GOWORK=off` build of pgwire therefore compiles
+  against the *released* bytdb its pin names, which is what an installing
+  user gets. A pgwire change that needs unreleased root API builds in the
+  workspace but fails with `GOWORK=off` until the root is tagged and the
+  pin bumped (steps 3–4).
+- **bench keeps `replace … => ../`** for bytdb and `=> ../pgwire` for
+  pgwire. Nothing installs bench, so the `replace` costs nothing and keeps
+  `bench/run.sh` on the working tree. Its pin still has to follow the
+  release: `bench/run.sh`'s `go run` under `set -e` fails with "updates to
+  go.mod needed" when the pin lags.
+
+Release steps 4–7 exist for those reasons.
 
 ## Choose the version
 
@@ -47,8 +62,15 @@ tags stay unbackfilled by decision (next-list N-012).
    ```
    The proxy check has to resolve before step 4. pgwire's pin names this
    tag, and `GOWORK=off` builds fetch it from the proxy.
-4. **Bump pgwire's pin.** In `pgwire/go.mod`, change
-   `github.com/rohanthewiz/bytdb vOLD` to `vX.Y.Z`. Only `go.mod` changes.
+4. **Bump pgwire's pin.** In `pgwire/`:
+   ```bash
+   GOWORK=off go get github.com/rohanthewiz/bytdb@vX.Y.Z && GOWORK=off go mod tidy
+   ```
+   Both `go.mod` and `go.sum` change. With no `replace`, `go.sum` carries
+   bytdb's checksums, and `go get` also raises any dependency the new
+   bytdb needs at a higher version (btypedb, serr). When `GOPRIVATE`
+   covers `github.com/rohanthewiz/*`, the fetch goes to GitHub rather than
+   the proxy. GitHub has the tag since step 3.
 5. **Tidy bench.** Run `cd bench && go mod tidy`. The bench pin rises to
    `vX.Y.Z` because bench requires pgwire, and pgwire now requires
    `vX.Y.Z` (minimum version selection). That is why this step comes after
@@ -77,5 +99,9 @@ tags stay unbackfilled by decision (next-list N-012).
   patch version instead.
 - **Tag root before bumping pgwire.** If pgwire names a version that
   doesn't exist yet, every `GOWORK=off` consumer of pgwire breaks.
+- **Never add a `replace` back to `pgwire/go.mod`**, not even for local
+  convenience: `go.work` already gives that, and a `replace` in a tagged
+  pgwire breaks `go install …/cmd/bytdb@vX.Y.Z` for that version for
+  good (N-031). Up to `pgwire/v0.22.0`, every pgwire tag has one.
 - `bench/` has no LICENSE and no tag on purpose. It is an internal
   harness that nothing imports (next-list N-015).

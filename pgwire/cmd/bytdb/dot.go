@@ -844,7 +844,11 @@ func humanBytes(n uint64) string {
 }
 
 // versionString reports the bytdb engine version compiled in, read from
-// the build info so it is always the real dependency version.
+// the build info so it is always the real dependency version. A
+// workspace build (go.work) reports the working tree as "(devel)".
+// pgwire's own go.mod has no replace (N-031), so the "(local build)"
+// mark only appears when a module that builds the shell replaces bytdb
+// itself.
 func versionString() string {
 	v := "(devel)"
 	if bi, ok := debug.ReadBuildInfo(); ok {

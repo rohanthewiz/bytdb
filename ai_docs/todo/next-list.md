@@ -35,20 +35,6 @@ through all 74 docs.
 
 ## Open
 
-- **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
-  **`go install …@version` refuses the pgwire commands.** `pgwire/go.mod`
-  carries `replace github.com/rohanthewiz/bytdb => ../`, and the Go
-  toolchain rejects `@version` installs and runs of a module with a
-  replace directive. Confirmed this session: `go run
-  github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@v0.22.0` fails with "The
-  go.mod file for the module providing named packages contains one or
-  more replace ... directives". So neither `bytdbd` nor the new `bytdb`
-  shell installs from the proxy, and the README's `go run …/bytdbd` line
-  only works from inside a checkout. Decide: drop the replace (`go.work`
-  already keeps workspace builds on the working tree, and the release
-  skill bumps the pin anyway), or move the commands into a module
-  without one. The release skill's step 5–7 rationale for the replace
-  needs revisiting either way.
 - **N-032** · raised `2026-1104-1337-bytdb-cli-shell` · value low
   **`.dump` cannot carry identity counters.** A restored `serial` column
   resumes after the highest restored value, because explicit inserts bump
@@ -69,6 +55,29 @@ through all 74 docs.
 
 ## Validate
 
+- **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
+  **`go install …@version` refuses the pgwire commands.** *Fixed
+  `2026-1104-1346-n030-n031-estring-split-pgwire-replace`, awaiting a release.* `pgwire/go.mod` dropped its `replace
+  github.com/rohanthewiz/bytdb => ../`. The item offered that or moving the
+  commands into a module without one, and dropping it was the cheaper,
+  reversible choice that keeps the install paths. `go.work` still keeps
+  workspace builds on the working tree. `GOWORK=off` builds and tests of
+  pgwire now compile against the released bytdb v0.22.0 and pass. bench
+  keeps its `replace`, because nothing installs it. The release skill's
+  rationale and step 4 now say this: step 4 runs `GOWORK=off go get
+  …@vX.Y.Z && go mod tidy`, because `go.sum` changes too. A new gotcha says
+  never to add the `replace` back. README, `docs/cli.md`, `docs/index.md`,
+  `docs/features.md` and the bytdb skill now show `@latest`, noting that it
+  needs a pgwire release newer than v0.22.0. Checked with a local file
+  GOPROXY serving the working tree as fake versions (with
+  `GOPRIVATE=none.invalid`, since the dev machine's GOPRIVATE covers
+  `github.com/rohanthewiz/*`): the old `go.mod` fails with the toolchain's
+  "replace directives" error, and the new one installs `bytdb` and
+  `bytdbd` and runs `go run …/cmd/bytdb@v…`. **Check after the next pgwire
+  tag:** from outside a checkout, `go install
+  github.com/rohanthewiz/bytdb/pgwire/cmd/bytdb@latest` and `go run
+  github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@latest -h`, once through
+  the proxy (`GOPRIVATE=none.invalid`) and once with the default env.
 - **N-033** · raised `2026-1104-1337-bytdb-cli-shell` · value low
   **Run the `bytdb` shell interactively on Linux and Windows terminals.**
   Interactive mode (liner line editing, raw/cooked terminal handoff

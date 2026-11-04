@@ -795,7 +795,7 @@ replication cursor — see [Replication & Backup](replication.md).
 ## The wire server
 
 ```sh
-go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd -db app.db -addr 127.0.0.1:5433
+go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@latest -db app.db -addr 127.0.0.1:5433
 ```
 
 Tested against real clients, not just protocol specs:
