@@ -31,11 +31,56 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-030
+**Next ID:** N-034
 
 ## Open
 
-*(none)*
+- **N-030** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
+  **pgwire's simple-query splitter mis-splits `E'...'` strings.**
+  `splitStatements` in `pgwire/split.go` treats every `'` as a plain
+  standard-string quote, so the backslash escape in an escape string
+  closes the string early: `SELECT E'it\'s; fine'` splits into
+  `SELECT E'it\'s` and `fine'` (confirmed with a throwaway test this
+  session). psql sends everything through the simple protocol, so a psql
+  user typing an escape string with a `;` in it gets a syntax error. The
+  extended protocol is unaffected (one statement per Parse). Fix: track
+  E-strings the way `pgwire/cmd/bytdb/scan.go` does: an `E` token right
+  before the quote enables `\` escapes, and a doubled quote stays inside
+  the same string. Add the case to `split_test.go`.
+- **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
+  **`go install …@version` refuses the pgwire commands.** `pgwire/go.mod`
+  carries `replace github.com/rohanthewiz/bytdb => ../`, and the Go
+  toolchain rejects `@version` installs and runs of a module with a
+  replace directive. Confirmed this session: `go run
+  github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@v0.22.0` fails with "The
+  go.mod file for the module providing named packages contains one or
+  more replace ... directives". So neither `bytdbd` nor the new `bytdb`
+  shell installs from the proxy, and the README's `go run …/bytdbd` line
+  only works from inside a checkout. Decide: drop the replace (`go.work`
+  already keeps workspace builds on the working tree, and the release
+  skill bumps the pin anyway), or move the commands into a module
+  without one. The release skill's step 5–7 rationale for the replace
+  needs revisiting either way.
+- **N-032** · raised `2026-1104-1337-bytdb-cli-shell` · value low
+  **`.dump` cannot carry identity counters.** A restored `serial` column
+  resumes after the highest restored value, because explicit inserts bump
+  the counter past themselves. A value that was drawn and then deleted
+  before the dump can therefore be handed out again after a restore.
+  bytdb has no SQL to set an identity counter (no `ALTER TABLE ... ALTER
+  COLUMN ... RESTART WITH`, and `setval` only reaches sequence objects),
+  so the shell cannot emit one. Fix needs that SQL surface first, then a
+  line per identity column in `writeDump` (`pgwire/cmd/bytdb/schema.go`).
+
+## Validate
+
+- **N-033** · raised `2026-1104-1337-bytdb-cli-shell` · value low
+  **Run the `bytdb` shell interactively on Linux and Windows terminals.**
+  Interactive mode (liner line editing, raw/cooked terminal handoff
+  around `.shell` / `.edit`, Ctrl-C cancelling a running query, Tab
+  completion, history, width fitting) was exercised through a pty on
+  macOS only. Linux and Windows were cross-compiled, never run. Check
+  each: prompt editing, Ctrl-C mid-query, `.shell`, `.edit`, and that the
+  terminal is sane after exit.
 
 ## Roadmap
 

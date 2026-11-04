@@ -242,6 +242,24 @@ psql's `\dt`, `\d <table>`, `\di`, `\du`, and `\l` render for real;
 pgx works in both simple and extended protocol modes, text and binary
 formats, nested transactions included.
 
+### Or just open it in the shell
+
+`bytdb` is an interactive shell in the style of the DuckDB and sqlite3
+CLIs. It provides line editing, history, tab completion, Ctrl-C to cancel
+a query, and output as duckbox, CSV, JSON, Markdown, INSERT statements,
+and more. Dot commands are available, and so are the psql meta-commands
+you already know. It also adds `.dump` for a replayable SQL snapshot and
+`.import` for loading CSV files.
+
+```sh
+cd pgwire && go install ./cmd/bytdb
+bytdb app.db                                      # interactive
+bytdb -csv app.db -c "SELECT * FROM users" > users.csv
+bytdb app.db .dump > backup.sql && bytdb copy.db < backup.sql
+```
+
+See [docs/cli.md](docs/cli.md) for the full reference.
+
 ### The engine API — ordered scans SQL doesn't express
 
 ```go
@@ -917,6 +935,7 @@ so bind it to a private address.
 The `docs/` site goes deeper on everything here:
 [architecture](docs/architecture.md) ·
 [features](docs/features.md) ·
+[the shell](docs/cli.md) ·
 [benchmarks](docs/benchmarks.md) ·
 [concurrency](docs/concurrency.md) ·
 [replication](docs/replication.md) ·
