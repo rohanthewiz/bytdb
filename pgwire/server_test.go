@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -346,6 +347,34 @@ func TestSimpleProtocol(t *testing.T) {
 	var n int64
 	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 3 {
 		t.Fatalf("after failed buffer: %v %d", err, n)
+	}
+}
+
+// TestSimpleQueryEString sends E'...' strings holding a ';' through the
+// simple protocol in one buffer, as psql does with everything it reads.
+// The splitter must keep each string whole (N-030): before it knew
+// E-strings, the \' closed the string early and the ';' after it split
+// the statement into two unparsable halves.
+func TestSimpleQueryEString(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	res, err := c.PgConn().Exec(ctx,
+		`create table t (id int primary key, s text); `+
+			`insert into t values (1, E'it\'s; fine'), (2, E'a''b\'; c'); `+
+			`select s from t order by id`).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 3 {
+		t.Fatalf("got %d results, want 3 (the buffer was split wrongly)", len(res))
+	}
+	var got []string
+	for _, row := range res[2].Rows {
+		got = append(got, string(row[0]))
+	}
+	want := []string{"it's; fine", "a'b'; c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %q, want %q", got, want)
 	}
 }
 

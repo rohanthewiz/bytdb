@@ -31,22 +31,10 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-034
+**Next ID:** N-035
 
 ## Open
 
-- **N-030** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
-  **pgwire's simple-query splitter mis-splits `E'...'` strings.**
-  `splitStatements` in `pgwire/split.go` treats every `'` as a plain
-  standard-string quote, so the backslash escape in an escape string
-  closes the string early: `SELECT E'it\'s; fine'` splits into
-  `SELECT E'it\'s` and `fine'` (confirmed with a throwaway test this
-  session). psql sends everything through the simple protocol, so a psql
-  user typing an escape string with a `;` in it gets a syntax error. The
-  extended protocol is unaffected (one statement per Parse). Fix: track
-  E-strings the way `pgwire/cmd/bytdb/scan.go` does: an `E` token right
-  before the quote enables `\` escapes, and a doubled quote stays inside
-  the same string. Add the case to `split_test.go`.
 - **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
   **`go install …@version` refuses the pgwire commands.** `pgwire/go.mod`
   carries `replace github.com/rohanthewiz/bytdb => ../`, and the Go
@@ -70,6 +58,14 @@ through all 74 docs.
   COLUMN ... RESTART WITH`, and `setval` only reaches sequence objects),
   so the shell cannot emit one. Fix needs that SQL surface first, then a
   line per identity column in `writeDump` (`pgwire/cmd/bytdb/schema.go`).
+- **N-034** · raised `2026-1104-1346-n030-n031-estring-split-pgwire-replace` · value low
+  **The lexer does not nest block comments.** `lex` (`sql/lexer.go`) ends a
+  `/* */` comment at the first `*/`, but Postgres nests them, and so do
+  pgwire's splitter and the shell's scanner. `select 1 /* a /* b */ c */`
+  is valid in Postgres and a syntax error in bytdb (checked with the shell
+  this session). The splitter and the lexer agree on every comment that
+  doesn't nest. Fix: count depth in `lex` the way `splitStatements` does,
+  and keep "unterminated block comment" for a depth that never reaches 0.
 
 ## Validate
 
@@ -168,6 +164,20 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-030** · raised `2026-1104-1337-bytdb-cli-shell` · closed 2026-11-04,
+  `2026-1104-1346-n030-n031-estring-split-pgwire-replace`. **pgwire's simple-query splitter mis-split `E'...'`
+  strings.** Fixed: `splitStatements` (`pgwire/split.go`) now hands each
+  quoted region to `skipQuoted`. An `E` (or `e`) that starts its own token
+  before the quote turns on `\` escapes, and a doubled quote is consumed
+  inside the region, so `E'a''b\'; c'` stays one string. The token test is
+  the lexer's `isIdentPart` (ASCII letters, digits, underscore), so
+  `some'x\'` is still an identifier followed by a standard string. Tests:
+  ten new `TestSplitStatements` cases, and `TestSimpleQueryEString`
+  (`pgwire/server_test.go`), which sends a create, an insert of two
+  E-strings holding `;` and a select in one simple-protocol buffer over pgx.
+  It fails on the old splitter with "unterminated string literal". The
+  shell scanner's comment (`pgwire/cmd/bytdb/scan.go`), which said pgwire
+  didn't know E-strings, now says the two follow the same rules.
 - **N-028** · raised `2026-1015-0809-memory-ceiling-result-row-cap` · closed
   2026-10-15, `2026-1015-1609-txn-write-cap`. **Cap the size of one write transaction.**
   `Engine.SetMaxTxnWrites(n)` / `MaxTxnWrites()` in `memguard.go`, default

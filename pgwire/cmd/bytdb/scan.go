@@ -16,10 +16,11 @@ package main
 // dollar-quoted strings, and $1 is a parameter, so treating '$' as a
 // quote would only mis-split statements the engine would reject anyway.
 //
-// pgwire has its own splitter (pgwire/split.go), but it is unexported
-// and does not know E-strings: E'it\'s; fine' would split at the ';'.
-// The shell is the one place users type escape strings by hand, so it
-// carries its own, stricter scan.
+// pgwire has its own splitter (pgwire/split.go) that follows the same
+// rules (it learned E-strings in N-030), but it is unexported and only
+// splits: the shell also needs to know whether a buffer ended inside a
+// string or comment, to decide whether to keep reading lines. So the
+// shell carries its own scan.
 
 import "strings"
 

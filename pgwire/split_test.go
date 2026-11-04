@@ -34,6 +34,46 @@ func TestSplitStatements(t *testing.T) {
 			{"select 2", 35},
 		}},
 		{"select 'it''s; fine'", []stmtPart{{"select 'it''s; fine'", 0}}},
+		// N-030: E'...' escape strings. \' does not close the string,
+		// so the ';' after it stays inside.
+		{`SELECT E'it\'s; fine'`, []stmtPart{{`SELECT E'it\'s; fine'`, 0}}},
+		{`select e'it\'s; fine'; select 2`, []stmtPart{
+			{`select e'it\'s; fine'`, 0},
+			{"select 2", 23},
+		}},
+		// \\ is an escaped backslash, so the quote after it closes.
+		{`select E'a\\'; select 2`, []stmtPart{
+			{`select E'a\\'`, 0},
+			{"select 2", 15},
+		}},
+		// A doubled quote keeps the string in escape mode: the \'
+		// after it is still an escape, not the terminator.
+		{`select E'a''b\'; c'; select 2`, []stmtPart{
+			{`select E'a''b\'; c'`, 0},
+			{"select 2", 21},
+		}},
+		// E only prefixes a string when it starts a token: here it
+		// ends the identifier "some", so 'x\' is a standard string
+		// and its backslash is an ordinary character.
+		{`select some'x\'; select 2`, []stmtPart{
+			{`select some'x\'`, 0},
+			{"select 2", 17},
+		}},
+		{`select (E'\';'); select 2`, []stmtPart{
+			{`select (E'\';')`, 0},
+			{"select 2", 17},
+		}},
+		// Backslashes are not escapes in standard strings or quoted
+		// identifiers.
+		{`select 'a\'; select "b\"; select 3`, []stmtPart{
+			{`select 'a\'`, 0},
+			{`select "b\"`, 13},
+			{"select 3", 26},
+		}},
+		// An unterminated E-string runs to the end of the buffer, even
+		// when its last byte is a lone backslash.
+		{`select E'x\`, []stmtPart{{`select E'x\`, 0}}},
+		{`select E'x\'; select 2`, []stmtPart{{`select E'x\'; select 2`, 0}}},
 	}
 	for _, c := range cases {
 		got := splitStatements(c.q)
