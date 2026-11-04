@@ -44,7 +44,7 @@ through all 74 docs.
   COLUMN ... RESTART WITH`, and `setval` only reaches sequence objects),
   so the shell cannot emit one. Fix needs that SQL surface first, then a
   line per identity column in `writeDump` (`pgwire/cmd/bytdb/schema.go`).
-- **N-034** · raised `2026-1104-1346-n030-n031-estring-split-pgwire-replace` · value low
+- **N-034** · raised `2026-1104-1351-n030-n031-estring-split-pgwire-replace` · value low
   **The lexer does not nest block comments.** `lex` (`sql/lexer.go`) ends a
   `/* */` comment at the first `*/`, but Postgres nests them, and so do
   pgwire's splitter and the shell's scanner. `select 1 /* a /* b */ c */`
@@ -57,7 +57,7 @@ through all 74 docs.
 
 - **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
   **`go install …@version` refuses the pgwire commands.** *Fixed
-  `2026-1104-1346-n030-n031-estring-split-pgwire-replace`, awaiting a release.* `pgwire/go.mod` dropped its `replace
+  `2026-1104-1351-n030-n031-estring-split-pgwire-replace`, awaiting a release.* `pgwire/go.mod` dropped its `replace
   github.com/rohanthewiz/bytdb => ../`. The item offered that or moving the
   commands into a module without one, and dropping it was the cheaper,
   reversible choice that keeps the install paths. `go.work` still keeps
@@ -174,7 +174,7 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 ## Closed
 
 - **N-030** · raised `2026-1104-1337-bytdb-cli-shell` · closed 2026-11-04,
-  `2026-1104-1346-n030-n031-estring-split-pgwire-replace`. **pgwire's simple-query splitter mis-split `E'...'`
+  `2026-1104-1351-n030-n031-estring-split-pgwire-replace`. **pgwire's simple-query splitter mis-split `E'...'`
   strings.** Fixed: `splitStatements` (`pgwire/split.go`) now hands each
   quoted region to `skipQuoted`. An `E` (or `e`) that starts its own token
   before the quote turns on `\` escapes, and a doubled quote is consumed
