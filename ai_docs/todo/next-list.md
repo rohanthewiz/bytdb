@@ -35,6 +35,8 @@ through all 74 docs.
 
 ## Open
 
+*Nothing open.*
+
 ## Validate
 
 - **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
@@ -156,7 +158,7 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 ## Closed
 
 - **N-034** · raised `2026-1104-1351-n030-n031-estring-split-pgwire-replace` · closed
-  2026-11-04, `2026-1104-1424-n032-n034-identity-restart-nested-comments`. **The lexer did not nest block comments.**
+  2026-11-04, `2026-1104-1401-n032-n034-identity-restart-nested-comments`. **The lexer did not nest block comments.**
   Fixed: `lex` (`sql/lexer.go`) now hands each `/*` to `blockCommentLen`,
   which counts depth and ends the comment at the `*/` that closes the
   outermost level, the way Postgres, pgwire's splitter and the shell's
@@ -170,7 +172,7 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   holding `;` in one simple-protocol buffer; the old lexer gave a syntax
   error). The README's dialect paragraph says block comments nest.
 - **N-032** · raised `2026-1104-1337-bytdb-cli-shell` · closed 2026-11-04,
-  `2026-1104-1424-n032-n034-identity-restart-nested-comments`. **`.dump` could not carry identity counters.** Fixed in two
+  `2026-1104-1401-n032-n034-identity-restart-nested-comments`. **`.dump` could not carry identity counters.** Fixed in two
   parts. First, the SQL: `ALTER TABLE t ALTER [COLUMN] c RESTART [[WITH] n]`
   (Postgres's identity syntax; a bare `RESTART` means 1), backed by
   `Txn.RestartIdentity` / `Txn.PeekIdentity` and Engine wrappers
