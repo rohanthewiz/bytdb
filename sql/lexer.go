@@ -29,7 +29,8 @@ type token struct {
 // lex tokenizes one SQL statement. Unquoted identifiers fold to
 // lowercase, so keywords and column names match case-insensitively;
 // "quoted" identifiers and 'string' literals resolve their doubled
-// quote escapes. -- line and /* block */ comments are skipped.
+// quote escapes. -- line and /* block */ comments are skipped; block
+// comments nest (blockCommentLen).
 func lex(src string) ([]token, error) {
 	var toks []token
 	i := 0
@@ -43,11 +44,11 @@ func lex(src string) ([]token, error) {
 				i++
 			}
 		case c == '/' && i+1 < len(src) && src[i+1] == '*':
-			end := strings.Index(src[i+2:], "*/")
-			if end < 0 {
+			n := blockCommentLen(src[i:])
+			if n < 0 {
 				return nil, serr.New("unterminated block comment", "pos", fmt.Sprint(i))
 			}
-			i += 2 + end + 2
+			i += n
 		case (c == 'e' || c == 'E') && i+1 < len(src) && src[i+1] == '\'':
 			// E'...' escape-string literal (\n, \t, \\, '', \', ...)
 			text, n, err := scanEString(src[i+1:])
@@ -97,6 +98,37 @@ func lex(src string) ([]token, error) {
 		}
 	}
 	return append(toks, token{tEOF, "", len(src)}), nil
+}
+
+// blockCommentLen returns the length of the block comment that opens at
+// s[0:2] == "/*", or -1 when it never closes. Block comments nest, as in
+// Postgres (and the SQL standard): each "/*" inside opens another level
+// and the comment ends at the "*/" that closes the outermost one.
+//
+//	/* a /* b */ c */ x     the comment is everything before " x"
+//	/* a /* b */ c           unterminated: depth never returns to 0
+//
+// pgwire's statement splitter and the shell's scanner count depth the
+// same way, so all three agree on where a comment ends (N-034). Before
+// this, the lexer stopped at the first "*/" and the splitter did not.
+func blockCommentLen(s string) int {
+	depth := 0
+	for i := 0; i+1 < len(s); {
+		switch {
+		case s[i] == '/' && s[i+1] == '*':
+			depth++
+			i += 2
+		case s[i] == '*' && s[i+1] == '/':
+			depth--
+			i += 2
+			if depth == 0 {
+				return i
+			}
+		default:
+			i++
+		}
+	}
+	return -1
 }
 
 // scanQuoted scans a q-delimited region starting at s[0] == q, where a

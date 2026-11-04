@@ -35,15 +35,6 @@ through all 74 docs.
 
 ## Open
 
-- **N-034** · raised `2026-1104-1351-n030-n031-estring-split-pgwire-replace` · value low
-  **The lexer does not nest block comments.** `lex` (`sql/lexer.go`) ends a
-  `/* */` comment at the first `*/`, but Postgres nests them, and so do
-  pgwire's splitter and the shell's scanner. `select 1 /* a /* b */ c */`
-  is valid in Postgres and a syntax error in bytdb (checked with the shell
-  this session). The splitter and the lexer agree on every comment that
-  doesn't nest. Fix: count depth in `lex` the way `splitStatements` does,
-  and keep "unterminated block comment" for a depth that never reaches 0.
-
 ## Validate
 
 - **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
@@ -164,6 +155,20 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-034** · raised `2026-1104-1351-n030-n031-estring-split-pgwire-replace` · closed
+  2026-11-04, `2026-1104-1424-n032-n034-identity-restart-nested-comments`. **The lexer did not nest block comments.**
+  Fixed: `lex` (`sql/lexer.go`) now hands each `/*` to `blockCommentLen`,
+  which counts depth and ends the comment at the `*/` that closes the
+  outermost level, the way Postgres, pgwire's splitter and the shell's
+  scanner already did. "unterminated block comment" now covers a depth
+  that never reaches 0, including `/*/`. A stored view whose verbatim text
+  has an unbalanced inner `/*` would stop parsing. Postgres rejects such
+  text too, and broken views are already handled
+  (`TestSystemCatalogBrokenView`). Tests: `TestLexNestedBlockComments`
+  (seven nesting forms plus three unterminated ones; five fail on the old
+  lexer), and pgwire `TestSimpleQueryNestedComment` (a nested comment
+  holding `;` in one simple-protocol buffer; the old lexer gave a syntax
+  error). The README's dialect paragraph says block comments nest.
 - **N-032** · raised `2026-1104-1337-bytdb-cli-shell` · closed 2026-11-04,
   `2026-1104-1424-n032-n034-identity-restart-nested-comments`. **`.dump` could not carry identity counters.** Fixed in two
   parts. First, the SQL: `ALTER TABLE t ALTER [COLUMN] c RESTART [[WITH] n]`

@@ -406,6 +406,27 @@ func TestSimpleQueryEString(t *testing.T) {
 	}
 }
 
+// TestSimpleQueryNestedComment: a nested block comment holding ';' in a
+// simple-protocol buffer (N-034). The splitter has always nested
+// comments; the lexer now does too, so the statement it hands over
+// parses instead of failing at the inner "*/".
+func TestSimpleQueryNestedComment(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	res, err := c.PgConn().Exec(ctx, `select 1 /* a; /* b; */ c; */ as x; select 2 as y`).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("got %d results, want 2", len(res))
+	}
+	for i, want := range []string{"1", "2"} {
+		if len(res[i].Rows) != 1 || string(res[i].Rows[0][0]) != want {
+			t.Errorf("result %d rows = %q, want %s", i, res[i].Rows, want)
+		}
+	}
+}
+
 // TestDatabaseSQL smoke-tests the database/sql surface through pgx's
 // stdlib adapter.
 func TestDatabaseSQL(t *testing.T) {

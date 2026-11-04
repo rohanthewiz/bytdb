@@ -59,6 +59,44 @@ func TestLexOpsAndParams(t *testing.T) {
 	}
 }
 
+// TestLexNestedBlockComments: block comments nest, as in Postgres
+// (N-034), so the comment ends at the "*/" that closes the outermost
+// "/*", not at the first one.
+func TestLexNestedBlockComments(t *testing.T) {
+	for _, c := range []struct {
+		src  string
+		want []string // token texts, EOF excluded
+	}{
+		{`a /* x /* y */ z */ b`, []string{"a", "b"}},
+		{`a /* 1 /* 2 /* 3 */ 2 */ 1 */ b`, []string{"a", "b"}},
+		{`a /**/ b /* /**/ */ c`, []string{"a", "b", "c"}},
+		{`a /* ** */ b`, []string{"a", "b"}},
+		{`a /* -- */ b`, []string{"a", "b"}},             // a line comment does not hide the close
+		{`a /* ' */ b`, []string{"a", "b"}},              // nor does a quote
+		{`a /* x */ */ b`, []string{"a", "*", "/", "b"}}, // a stray close is operators
+	} {
+		toks, err := lex(c.src)
+		if err != nil {
+			t.Errorf("lex(%q): %v", c.src, err)
+			continue
+		}
+		var got []string
+		for _, tk := range toks[:len(toks)-1] {
+			got = append(got, tk.text)
+		}
+		if strings.Join(got, " ") != strings.Join(c.want, " ") {
+			t.Errorf("lex(%q) = %q, want %q", c.src, got, c.want)
+		}
+	}
+	// Depth that never returns to 0 is unterminated, including "/*/",
+	// whose "/" does not close the "/*" it follows.
+	for _, src := range []string{`a /* x /* y */ b`, `/*/`, `/*/**/`} {
+		if _, err := lex(src); err == nil || !strings.Contains(err.Error(), "unterminated block comment") {
+			t.Errorf("lex(%q): got %v, want unterminated block comment", src, err)
+		}
+	}
+}
+
 func TestLexErrors(t *testing.T) {
 	for _, src := range []string{`'unterminated`, `"unterminated`, `/* open`, `a & b`} {
 		if _, err := lex(src); err == nil {

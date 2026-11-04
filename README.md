@@ -499,7 +499,8 @@ durability with group commit.
 
 The dialect is deliberately small and Postgres-flavored — `'string'`
 literals, `"quoted"` identifiers (unquoted ones fold to lowercase),
-`--` and `/* */` comments, and Postgres type names as aliases
+`--` and `/* */` comments (block comments nest, as in Postgres), and
+Postgres type names as aliases
 (`bigint`/`int8` → int, `double precision`/`real` → float, `text`/
 `varchar(n)` → string, `boolean` → bool, `bytea` → bytes). Beyond
 those, `timestamp[tz]`, `date`, and `uuid` store UTC instants (int64
