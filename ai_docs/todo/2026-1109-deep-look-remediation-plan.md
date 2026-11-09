@@ -41,8 +41,10 @@ every later phase lands against a safety net.
 - **Effort**: S = under half a day, M = one to two days, L = most of a week.
 - "Postgres gives" is stated from knowledge. Nobody ran Postgres during the
   audit; D-02 is what makes those claims checkable.
-- Every item carries its minimal repro inline, because the audit's scratch
-  modules live in a session-scoped temp directory and will not survive.
+- Every item carries its minimal repro inline. The audit's full runnable
+  repro modules are in `ai_docs/todo/deep-look-repros/` (see its README for
+  how to run them and which directory covers which items); delete that
+  directory once D-01 has ported them.
 
 ## Decisions needed before starting
 

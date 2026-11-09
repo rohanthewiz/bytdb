@@ -47,8 +47,9 @@ top of the plan) are waiting on the user and shape N-036 to N-039 and N-043.
   `.github/workflows/ci.yml` to both repos (vet, race, `GOWORK=off` pgwire
   build, staticcheck, nightly fuzz), and add a differential harness
   (`sql/difftest/`, own module, skipped without `BYTDB_DIFF_PG_URL`). Do the
-  repro port first: the runnable originals are in a session-scoped
-  scratchpad and only the inline copies in the plan will survive.
+  repro port first: the runnable originals are in
+  `ai_docs/todo/deep-look-repros/` (six standalone modules, outside
+  `go.work`), to be deleted once ported.
 - **N-036** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
   **Small isolated correctness and outage fixes (plan Phase 1, D-05 to
   D-22).** Eighteen independent fixes, each under half a day. The ones that
