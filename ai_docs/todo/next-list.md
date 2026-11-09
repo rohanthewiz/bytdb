@@ -31,11 +31,105 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-035
+**Next ID:** N-044
 
 ## Open
 
-*Nothing open.*
+All nine items below come from one audit and share one plan,
+`ai_docs/todo/2026-1109-deep-look-remediation-plan.md`. Each is a phase of
+it; the `D-xx` numbers are that plan's item IDs. Six decisions (Q1–Q6 at the
+top of the plan) are waiting on the user and shape N-036 to N-039 and N-043.
+
+- **N-035** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
+  **Safety net before any fix (plan Phase 0, D-01 to D-04).** Neither bytdb
+  nor btypedb has CI, and nothing checks SQL results against real Postgres.
+  Port the audit's repros into the tree as skipped failing tests, add
+  `.github/workflows/ci.yml` to both repos (vet, race, `GOWORK=off` pgwire
+  build, staticcheck, nightly fuzz), and add a differential harness
+  (`sql/difftest/`, own module, skipped without `BYTDB_DIFF_PG_URL`). Do the
+  repro port first: the runnable originals are in a session-scoped
+  scratchpad and only the inline copies in the plan will survive.
+- **N-036** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
+  **Small isolated correctness and outage fixes (plan Phase 1, D-05 to
+  D-22).** Eighteen independent fixes, each under half a day. The ones that
+  lose data or take the server down: a replication generation made
+  unrestorable by an ambiguous PUT followed by log growth
+  (`replicate/restore.go:191-200`); a 1M-term expression chain that
+  overflows the stack (`sql/parser.go:3220-3261`); a syntax error inside
+  `BEGIN` that does not abort the block (`sql/session.go:130-136`); pgx's
+  `-- ping` rejected as a syntax error (`pgwire/split.go:39-45`); an upsert
+  that skips the parent-side FK check (`sql/exec.go:1001-1012`);
+  SERIALIZABLE missing write skew through a failed uniqueness probe
+  (`dml.go:121-146`); a DDL-callback deadlock (`engine.go:408-449`); a
+  `CACHE 2^50` sequence spin (`seqalloc.go:454-468`); `Serve` exiting on a
+  transient accept error (`pgwire/pgwire.go:336-345`).
+- **N-037** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
+  **One static typing pass over the whole statement (plan Phase 2, D-23 to
+  D-26).** Timestamps, dates and uuids lose their SQL type at runtime, and
+  `coerceLiterals` types only top-level `Pred` leaves, so anything else is
+  compared by Go kind and a failed coercion is swallowed
+  (`sql/exec.go:293-318`). Today `WHERE due > now()` returns nothing for a
+  future date, `ts::date` returns microseconds, `CHECK (day >=
+  '2000-01-01')` is not enforced, and date predicates inside subqueries,
+  CTEs and views match nothing. The pass annotates every expression node
+  with its type, coerces untyped literals and params from their sibling,
+  inserts explicit conversions, rejects the rest at bind, and replaces
+  `coerceLiterals`. It also fixes pgx's parameter-encode and result-scan
+  failures. Existing databases may hold rows that violate a previously inert
+  CHECK; ship a validation helper with the release.
+- **N-038** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
+  **Subqueries through the real SELECT path (plan Phase 3, D-27, D-28).**
+  The four subquery runners in `sql/expr.go:1323-1590` ignore `ORDER BY`,
+  `LIMIT` and `OFFSET` and reject `GROUP BY`, `HAVING` and `UNION`.
+  `(SELECT amt FROM o ORDER BY amt DESC LIMIT 1)` returns the first row, not
+  the largest. Run uncorrelated subqueries once through `runSelectBody` and
+  memoize, as the CTE path does; run correlated ones through the same
+  executor with the outer row bound. Removes the interim reject from N-036
+  (D-09) and adds a hash set for `IN (subquery)`.
+- **N-039** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
+  **One statement, one snapshot, none of its own writes (plan Phase 4, D-29
+  to D-32).** `UPDATE ... SET x = (subquery)` sees rows the same statement
+  already updated (`sql/exec.go:1172-1247`); a plain `UNION` reads two
+  snapshots (`sql/sql.go:1027`); child-side FK checks run per row, so a
+  self-referential bulk insert depends on row order (`sql/exec.go:1044-1048`);
+  multi-statement queries and `pgx.Batch` commit per statement
+  (`pgwire/conn.go:521-545`). Also closes N-029 on the way, since the
+  two-pass UPDATE is where the row budget gets charged.
+- **N-040** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
+  **Interruptible writer-lock waits (plan Phase 5, D-33).** Context,
+  `statement_timeout` and `CancelRequest` do not bound the wait for the
+  writer lock (`txn.go:230-243`, `sql/session.go:175-177`); a timed-out
+  write still commits once the lock frees. Needs `BeginCtx`/`UpdateCtx` in
+  btypedb (the writer mutex becomes a one-slot channel) and a btypedb tag
+  before bytdb can use it.
+- **N-041** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
+  **Replication and server hardening (plan Phase 6, D-34 to D-36).**
+  Generations ordered by wall-clock name; `Status` cannot show that new
+  writes are unprotected after a restart or compaction; no bound on a
+  stalled S3 transfer; unbounded chunk count per generation; no session
+  token for temporary credentials; `Close` does not drain connections; NaN
+  cannot be stored in a float column. Most of these were found by reading,
+  not reproduced.
+- **N-042** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
+  **Performance (plan Phase 7, D-37 to D-50).** UUID, timestamp and date
+  keys never push down (`sql/plan.go:302-320`; do after N-037); `IN`-lists
+  on a key are full scans; `decodeRow` decodes every column of every row and
+  is 77% of an aggregate scan (`dml.go:809-838`); a prepared point read
+  re-derives everything and opens four snapshots; wire rows cost 11–16
+  allocations each; startup replay is 0.9 s per million rows. Correct
+  `docs/benchmarks.md`, which blames interpreted execution for the scan gap.
+  Memory per row (D-49) and streamed results (D-50) are recorded in the plan
+  but not scheduled.
+- **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
+  **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
+  tables that clients and migration tools send (advisory locks, `DISCARD
+  ALL`, `current_user`, `pg_tables`); everyday SQL that fails to parse
+  (`CAST`, `INSERT ... SELECT`, `FOR UPDATE`, `NULLS FIRST/LAST`); scalar
+  functions and aggregates; migration DDL; sentinel errors and readable
+  messages in the Go API; multi-statement `Exec` in the stdlib driver;
+  replication flags and a Unix socket for `bytdbd`. Which tool needs which
+  statement is from memory: capture each tool's real statements before
+  prioritizing by it.
 
 ## Validate
 
