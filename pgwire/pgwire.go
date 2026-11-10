@@ -61,6 +61,7 @@ package pgwire
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
@@ -193,6 +194,13 @@ type Server struct {
 	bindData []byte
 
 	nextPID atomic.Int32
+
+	// shuttingDown is set by Shutdown: connections finish the statement
+	// they are running, then end with FATAL 57P01 instead of reading
+	// another message. wg counts live connection goroutines, which is
+	// what Shutdown waits on.
+	shuttingDown atomic.Bool
+	wg           sync.WaitGroup
 
 	mu       sync.Mutex
 	ln       net.Listener
@@ -391,7 +399,9 @@ func (s *Server) Serve(ln net.Listener) error {
 		s.conns[nc] = struct{}{}
 		s.backends[c.pid] = c
 		s.mu.Unlock()
+		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			defer func() {
 				nc.Close()
 				s.mu.Lock()
@@ -403,6 +413,58 @@ func (s *Server) Serve(ln net.Listener) error {
 			c.run()
 		}()
 	}
+}
+
+// Shutdown stops the server gracefully (deep-look D-35): it stops
+// accepting at once, ends every idle connection — idle in a transaction
+// block too, which rolls back — with Postgres's FATAL 57P01
+// "terminating connection due to administrator command", and lets each
+// running statement finish and deliver its result before ending that
+// connection the same way. When ctx ends first, running statements are
+// canceled (as a CancelRequest would) and the remaining sockets closed;
+// Shutdown still waits for their goroutines, so the caller can close
+// the engine knowing nothing is executing against it, and returns
+// ctx's error.
+//
+// Close, by contrast, drops every socket at once and returns without
+// waiting, so closing the engine right after it could pull the store
+// out from under statements still running.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.shuttingDown.Store(true)
+	s.mu.Lock()
+	s.closed = true
+	if s.ln != nil {
+		s.ln.Close()
+	}
+	conns := make([]net.Conn, 0, len(s.conns))
+	for nc := range s.conns {
+		conns = append(conns, nc)
+	}
+	s.mu.Unlock()
+	// Wake every connection blocked reading its next message: an
+	// expired read deadline returns it to the loop, which sees the flag.
+	// A connection mid-statement is unaffected until it next reads.
+	for _, nc := range conns {
+		nc.SetReadDeadline(time.Now())
+	}
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	for _, c := range s.backends {
+		c.cancelQuery()
+	}
+	s.mu.Unlock()
+	s.Close()
+	<-done
+	return ctx.Err()
 }
 
 // Accept-retry backoff bounds: the net/http values.

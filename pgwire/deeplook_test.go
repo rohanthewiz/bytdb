@@ -472,3 +472,110 @@ func TestImplicitTransactions(t *testing.T) {
 		t.Fatalf("transaction status after the units: %c; want I", st)
 	}
 }
+
+// startShutdownServer serves a database with a table big enough that a
+// cross join of it runs for a while, and returns the server and address.
+func startShutdownServer(t *testing.T, rows int) (*pgwire.Server, string) {
+	t.Helper()
+	e, err := bytdb.Open(filepath.Join(t.TempDir(), "test.db"), bytdb.WithSyncNever())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateTable("big", []bytdb.Column{{Name: "id", Type: bytdb.TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WriteTxn(func(tx *bytdb.Txn) error {
+		for i := range rows {
+			if err := tx.Insert("big", i); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := pgwire.NewServer(bsql.New(e))
+	go srv.Serve(ln)
+	t.Cleanup(func() {
+		srv.Close()
+		e.Close()
+	})
+	return srv, fmt.Sprintf("postgres://test@%s/test", ln.Addr())
+}
+
+// TestGracefulShutdown (D-35): Close dropped every socket and returned
+// at once, so bytdbd closed the engine under running statements.
+// Shutdown ends idle sessions with FATAL 57P01, lets a running statement
+// finish and deliver its result, and returns only when every connection
+// is gone.
+func TestGracefulShutdown(t *testing.T) {
+	ctx := context.Background()
+	srv, url := startShutdownServer(t, 1500)
+	busy, idle := connect(t, url), connect(t, url)
+	if err := idle.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		n   int64
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		var n int64
+		err := busy.QueryRow(ctx, `select count(*) from big a, big b`).Scan(&n)
+		got <- result{n, err}
+	}()
+	time.Sleep(100 * time.Millisecond) // let the join start
+	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(sctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	r := <-got
+	if r.err != nil || r.n != 1500*1500 {
+		t.Fatalf("the running statement: n=%d err=%v; want its full result", r.n, r.err)
+	}
+	var pe *pgconn.PgError
+	if err := idle.Ping(ctx); err == nil {
+		t.Fatal("the idle session survived Shutdown")
+	} else if errors.As(err, &pe) && pe.Code != "57P01" {
+		t.Fatalf("idle session error %v; want 57P01", err)
+	}
+	if n := srv.ConnCount(); n != 0 {
+		t.Fatalf("%d connections left after Shutdown", n)
+	}
+}
+
+// TestShutdownGraceExpires (D-35): when the grace period ends first, a
+// running statement is canceled and Shutdown still waits for it, then
+// reports the deadline.
+func TestShutdownGraceExpires(t *testing.T) {
+	ctx := context.Background()
+	srv, url := startShutdownServer(t, 4000)
+	busy := connect(t, url)
+	got := make(chan error, 1)
+	go func() {
+		var n int64
+		got <- busy.QueryRow(ctx, `select count(*) from big a, big b`).Scan(&n)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	sctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := srv.Shutdown(sctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown: %v; want the deadline", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("Shutdown took %v after its grace period", took)
+	}
+	if err := <-got; err == nil {
+		t.Fatal("the canceled statement reported success")
+	}
+	if n := srv.ConnCount(); n != 0 {
+		t.Fatalf("%d connections left after Shutdown", n)
+	}
+}

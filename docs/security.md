@@ -213,6 +213,7 @@ returns XX000 instead of killing the process.
 | `-max-txn-writes` | `10000000` | Row inserts and updates one transaction may stage; `0` disables (54000 when exceeded) |
 | `-memory-ceiling` | `auto` | Refuse inserts, updates and large results past this live heap: `auto` (90% of `GOMEMLIMIT`), `off`, or a size like `6GiB` (53200 when exceeded) |
 | `-log-queries` | false | Log SQL, duration, and outcome per statement |
+| `-shutdown-grace` | `10s` | On SIGTERM/SIGINT: idle sessions end at once (FATAL 57P01); running statements get this long to finish and reply before they are canceled. A second signal stops at once |
 
 Configuration is validated before the database opens, so a bad flag can never
 strand a half-open engine.

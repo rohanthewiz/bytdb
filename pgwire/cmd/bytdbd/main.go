@@ -18,6 +18,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -68,6 +69,8 @@ func main() {
 	maxTxnWrites := flag.Int64("max-txn-writes", bytdb.DefaultMaxTxnWrites,
 		"maximum row inserts and updates one transaction may stage before commit (0 or negative = no cap); "+
 			"the write past it fails with 54000")
+	shutdownGrace := flag.Duration("shutdown-grace", 10*time.Second,
+		"on SIGTERM/SIGINT, how long running statements may take to finish before they are canceled")
 	memCeiling := flag.String("memory-ceiling", "auto",
 		"refuse inserts, updates and large results with 53200 once the live heap passes this: "+
 			"auto (90% of GOMEMLIMIT; inactive without it), off, or a size like 6GiB")
@@ -173,15 +176,30 @@ func main() {
 	// Close guarantees they reach disk. Closing the server makes
 	// ListenAndServe return nil, letting main unwind through the
 	// deferred e.Close.
-	sig := make(chan os.Signal, 1)
+	//
+	// The shutdown is graceful (deep-look D-35): idle sessions end with
+	// FATAL 57P01, running statements get up to -shutdown-grace to finish
+	// and reply, and only then is anything still running canceled.
+	// Shutdown waits for every connection, so the deferred e.Close never
+	// runs under an executing statement. A second signal skips the wait.
+	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		s := <-sig
-		fmt.Printf("bytdbd: %s received, shutting down\n", s)
+		fmt.Printf("bytdbd: %s received, shutting down (grace %v)\n", s, *shutdownGrace)
 		if metricsSrv != nil {
 			metricsSrv.Close()
 		}
-		srv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
+		defer cancel()
+		go func() {
+			<-sig
+			fmt.Println("bytdbd: second signal, stopping now")
+			cancel()
+		}()
+		if err := srv.Shutdown(ctx); err != nil {
+			fmt.Printf("bytdbd: grace period over, canceled running statements: %v\n", err)
+		}
 	}()
 
 	fmt.Printf("bytdbd: serving %s on %s (tls: %v, auth: %v)\n",

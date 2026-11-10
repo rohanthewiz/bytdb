@@ -254,12 +254,26 @@ func (c *conn) run() (err error) {
 	}
 	for {
 		c.armIdleDeadline()
+		// Checked after arming: Shutdown sets the flag before it expires
+		// the read deadline, so either this sees the flag or the read
+		// below wakes on the expired deadline (armIdleDeadline cannot
+		// overwrite it after the flag is seen unset). Messages the client
+		// already sent are still served first — the Sync behind a
+		// running Execute, say — so a statement that finishes during the
+		// shutdown delivers its ReadyForQuery, not the FATAL; only a
+		// connection about to wait on the network is ended.
+		if c.srv.shuttingDown.Load() && c.r.Buffered() == 0 {
+			return c.terminateForShutdown()
+		}
 		// Read the type byte under the idle deadline — a silent client
 		// blocks here. Once a message has begun, armBodyDeadline bounds
 		// the rest of the frame so a peer that dribbles a body cannot pin
 		// this goroutine (see readBodyPrealloc for the memory side).
 		typ, err := c.r.ReadByte()
 		if err != nil {
+			if c.srv.shuttingDown.Load() {
+				return c.terminateForShutdown()
+			}
 			if c.idleTxExpired(err) {
 				// The client sat inside a transaction block past the
 				// timeout. Terminate it as Postgres does (FATAL 25P03);
@@ -331,6 +345,16 @@ func (c *conn) run() (err error) {
 			return err
 		}
 	}
+}
+
+// terminateForShutdown ends the connection for Server.Shutdown with
+// Postgres's FATAL 57P01; the deferred session close rolls back any
+// open block.
+func (c *conn) terminateForShutdown() error {
+	c.nc.SetWriteDeadline(time.Now().Add(time.Second)) // best effort
+	c.send(msgErrorResponse, fatalBody("terminating connection due to administrator command", "57P01"))
+	c.w.Flush()
+	return serr.New("server shutting down")
 }
 
 // armIdleDeadline sets the read deadline for the wait before the next
