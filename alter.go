@@ -492,16 +492,9 @@ func castToText(v any, t ColType) (string, error) {
 	case TInt:
 		return strconv.FormatInt(v.(int64), 10), nil
 	case TFloat:
-		f := v.(float64)
-		switch {
-		case math.IsNaN(f):
-			return "NaN", nil
-		case math.IsInf(f, 1):
-			return "Infinity", nil
-		case math.IsInf(f, -1):
-			return "-Infinity", nil
-		}
-		return strconv.FormatFloat(f, 'g', -1, 64), nil
+		// Postgres's float8 output, NaN and the infinities included (a
+		// float column can hold NaN since deep-look D-36).
+		return FormatFloat(v.(float64)), nil
 	case TString, TTextArray, TJSONB:
 		// Arrays and jsonb already hold their canonical text.
 		return v.(string), nil

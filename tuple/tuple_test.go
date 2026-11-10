@@ -55,10 +55,54 @@ func normalizeAll(t *testing.T, in []any) []any {
 	return out
 }
 
-func TestRejects(t *testing.T) {
-	if _, err := Encode(math.NaN()); err == nil {
-		t.Fatal("NaN encoded")
+// TestNaNOrdersLast (deep-look D-36): NaN encodes (it was refused), every
+// NaN bit pattern encodes alike, and NaN sorts above +Inf in both byte
+// order and Compare, as Postgres orders it; descending reverses it.
+func TestNaNOrdersLast(t *testing.T) {
+	nan, err := Encode(math.NaN())
+	if err != nil {
+		t.Fatal(err)
 	}
+	negNaN, _ := Encode(math.Float64frombits(0xFFF8000000000001))
+	if !bytes.Equal(nan, negNaN) {
+		t.Fatal("two NaN bit patterns encode differently")
+	}
+	inf, _ := Encode(math.Inf(1))
+	if bytes.Compare(inf, nan) >= 0 || Compare([]any{math.Inf(1)}, []any{math.NaN()}) >= 0 {
+		t.Fatal("NaN does not sort above +Inf")
+	}
+	if Compare([]any{math.NaN()}, []any{math.NaN()}) != 0 {
+		t.Fatal("NaN does not compare equal to itself")
+	}
+	dnan, _ := AppendDesc(nil, math.NaN())
+	dinf, _ := AppendDesc(nil, math.Inf(1))
+	if bytes.Compare(dnan, dinf) >= 0 {
+		t.Fatal("descending NaN does not sort before +Inf")
+	}
+	vals, err := Decode(nan)
+	if err != nil || len(vals) != 1 || !math.IsNaN(vals[0].(float64)) {
+		t.Fatalf("NaN round trip: %v %v", vals, err)
+	}
+}
+
+// TestAppendValueKeepsNegativeZero (D-36): stored values keep -0's sign;
+// keys still collapse it.
+func TestAppendValueKeepsNegativeZero(t *testing.T) {
+	enc, err := AppendValue(nil, math.Copysign(0, -1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vals, err := Decode(enc)
+	if err != nil || !math.Signbit(vals[0].(float64)) {
+		t.Fatalf("AppendValue lost -0's sign: %v %v", vals, err)
+	}
+	key, _ := Append(nil, math.Copysign(0, -1))
+	if vals, _ := Decode(key); math.Signbit(vals[0].(float64)) {
+		t.Fatal("a key kept -0's sign")
+	}
+}
+
+func TestRejects(t *testing.T) {
 	if _, err := Encode(uint64(math.MaxUint64)); err == nil {
 		t.Fatal("overflowing uint64 encoded")
 	}

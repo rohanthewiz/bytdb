@@ -62,16 +62,21 @@ func TestNormalizeWidths(t *testing.T) {
 }
 
 // TestNormalizeRejects covers every rejection path: values outside
-// int64's range (from both uint and uint64), NaN, and Go types the
-// encoding does not speak.
+// int64's range (from both uint and uint64) and Go types the encoding
+// does not speak. (NaN was one until deep-look D-36; it now normalizes
+// to the canonical NaN.)
 func TestNormalizeRejects(t *testing.T) {
 	rejects := []any{
 		uint(math.MaxUint64),   // uint overflow branch
 		uint64(math.MaxUint64), // uint64 overflow branch
-		math.NaN(),             // float64 NaN
-		float32(math.NaN()),    // float32 NaN routes through the same check
 		struct{}{},             // unsupported type
 		[]int{1},               // unsupported type (slice of non-byte)
+	}
+	for _, v := range []any{math.NaN(), float32(math.NaN())} {
+		got, err := normalize(v)
+		if err != nil || math.Float64bits(got.(float64)) != math.Float64bits(canonicalNaN) {
+			t.Fatalf("normalize(%v) = %v, %v; want the canonical NaN", v, got, err)
+		}
 	}
 	for _, v := range rejects {
 		if got, err := normalize(v); err == nil {

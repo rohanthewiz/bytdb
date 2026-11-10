@@ -307,7 +307,7 @@ func backfillColumn(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint3
 		vals = append(vals, v)
 	}
 	for i, k := range keys {
-		buf, err := tuple.Append(append([]byte(nil), vals[i]...), int64(colID), val)
+		buf, err := tuple.AppendValue(append([]byte(nil), vals[i]...), int64(colID), val)
 		if err != nil {
 			return serr.Wrap(err, "op", "backfill column default", "table", desc.Name)
 		}

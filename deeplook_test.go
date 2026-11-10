@@ -635,3 +635,54 @@ func TestCatalogVersion(t *testing.T) {
 		t.Fatalf("ADD COLUMN left the version at %d", v)
 	}
 }
+
+// TestNaNAndNegativeZero (D-36): a float column refused NaN ("tuple: NaN
+// is not encodable") and stored -0.0 as +0.0 while InsertReturning
+// reported -0.0. NaN now stores, also as a key (sorting after +Inf, as
+// Postgres orders it), and a stored -0 keeps its sign.
+func TestNaNAndNegativeZero(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt}, {Name: "f", Type: TFloat}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", 1, math.NaN()); err != nil {
+		t.Fatalf("insert NaN: %v", err)
+	}
+	r, ok, err := e.Get("t", 1)
+	if err != nil || !ok || !math.IsNaN(r.Vals[1].(float64)) {
+		t.Fatalf("NaN round trip: %v %v %v", r.Vals, ok, err)
+	}
+	ret, err := e.InsertReturning("t", 2, math.Copysign(0, -1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, _, _ := e.Get("t", 2)
+	if math.Signbit(ret.Vals[1].(float64)) != math.Signbit(g.Vals[1].(float64)) || !math.Signbit(g.Vals[1].(float64)) {
+		t.Fatalf("-0: returned signbit %v, stored signbit %v; want both true",
+			math.Signbit(ret.Vals[1].(float64)), math.Signbit(g.Vals[1].(float64)))
+	}
+
+	// As a key: NaN sorts after +Inf in an index scan.
+	if _, err := e.CreateTable("k", []Column{{Name: "f", Type: TFloat}}, "f"); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []float64{math.NaN(), math.Inf(1), 1, math.Inf(-1)} {
+		if err := e.Insert("k", f); err != nil {
+			t.Fatalf("insert key %v: %v", f, err)
+		}
+	}
+	if err := e.Insert("k", math.Float64frombits(0xFFF8000000000001)); err == nil {
+		t.Fatal("a second NaN key (another bit pattern) did not collide with the first")
+	}
+	var order []float64
+	for row, err := range e.Scan("k") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		order = append(order, row.Vals[0].(float64))
+	}
+	if len(order) != 4 || !math.IsInf(order[0], -1) || !math.IsInf(order[2], 1) || !math.IsNaN(order[3]) {
+		t.Fatalf("key order = %v; want -Inf, 1, +Inf, NaN", order)
+	}
+}

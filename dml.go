@@ -837,7 +837,9 @@ func encodeRowValue(desc *TableDesc, row []any) ([]byte, error) {
 		if desc.isPK(i) || row[i] == nil {
 			continue
 		}
-		if buf, err = tuple.Append(buf, int64(desc.Columns[i].ID), row[i]); err != nil {
+		// AppendValue, not Append: a stored float keeps -0's sign
+		// (deep-look D-36); only keys collapse it.
+		if buf, err = tuple.AppendValue(buf, int64(desc.Columns[i].ID), row[i]); err != nil {
 			return nil, serr.Wrap(err, "op", "encode row value", "column", desc.Columns[i].Name)
 		}
 	}

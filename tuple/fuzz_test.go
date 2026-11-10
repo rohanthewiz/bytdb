@@ -63,16 +63,16 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		if err != nil {
 			return // rejected garbage is fine; a panic is a fuzz failure
 		}
+		// Crafted bytes can decode to a NaN other than the canonical one
+		// Encode writes, so re-encoding would not reproduce them; such
+		// input is not canonical and has nothing more to check.
+		for _, v := range vals {
+			if fv, ok := v.(float64); ok && math.IsNaN(fv) {
+				return
+			}
+		}
 		enc, err := Encode(vals...)
 		if err != nil {
-			// Arbitrary bytes can decode to values Encode rejects
-			// (only NaN today: Encode never emits it, but the float
-			// bit pattern is reachable by crafted input).
-			for _, v := range vals {
-				if fv, ok := v.(float64); ok && math.IsNaN(fv) {
-					return
-				}
-			}
 			t.Fatalf("decoded values %#v failed to re-encode: %v", vals, err)
 		}
 
@@ -166,7 +166,7 @@ var boundaryVals = []any{
 // genTuple deterministically maps raw fuzz bytes onto a tuple of
 // encodable values. The mapping is a tiny bytecode: one selector byte
 // picks the element type, subsequent bytes supply the payload. Every
-// output is encodable by construction (NaN is redirected), so the fuzz
+// output is encodable by construction (NaN included), so the fuzz
 // body can treat Encode errors as failures.
 func genTuple(data []byte) []any {
 	var vals []any
@@ -188,18 +188,14 @@ func genTuple(data []byte) []any {
 			}
 			data = consume(data, n)
 			vals = append(vals, int64(u))
-		case 3: // float64 from 8 payload bytes; NaN redirected to +Inf
+		case 3: // float64 from 8 payload bytes, NaN included (it sorts last)
 			var u uint64
 			n := min(len(data), 8)
 			for _, c := range data[:n] {
 				u = u<<8 | uint64(c)
 			}
 			data = consume(data, n)
-			fv := math.Float64frombits(u)
-			if math.IsNaN(fv) {
-				fv = math.Inf(1)
-			}
-			vals = append(vals, fv)
+			vals = append(vals, math.Float64frombits(u))
 		case 4: // string with explicit length byte
 			var n int
 			if len(data) > 0 {

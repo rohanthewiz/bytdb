@@ -6,8 +6,16 @@
 //
 // Supported element types (after normalization): nil (NULL), bool,
 // int64, float64, string, []byte. Inputs of any Go integer width are
-// normalized to int64, float32 to float64. NaN is rejected; negative
-// zero normalizes to positive zero.
+// normalized to int64, float32 to float64. Every NaN normalizes to one
+// canonical NaN, which sorts above +Inf (Postgres's order: NaN is
+// greater than every number and equal to itself). Negative zero
+// normalizes to positive zero in keys (Append), so equal values encode
+// identically; AppendValue keeps it, for stored values whose order does
+// not matter but whose sign Postgres preserves.
+//
+// NaN was refused outright until deep-look D-36, so no existing key or
+// value holds one; adding it extends the encoding without changing any
+// byte an earlier version wrote.
 //
 // Elements of different types order by type tag: NULL < false < true <
 // ints < floats < bytes < strings. Within a typed column only one tag
@@ -54,7 +62,17 @@ func Encode(vals ...any) ([]byte, error) {
 
 // Append appends the encoding of vals to buf and returns the result.
 func Append(buf []byte, vals ...any) ([]byte, error) {
-	return appendVals(buf, 0x00, vals)
+	return appendVals(buf, 0x00, vals, false)
+}
+
+// AppendValue is Append for a stored value rather than a key: the one
+// difference is that a float's negative zero keeps its sign. Keys must
+// collapse it (0 = -0, so both must encode alike), but a value is only
+// ever decoded, and Postgres preserves -0 in a float8 column; collapsing
+// it made the stored row disagree with the row InsertReturning reported
+// (deep-look D-36).
+func AppendValue(buf []byte, vals ...any) ([]byte, error) {
+	return appendVals(buf, 0x00, vals, true)
 }
 
 // AppendDesc appends vals encoded for descending order: each element's
@@ -65,13 +83,18 @@ func Append(buf []byte, vals ...any) ([]byte, error) {
 // Descending elements decode with DecodeOne(data, true); note that a
 // descending NULL sorts after every value, the mirror of ascending.
 func AppendDesc(buf []byte, vals ...any) ([]byte, error) {
-	return appendVals(buf, 0xFF, vals)
+	return appendVals(buf, 0xFF, vals, false)
 }
 
 // appendVals encodes vals with every byte XORed by mask (0x00 keeps
-// ascending order; 0xFF reverses it).
-func appendVals(buf []byte, mask byte, vals []any) ([]byte, error) {
+// ascending order; 0xFF reverses it). keepNegZero is AppendValue's
+// mode.
+func appendVals(buf []byte, mask byte, vals []any, keepNegZero bool) ([]byte, error) {
 	for _, v := range vals {
+		if f, ok := v.(float64); ok && keepNegZero && f == 0 {
+			buf = appendValue(buf, mask, f) // ±0 as given
+			continue
+		}
 		n, err := normalize(v)
 		if err != nil {
 			return nil, err
@@ -295,7 +318,7 @@ func compareValues(av, bv any) int {
 	case int64:
 		return cmp.Compare(t, b.(int64))
 	case float64:
-		return cmp.Compare(t, b.(float64))
+		return compareFloat(t, b.(float64))
 	case []byte:
 		return bytes.Compare(t, b.([]byte))
 	case string:
@@ -362,14 +385,37 @@ func normalize(v any) (any, error) {
 	return nil, serr.New("tuple: unsupported element type", "type", fmt.Sprintf("%T", v))
 }
 
+// canonicalNaN is the one NaN the encoding stores: positive, quiet.
+// Under the sign transform appendValue applies, its bits order just
+// above +Inf, which is where Postgres sorts NaN.
+var canonicalNaN = math.Float64frombits(0x7FF8000000000000)
+
 func normalizeFloat(f float64) (any, error) {
 	if math.IsNaN(f) {
-		return nil, serr.New("tuple: NaN is not encodable")
+		// Every NaN encodes as the canonical one, so they all compare
+		// equal (and a negative-signed NaN cannot sort below -Inf).
+		return canonicalNaN, nil
 	}
 	if f == 0 {
 		return 0.0, nil // collapse -0 so equal values encode identically
 	}
 	return f, nil
+}
+
+// compareFloat orders floats as the encoding does: NaN above every
+// number and equal to itself. (cmp.Compare puts NaN below everything,
+// which would contradict the byte order.)
+func compareFloat(a, b float64) int {
+	an, bn := math.IsNaN(a), math.IsNaN(b)
+	switch {
+	case an && bn:
+		return 0
+	case an:
+		return 1
+	case bn:
+		return -1
+	}
+	return cmp.Compare(a, b)
 }
 
 // PrefixEnd returns the smallest byte string greater than every string

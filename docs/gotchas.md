@@ -159,7 +159,13 @@ Deliberate Postgres *divergences* to know about:
 - `LIKE`'s `ESCAPE` accepts only the default backslash — any other escape
   character is rejected rather than silently misapplied.
 
-Three semantic notes that surprise people (all Postgres-faithful):
+Four semantic notes that surprise people (all Postgres-faithful):
+
+- **`NaN` is a value, and it sorts last.** A float column stores `'NaN'`, in
+  a key too; every NaN equals every other, and NaN sorts above every number,
+  `Infinity` included, so `ORDER BY f` puts it last and `GROUP BY f` makes one
+  group of them. A stored `-0` keeps its sign (`'-0'::float8` reads back as
+  `-0`) but compares equal to `0`.
 
 - `x NOT IN (...)` with a NULL in the list matches **zero rows** — three-valued
   logic, same as Postgres.
