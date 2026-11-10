@@ -112,6 +112,32 @@ func formatFor(formats []int, i int) int {
 // type can say whether an int64 is a count or an instant. "" (an
 // untyped expression) falls through to representation-driven encoding.
 func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
+	// The declared type is what the client decodes by, so a value whose
+	// Go kind contradicts it would be read as something else entirely —
+	// an int64 under a uuid OID, a string's bytes under int8 in binary.
+	// Two contradictions have a correct answer and get it; the rest are
+	// refused (XX000) rather than sent as wrong bytes (deep-look D-17).
+	switch t {
+	case "", bytdb.TString:
+		// Text (or untyped, which is described as text): every value has
+		// a text rendering, and text is what the client was told. This
+		// is the "result described as text" fallback, coalesce(int, 0)
+		// say, until typing describes it properly. The rendering goes
+		// out in both formats — text's binary form is the same bytes —
+		// where the value's own binary encoding (8 raw bytes for an
+		// int64) would be read as garbage text.
+		if _, ok := v.(string); !ok {
+			return encodeByKind(v, fmtText)
+		}
+	case bytdb.TFloat:
+		if n, ok := v.(int64); ok {
+			v = float64(n) // exact for any count a float column could describe
+		}
+	}
+	if !kindFits(v, t) {
+		return nil, serr.New("result value does not match its column type",
+			"type", string(t), "value_type", fmt.Sprintf("%T", v))
+	}
 	switch t {
 	case bytdb.TTimestamp:
 		if x, ok := v.(int64); ok {
@@ -154,6 +180,39 @@ func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
 			return append([]byte{1}, x...), nil
 		}
 	}
+	return encodeByKind(v, format)
+}
+
+// kindFits reports whether v's Go kind is the runtime representation of
+// declared type t (see bytdb.ColType). Text-like types are handled
+// before this check.
+func kindFits(v any, t bytdb.ColType) bool {
+	switch t {
+	case bytdb.TBool:
+		_, ok := v.(bool)
+		return ok
+	case bytdb.TInt, bytdb.TTimestamp, bytdb.TDate:
+		_, ok := v.(int64)
+		return ok
+	case bytdb.TFloat:
+		_, ok := v.(float64)
+		return ok
+	case bytdb.TBytes:
+		_, ok := v.([]byte)
+		return ok
+	case bytdb.TUUID:
+		b, ok := v.([]byte)
+		return ok && len(b) == 16
+	case bytdb.TTextArray, bytdb.TJSONB:
+		_, ok := v.(string)
+		return ok
+	}
+	return true
+}
+
+// encodeByKind is representation-driven encoding: the value's own Go
+// kind decides the bytes.
+func encodeByKind(v any, format int) ([]byte, error) {
 	if format == fmtText {
 		switch x := v.(type) {
 		case bool:
