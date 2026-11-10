@@ -718,6 +718,16 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
   that point, so a concurrent writer of the rows it read fails one side with
   40001 rather than letting both proceed on stale data. NOWAIT and SKIP
   LOCKED change nothing: no row is ever locked
+- `INSERT ... SELECT` (or a parenthesized query): the query runs inside the
+  insert's transaction, so it reads the starting state, never the rows being
+  inserted; without a column list, rows shorter than the table fill its
+  first columns and the rest take their defaults, as in Postgres. `ON
+  CONFLICT` and `RETURNING` apply as for `VALUES`
+- `UPDATE t [AS x] SET ... FROM other ... WHERE ...` and `DELETE FROM t [AS
+  x] USING other ... WHERE ...`: the target joined with the other tables
+  under WHERE; a target row matching several rows is updated once, from the
+  first match. `RETURNING` reads the target's columns. `SET col = DEFAULT`
+  (also in `ON CONFLICT DO UPDATE`) assigns the column's default
 - Expression values in `INSERT ... VALUES` — evaluated per row, so
   `VALUES (nextval('s'), 'by'||'tdb', (SELECT max(id) FROM t))` all work;
   aggregates, window calls, and column references are rejected, as in

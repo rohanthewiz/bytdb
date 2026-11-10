@@ -20,6 +20,9 @@ func numParams(st Statement) int {
 	}
 	switch s := st.(type) {
 	case *Insert:
+		if s.Query != nil {
+			noteSelectVals(s.Query, note)
+		}
 		for _, row := range s.Rows {
 			for _, v := range row {
 				// An expression value carries its placeholders inside the
@@ -48,9 +51,15 @@ func numParams(st Statement) int {
 		for _, ex := range s.SetEx {
 			noteExprVals(ex, note)
 		}
+		for _, f := range s.From {
+			notePredVals(f.On, note)
+		}
 		notePredVals(s.Where, note)
 		noteReturningVals(&s.Returning, note)
 	case *Delete:
+		for _, f := range s.Using {
+			notePredVals(f.On, note)
+		}
 		notePredVals(s.Where, note)
 		noteReturningVals(&s.Returning, note)
 	case *Select:
@@ -176,6 +185,9 @@ func bindParams(st Statement, args []any) (Statement, error) {
 	switch s := st.(type) {
 	case *Insert:
 		c := *s
+		if s.Query != nil {
+			c.Query = bindSelect(s.Query, b)
+		}
 		c.Rows = make([][]any, len(s.Rows))
 		for i, row := range s.Rows {
 			r := make([]any, len(row))
@@ -215,11 +227,13 @@ func bindParams(st Statement, args []any) (Statement, error) {
 		for k, ex := range s.SetEx {
 			c.SetEx[k] = bindExpr(ex, b)
 		}
+		c.From = bindFromItems(s.From, b)
 		c.Where = bindBool(s.Where, b)
 		c.Returning = bindReturning(s.Returning, b)
 		out = &c
 	case *Delete:
 		c := *s
+		c.Using = bindFromItems(s.Using, b)
 		c.Where = bindBool(s.Where, b)
 		c.Returning = bindReturning(s.Returning, b)
 		out = &c
@@ -236,6 +250,20 @@ func bindParams(st Statement, args []any) (Statement, error) {
 		return nil, b.err
 	}
 	return out, nil
+}
+
+// bindFromItems binds the ON conditions of a FROM list (UPDATE ...
+// FROM, DELETE ... USING) into a copy; nil stays nil.
+func bindFromItems(items []FromItem, b *binder) []FromItem {
+	if items == nil {
+		return nil
+	}
+	out := make([]FromItem, len(items))
+	copy(out, items)
+	for i := range out {
+		out[i].On = bindBool(out[i].On, b)
+	}
+	return out
 }
 
 // binder carries one execution's normalized argument values through

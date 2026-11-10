@@ -1045,16 +1045,57 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		// whole, before the first row is staged. With ON CONFLICT the
 		// row count is only an upper bound (DO NOTHING writes nothing),
 		// so the per-row charge in Txn.InsertReturning decides instead.
+		rows := s.Rows
+		if s.Query != nil {
+			// INSERT ... SELECT: the query runs inside this write
+			// transaction, so it reads the snapshot the inserts land in
+			// (and never the rows it is inserting), and its rows are the
+			// values (deep-look D-52).
+			dq := *d
+			dq.tx = tx
+			qres, err := dq.execSelectWith(s.Query)
+			if err != nil {
+				return err
+			}
+			width := len(desc.Columns)
+			if s.Cols != nil {
+				width = len(s.Cols)
+			}
+			switch {
+			case len(qres.Cols) > width:
+				return serr.New("INSERT has more expressions than target columns", "table", s.Table)
+			case len(qres.Cols) < width && s.Cols != nil:
+				return serr.New("INSERT has more target columns than expressions", "table", s.Table)
+			}
+			rows = make([][]any, len(qres.Rows))
+			for i, r := range qres.Rows {
+				row := make([]any, len(r))
+				copy(row, r)
+				rows[i] = row
+			}
+		}
+		// Without a column list, rows shorter than the table fill its
+		// first columns and the rest take their defaults — Postgres's
+		// rule for both VALUES and a query (deep-look D-52). Longer rows
+		// fall through to the engine's arity error.
+		colList := s.Cols != nil
+		if !colList && len(rows) > 0 && len(rows[0]) < len(desc.Columns) {
+			colList = true
+			ords = make([]int, len(rows[0]))
+			for i := range ords {
+				ords[i] = i
+			}
+		}
 		if up == nil {
-			if err := tx.CheckWrites(int64(len(s.Rows))); err != nil {
+			if err := tx.CheckWrites(int64(len(rows))); err != nil {
 				return serr.Wrap(err, "op", "insert", "table", s.Table)
 			}
 		}
-		for _, row := range s.Rows {
+		for _, row := range rows {
 			vals := row
 			// s.Cols (not ords) is the column-list signal: DEFAULT VALUES
 			// parses as an empty list, where ords stays nil too.
-			if s.Cols != nil {
+			if colList {
 				if len(row) != len(ords) {
 					return serr.New("INSERT row has wrong number of values", "table", s.Table)
 				}
@@ -1193,30 +1234,34 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
-		ret, err := d.prepareReturning(tx, s.Table, desc, &s.Returning, res)
+		name := targetName(s.Table, s.Alias)
+		ret, err := d.prepareReturning(tx, name, desc, &s.Returning, res)
 		if err != nil {
 			return err
 		}
 		// RETURNING accumulates one output row per affected row; it is
 		// a result set like any SELECT's and held to the same budget.
 		retBudget := d.budget()
-		pl, err := planScan(desc, s.Table, s.Where)
-		if err != nil {
-			return err
-		}
 		checks, err := tableChecks(desc)
 		if err != nil {
 			return err
 		}
+		// SET col = DEFAULT resolves to the column's default here: a
+		// constant joins the literal assignments, a per-row default
+		// (gen_random_uuid()) the expression ones (deep-look D-52).
+		set, setEx, err := resolveSetDefaults(desc, s.Set, s.SetEx)
+		if err != nil {
+			return err
+		}
 		setOrds := map[string]int{}
-		for col := range s.Set {
+		for col := range set {
 			ord := desc.ColIndex(col)
 			if ord < 0 {
 				return serr.New("no such column", "table", s.Table, "column", col)
 			}
 			setOrds[col] = ord
 		}
-		for col := range s.SetEx {
+		for col := range setEx {
 			ord := desc.ColIndex(col)
 			if ord < 0 {
 				return serr.New("no such column", "table", s.Table, "column", col)
@@ -1231,10 +1276,10 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		// but this executor resolves the transaction's catalog; coercing
 		// here (a no-op on already-coerced values) removes that hidden
 		// coupling instead of trusting it.
-		setVals := s.Set
+		setVals := set
 		if len(checks) > 0 {
-			setVals = make(map[string]any, len(s.Set))
-			for col, v := range s.Set {
+			setVals = make(map[string]any, len(set))
+			for col, v := range set {
 				cv, err := coerceLit(v, desc.Columns[setOrds[col]].Type)
 				if err != nil {
 					return serr.Wrap(err, "table", s.Table, "column", col)
@@ -1250,22 +1295,41 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		// the set grows: an UPDATE that would go over it fails during
 		// the scan, before it has staged a single write or finished
 		// materializing a table it could never commit.
-		env := d.tableEnv(tx, s.Table, desc)
+		env := d.tableEnv(tx, name, desc)
 		var rows [][]any
 		var capErr error
 		// The materialized rows are an in-memory row set like any other,
 		// so besides the write cap they are held to the row cap and the
 		// memory-ceiling poll (next-list N-029).
 		budget := d.budget()
-		err = scanPlan(d.ctx, tx, s.Table, pl, env, func(r bytdb.Row) bool {
-			rows = append(rows, r.Vals)
-			if capErr = tx.CheckWrites(int64(len(rows))); capErr == nil {
-				capErr = budget.check(len(rows))
+		charge := func(n int) error {
+			if err := tx.CheckWrites(int64(n)); err != nil {
+				return err
 			}
-			return capErr == nil
-		})
-		if err != nil {
-			return err
+			return budget.check(n)
+		}
+		// SET expressions evaluate in setEnv: the target's own row, or
+		// for UPDATE ... FROM the combined row of the match (combined).
+		setEnv := env
+		var combined [][]any
+		if len(s.From) > 0 {
+			rows, combined, setEnv, err = d.targetJoinRows(tx, s.Table, s.Alias, desc, s.From, s.Where, charge)
+			if err != nil {
+				return err
+			}
+		} else {
+			pl, err := planScan(desc, name, s.Where)
+			if err != nil {
+				return err
+			}
+			err = scanPlan(d.ctx, tx, s.Table, pl, env, func(r bytdb.Row) bool {
+				rows = append(rows, r.Vals)
+				capErr = charge(len(rows))
+				return capErr == nil
+			})
+			if err != nil {
+				return err
+			}
 		}
 		if capErr != nil {
 			return serr.Wrap(capErr, "op", "update", "table", s.Table)
@@ -1297,15 +1361,19 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 			// literal would. The merged map starts from the uncoerced
 			// literal Set — tx.Update applies its own coercion to those,
 			// preserving the literal-only path's behavior byte for byte.
-			set := s.Set
-			if len(s.SetEx) > 0 {
-				set = make(map[string]any, len(s.Set)+len(s.SetEx))
-				for col, v := range s.Set {
-					set[col] = v
+			set := set
+			if len(setEx) > 0 {
+				merged := make(map[string]any, len(set)+len(setEx))
+				for col, v := range set {
+					merged[col] = v
 				}
-				env.row = rv
-				for col, ex := range s.SetEx {
-					v, err := evalEx(env, ex)
+				set = merged
+				setEnv.row = rv
+				if combined != nil {
+					setEnv.row = combined[i]
+				}
+				for col, ex := range setEx {
+					v, err := evalEx(setEnv, ex)
 					if err != nil {
 						return err
 					}
@@ -1324,7 +1392,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 				// Expression results are already evaluated and coerced in
 				// the merged map; the check row must judge those values,
 				// not the expressions' raw text.
-				for col := range s.SetEx {
+				for col := range setEx {
 					nv[setOrds[col]] = set[col]
 				}
 				if err := checkRow(env, s.Table, checks, nv); err != nil {
@@ -1402,17 +1470,14 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
-		ret, err := d.prepareReturning(tx, s.Table, desc, &s.Returning, res)
+		name := targetName(s.Table, s.Alias)
+		ret, err := d.prepareReturning(tx, name, desc, &s.Returning, res)
 		if err != nil {
 			return err
 		}
 		// RETURNING's rows are held to the row cap; the memory ceiling
 		// is skipped for the whole DELETE (DB.freeing, set by dispatch).
 		retBudget := d.budget()
-		pl, err := planScan(desc, s.Table, s.Where)
-		if err != nil {
-			return err
-		}
 		refs, err := tx.ReferencingFKs(s.Table)
 		if err != nil {
 			return err
@@ -1426,13 +1491,38 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		// self-referencing row) in one statement is legal.
 		keepRows := ret != nil || len(refs) > 0
 		var rows [][]any
-		pks, err := collectPKs(d.ctx, tx, s.Table, desc, pl, d.tableEnv(tx, s.Table, desc), func(vals []any) {
-			if keepRows {
-				rows = append(rows, vals)
+		var pks [][]any
+		if len(s.Using) > 0 {
+			// DELETE ... USING: a target row goes if any combination with
+			// the USING tables matches WHERE (deep-look D-52).
+			matched, _, _, err := d.targetJoinRows(tx, s.Table, s.Alias, desc, s.Using, s.Where,
+				d.budget().check)
+			if err != nil {
+				return err
 			}
-		})
-		if err != nil {
-			return err
+			for _, vals := range matched {
+				pk := make([]any, len(desc.PKCols))
+				for i, ord := range desc.PKCols {
+					pk[i] = vals[ord]
+				}
+				pks = append(pks, pk)
+				if keepRows {
+					rows = append(rows, vals)
+				}
+			}
+		} else {
+			pl, err := planScan(desc, name, s.Where)
+			if err != nil {
+				return err
+			}
+			pks, err = collectPKs(d.ctx, tx, s.Table, desc, pl, d.tableEnv(tx, name, desc), func(vals []any) {
+				if keepRows {
+					rows = append(rows, vals)
+				}
+			})
+			if err != nil {
+				return err
+			}
 		}
 		// RETURNING is computed for every row before the first delete, so
 		// a subquery in it sees the statement's starting state: DELETE ...
@@ -2059,4 +2149,96 @@ func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 		return nil, err
 	}
 	return &Result{}, nil
+}
+
+// resolveSetDefaults replaces SET col = DEFAULT markers with the
+// column's default (NULL without one): a constant joins the literal
+// assignments; a per-row default (DEFAULT gen_random_uuid()) becomes an
+// expression assignment, evaluated per row. The maps are copied only
+// when a marker is present — they belong to a parsed tree that may be
+// shared.
+func resolveSetDefaults(desc *bytdb.TableDesc, set map[string]any, setEx map[string]Expr) (map[string]any, map[string]Expr, error) {
+	if !hasDefaultMarker(set) {
+		return set, setEx, nil
+	}
+	defaults, err := columnDefaults(desc)
+	if err != nil {
+		return nil, nil, err
+	}
+	outSet := make(map[string]any, len(set))
+	outEx := make(map[string]Expr, len(setEx)+1)
+	for col, ex := range setEx {
+		outEx[col] = ex
+	}
+	for col, v := range set {
+		if _, ok := v.(defaultMarker); !ok {
+			outSet[col] = v
+			continue
+		}
+		ord := desc.ColIndex(col)
+		if ord < 0 {
+			return nil, nil, serr.New("no such column", "table", desc.Name, "column", col)
+		}
+		if ex, isEx := defaults[ord].(Expr); isEx {
+			outEx[col] = ex
+		} else {
+			outSet[col] = defaults[ord]
+		}
+	}
+	return outSet, outEx, nil
+}
+
+// targetJoinRows finds the target rows of UPDATE ... FROM or DELETE ...
+// USING: the target (first, under its alias) joined with the extra
+// tables under WHERE. Each target row is returned once, with the
+// combined row of its first match and an environment over the combined
+// scope for evaluating SET (deep-look D-52). charge is called with the
+// running count, for the write cap and row budget.
+func (d *DB) targetJoinRows(tx *bytdb.Txn, table, alias string, desc *bytdb.TableDesc,
+	more []FromItem, where BoolExpr, charge func(int) error) (rows, combined [][]any, env *exEnv, err error) {
+	items := append([]FromItem{{Table: table, Alias: alias}}, more...)
+	fp, err := prepareFrom(d.lookup(tx.TableShared), items, where)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	env = &exEnv{d: d, tx: tx, sc: fp.sc, subs: newSubMemo(), outer: d.outer}
+	width := len(desc.Columns)
+	seen := map[string]bool{}
+	pk := make([]any, len(desc.PKCols))
+	var cbErr error
+	err = runJoin(tx, fp, env, func(vals []any) bool {
+		for i, ord := range desc.PKCols {
+			pk[i] = vals[ord]
+		}
+		k, kerr := hashKey(pk...)
+		if kerr != nil {
+			cbErr = kerr
+			return false
+		}
+		if seen[string(k)] {
+			return true // already matched: the first match decides
+		}
+		seen[string(k)] = true
+		rows = append(rows, vals[:width:width])
+		combined = append(combined, vals)
+		cbErr = charge(len(rows))
+		return cbErr == nil
+	})
+	if err == nil {
+		err = cbErr
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return rows, combined, env, nil
+}
+
+// hasDefaultMarker reports whether a SET map assigns DEFAULT anywhere.
+func hasDefaultMarker(set map[string]any) bool {
+	for _, v := range set {
+		if _, ok := v.(defaultMarker); ok {
+			return true
+		}
+	}
+	return false
 }

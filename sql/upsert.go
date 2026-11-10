@@ -56,6 +56,17 @@ func (d *DB) prepareUpsert(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, o
 	if !oc.Update {
 		return u, nil
 	}
+	// DO UPDATE SET col = DEFAULT, as in UPDATE (resolveSetDefaults);
+	// the clause is copied, not changed — it belongs to the parsed tree.
+	if hasDefaultMarker(oc.Set) {
+		set, setEx, err := resolveSetDefaults(desc, oc.Set, oc.SetEx)
+		if err != nil {
+			return nil, err
+		}
+		oc2 := *oc
+		oc2.Set, oc2.SetEx = set, setEx
+		oc, u.oc = &oc2, &oc2
+	}
 	u.touched = map[string]bool{}
 	u.checkEnv = d.tableEnv(tx, table, desc)
 	w := len(desc.Columns)

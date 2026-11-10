@@ -538,6 +538,15 @@ func (t *typer) insert(s *Insert) (Statement, error) {
 	if changed {
 		c.Rows = rows
 	}
+	if s.Query != nil {
+		q, _, err := t.sel(s.Query, nil)
+		if err != nil {
+			return nil, err
+		}
+		if q != s.Query {
+			c.Query, changed = q, true
+		}
+	}
 	if oc := s.Conflict; oc != nil {
 		// The DO UPDATE arm resolves over the target plus "excluded";
 		// both share the descriptor.
@@ -583,7 +592,13 @@ func (t *typer) update(s *Update) (Statement, error) {
 	if desc == nil {
 		return s, nil
 	}
-	ts := &tscope{sc: tableScope(s.Table, desc)}
+	// RETURNING reads the target alone; SET and WHERE also see the FROM
+	// tables of UPDATE ... FROM.
+	retTS := &tscope{sc: tableScope(targetName(s.Table, s.Alias), desc)}
+	ts, err := t.targetScope(s.Table, s.Alias, desc, s.From)
+	if err != nil {
+		return nil, err
+	}
 	c := *s
 	changed := false
 	set, setEx, err := t.assignments(desc, s.Set, s.SetEx, ts)
@@ -603,7 +618,7 @@ func (t *typer) update(s *Update) (Statement, error) {
 	if where != s.Where {
 		c.Where, changed = where, true
 	}
-	ret, retChanged, err := t.returning(s.Returning, ts)
+	ret, retChanged, err := t.returning(s.Returning, retTS)
 	if err != nil {
 		return nil, err
 	}
@@ -616,12 +631,30 @@ func (t *typer) update(s *Update) (Statement, error) {
 	return &c, nil
 }
 
+// targetScope is the scope an UPDATE or DELETE's WHERE (and SET) sees:
+// the target under its alias, then any FROM / USING tables.
+func (t *typer) targetScope(table, alias string, desc *bytdb.TableDesc, more []FromItem) (*tscope, error) {
+	if len(more) == 0 {
+		return &tscope{sc: tableScope(targetName(table, alias), desc)}, nil
+	}
+	items := append([]FromItem{{Table: table, Alias: alias}}, more...)
+	sc, err := buildScope(t.lookup, items)
+	if err != nil {
+		return nil, err
+	}
+	return &tscope{sc: sc}, nil
+}
+
 func (t *typer) delete(s *Delete) (Statement, error) {
 	desc, _ := t.lookup(s.Table)
 	if desc == nil {
 		return s, nil
 	}
-	ts := &tscope{sc: tableScope(s.Table, desc)}
+	retTS := &tscope{sc: tableScope(targetName(s.Table, s.Alias), desc)}
+	ts, err := t.targetScope(s.Table, s.Alias, desc, s.Using)
+	if err != nil {
+		return nil, err
+	}
 	c := *s
 	changed := false
 	where, err := t.boolx(s.Where, ts, false)
@@ -631,7 +664,7 @@ func (t *typer) delete(s *Delete) (Statement, error) {
 	if where != s.Where {
 		c.Where, changed = where, true
 	}
-	ret, retChanged, err := t.returning(s.Returning, ts)
+	ret, retChanged, err := t.returning(s.Returning, retTS)
 	if err != nil {
 		return nil, err
 	}

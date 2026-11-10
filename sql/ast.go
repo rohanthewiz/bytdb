@@ -929,9 +929,13 @@ type defaultMarker struct{}
 // Postgres. INSERT ... DEFAULT VALUES parses as an empty column list
 // with one empty row.
 type Insert struct {
-	Table    string
-	Cols     []string // nil: values in declared column order
-	Rows     [][]any
+	Table string
+	Cols  []string // nil: values in declared column order
+	Rows  [][]any
+	// Query is INSERT ... SELECT (or a parenthesized query): its rows
+	// are the values, computed inside the insert's own transaction
+	// (deep-look D-52). Rows is nil when it is set.
+	Query    *Select
 	Conflict *OnConflict // nil: a collision is an error, as ever
 	Returning
 }
@@ -1122,15 +1126,36 @@ func (o SetOp) String() string {
 // at execution. A column appears in at most one of the two maps.
 type Update struct {
 	Table string
+	// Alias is UPDATE t [AS] x: the name the statement's clauses
+	// qualify the target's columns with ("" means Table).
+	Alias string
 	Set   map[string]any
 	SetEx map[string]Expr
+	// From is UPDATE ... FROM: further tables joined with the target
+	// under WHERE; SET may read their columns. A target row matching
+	// several joined rows is updated once, from the first (Postgres
+	// leaves which one unspecified). RETURNING reads the target only.
+	From  []FromItem
 	Where BoolExpr
 	Returning
+}
+
+// targetName is the qualifier an UPDATE or DELETE's clauses use for its
+// target table.
+func targetName(table, alias string) string {
+	if alias != "" {
+		return alias
+	}
+	return table
 }
 
 // Delete is DELETE FROM t [WHERE ...] [RETURNING ...].
 type Delete struct {
 	Table string
+	Alias string // DELETE FROM t [AS] x
+	// Using is DELETE ... USING: further tables joined with the target
+	// under WHERE; a target row is deleted if any combination matches.
+	Using []FromItem
 	Where BoolExpr
 	Returning
 }

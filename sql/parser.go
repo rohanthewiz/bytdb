@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -49,6 +50,12 @@ func attachCTEs(st Statement, ctes []CTE) error {
 	case *Select:
 		s.With = ctes
 		return nil
+	case *Insert:
+		// INSERT ... SELECT: the derived tables belong to its query.
+		if s.Query != nil {
+			s.Query.With = append(s.Query.With, ctes...)
+			return nil
+		}
 	case *Explain:
 		return attachCTEs(s.Stmt, ctes)
 	}
@@ -1907,7 +1914,14 @@ func (p *parser) insert() (Statement, error) {
 		return nil, err
 	}
 	ins := &Insert{Table: table}
-	if p.cur().kind == tOp && p.cur().text == "(" {
+	// INSERT INTO t (SELECT ...) — a parenthesized query, not a column list.
+	queryNext := func() bool {
+		t := p.cur()
+		return (t.kind == tIdent && t.text == "select") ||
+			(t.kind == tOp && t.text == "(" && p.tokAt(1).kind == tIdent &&
+				(p.tokAt(1).text == "select" || p.tokAt(1).text == "values"))
+	}
+	if p.cur().kind == tOp && p.cur().text == "(" && !queryNext() {
 		if ins.Cols, err = p.identList("a column name"); err != nil {
 			return nil, err
 		}
@@ -1919,7 +1933,11 @@ func (p *parser) insert() (Statement, error) {
 			seen[c] = true
 		}
 	}
-	if p.acceptKw("default") {
+	if queryNext() {
+		if ins.Query, err = p.queryExpr(); err != nil {
+			return nil, err
+		}
+	} else if p.acceptKw("default") {
 		// INSERT INTO t DEFAULT VALUES: one row, every column its
 		// default (NULL without one) — modeled as an empty column list
 		// with an empty row, which the executor already fills.
@@ -2582,16 +2600,25 @@ func (p *parser) nonNegInt(clause string) (int64, Param, error) {
 }
 
 func (p *parser) update() (Statement, error) {
+	p.acceptKw("only") // no table inheritance in bytdb
 	table, err := p.tableName()
 	if err != nil {
+		return nil, err
+	}
+	u := &Update{Table: table}
+	if u.Alias, err = p.targetAlias("set"); err != nil {
 		return nil, err
 	}
 	if err := p.expectKw("set"); err != nil {
 		return nil, err
 	}
-	u := &Update{Table: table}
 	if u.Set, u.SetEx, err = p.setClause("UPDATE"); err != nil {
 		return nil, err
+	}
+	if p.acceptKw("from") {
+		if u.From, err = p.fromClause(); err != nil {
+			return nil, err
+		}
 	}
 	if p.acceptKw("where") {
 		if u.Where, err = p.boolExpr(false); err != nil {
@@ -2602,6 +2629,19 @@ func (p *parser) update() (Statement, error) {
 		return nil, err
 	}
 	return u, nil
+}
+
+// targetAlias parses an UPDATE or DELETE target's optional [AS] alias;
+// stops are the keywords that may follow the table instead.
+func (p *parser) targetAlias(stops ...string) (string, error) {
+	if p.acceptKw("as") {
+		return p.ident("an alias")
+	}
+	t := p.cur()
+	if t.kind == tQIdent || (t.kind == tIdent && !slices.Contains(stops, t.text) && !noAlias[t.text]) {
+		return p.ident("an alias")
+	}
+	return "", nil
 }
 
 // setClause parses SET col = expr, ... into the literal / expression
@@ -2617,6 +2657,22 @@ func (p *parser) setClause(stmt string) (map[string]any, map[string]Expr, error)
 		}
 		if err := p.expectOp("="); err != nil {
 			return nil, nil, err
+		}
+		// SET col = DEFAULT: the column's default, as in Postgres
+		// (deep-look D-52). Checked before the expression grammar, which
+		// would read the keyword as a column name.
+		if t := p.cur(); t.kind == tIdent && t.text == "default" &&
+			(p.tokAt(1).kind == tEOF || (p.tokAt(1).kind == tOp && (p.tokAt(1).text == "," || p.tokAt(1).text == ";")) ||
+				(p.tokAt(1).kind == tIdent && (p.tokAt(1).text == "where" || p.tokAt(1).text == "from" || p.tokAt(1).text == "returning"))) {
+			p.advance()
+			if _, dup := set[col]; dup {
+				return nil, nil, serr.New("duplicate column in SET", "column", col)
+			}
+			set[col] = defaultMarker{}
+			if !p.acceptOp(",") {
+				return set, setEx, nil
+			}
+			continue
 		}
 		ex, err := p.expression()
 		if err != nil {
@@ -2654,11 +2710,20 @@ func (p *parser) deleteStmt() (Statement, error) {
 	if err := p.expectKw("from"); err != nil {
 		return nil, err
 	}
+	p.acceptKw("only")
 	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
 	d := &Delete{Table: table}
+	if d.Alias, err = p.targetAlias("using", "where", "returning"); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("using") {
+		if d.Using, err = p.fromClause(); err != nil {
+			return nil, err
+		}
+	}
 	if p.acceptKw("where") {
 		if d.Where, err = p.boolExpr(false); err != nil {
 			return nil, err

@@ -181,6 +181,9 @@ func collectStmtTables(st Statement, out map[string]bool) {
 	case *Select:
 		collectSelTables(s, out)
 	case *Insert:
+		if s.Query != nil {
+			collectSelTables(s.Query, out)
+		}
 		for _, row := range s.Rows {
 			for _, v := range row {
 				if ex, ok := v.(Expr); ok {
@@ -196,12 +199,20 @@ func collectStmtTables(st Statement, out map[string]bool) {
 		}
 		collectItemsTables(s.RetItems, out)
 	case *Update:
+		for _, f := range s.From {
+			out[f.Table] = true
+			collectBoolTables(f.On, out)
+		}
 		for _, ex := range s.SetEx {
 			collectExprTables(ex, out)
 		}
 		collectBoolTables(s.Where, out)
 		collectItemsTables(s.RetItems, out)
 	case *Delete:
+		for _, f := range s.Using {
+			out[f.Table] = true
+			collectBoolTables(f.On, out)
+		}
 		collectBoolTables(s.Where, out)
 		collectItemsTables(s.RetItems, out)
 	case *Explain:
