@@ -3,6 +3,7 @@ package sql
 // Session regression tests from the deep-look remediation plan.
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -55,36 +56,32 @@ func TestSessionParseErrorFailsBlock(t *testing.T) {
 	sessExec(t, s, `rollback`)
 }
 
-// TestSubqueryLimitInterimReject (D-09): the subquery runners ignore
-// some ORDER BY / LIMIT / OFFSET combinations, which returned wrong rows
-// silently. Until subqueries run through the real SELECT path (D-27)
-// those shapes are refused; the shapes the runners get right still run.
-func TestSubqueryLimitInterimReject(t *testing.T) {
+// TestSubqueriesThroughExecutor (D-27; replaces D-09's interim
+// refusal): every subquery shape the reduced runners did not implement
+// runs through the full SELECT executor — ORDER BY, LIMIT, OFFSET,
+// GROUP BY, HAVING, UNION and aggregate expressions, correlated or not.
+func TestSubqueriesThroughExecutor(t *testing.T) {
 	d := openDB(t)
-	exec(t, d, `create table o (id int primary key, amt int)`)
-	exec(t, d, `insert into o values (1, 10), (2, 50), (3, 30), (4, 5), (5, 99)`)
-	for _, q := range []string{
-		`select (select amt from o order by amt desc limit 1)`,
-		`select (select amt from o order by amt offset 1 limit 1)`,
-		`select id from o where id in (select id from o order by amt desc limit 2)`,
-		`select id from o where id = any (select id from o limit 2)`,
-		`select exists (select 1 from o limit 0)`,
-		`select exists (select 1 from o offset 10)`,
-		`select array(select amt from o limit 2)`,
-		`select array(select amt from o order by amt desc)`,
-		`select array(select amt from o order by id)`,
-	} {
-		if _, err := d.Exec(q); err == nil || !strings.Contains(err.Error(), "not supported yet") {
-			t.Errorf("%s: err = %v, want the interim refusal", q, err)
-		}
-	}
+	exec(t, d, `create table o (id int primary key, cust int, amt int)`)
+	exec(t, d, `insert into o values (1, 1, 10), (2, 1, 50), (3, 2, 30), (4, 2, 5), (5, 3, 99)`)
 	for q, want := range map[string]any{
-		`select exists (select 1 from o where amt > 90 limit 1)`:               true,
-		`select (select amt from o limit 1)`:                                   int64(10),
-		`select (select max(amt) from o)`:                                      int64(99),
-		`select array(select amt from o order by amt)`:                         "{5,10,30,50,99}",
-		`select array(select amt from o order by 1)`:                           "{5,10,30,50,99}",
-		`select count(*) from o where id in (select id from o where amt > 20)`: int64(3),
+		`select (select amt from o order by amt desc limit 1)`:                                        int64(99),
+		`select (select amt from o order by amt offset 1 limit 1)`:                                    int64(10),
+		`select count(*) from o where id = any (select id from o limit 2)`:                            int64(2),
+		`select exists (select 1 from o limit 0)`:                                                     false,
+		`select exists (select 1 from o offset 10)`:                                                   false,
+		`select exists (select 1 from o offset 4)`:                                                    true,
+		`select array(select amt from o limit 2)`:                                                     "{10,50}",
+		`select array(select amt from o order by amt desc)`:                                           "{99,50,30,10,5}",
+		`select array(select amt from o order by id)`:                                                 "{10,50,30,5,99}",
+		`select (select coalesce(sum(amt), 0) from o where cust = 9)`:                                 int64(0),
+		`select (select count(distinct cust) from o)`:                                                 int64(3),
+		`select (select count(*) + 1 from o)`:                                                         int64(6),
+		`select count(*) from o where cust in (select cust from o group by cust having count(*) > 1)`: int64(4),
+		`select count(*) from o where amt in (select max(amt) from o)`:                                int64(1),
+		`select count(*) from o where id in (select 1 union select 2)`:                                int64(2),
+		`select exists (select cust from o where amt > 1000 group by cust)`:                           false,
+		`select exists (select cust from o group by cust)`:                                            true,
 	} {
 		res, err := d.Exec(q)
 		if err != nil {
@@ -92,8 +89,27 @@ func TestSubqueryLimitInterimReject(t *testing.T) {
 			continue
 		}
 		if got := res.Rows[0][0]; got != want {
-			t.Errorf("%s = %v (%T), want %v", q, got, got, want)
+			t.Errorf("%s = %#v, want %#v", q, got, want)
 		}
+	}
+	// IN over an ordered, limited subquery picks the right rows.
+	if got := ids(t, d, `select id from o where id in (select id from o order by amt desc limit 2) order by id`); !reflect.DeepEqual(got, []int64{2, 5}) {
+		t.Errorf("IN (ORDER BY ... LIMIT 2) = %v, want [2 5]", got)
+	}
+	// Correlated: the latest row per customer, and an outer column in
+	// the select list and ORDER BY of the subquery.
+	res := exec(t, d, `select o1.cust, (select o2.amt from o o2 where o2.cust = o1.cust order by o2.id desc limit 1)
+		from o o1 where o1.id in (1, 3, 5) order by o1.cust`)
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(1), int64(50)}, {int64(2), int64(5)}, {int64(3), int64(99)}}) {
+		t.Errorf("latest per customer: %v", res.Rows)
+	}
+	res = exec(t, d, `select o1.id, (select o1.amt + count(*) from o o2 where o2.cust = o1.cust group by o2.cust)
+		from o o1 order by o1.id`)
+	if !reflect.DeepEqual(res.Rows[0], []any{int64(1), int64(12)}) || !reflect.DeepEqual(res.Rows[4], []any{int64(5), int64(100)}) {
+		t.Errorf("outer column in a grouped subquery: %v", res.Rows)
+	}
+	if msg := execErr(t, d, `select (select amt from o order by amt limit 2)`); !strings.Contains(msg, "more than one row") {
+		t.Errorf("two rows from a scalar subquery: %s", msg)
 	}
 }
 
@@ -259,5 +275,37 @@ func TestLexerParserDivergences(t *testing.T) {
 		if _, err := d.Exec(q); err == nil {
 			t.Errorf("%s: accepted", q)
 		}
+	}
+}
+
+// TestInSubquerySet (D-28): the hash-set probe keeps IN's three-valued
+// answers and defers to the comparison loop when kinds differ.
+func TestInSubquerySet(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table a (id int primary key, x int, f float, s text)`)
+	exec(t, d, `insert into a values (1, 1, 1.0, '1'), (2, 2, 2.5, 'b'), (3, null, null, null)`)
+	exec(t, d, `create table b (id int primary key, y int)`)
+	exec(t, d, `insert into b values (1, 1), (2, 2), (3, null)`)
+	for q, want := range map[string]any{
+		`select count(*) from a where x in (select y from b)`:                         int64(2),
+		`select count(*) from a where x not in (select y from b)`:                     int64(0), // NULL in the set
+		`select count(*) from a where x not in (select y from b where y is not null)`: int64(0),
+		`select count(*) from a where f in (select y from b)`:                         int64(1), // 1.0 = 1
+		`select 5 in (select y from b where y is not null)`:                           false,
+		`select 5 in (select y from b)`:                                               nil,
+		`select null::int in (select y from b where false)`:                           false,
+	} {
+		res, err := d.Exec(q)
+		if err != nil {
+			t.Errorf("%s: %v", q, err)
+			continue
+		}
+		if got := res.Rows[0][0]; got != want {
+			t.Errorf("%s = %#v, want %#v", q, got, want)
+		}
+	}
+	// text against integers is still refused, through the loop.
+	if msg := execErr(t, d, `select count(*) from a where s in (select y from b)`); !strings.Contains(msg, "operator does not exist") {
+		t.Errorf("text IN (integers): %s", msg)
 	}
 }

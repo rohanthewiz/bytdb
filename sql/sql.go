@@ -489,6 +489,13 @@ type DB struct {
 	// serializable, so tracking reads would be pure overhead.
 	serial bool
 
+	// outer is the correlation scope of a subquery run through the full
+	// SELECT executor (subselect.go): the enclosing query's current row.
+	// Every root evaluation environment the executor builds links to it,
+	// so a reference the subquery's own FROM does not resolve falls back
+	// to the outer row, exactly as in the reduced subquery runners.
+	outer *exEnv
+
 	// catalogShapes makes virtual system tables resolve to their
 	// descriptors with no rows. It is set only on the private copy that
 	// derives view shapes for the catalog (viewColumns), which needs

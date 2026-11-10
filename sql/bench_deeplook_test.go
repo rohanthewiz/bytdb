@@ -173,3 +173,9 @@ func BenchmarkDLHashJoin(b *testing.B) {
 func BenchmarkDLIndexNLJoin(b *testing.B) {
 	benchQuery(b, `SELECT count(*) FROM orders o JOIN cust c ON c.id = o.cust`)
 }
+
+// D-28: x IN (uncorrelated subquery) over 100k outer rows and 500
+// subquery values (the plan's shape).
+func BenchmarkDLInSubquery(b *testing.B) {
+	benchQuery(b, `SELECT count(*) FROM orders WHERE cust IN (SELECT id FROM cust WHERE id < 500)`)
+}

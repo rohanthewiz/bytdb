@@ -357,6 +357,13 @@ func evalAnyAll(env *exEnv, n *ExAny) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	// x IN (uncorrelated subquery): probe a memoized hash set instead of
+	// walking the value list per outer row (deep-look D-28).
+	if sub, ok := n.R.(*ExSub); ok && n.Op == OpEQ && !n.All {
+		if v, handled, err := inSubquerySet(env, sub.Sel, l); handled || err != nil {
+			return v, err
+		}
+	}
 	elems, err := anyElements(env, n.R)
 	if err != nil {
 		return nil, err
@@ -506,6 +513,16 @@ func parseArrayLiteral(s string) ([]any, error) {
 // its single output column's values — the row-set form of ANY/ALL's
 // right-hand side, sharing evalArraySub's non-aggregate constraints.
 func runSubColumn(env *exEnv, sel *Select) ([]any, error) {
+	if subNeedsExecutor(sel, subColumn) {
+		res, err := runSubSelect(env, sel) // D-27
+		if err != nil {
+			return nil, err
+		}
+		if err := oneColumn(res, "a subquery on the right of ANY/ALL"); err != nil {
+			return nil, err
+		}
+		return subColumnValues(res), nil
+	}
 	if sel.Star || len(sel.Items) != 1 {
 		return nil, serr.New("a subquery on the right of ANY/ALL must select exactly one column")
 	}
@@ -1444,6 +1461,9 @@ func constraintdef(d *DB, oid int64) any {
 // the whole correlation mechanism. The result is the single item's
 // value from the single row; zero rows read as NULL.
 func runScalarSub(env *exEnv, sel *Select) (any, error) {
+	if subNeedsExecutor(sel, subScalar) {
+		return scalarFromExecutor(env, sel) // ORDER BY, LIMIT, GROUP BY, ...: D-27
+	}
 	if len(sel.Union) > 0 {
 		return nil, serr.New("UNION in a scalar subquery is not supported")
 	}
@@ -1615,6 +1635,16 @@ func dedupScalars(vals []any) ([]any, error) {
 // subquery's single output column sorts ascending when it has any
 // ORDER BY (the one psql writes is ORDER BY 1).
 func runArraySub(env *exEnv, sel *Select) (any, error) {
+	if subNeedsExecutor(sel, subArray) {
+		res, err := runSubSelect(env, sel) // D-27: ORDER BY in full, LIMIT, ...
+		if err != nil {
+			return nil, err
+		}
+		if err := oneColumn(res, "ARRAY(SELECT ...)"); err != nil {
+			return nil, err
+		}
+		return textArrayValue(subColumnValues(res)), nil
+	}
 	if sel.Star || len(sel.Items) != 1 {
 		return nil, serr.New("ARRAY(SELECT ...) must select exactly one column")
 	}
@@ -1699,12 +1729,18 @@ func textArrayValue(vals []any) string {
 // evalExistsSub runs EXISTS (SELECT ...): whether the (possibly
 // correlated) subquery yields any row; its select list is irrelevant.
 func runExistsSub(env *exEnv, sel *Select) (any, error) {
-	if len(sel.Union) > 0 || sel.GroupBy != nil || sel.Having != nil {
-		return nil, serr.New("this EXISTS (SELECT ...) shape is not supported")
+	if subNeedsExecutor(sel, subExists) {
+		// GROUP BY, HAVING, UNION, LIMIT 0, ...: run it and see whether
+		// any row comes back (deep-look D-27).
+		res, err := runSubSelect(env, sel)
+		if err != nil {
+			return nil, err
+		}
+		return len(res.Rows) > 0, nil
 	}
 	// An ungrouped aggregate yields exactly one row whatever its input,
 	// so EXISTS (SELECT count(*) ... WHERE false) is true (it was false:
-	// deep-look D-21). LIMIT 0 is refused before this runner is reached.
+	// deep-look D-21). A grouped one went to the executor above.
 	if selectHasAgg(sel) {
 		return true, nil
 	}

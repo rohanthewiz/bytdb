@@ -17,6 +17,12 @@ import (
 type scope struct {
 	tables []scopeTable
 	width  int
+	// correlated marks the scope of a subquery the full executor runs
+	// per outer row (subselect.go): a column it does not resolve may be
+	// an outer reference, which evaluation finds through exEnv.outer.
+	// Only the aggregate rewriter consults it — it otherwise insists that
+	// every column be a group key or an aggregate argument.
+	correlated bool
 }
 
 type scopeTable struct {

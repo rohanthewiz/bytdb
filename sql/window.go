@@ -218,7 +218,7 @@ func (d *DB) execSelectWindow(s *Select) (*Result, error) {
 			return err
 		}
 		sc := fp.sc
-		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo()}
+		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo(), outer: d.outer}
 
 		// Materialize the base (post-filter, post-join) rows; only the
 		// join columns are kept — window values and select expressions
@@ -355,7 +355,7 @@ func (d *DB) execSelectAggWindow(s *Select) (*Result, error) {
 			return err
 		}
 		sc := fp.sc
-		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo()}
+		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo(), outer: d.outer}
 
 		// Extract window calls from a shallow copy of the select list
 		// and ORDER BY, as the plain window path does.

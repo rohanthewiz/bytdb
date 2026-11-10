@@ -460,7 +460,7 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 			fp.steps[0].plan = p
 			keys = nil
 		}
-		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo()}
+		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo(), outer: d.outer}
 		var evalErr error
 		// One reusable evaluation env for the expression items, its .row
 		// swapped per row. A fresh copy per expression per row escapes to

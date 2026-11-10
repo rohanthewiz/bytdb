@@ -423,6 +423,12 @@ func (q *aggQuery) rewrite(e Expr) (Expr, error) {
 		return e, nil
 	case *ExCol:
 		if _, err := q.sc.resolve(n.Col); err != nil {
+			if q.sc.correlated {
+				// An outer reference: one value per evaluation of the
+				// subquery, so a constant within every group (as in
+				// Postgres). Evaluation resolves it through the outer row.
+				return e, nil
+			}
 			return nil, err
 		}
 		return nil, serr.New(`column "` + n.Col.String() +
@@ -782,12 +788,13 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		fp.sc.correlated = d.outer != nil
 		q, err := resolveAgg(fp.sc, s, false)
 		if err != nil {
 			return err
 		}
 		q.resultCols(s, res)
-		env := &exEnv{d: d, tx: tx, sc: fp.sc, subs: newSubMemo()}
+		env := &exEnv{d: d, tx: tx, sc: fp.sc, subs: newSubMemo(), outer: d.outer}
 		groups, err := aggScanGroups(tx, fp, q, env)
 		if err != nil {
 			return err

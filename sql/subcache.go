@@ -1,11 +1,5 @@
 package sql
 
-import (
-	"reflect"
-
-	"github.com/rohanthewiz/serr"
-)
-
 // Per-statement memoization of uncorrelated subqueries.
 //
 // Subquery evaluation is lazy and per-row: every ExSub/ExAny/EXISTS
@@ -47,6 +41,13 @@ type subMemo struct {
 	// values and rebinds scan bounds instead of re-planning from
 	// scratch; see corrsub.go.
 	plans map[*Select]*subPrep
+	// bodies caches each subquery's decorrelated form for the full
+	// executor path (subselect.go), so a correlated subquery re-run per
+	// outer row rewrites its tree once per statement.
+	bodies map[*Select]*Select
+	// sets holds uncorrelated IN-subqueries' values as hash sets
+	// (subselect.go, D-28).
+	sets map[*Select]*subSet
 }
 
 func newSubMemo() *subMemo {
@@ -56,7 +57,7 @@ func newSubMemo() *subMemo {
 // The four subquery evaluators: memoize when a memo is present and the
 // subquery is provably uncorrelated, otherwise run per row as before.
 
-// subKind names the four subquery shapes for rejectSubLimit.
+// subKind names the four subquery shapes (see subNeedsExecutor).
 type subKind int
 
 const (
@@ -66,83 +67,7 @@ const (
 	subColumn                // x IN / op ANY|ALL (SELECT ...)
 )
 
-// rejectSubLimit refuses the ORDER BY / LIMIT / OFFSET combinations the
-// four runners below would answer wrongly. They are a reduced executor:
-// the scalar runner applies LIMIT and OFFSET in scan order but never
-// sorts, ARRAY sorts ascending by the value itself and ignores LIMIT,
-// and IN and EXISTS ignore all three. So (SELECT amt FROM o ORDER BY
-// amt DESC LIMIT 1) returned the first row scanned, x IN (SELECT ...
-// LIMIT 2) matched every row, and EXISTS (... LIMIT 0) was true. A loud
-// error beats a wrong answer until subqueries run through the real
-// SELECT path (deep-look D-09; D-27 removes this). The shapes the
-// runners do get right stay accepted, because applications use them:
-// EXISTS (... LIMIT 1) is an ORM staple, LIMIT/OFFSET without ORDER BY
-// may pick any rows (scan order is as good as any), and ARRAY(SELECT x
-// ... ORDER BY x) sorts exactly what the runner sorts. The hint names
-// the rewrites that already execute correctly.
-func rejectSubLimit(sel *Select, kind subKind) error {
-	limited := sel.Limit >= 0 || sel.LimitParam != 0
-	offset := sel.Offset > 0 || sel.OffsetParam != 0
-	clause := ""
-	switch kind {
-	case subScalar:
-		if len(sel.OrderBy) > 0 && (limited || offset) {
-			clause = "ORDER BY with LIMIT or OFFSET"
-		}
-	case subArray:
-		switch {
-		case limited || offset:
-			clause = "LIMIT or OFFSET"
-		case !arrayOrderSortsItem(sel):
-			clause = "this ORDER BY"
-		}
-	case subExists:
-		// EXISTS asks only whether a row exists: a positive literal
-		// LIMIT cannot change that; LIMIT 0, a parameter, or OFFSET can.
-		if offset || sel.LimitParam != 0 || sel.Limit == 0 {
-			clause = "LIMIT 0, a parameterized LIMIT, or OFFSET"
-		}
-	case subColumn:
-		if limited || offset {
-			clause = "LIMIT or OFFSET"
-		}
-	}
-	if clause == "" {
-		return nil
-	}
-	return serr.New(clause+" in this subquery is not supported yet",
-		"hint", "move the subquery into a WITH clause or a derived table in FROM, which apply it")
-}
-
-// arrayOrderSortsItem reports whether an ARRAY subquery's ORDER BY is
-// what runArraySub implements: nothing, or ascending keys that are the
-// selected item itself (by position or by the same expression).
-func arrayOrderSortsItem(sel *Select) bool {
-	if len(sel.Items) != 1 {
-		return len(sel.OrderBy) == 0
-	}
-	item := itemToExpr(sel.Items[0])
-	for _, o := range sel.OrderBy {
-		if o.Desc {
-			return false
-		}
-		if o.IsLit {
-			if n, ok := o.Lit.(int64); ok && n == 1 {
-				continue
-			}
-			return false
-		}
-		if !reflect.DeepEqual(itemToExpr(o.SelectItem), item) {
-			return false
-		}
-	}
-	return true
-}
-
 func evalSubquery(env *exEnv, sel *Select) (any, error) {
-	if err := rejectSubLimit(sel, subScalar); err != nil {
-		return nil, err
-	}
 	m := env.subMemo()
 	if m == nil || !m.uncorrelated(env, sel) {
 		return runScalarSub(env, sel)
@@ -158,9 +83,6 @@ func evalSubquery(env *exEnv, sel *Select) (any, error) {
 }
 
 func evalArraySub(env *exEnv, sel *Select) (any, error) {
-	if err := rejectSubLimit(sel, subArray); err != nil {
-		return nil, err
-	}
 	m := env.subMemo()
 	if m == nil || !m.uncorrelated(env, sel) {
 		return runArraySub(env, sel)
@@ -176,9 +98,6 @@ func evalArraySub(env *exEnv, sel *Select) (any, error) {
 }
 
 func evalExistsSub(env *exEnv, sel *Select) (any, error) {
-	if err := rejectSubLimit(sel, subExists); err != nil {
-		return nil, err
-	}
 	m := env.subMemo()
 	if m == nil || !m.uncorrelated(env, sel) {
 		return runExistsSub(env, sel)
@@ -194,9 +113,6 @@ func evalExistsSub(env *exEnv, sel *Select) (any, error) {
 }
 
 func collectSubColumn(env *exEnv, sel *Select) ([]any, error) {
-	if err := rejectSubLimit(sel, subColumn); err != nil {
-		return nil, err
-	}
 	m := env.subMemo()
 	if m == nil || !m.uncorrelated(env, sel) {
 		return runSubColumn(env, sel)
