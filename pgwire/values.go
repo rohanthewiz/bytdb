@@ -223,7 +223,9 @@ func encodeByKind(v any, format int) ([]byte, error) {
 		case int64:
 			return strconv.AppendInt(nil, x, 10), nil
 		case float64:
-			return strconv.AppendFloat(nil, x, 'g', -1, 64), nil
+			// Postgres's float8 text: 1000000 not 1e+06, Infinity not +Inf
+			// (deep-look D-24, D-55).
+			return []byte(bytdb.FormatFloat(x)), nil
 		case string:
 			return []byte(x), nil
 		case []byte:

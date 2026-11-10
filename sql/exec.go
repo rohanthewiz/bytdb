@@ -306,9 +306,18 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 				return triUnknown, serr.New(fmt.Sprintf(
 					"operator does not exist: text %s %s", opText(op), kindOf(lit)))
 			} else if s, isS := lit.(string); isS {
-				if cl, err := coerceLit(s, kindOf(v)); err == nil {
-					lit = cl
+				// The typed bind pass converts literals by their context
+				// before execution; what reaches here is a string the pass
+				// could not place (a bound value inside an untyped
+				// construct). It adapts to the value it meets, and a string
+				// that cannot is "invalid input syntax" (22P02). The error
+				// used to be swallowed and the comparison read as unknown,
+				// so the row silently dropped out (deep-look D-23).
+				cl, err := coerceLit(s, kindOf(v))
+				if err != nil {
+					return triUnknown, err
 				}
+				lit = cl
 			}
 		}
 	}

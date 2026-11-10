@@ -9,11 +9,10 @@ insert into o values (1, 1, 10), (2, 1, 50), (3, 2, 30), (4, 2, 5), (5, 3, 99);
 select (select amt from o order by amt desc limit 1);
 -- @todo D-27: subquery LIMIT ignored
 select id from o where id in (select id from o order by amt desc limit 2);
--- @todo D-25: exists() described as text
+-- @todo D-27: LIMIT 0 in EXISTS refused until subqueries run through the SELECT executor (D-09)
 select exists (select 1 from o limit 0);
 -- @todo D-27: subquery OFFSET ignored
 select (select amt from o order by amt limit 1 offset 1);
--- @todo D-25: coalesce over a scalar subquery described as text
 select coalesce((select sum(amt) from o where cust = 9), 0);
 -- @todo D-27: aggregate inside a subquery's expression
 select (select coalesce(sum(amt), 0) from o where cust = 9);
@@ -21,7 +20,6 @@ select (select coalesce(sum(amt), 0) from o where cust = 9);
 select (select count(distinct cust) from o);
 -- @todo D-27: expression over an aggregate inside a scalar subquery
 select (select count(*) + 1 from o);
--- @todo D-25: exists() described as text (its value is right since D-21)
 select exists (select count(*) from o where false);
 -- latest row per customer, correlated
 -- @todo D-27: correlated subquery ORDER BY/LIMIT; result typed text

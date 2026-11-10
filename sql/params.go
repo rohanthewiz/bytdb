@@ -444,7 +444,7 @@ func bindExpr(e Expr, b *binder) Expr {
 		}
 		return c
 	case *ExCast:
-		return &ExCast{E: bindExpr(n.E, b), Type: n.Type}
+		return &ExCast{E: bindExpr(n.E, b), Type: n.Type, From: n.From}
 	case *ExIndex:
 		return &ExIndex{E: bindExpr(n.E, b), Idx: bindExpr(n.Idx, b)}
 	case *ExArray:

@@ -34,11 +34,13 @@ func (e *Engine) CreateView(name, query string, orReplace bool) error {
 	if query == "" {
 		return serr.New("view query is required", "view", name)
 	}
+	replaced := false // reset on every run: updateDDL may retry the closure
 	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		if tx.Contains(descKey(name)) || tx.Contains(sqlSeqKey(name)) {
 			return serr.New(`relation "` + name + `" already exists`)
 		}
-		if !orReplace && tx.Contains(viewKey(name)) {
+		replaced = tx.Contains(viewKey(name))
+		if !orReplace && replaced {
 			return serr.New(`relation "` + name + `" already exists`)
 		}
 		blob, err := json.Marshal(ViewDesc{Name: name, Query: query})
@@ -50,8 +52,17 @@ func (e *Engine) CreateView(name, query string, orReplace bool) error {
 	if err != nil {
 		return serr.Wrap(err, "op", "create view", "view", name)
 	}
+	if !replaced {
+		e.viewCount.Add(1)
+	}
 	return nil
 }
+
+// HasViews reports whether any view exists. The SQL layer asks before
+// looking a FROM name up as a view, so the common database with no
+// views pays one atomic load per statement instead of a catalog
+// snapshot per referenced name (deep-look D-40 step 1).
+func (e *Engine) HasViews() bool { return e.viewCount.Load() > 0 }
 
 // DropView removes a view, reporting whether it existed.
 func (e *Engine) DropView(name string) (bool, error) {
@@ -63,6 +74,9 @@ func (e *Engine) DropView(name string) (bool, error) {
 	})
 	if err != nil {
 		return false, serr.Wrap(err, "op", "drop view", "view", name)
+	}
+	if existed {
+		e.viewCount.Add(-1)
 	}
 	return existed, nil
 }

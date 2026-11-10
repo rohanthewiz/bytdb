@@ -59,7 +59,13 @@ func resolveChecks(ct *CreateTable, cols []bytdb.Column) ([]bytdb.CheckDesc, err
 // columns of its own table, literals, and row-level operations — no
 // aggregates, subqueries, or placeholders.
 func validateCheckExpr(sc *scope, ex Expr) error {
-	return validateRowExpr(sc, ex, "check constraints", "check constraint")
+	if err := validateRowExpr(sc, ex, "check constraints", "check constraint"); err != nil {
+		return err
+	}
+	// Type it now so a comparison Postgres has no operator for is
+	// refused at CREATE/ADD, not on the first insert.
+	_, err := typeRowExpr(sc, ex)
+	return err
 }
 
 // validateRowExpr is the shared rule for expressions evaluated against
@@ -125,10 +131,18 @@ func tableChecks(desc *bytdb.TableDesc) ([]namedCheck, error) {
 		return nil, nil
 	}
 	out := make([]namedCheck, len(desc.Checks))
+	sc := tableScope(desc.Name, desc)
 	for i, ck := range desc.Checks {
 		ex, err := parseCheckExpr(ck.Expr)
 		if err != nil {
 			return nil, serr.Wrap(err, "op", "parse check constraint", "constraint", ck.Name)
+		}
+		// Typed against the table, so CHECK (day >= '2000-01-01') on a
+		// date column compares dates. The literal used to stay a string
+		// the comparison could not use, and the check never failed: a
+		// declared constraint that was not enforced (deep-look D-23).
+		if ex, err = typeRowExpr(sc, ex); err != nil {
+			return nil, serr.Wrap(err, "op", "type check constraint", "constraint", ck.Name)
 		}
 		out[i] = namedCheck{ck.Name, ex}
 	}

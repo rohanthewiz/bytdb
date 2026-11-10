@@ -211,9 +211,18 @@ type portal struct {
 
 // paramOID is parameter i's wire type: the client's declaration when
 // it made one, else the OID of the inferred column type.
+//
+// A parameter the statement gives no type ($1 alone in a select list)
+// is described as OID 0, unknown, not as text (deep-look D-25): a driver
+// told "text" refuses to encode an integer into it (pgx: "unable to
+// encode 7 into text format"), while for unknown it picks the value's
+// own text encoding, which the typed bind pass then converts by context.
 func (p *prepared) paramOID(i int) uint32 {
 	if i < len(p.paramOIDs) && p.paramOIDs[i] != 0 {
 		return p.paramOIDs[i]
+	}
+	if p.info.Params[i] == "" {
+		return 0
 	}
 	return oidForType(p.info.Params[i])
 }

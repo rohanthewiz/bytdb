@@ -6,7 +6,6 @@ create table d (id int primary key, x int);
 insert into d values (1, 1), (2, 2);
 
 -- @queries
--- @todo D-25: coalesce described as text (it now short-circuits: D-21)
 select coalesce(1, 1/0);
 -- @error
 insert into s (v) values (1);

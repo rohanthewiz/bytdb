@@ -211,7 +211,7 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return castVal(env, v, n.Type)
+		return castValFrom(env, v, n.From, n.Type)
 	case *ExIndex:
 		return nil, serr.New("array subscripts are not supported")
 	case *ExArray:
@@ -828,7 +828,8 @@ func valText(v any) string {
 	case int64:
 		return strconv.FormatInt(x, 10)
 	case float64:
-		return strconv.FormatFloat(x, 'g', -1, 64)
+		// Postgres's float8 output, not Go's %g: 1000000, not 1e+06.
+		return bytdb.FormatFloat(x)
 	case bool:
 		if x {
 			return "true"
@@ -838,6 +839,83 @@ func valText(v any) string {
 		return `\x` + fmt.Sprintf("%x", x)
 	}
 	return fmt.Sprint(v)
+}
+
+// typedText renders a value as text by its static type. Timestamps and
+// dates are int64 at runtime and a uuid is a []byte, so only the type
+// can say whether 19782 means a count or 2024-02-29; valText alone
+// rendered the count (deep-look D-24).
+func typedText(v any, t bytdb.ColType) string {
+	switch t {
+	case bytdb.TTimestamp:
+		if x, ok := v.(int64); ok {
+			return bytdb.FormatTimestamp(x)
+		}
+	case bytdb.TDate:
+		if x, ok := v.(int64); ok {
+			return bytdb.FormatDate(x)
+		}
+	case bytdb.TUUID:
+		if x, ok := v.([]byte); ok && len(x) == 16 {
+			return bytdb.FormatUUID(x)
+		}
+	}
+	return valText(v)
+}
+
+// microsPerDay converts between the date (days) and timestamp
+// (microseconds) representations.
+const microsPerDay = 86_400_000_000
+
+// castValFrom is castVal with the operand's static type known
+// (ExCast.From, set by the typed bind pass; "" when the operand was an
+// untyped literal or could not be typed). The conversions that depend
+// on what the value IS, not just its Go kind, happen here; everything
+// else is castVal's (deep-look D-24):
+//
+//	timestamp → date        floor(micros / micros-per-day): ts::date
+//	date → timestamp        days * micros-per-day (midnight UTC)
+//	typed → text            rendered by type: 2024-02-29, not 19782
+//	integer → boolean       nonzero is true; boolean → integer is 1/0
+func castValFrom(env *exEnv, v any, from bytdb.ColType, typ string) (any, error) {
+	if v == nil || from == "" {
+		return castVal(env, v, typ)
+	}
+	switch typ {
+	case "text", "varchar", "name", "char", "bpchar", "cstring":
+		return typedText(v, from), nil
+	}
+	to := castColType(typ)
+	switch {
+	case to == bytdb.TDate && from == bytdb.TTimestamp:
+		if micros, ok := v.(int64); ok {
+			days := micros / microsPerDay
+			if micros%microsPerDay < 0 {
+				days-- // floor, for instants before 1970
+			}
+			return days, nil
+		}
+	case to == bytdb.TTimestamp && from == bytdb.TDate:
+		if days, ok := v.(int64); ok {
+			return days * microsPerDay, nil
+		}
+	case to == bytdb.TBool && from == bytdb.TInt:
+		if n, ok := v.(int64); ok {
+			return n != 0, nil
+		}
+	case to == bytdb.TInt && from == bytdb.TBool && castColType(typ) == bytdb.TInt:
+		if b, ok := v.(bool); ok {
+			if b {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		}
+	case (to == bytdb.TInt || to == bytdb.TFloat) && temporalType(from):
+		// Postgres has no cast from date or timestamp to a number; the
+		// runtime value would silently be the day or microsecond count.
+		return nil, serr.New("cannot cast type " + pgTypeName(from) + " to " + pgTypeName(to))
+	}
+	return castVal(env, v, typ)
 }
 
 // --- casts ---
@@ -1726,7 +1804,18 @@ func itemToExpr(it SelectItem) Expr {
 func exprType(sc *scope, e Expr) bytdb.ColType {
 	switch n := e.(type) {
 	case *ExLit:
+		if n.Typ != "" {
+			return n.Typ // converted by the typed bind pass
+		}
 		return litType(n.Val)
+	case *ExSub:
+		// The typed bind pass records a scalar subquery's column type;
+		// this used to fall through to text, so (SELECT max(n) ...) was
+		// described as text and pgx could not scan it into an int
+		// (deep-look D-25).
+		if n.Typ != "" {
+			return n.Typ
+		}
 	case *ExCol:
 		if ord, err := sc.resolve(n.Col); err == nil {
 			return sc.column(ord).Type
@@ -1755,13 +1844,33 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 			}
 		}
 	case *ExFunc:
+		switch n.Name {
+		case "coalesce", "greatest", "least":
+			// The arguments' common type, as the bind pass unifies them:
+			// coalesce(sum(x), 0) is a number, not text (D-25).
+			return branchType(sc, n.Args)
+		case "nullif":
+			if len(n.Args) > 0 {
+				return exprType(sc, n.Args[0])
+			}
+		case "exists":
+			return bytdb.TBool
+		}
 		if t, ok := funcTypes[n.Name]; ok {
 			return t
 		}
 	case *ExCase:
-		if len(n.Whens) > 0 {
-			return exprType(sc, n.Whens[0].Then)
+		// The first branch that has a type decides, skipping NULL and
+		// untyped literals: CASE WHEN ... THEN NULL ELSE n END is n's
+		// type, not text (D-25).
+		branches := make([]Expr, 0, len(n.Whens)+1)
+		for _, w := range n.Whens {
+			branches = append(branches, w.Then)
 		}
+		if n.Else != nil {
+			branches = append(branches, n.Else)
+		}
+		return branchType(sc, branches)
 	case *ExCast:
 		return castColType(n.Type)
 	case *exGroupRef:
@@ -1788,6 +1897,15 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 		// 30-term `SELECT 0-0-0-...` burned seconds of CPU in type
 		// derivation alone (surfaced by FuzzExec as a hung worker).
 		lt, rt := exprType(sc, n.L), exprType(sc, n.R)
+		// Date arithmetic: date ± integer is a date, date - date a day
+		// count (D-23; it was described as an integer before).
+		switch {
+		case lt == bytdb.TDate && rt == bytdb.TInt && (n.Op == "+" || n.Op == "-"),
+			lt == bytdb.TInt && rt == bytdb.TDate && n.Op == "+":
+			return bytdb.TDate
+		case lt == bytdb.TDate && rt == bytdb.TDate && n.Op == "-":
+			return bytdb.TInt
+		}
 		switch n.Op {
 		case "||":
 			if lt == bytdb.TJSONB || rt == bytdb.TJSONB {
@@ -1805,6 +1923,33 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 		return bytdb.TInt
 	}
 	return bytdb.TString
+}
+
+// branchType is the common type of expressions that must agree (CASE
+// branches, COALESCE arguments): the first that is not a NULL or an
+// untyped string literal, widened to float when integer and float mix;
+// text when every branch is untyped.
+func branchType(sc *scope, es []Expr) bytdb.ColType {
+	var out bytdb.ColType
+	for _, e := range es {
+		if lit, ok := e.(*ExLit); ok && lit.Typ == "" {
+			switch lit.Val.(type) {
+			case nil, string:
+				continue
+			}
+		}
+		t := exprType(sc, e)
+		switch {
+		case out == "":
+			out = t
+		case numericType(out) && numericType(t) && out != t:
+			out = bytdb.TFloat
+		}
+	}
+	if out == "" {
+		return bytdb.TString
+	}
+	return out
 }
 
 var funcTypes = map[string]bytdb.ColType{

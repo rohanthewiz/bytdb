@@ -19,7 +19,6 @@ select -1::int;
 select - - 1;
 select 1+-+1;
 select -9223372036854775808;
--- @todo D-23: integer || integer is accepted; Postgres has no such operator
 select 2 || 3 + 4;
 select 'a' || 3 + 4;
 select 'x' || 1 || 2;

@@ -45,7 +45,7 @@ func TestLiteralCoercion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cst, err := d.coerceLiterals(st)
+	cst, err := d.typeStatement(st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

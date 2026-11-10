@@ -156,7 +156,16 @@ Three semantic notes that surprise people (all Postgres-faithful):
   logic, same as Postgres.
 - Text-vs-number comparison errors with `operator does not exist` rather than
   coercing; a *quoted untyped literal* against a typed column still adapts
-  (`'42'` works where `42` does).
+  (`'42'` works where `42` does). That adaptation happens everywhere a
+  literal has a typed neighbor (comparisons, `IN`, `ANY`, `BETWEEN`, `CASE`,
+  `COALESCE`, arithmetic, `CHECK`, subqueries, CTEs and views), and a
+  literal that cannot take the type is `invalid input syntax` (22P02).
+  Pairings Postgres has no operator for are refused the same way:
+  `1 = true`, `timestamp + 1` (write `+ interval` math in your application,
+  or use dates: `date + 1` is the next day), and `integer || integer`.
+  Two pairings Postgres refuses are accepted on purpose: an integer against
+  a `date` or `timestamp` (compared as the day or microsecond count), and
+  raw 16-byte `bytea` against a `uuid`.
 - `LAST_VALUE(v) OVER (ORDER BY k)` returns the current row's last *peer*,
   not the partition's last row — the default frame ends at the current row's
   peer group, exactly as in Postgres. The fix is Postgres' usual one, an

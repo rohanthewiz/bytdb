@@ -193,7 +193,7 @@ func rewriteWindows(e Expr, sc *scope, out *[]*ExWindow) Expr {
 		}
 		return c
 	case *ExCast:
-		return &ExCast{E: rw(n.E), Type: n.Type}
+		return &ExCast{E: rw(n.E), Type: n.Type, From: n.From}
 	case *ExIndex:
 		return &ExIndex{E: rw(n.E), Idx: rw(n.Idx)}
 	case *ExArray:

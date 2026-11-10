@@ -51,7 +51,10 @@ func TestCastValErrors(t *testing.T) {
 
 	for _, c := range []struct{ q, want string }{
 		{`select 'abc'::int`, "invalid input syntax for type int"},
-		{`select true::int`, "unsupported cast"},
+		// boolean → integer is a real cast in Postgres (1/0) since the
+		// typed bind pass knows the operand's type (deep-look D-24); a
+		// date has no cast to a number at all.
+		{`select current_date::int`, "cannot cast type date to bigint"},
 		{`select 'missing'::regclass`, "relation does not exist"},
 		// reg* types other than regclass do not resolve names.
 		{`select 'pg_type'::regtype`, "unsupported cast"},

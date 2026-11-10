@@ -759,7 +759,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if st, err = d.coerceLiterals(st); err != nil {
+	if st, err = d.typeStatement(st, nil); err != nil {
 		return nil, err
 	}
 	if err := sysWriteGuard(writeTarget(st)); err != nil {

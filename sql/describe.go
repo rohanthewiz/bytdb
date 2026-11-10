@@ -47,6 +47,16 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 // describeInto infers a statement's parameter types and output shape
 // into info.
 func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *StmtInfo) error {
+	// Describe sees the statement as execution will: typed by the bind
+	// pass, whose context typing is also what gives placeholders their
+	// types — $1 in id IN ($1, $2), in i + $1, under a cast, in a
+	// subquery (deep-look D-23/D-25). The specific inferences below then
+	// fill in what the pass leaves (INSERT targets, LIMIT counts).
+	typed, err := d.typeStatement(st, note)
+	if err != nil {
+		return err
+	}
+	st = typed
 	lk := d.lookup(d.e.TableShared)
 	switch st := st.(type) {
 	case *Explain:

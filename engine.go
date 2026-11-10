@@ -422,6 +422,12 @@ type Engine struct {
 	// schema and never look again.
 	catalogVer atomic.Uint64
 
+	// viewCount is how many views exist (see HasViews). Counted at Open
+	// and kept by CreateView/DropView after their commits; it only
+	// gates a lookup, so a moment's lag after a concurrent CREATE VIEW
+	// costs nothing a statement racing that DDL could rely on anyway.
+	viewCount atomic.Int64
+
 	// testCommitErr, when non-nil, replaces a successful DDL commit's
 	// result (see updateDDL). Only tests set it, to simulate a WAL
 	// append or fsync failing after the transaction closure ran.
@@ -869,6 +875,15 @@ func (e *Engine) loadCatalog() error {
 			continue
 		}
 		e.cacheStore(desc.Name, string(v), desc)
+	}
+	// Count views for HasViews.
+	vprefix := string(tablePrefix(sysViewTableID))
+	vend := string(tuple.PrefixEnd([]byte(vprefix)))
+	for k := range e.kv.Ascend(vprefix) {
+		if k >= vend {
+			break
+		}
+		e.viewCount.Add(1)
 	}
 	if len(bad) > 0 {
 		// The offenders go in the message itself, not structured

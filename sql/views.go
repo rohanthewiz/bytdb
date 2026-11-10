@@ -152,6 +152,12 @@ func (dw *DB) materializeView(name string, depth int) error {
 			}
 		}
 	}
+	// A view body is a statement of its own, typed like any other: the
+	// pass used to see only the outer statement, so a literal compared
+	// inside a view never took its column's type (deep-look D-23).
+	if sel, err = dw.typeSelectStmt(sel); err != nil {
+		return serr.Wrap(err, "view", name)
+	}
 	res, err := dw.execSelectWith(sel)
 	if err != nil {
 		return serr.Wrap(err, "view", name)
@@ -345,6 +351,9 @@ func (d *DB) staticView(name string, depth int) (*DB, error) {
 			return nil, err
 		}
 	}
+	if sel, err = dw.typeSelectStmt(sel); err != nil {
+		return nil, serr.Wrap(err, "view", name)
+	}
 	// The body's CTE shapes live on a side copy used only to describe
 	// it — they must not leak into the outer scope, where they could
 	// shadow real names.
@@ -388,7 +397,12 @@ func (d *DB) execCreateView(s *CreateView) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := dv.execSelectWith(st.(*Select)); err != nil {
+	// Typed like every executed SELECT (and as each later use will be).
+	sel, err := dv.typeSelectStmt(st.(*Select))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dv.execSelectWith(sel); err != nil {
 		return nil, err
 	}
 	if err := d.e.CreateView(s.Name, s.Query, s.OrReplace); err != nil {

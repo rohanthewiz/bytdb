@@ -92,6 +92,11 @@ func sqlstate(msg string, hasPos bool) string {
 		return "0A000" // feature_not_supported (Postgres's code for it sans CASCADE)
 	// Subquery shapes the subquery executor does not run (LIMIT/OFFSET
 	// until deep-look D-27; UNION and GROUP BY in a scalar subquery).
+	// The typed bind pass's refusals, in Postgres's wording.
+	case strings.HasPrefix(msg, "operator does not exist"):
+		return "42883" // undefined_function
+	case strings.HasPrefix(msg, "cannot cast type "):
+		return "42846" // cannot_coerce
 	case strings.Contains(msg, "subquery is not supported"),
 		strings.Contains(msg, "cached plan must not change result type"):
 		return "0A000" // feature_not_supported

@@ -90,9 +90,16 @@ type Expr interface{ expr() }
 
 // ExLit is a literal value or a $n Param; Name is the output column
 // name a folded system function carries ("" reads as "?column?").
+//
+// Typ is set by the typed bind pass (typecheck.go) when it converted
+// an untyped literal for its context: '2024-01-01' compared with a date
+// column becomes an int64 day number, and Typ records that it is a date
+// — the runtime value alone cannot say (an int64 is also an int or a
+// timestamp). "" means the value's Go kind is its type (litType).
 type ExLit struct {
 	Val  any
 	Name string
+	Typ  bytdb.ColType
 }
 
 // ExCol is a column reference.
@@ -172,9 +179,18 @@ type ExFunc struct {
 
 // ExCast is E::type; Type is the lowercased base name, keeping a
 // trailing "[]" for array types (which parse but do not evaluate).
+//
+// From is the operand's static type, filled in by the typed bind pass
+// ("" when unknown — an untyped literal, parsed as text input of the
+// target type). Timestamps and dates are both int64 at runtime and a
+// uuid is a []byte, so without it ts::date returned raw microseconds and
+// u::text raw bytes (deep-look D-24). The pass also inserts casts of its
+// own: date to timestamp where the two are compared, and typed values to
+// text under ||.
 type ExCast struct {
 	E    Expr
 	Type string
+	From bytdb.ColType
 }
 
 // ExIndex is E[Idx]; parses, does not evaluate (no arrays).
@@ -190,8 +206,13 @@ type ExArith struct {
 }
 
 // ExSub is a scalar subquery, executed lazily per row with the
-// enclosing scopes visible for correlation.
-type ExSub struct{ Sel *Select }
+// enclosing scopes visible for correlation. Typ is its single output
+// column's static type, recorded by the typed bind pass so the result
+// can be described without re-typing the subquery ("" when unknown).
+type ExSub struct {
+	Sel *Select
+	Typ bytdb.ColType
+}
 
 // walkExpr visits e and its subexpressions pre-order; visit returning
 // false skips a node's children. A subquery's own expressions are not

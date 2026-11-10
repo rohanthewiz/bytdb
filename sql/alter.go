@@ -37,10 +37,18 @@ func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 		if err := validateRowExpr(sc, s.Using, "transform expressions", "transform expression"); err != nil {
 			return nil, err
 		}
+		// Typed over the old row, so USING ts::date knows its operand is
+		// a timestamp and converts it; untyped, it stored the microsecond
+		// count as a day number (deep-look D-23/D-24).
+		// (A local, not s.Using: a prepared statement's tree is shared.)
+		using, err := typeRowExpr(sc, s.Using)
+		if err != nil {
+			return nil, err
+		}
 		env := rowEnvFor(d, s.Table)
 		ch.Using = func(old bytdb.Row) (any, error) {
 			e := env(old)
-			v, err := evalEx(e, s.Using)
+			v, err := evalEx(e, using)
 			if err != nil {
 				return nil, serr.Wrap(err, "clause", "USING")
 			}
@@ -53,8 +61,12 @@ func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 
 	// CHECK constraints are stored as text and may mention the column
 	// being converted; Postgres re-verifies them against the rewritten
-	// rows, and so does this, with ADD CONSTRAINT's wording.
-	checks, err := tableChecks(desc)
+	// rows, and so does this, with ADD CONSTRAINT's wording. They are
+	// typed against the column's new type, which is what the rewritten
+	// rows carry.
+	newDesc := desc.Clone()
+	newDesc.Columns[newDesc.ColIndex(s.Col)].Type = s.Type
+	checks, err := tableChecks(newDesc)
 	if err != nil {
 		return nil, err
 	}

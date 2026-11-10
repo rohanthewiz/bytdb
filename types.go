@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +53,33 @@ func ParseTimestamp(s string) (int64, error) {
 		}
 	}
 	return 0, serr.New("invalid input syntax for type timestamp", "value", s)
+}
+
+// FormatFloat renders a float64 the way Postgres's float8 output does
+// (extra_float_digits = 1, its default since Postgres 12): the shortest
+// digits that round-trip, positional for decimal exponents from -4 to
+// 14 and scientific outside that ("1e+15", "1e-05"), and NaN / Infinity
+// / -Infinity spelled out. Go's %g switches to scientific after six
+// digits, so 1000000 printed as "1e+06" where Postgres prints 1000000,
+// on the wire and in ::text (deep-look D-24, D-55).
+func FormatFloat(f float64) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+	s := strconv.FormatFloat(f, 'e', -1, 64) // shortest digits, e.g. "1.25e+08"
+	if f == 0 {
+		return strings.TrimSuffix(s, "e+00") // "0" or "-0", as Postgres prints
+	}
+	_, exp, _ := strings.Cut(s, "e")
+	if e, _ := strconv.Atoi(exp); e < -4 || e >= 15 {
+		return s // Go pads the exponent to two digits, as Postgres does
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
 // FormatTimestamp renders micros-since-epoch the way Postgres renders
