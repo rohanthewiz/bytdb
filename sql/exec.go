@@ -470,6 +470,7 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 	var rows [][]any     // full combined rows; projected after sort/limit
 	var proj []projEntry // projected column ordinals and literals
 	var keys []sortKey
+	var top *topN // set when ORDER BY ... LIMIT collects through a bounded heap
 	err := d.read(func(tx *bytdb.Txn) error {
 		fp, err := prepareFrom(d.lookup(tx.TableShared), s.From, s.Where)
 		if err != nil {
@@ -507,6 +508,12 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 		// (ORDER BY sorts them in place), so they are what the result
 		// row cap and the memory ceiling police. See rowbudget.go.
 		budget := d.budget()
+		// A sort under a LIMIT needs only the best OFFSET+LIMIT rows: a
+		// bounded heap keeps those and the budget sees only them (topn.go,
+		// deep-look D-43).
+		if len(keys) > 0 && s.Limit >= 0 {
+			top = newTopN(keys, satAdd(s.Offset, s.Limit))
+		}
 		// With no ORDER BY the join order is the result order, so
 		// collection can end at OFFSET+LIMIT rows.
 		err = runJoin(tx, fp, env, func(vals []any) bool {
@@ -518,6 +525,11 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 					return false
 				}
 				vals = append(vals, v)
+			}
+			if top != nil {
+				top.add(vals)
+				evalErr = budget.check(top.held())
+				return evalErr == nil
 			}
 			rows = append(rows, vals)
 			if evalErr = budget.check(len(rows)); evalErr != nil {
@@ -532,6 +544,9 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if top != nil {
+		rows, keys = top.sorted(), nil // already in order
 	}
 	sortOffsetProject(res, rows, keys, proj, s.Offset, s.Limit)
 	return res, nil

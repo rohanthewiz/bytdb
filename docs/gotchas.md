@@ -21,9 +21,11 @@ row inserts and updates) applies to everything one transaction stages
 before commit, and breaching it also fails with SQLSTATE 54000. Edges
 worth knowing:
 
-- An unindexed `ORDER BY x LIMIT 10` sorts every matching row before the
-  LIMIT applies, so it counts all of them against the cap. An index on `x`
-  removes both the sort and the refusal.
+- An unindexed `ORDER BY x LIMIT n OFFSET m` keeps only the best `n + m`
+  rows as it scans (a bounded heap), so only those count against the cap —
+  a top 10 over a huge table is fine. A large `LIMIT` still holds that many
+  rows; an index on `x` avoids even that by reading in order and stopping.
+  Without a `LIMIT`, `ORDER BY` holds every matching row.
 - The cap is per row set, not per statement. A query can hold several
   capped sets at once, and the memory ceiling is what bounds their total.
 - The ceiling reads the heap as of the last GC. With an explicit

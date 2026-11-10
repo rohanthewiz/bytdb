@@ -40,8 +40,7 @@ func TestResultRowCap(t *testing.T) {
 
 	over := []string{
 		`select * from nums`,
-		`select * from nums order by v desc limit 3`, // unindexed sort holds every row
-		`select id, count(*) from nums group by id`,  // ten groups
+		`select id, count(*) from nums group by id`, // ten groups
 		`select id, row_number() over (order by id) from nums`,
 		`select id from nums where id = 1 and id in (select id from nums)`,             // 1-row result, 10-value subquery set
 		`select n.id from other o join nums n on n.v = o.nid`,                          // 3-row result, 10-row hash build side
@@ -58,8 +57,10 @@ func TestResultRowCap(t *testing.T) {
 	}
 
 	under := []string{
-		`select * from nums limit 5`,                  // collection stops at the LIMIT
-		`select * from nums order by id limit 5`,      // PK order: no sort, early stop
+		`select * from nums limit 5`,                 // collection stops at the LIMIT
+		`select * from nums order by id limit 5`,     // PK order: no sort, early stop
+		`select * from nums order by v desc limit 3`, // unindexed sort: a 3-row heap (D-43)
+		`select * from nums order by v limit 2 offset 3`,
 		`select count(*), sum(v) from nums`,           // streams: one group
 		`select grp, count(*) from nums group by grp`, // three groups
 		`select * from nums where id < 5`,
