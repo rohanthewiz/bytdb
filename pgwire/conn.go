@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"runtime/debug"
@@ -35,7 +36,9 @@ type conn struct {
 	readTx   time.Duration // in-flight message-body read deadline; 0 = disabled
 	r        *bufio.Reader
 	w        *bufio.Writer // always wraps a stallWriter over nc
-	sess     *sql.Session
+	// rowBuf is the reused DataRow encoding buffer (sendDataRows).
+	rowBuf []byte
+	sess   *sql.Session
 
 	// inSession is set once the startup handshake completes. From then
 	// on the write deadline is the per-write stall bound (stallWriter);
@@ -596,7 +599,7 @@ func (c *conn) maybeStartTLS() error {
 	// reader and writer must be rebuilt around it.
 	c.nc = tc
 	c.r = bufio.NewReader(tc)
-	c.w = bufio.NewWriter(stallWriter{c})
+	c.w = bufio.NewWriterSize(stallWriter{c}, writeBufSize)
 	c.tlsOn = true
 	return nil
 }
@@ -1009,6 +1012,17 @@ func (c *conn) closeTarget(r *rbuf) {
 // --- backend message helpers ---
 
 // send frames and buffers one backend message.
+// writeBufSize is the connection's output buffer. 64 KiB rather than
+// bufio's 4 KiB default: a result streams in a sixteenth of the write
+// calls, about 5% of a large scan's wire time (deep-look D-41). The
+// stall deadline (stallWriter) still covers each flush.
+const writeBufSize = 64 << 10
+
+// maxRetainedRowBuf caps the DataRow buffer a connection keeps between
+// results: one huge row (a multi-megabyte bytea) should not pin its
+// buffer for the life of the connection.
+const maxRetainedRowBuf = 64 << 10
+
 func (c *conn) send(typ byte, body wbuf) {
 	c.w.WriteByte(typ)
 	var lb [4]byte
@@ -1077,20 +1091,33 @@ func (c *conn) sendRowDescription(cols []string, types []bytdb.ColType, formats 
 // integer and byte kinds, so encoding must be driven by declaration,
 // not representation.
 func (c *conn) sendDataRows(rows [][]any, formats []int, types []bytdb.ColType, cols []string) bool {
+	// One buffer, reused for every row of the connection's life: the
+	// message header and each value's length are reserved, the values
+	// appended in place, and the lengths patched in afterwards. Each row
+	// used to allocate a message body plus a slice per value (deep-look
+	// D-41: 172 -> 18 ns per row in binary).
+	buf := c.rowBuf[:0]
+	defer func() {
+		if cap(buf) <= maxRetainedRowBuf {
+			c.rowBuf = buf[:0]
+		}
+	}()
 	for _, row := range rows {
-		var b wbuf
-		b.int16(len(row))
+		buf = append(buf[:0], msgDataRow, 0, 0, 0, 0) // length patched below
+		buf = binary.BigEndian.AppendUint16(buf, uint16(len(row)))
 		for i, v := range row {
 			if v == nil {
-				b.int32(-1)
+				buf = binary.BigEndian.AppendUint32(buf, math.MaxUint32) // -1: NULL
 				continue
 			}
 			var t bytdb.ColType
 			if i < len(types) {
 				t = types[i]
 			}
-			enc, err := encodeValue(v, formatFor(formats, i), t)
-			if err != nil {
+			at := len(buf)
+			buf = append(buf, 0, 0, 0, 0)
+			var err error
+			if buf, err = appendValue(buf, v, formatFor(formats, i), t); err != nil {
 				col := fmt.Sprint(i + 1)
 				if i < len(cols) {
 					col = cols[i]
@@ -1098,10 +1125,10 @@ func (c *conn) sendDataRows(rows [][]any, formats []int, types []bytdb.ColType, 
 				c.sendError(serr.Wrap(err, "column", col), "", 0)
 				return false
 			}
-			b.int32(len(enc))
-			b.raw(enc)
+			binary.BigEndian.PutUint32(buf[at:], uint32(len(buf)-at-4))
 		}
-		c.send(msgDataRow, b)
+		binary.BigEndian.PutUint32(buf[1:], uint32(len(buf)-1))
+		c.w.Write(buf)
 	}
 	return true
 }

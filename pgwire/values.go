@@ -112,6 +112,14 @@ func formatFor(formats []int, i int) int {
 // type can say whether an int64 is a count or an instant. "" (an
 // untyped expression) falls through to representation-driven encoding.
 func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
+	return appendValue(nil, v, format, t)
+}
+
+// appendValue is encodeValue appending to dst, so a DataRow is built in
+// one reused buffer: encodeValue returned a fresh slice per value (and
+// a string first, for every text rendering), 11 allocations per row in
+// binary and 16 in text (deep-look D-41).
+func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error) {
 	// The declared type is what the client decodes by, so a value whose
 	// Go kind contradicts it would be read as something else entirely —
 	// an int64 under a uuid OID, a string's bytes under int8 in binary.
@@ -127,7 +135,7 @@ func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
 		// where the value's own binary encoding (8 raw bytes for an
 		// int64) would be read as garbage text.
 		if _, ok := v.(string); !ok {
-			return encodeByKind(v, fmtText)
+			return appendByKind(dst, v, fmtText)
 		}
 	case bytdb.TFloat:
 		if n, ok := v.(int64); ok {
@@ -135,30 +143,30 @@ func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
 		}
 	}
 	if !kindFits(v, t) {
-		return nil, serr.New("result value does not match its column type",
+		return dst, serr.New("result value does not match its column type",
 			"type", string(t), "value_type", fmt.Sprintf("%T", v))
 	}
 	switch t {
 	case bytdb.TTimestamp:
 		if x, ok := v.(int64); ok {
 			if format == fmtText {
-				return []byte(bytdb.FormatTimestamp(x)), nil
+				return bytdb.AppendTimestamp(dst, x), nil
 			}
-			return binary.BigEndian.AppendUint64(nil, uint64(x-pgEpochMicros)), nil
+			return binary.BigEndian.AppendUint64(dst, uint64(x-pgEpochMicros)), nil
 		}
 	case bytdb.TDate:
 		if x, ok := v.(int64); ok {
 			if format == fmtText {
-				return []byte(bytdb.FormatDate(x)), nil
+				return bytdb.AppendDate(dst, x), nil
 			}
-			return binary.BigEndian.AppendUint32(nil, uint32(int32(x-pgEpochDays))), nil
+			return binary.BigEndian.AppendUint32(dst, uint32(int32(x-pgEpochDays))), nil
 		}
 	case bytdb.TUUID:
 		if x, ok := v.([]byte); ok && len(x) == 16 {
 			if format == fmtText {
-				return []byte(bytdb.FormatUUID(x)), nil
+				return bytdb.AppendUUID(dst, x), nil
 			}
-			return x, nil
+			return append(dst, x...), nil
 		}
 	case bytdb.TTextArray:
 		// The stored value IS the text wire form (the canonical array
@@ -166,21 +174,25 @@ func encodeValue(v any, format int, t bytdb.ColType) ([]byte, error) {
 		// Postgres's array format, which pgx requests for text[].
 		if x, ok := v.(string); ok {
 			if format == fmtText {
-				return []byte(x), nil
+				return append(dst, x...), nil
 			}
-			return encodeTextArrayBinary(x)
+			enc, err := encodeTextArrayBinary(x)
+			if err != nil {
+				return dst, err
+			}
+			return append(dst, enc...), nil
 		}
 	case bytdb.TJSONB:
 		// The stored value IS the JSON text; jsonb's binary format is
 		// just a 1-byte version prefix (always 1) ahead of that text.
 		if x, ok := v.(string); ok {
 			if format == fmtText {
-				return []byte(x), nil
+				return append(dst, x...), nil
 			}
-			return append([]byte{1}, x...), nil
+			return append(append(dst, 1), x...), nil
 		}
 	}
-	return encodeByKind(v, format)
+	return appendByKind(dst, v, format)
 }
 
 // kindFits reports whether v's Go kind is the runtime representation of
@@ -210,45 +222,45 @@ func kindFits(v any, t bytdb.ColType) bool {
 	return true
 }
 
-// encodeByKind is representation-driven encoding: the value's own Go
-// kind decides the bytes.
-func encodeByKind(v any, format int) ([]byte, error) {
+// appendByKind is representation-driven encoding, appended to dst: the
+// value's own Go kind decides the bytes.
+func appendByKind(dst []byte, v any, format int) ([]byte, error) {
 	if format == fmtText {
 		switch x := v.(type) {
 		case bool:
 			if x {
-				return []byte("t"), nil
+				return append(dst, 't'), nil
 			}
-			return []byte("f"), nil
+			return append(dst, 'f'), nil
 		case int64:
-			return strconv.AppendInt(nil, x, 10), nil
+			return strconv.AppendInt(dst, x, 10), nil
 		case float64:
 			// Postgres's float8 text: 1000000 not 1e+06, Infinity not +Inf
 			// (deep-look D-24, D-55).
-			return []byte(bytdb.FormatFloat(x)), nil
+			return bytdb.AppendFloat(dst, x), nil
 		case string:
-			return []byte(x), nil
+			return append(dst, x...), nil
 		case []byte:
-			return []byte(`\x` + hex.EncodeToString(x)), nil
+			return hex.AppendEncode(append(dst, `\x`...), x), nil
 		}
-		return nil, serr.New("unencodable result value", "type", fmt.Sprintf("%T", v))
+		return dst, serr.New("unencodable result value", "type", fmt.Sprintf("%T", v))
 	}
 	switch x := v.(type) {
 	case bool:
 		if x {
-			return []byte{1}, nil
+			return append(dst, 1), nil
 		}
-		return []byte{0}, nil
+		return append(dst, 0), nil
 	case int64:
-		return binary.BigEndian.AppendUint64(nil, uint64(x)), nil
+		return binary.BigEndian.AppendUint64(dst, uint64(x)), nil
 	case float64:
-		return binary.BigEndian.AppendUint64(nil, math.Float64bits(x)), nil
+		return binary.BigEndian.AppendUint64(dst, math.Float64bits(x)), nil
 	case string:
-		return []byte(x), nil
+		return append(dst, x...), nil
 	case []byte:
-		return x, nil
+		return append(dst, x...), nil
 	}
-	return nil, serr.New("unencodable result value", "type", fmt.Sprintf("%T", v))
+	return dst, serr.New("unencodable result value", "type", fmt.Sprintf("%T", v))
 }
 
 // decodeParam converts one Bind parameter value to the Go value kinds

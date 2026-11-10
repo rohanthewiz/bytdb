@@ -394,7 +394,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			pid:      s.nextPID.Add(1),
 			secret:   newCancelSecret(),
 		}
-		c.w = bufio.NewWriter(stallWriter{c})
+		c.w = bufio.NewWriterSize(stallWriter{c}, writeBufSize)
 		c.overLimit = eff > 0 && len(s.conns) >= eff
 		s.conns[nc] = struct{}{}
 		s.backends[c.pid] = c

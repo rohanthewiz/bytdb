@@ -14,6 +14,7 @@ package bytdb
 // micros cover the years 290,000 BCE..CE — no range gymnastics needed.
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -63,35 +64,73 @@ func ParseTimestamp(s string) (int64, error) {
 // digits, so 1000000 printed as "1e+06" where Postgres prints 1000000,
 // on the wire and in ::text (deep-look D-24, D-55).
 func FormatFloat(f float64) string {
+	return string(AppendFloat(nil, f))
+}
+
+// AppendFloat appends FormatFloat's rendering of f to dst. The Append
+// forms of the formatters let the wire server encode a result row into
+// one reused buffer instead of allocating a string per value (deep-look
+// D-41); the Format forms wrap them.
+func AppendFloat(dst []byte, f float64) []byte {
 	switch {
 	case math.IsNaN(f):
-		return "NaN"
+		return append(dst, "NaN"...)
 	case math.IsInf(f, 1):
-		return "Infinity"
+		return append(dst, "Infinity"...)
 	case math.IsInf(f, -1):
-		return "-Infinity"
+		return append(dst, "-Infinity"...)
 	}
-	s := strconv.FormatFloat(f, 'e', -1, 64) // shortest digits, e.g. "1.25e+08"
+	start := len(dst)
+	dst = strconv.AppendFloat(dst, f, 'e', -1, 64) // shortest digits, e.g. "1.25e+08"
 	if f == 0 {
-		return strings.TrimSuffix(s, "e+00") // "0" or "-0", as Postgres prints
+		return bytes.TrimSuffix(dst, []byte("e+00")) // "0" or "-0", as Postgres prints
 	}
-	_, exp, _ := strings.Cut(s, "e")
-	if e, _ := strconv.Atoi(exp); e < -4 || e >= 15 {
-		return s // Go pads the exponent to two digits, as Postgres does
+	// The exponent: everything after the 'e', a sign and two or three
+	// digits.
+	e, neg := 0, false
+	for i := len(dst) - 1; i > start; i-- {
+		if dst[i] == 'e' {
+			neg = dst[i+1] == '-'
+			for _, c := range dst[i+2:] {
+				e = e*10 + int(c-'0')
+			}
+			break
+		}
 	}
-	return strconv.FormatFloat(f, 'f', -1, 64)
+	if neg {
+		e = -e
+	}
+	if e < -4 || e >= 15 {
+		return dst // Go pads the exponent to two digits, as Postgres does
+	}
+	return strconv.AppendFloat(dst[:start], f, 'f', -1, 64)
 }
 
 // FormatTimestamp renders micros-since-epoch the way Postgres renders
 // a UTC timestamptz — '2024-01-02 03:04:05.123456+00', fraction
 // omitted when zero — which is the exact form client libraries parse.
 func FormatTimestamp(micros int64) string {
-	t := time.UnixMicro(micros).UTC()
-	out := t.Format("2006-01-02 15:04:05")
+	return string(AppendTimestamp(nil, micros))
+}
+
+// AppendTimestamp appends FormatTimestamp's rendering to dst.
+func AppendTimestamp(dst []byte, micros int64) []byte {
+	dst = time.UnixMicro(micros).UTC().AppendFormat(dst, "2006-01-02 15:04:05")
 	if frac := ((micros % 1e6) + 1e6) % 1e6; frac != 0 {
-		out += strings.TrimRight(fmt.Sprintf(".%06d", frac), "0")
+		// ".%06d" with its trailing zeros trimmed: .5 for 500000µs.
+		var digits [7]byte
+		digits[0] = '.'
+		for i := 6; i >= 1; i-- {
+			digits[i] = byte('0' + frac%10)
+			frac /= 10
+		}
+		n := 7
+		for digits[n-1] == '0' {
+			n--
+		}
+		dst = append(dst, digits[:n]...)
 	}
-	return out + "+00"
+	return append(dst, "+00"...)
 }
 
 // ParseDate reads 'YYYY-MM-DD' to days since the Unix epoch. Any
@@ -129,7 +168,12 @@ func ParseDate(s string) (int64, error) {
 
 // FormatDate renders days-since-epoch as 'YYYY-MM-DD'.
 func FormatDate(days int64) string {
-	return time.Unix(days*86400, 0).UTC().Format("2006-01-02")
+	return string(AppendDate(nil, days))
+}
+
+// AppendDate appends FormatDate's rendering to dst.
+func AppendDate(dst []byte, days int64) []byte {
+	return time.Unix(days*86400, 0).UTC().AppendFormat(dst, "2006-01-02")
 }
 
 // ParseUUID reads the canonical 8-4-4-4-12 form (case-insensitive;
@@ -159,10 +203,19 @@ func ParseUUID(s string) ([]byte, error) {
 // Anything but 16 bytes is a programming error upstream; it renders
 // hex-escaped rather than panicking so a corrupt value stays visible.
 func FormatUUID(b []byte) string {
+	return string(AppendUUID(nil, b))
+}
+
+// AppendUUID appends FormatUUID's rendering to dst.
+func AppendUUID(dst []byte, b []byte) []byte {
 	if len(b) != 16 {
-		return fmt.Sprintf("\\x%x", b)
+		return hex.AppendEncode(append(dst, `\x`...), b)
 	}
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	dst = hex.AppendEncode(dst, b[0:4])
+	dst = hex.AppendEncode(append(dst, '-'), b[4:6])
+	dst = hex.AppendEncode(append(dst, '-'), b[6:8])
+	dst = hex.AppendEncode(append(dst, '-'), b[8:10])
+	return hex.AppendEncode(append(dst, '-'), b[10:16])
 }
 
 // --- text arrays ---
