@@ -130,10 +130,10 @@ func skipQuoted(q string, open int) int {
 // The identifier test matches the lexer's: ASCII letters, digits and
 // underscore. The lexer rejects every other byte outside quotes, so a
 // statement where the two could disagree fails to parse whichever way
-// it splits. The one byte they read differently is a digit: the lexer
-// ends a number before an e that no exponent digits follow, so 1e'x'
-// lexes as 1 then E'x', where this reads a standard string. A number
-// directly followed by a string is a syntax error either way.
+// it splits. The one byte they read differently is a digit: 1e'x' is a
+// standard string here, while the lexer refuses the 1e outright
+// ("trailing junk after numeric literal", since deep-look D-22), so it
+// fails to parse whichever way it splits.
 func isEStringPrefix(q string, open int) bool {
 	if open == 0 || (q[open-1] != 'e' && q[open-1] != 'E') {
 		return false
