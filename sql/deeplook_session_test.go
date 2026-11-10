@@ -54,3 +54,45 @@ func TestSessionParseErrorFailsBlock(t *testing.T) {
 	}
 	sessExec(t, s, `rollback`)
 }
+
+// TestSubqueryLimitInterimReject (D-09): the subquery runners ignore
+// some ORDER BY / LIMIT / OFFSET combinations, which returned wrong rows
+// silently. Until subqueries run through the real SELECT path (D-27)
+// those shapes are refused; the shapes the runners get right still run.
+func TestSubqueryLimitInterimReject(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table o (id int primary key, amt int)`)
+	exec(t, d, `insert into o values (1, 10), (2, 50), (3, 30), (4, 5), (5, 99)`)
+	for _, q := range []string{
+		`select (select amt from o order by amt desc limit 1)`,
+		`select (select amt from o order by amt offset 1 limit 1)`,
+		`select id from o where id in (select id from o order by amt desc limit 2)`,
+		`select id from o where id = any (select id from o limit 2)`,
+		`select exists (select 1 from o limit 0)`,
+		`select exists (select 1 from o offset 10)`,
+		`select array(select amt from o limit 2)`,
+		`select array(select amt from o order by amt desc)`,
+		`select array(select amt from o order by id)`,
+	} {
+		if _, err := d.Exec(q); err == nil || !strings.Contains(err.Error(), "not supported yet") {
+			t.Errorf("%s: err = %v, want the interim refusal", q, err)
+		}
+	}
+	for q, want := range map[string]any{
+		`select exists (select 1 from o where amt > 90 limit 1)`: true,
+		`select (select amt from o limit 1)`:                      int64(10),
+		`select (select max(amt) from o)`:                        int64(99),
+		`select array(select amt from o order by amt)`:           "{5,10,30,50,99}",
+		`select array(select amt from o order by 1)`:             "{5,10,30,50,99}",
+		`select count(*) from o where id in (select id from o where amt > 20)`: int64(3),
+	} {
+		res, err := d.Exec(q)
+		if err != nil {
+			t.Errorf("%s: %v", q, err)
+			continue
+		}
+		if got := res.Rows[0][0]; got != want {
+			t.Errorf("%s = %v (%T), want %v", q, got, got, want)
+		}
+	}
+}

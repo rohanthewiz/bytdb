@@ -113,6 +113,7 @@ Parse-time rejections with pointed errors:
 | `NULLS FIRST/LAST` in `CREATE INDEX` | NULL placement follows the key encoding: ascending columns put NULLs first, descending last |
 | `EXPLAIN ANALYZE` | `EXPLAIN` only — execution is not instrumented |
 | Aggregates, subqueries, or placeholders inside `CHECK` | — |
+| `ORDER BY` with `LIMIT`/`OFFSET` in a scalar subquery; `LIMIT`/`OFFSET` in an `IN`/`ANY` or `ARRAY(...)` subquery; `LIMIT 0`, `LIMIT $n` or `OFFSET` in `EXISTS`; an `ARRAY(...)` `ORDER BY` other than ascending on the selected value | Refused (0A000) until subqueries run through the full SELECT executor: the subquery runner would ignore the clause and return wrong rows. Move the subquery into a `WITH` clause or a derived table in `FROM`, which apply it. `EXISTS (... LIMIT 1)` and `LIMIT`/`OFFSET` without `ORDER BY` work |
 | `SELECT DISTINCT ON (...)` | Plain `DISTINCT` works; keep-first-per-group needs application code |
 | `SELECT DISTINCT ... ORDER BY <expression>` | Order by output column names or positions — a sort key the projection dropped would decide which duplicate survives |
 | `DROP SEQUENCE ... CASCADE`, `OWNED BY table.column` | Nothing can depend on a sequence yet; `OWNED BY NONE` parses |

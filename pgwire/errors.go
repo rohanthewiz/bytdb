@@ -90,6 +90,10 @@ func sqlstate(msg string, hasPos bool) string {
 		return "23503" // foreign_key_violation
 	case strings.Contains(msg, "truncate a table referenced in a foreign key"):
 		return "0A000" // feature_not_supported (Postgres's code for it sans CASCADE)
+	// Subquery shapes the subquery executor does not run (LIMIT/OFFSET
+	// until deep-look D-27; UNION and GROUP BY in a scalar subquery).
+	case strings.Contains(msg, "subquery is not supported"):
+		return "0A000" // feature_not_supported
 	// Schema changes refused because another object depends on the
 	// target: a foreign key, a CHECK, or an index. Postgres reports its
 	// own such refusals (DROP without CASCADE) as 2BP01, and the remedy

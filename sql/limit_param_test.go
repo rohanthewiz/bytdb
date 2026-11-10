@@ -72,10 +72,11 @@ func TestLimitOffsetParams(t *testing.T) {
 
 	// Placeholders resolve in nested SELECTs too — any select that
 	// binds through the same walk. The scalar-subquery form is the
-	// probe because it is a path that honors a subquery's LIMIT (the
-	// IN-subquery evaluation ignores LIMIT even as a literal — a
-	// separate, pre-existing gap).
-	if got := ids(t, d, `select (select id from t order by id limit 1 offset $1)`, 1); !reflect.DeepEqual(got, []int64{2}) {
+	// probe because it is a path that honors a subquery's LIMIT and
+	// OFFSET (in scan order, which is primary-key order here). It has
+	// no ORDER BY: the subquery runner does not sort, so ORDER BY with
+	// LIMIT/OFFSET in a subquery is refused until deep-look D-27.
+	if got := ids(t, d, `select (select id from t limit 1 offset $1)`, 1); !reflect.DeepEqual(got, []int64{2}) {
 		t.Fatalf("scalar subquery OFFSET $1: %v", got)
 	}
 	if got := ids(t, d, `select id from t union all select id from t order by id limit $1`, 2); !reflect.DeepEqual(got, []int64{1, 1}) {
