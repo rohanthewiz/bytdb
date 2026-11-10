@@ -1543,7 +1543,11 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 				return nil, serr.New(it.Agg.name()+" requires a numeric column",
 					"column", it.Col.String())
 			}
+			if err := aggArgCheck(it.Agg, t, ""); err != nil {
+				return nil, err
+			}
 			acc.ord, acc.intSum = ord, t == bytdb.TInt
+			acc.spec = &accumSpec{elemType: t} // array_agg renders by it
 		} else if it.Agg != AggCount {
 			return nil, serr.New("only COUNT takes *", "function", it.Agg.name())
 		}
@@ -1906,11 +1910,8 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 	case *ExCmp, *ExAny, *ExIsNull, *ExIn, *ExAnd, *ExOr, *ExNot:
 		return bytdb.TBool
 	case *ExAgg:
-		switch n.Fn {
-		case AggCount:
-			return bytdb.TInt
-		case AggAvg:
-			return bytdb.TFloat
+		if t, ok := n.Fn.fixedType(); ok { // count, avg, the D-53 aggregates
+			return t
 		}
 		// Mirrors accumType: SUM over anything not statically integer
 		// accumulates as float; MIN/MAX surface the argument's type.
@@ -2080,6 +2081,10 @@ func castColType(typ string) bytdb.ColType {
 		return bytdb.TUUID
 	case "json", "jsonb":
 		return bytdb.TJSONB
+	case "text[]", "varchar[]", "character varying[]":
+		// castVal canonicalizes these into the one array type; typing
+		// them as text let '{a}'::text[] slip past array-only checks.
+		return bytdb.TTextArray
 	}
 	return bytdb.TString
 }

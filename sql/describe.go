@@ -410,11 +410,8 @@ func columnType(sc *scope) func(SelectItem) (bytdb.ColType, error) {
 // argument's type.
 func itemType(sc *scope) func(SelectItem) (bytdb.ColType, error) {
 	return func(it SelectItem) (bytdb.ColType, error) {
-		switch it.Agg {
-		case AggCount:
-			return bytdb.TInt, nil
-		case AggAvg:
-			return bytdb.TFloat, nil
+		if t, ok := it.Agg.fixedType(); ok { // count, avg, the D-53 aggregates
+			return t, nil
 		}
 		ord, err := sc.resolve(it.Col)
 		if err != nil {

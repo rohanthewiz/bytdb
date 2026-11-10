@@ -117,6 +117,20 @@ type ExAgg struct {
 	Star     bool
 	Arg      Expr
 	Distinct bool
+	// Sep is string_agg's delimiter, evaluated per row (deep-look D-53).
+	Sep Expr
+	// Filter is FILTER (WHERE cond): only rows for which cond is true
+	// feed the aggregate.
+	Filter Expr
+	// OrderBy is the ORDER BY inside the call — string_agg(x, ',' ORDER
+	// BY y), array_agg(x ORDER BY y) — the order values are combined in.
+	OrderBy []OrderItem
+}
+
+// plainAgg reports whether a call is the legacy shape a SelectItem can
+// carry (Agg + Col or Star): none of the extended parts.
+func (n *ExAgg) plainAgg() bool {
+	return n.Arg == nil && !n.Distinct && n.Sep == nil && n.Filter == nil && len(n.OrderBy) == 0
 }
 
 // ExAnd / ExOr / ExNot are boolean operators within an expression.
@@ -241,6 +255,11 @@ func walkExpr(e Expr, visit func(Expr) bool) {
 	switch n := e.(type) {
 	case *ExAgg:
 		walkExpr(n.Arg, visit)
+		walkExpr(n.Sep, visit)
+		walkExpr(n.Filter, visit)
+		for _, o := range n.OrderBy {
+			walkExpr(o.Ex, visit)
+		}
 	case *ExAnd:
 		for _, sub := range n.Exprs {
 			walkExpr(sub, visit)
@@ -359,19 +378,60 @@ const (
 	AggAvg
 	AggMin
 	AggMax
+	// deep-look D-53
+	AggStringAgg // string_agg(text, delimiter)
+	AggArrayAgg  // array_agg(x): bytdb's text[] (elements as text)
+	AggBoolAnd   // bool_and(bool), also spelled every
+	AggBoolOr    // bool_or(bool)
 )
 
 var aggNames = map[string]AggFunc{
 	"count": AggCount, "sum": AggSum, "avg": AggAvg, "min": AggMin, "max": AggMax,
+	"string_agg": AggStringAgg, "array_agg": AggArrayAgg,
+	"bool_and": AggBoolAnd, "every": AggBoolAnd, "bool_or": AggBoolOr,
 }
 
 func (f AggFunc) name() string {
-	for n, fn := range aggNames {
-		if fn == f {
-			return n
-		}
+	switch f {
+	case AggCount:
+		return "count"
+	case AggSum:
+		return "sum"
+	case AggAvg:
+		return "avg"
+	case AggMin:
+		return "min"
+	case AggMax:
+		return "max"
+	case AggStringAgg:
+		return "string_agg"
+	case AggArrayAgg:
+		return "array_agg"
+	case AggBoolAnd:
+		return "bool_and"
+	case AggBoolOr:
+		return "bool_or"
 	}
 	return ""
+}
+
+// fixedType is an aggregate's result type when it does not depend on
+// the argument's: count, avg, and the D-53 aggregates. ok is false for
+// sum/min/max.
+func (f AggFunc) fixedType() (bytdb.ColType, bool) {
+	switch f {
+	case AggCount:
+		return bytdb.TInt, true
+	case AggAvg:
+		return bytdb.TFloat, true
+	case AggStringAgg:
+		return bytdb.TString, true
+	case AggArrayAgg:
+		return bytdb.TTextArray, true
+	case AggBoolAnd, AggBoolOr:
+		return bytdb.TBool, true
+	}
+	return "", false
 }
 
 // WinFunc identifies a window-only function: the ranking family

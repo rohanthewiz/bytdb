@@ -707,7 +707,24 @@ func exprText(e Expr) string {
 		if n.Distinct {
 			arg = "DISTINCT " + arg
 		}
-		return n.Fn.name() + "(" + arg + ")"
+		if n.Sep != nil {
+			arg += ", " + exprText(n.Sep)
+		}
+		if len(n.OrderBy) > 0 {
+			keys := make([]string, len(n.OrderBy))
+			for i, o := range n.OrderBy {
+				keys[i] = exprText(o.Ex)
+				if o.Desc {
+					keys[i] += " DESC"
+				}
+			}
+			arg += " ORDER BY " + strings.Join(keys, ", ")
+		}
+		out := n.Fn.name() + "(" + arg + ")"
+		if n.Filter != nil {
+			out += " FILTER (WHERE " + exprText(n.Filter) + ")"
+		}
+		return out
 	case *ExAnd:
 		return joinExprs(n.Exprs, " AND ")
 	case *ExOr:

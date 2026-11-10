@@ -484,6 +484,38 @@ GROUP BY age / 10 HAVING count(*) >= 2
 ORDER BY n DESC, decade LIMIT 3
 ```
 
+Beyond the classic five:
+
+- `string_agg(text, delimiter)` joins non-NULL values; each value after
+  the first is preceded by its own row's delimiter (a NULL delimiter joins
+  with nothing). No input gives NULL, not `''`.
+- `array_agg(x)` collects values, NULLs included, into a `text[]` — the
+  one array type — so `array_agg(int_col)` reads `{1,2,3}` as Postgres's
+  `int[]` does, typed `text[]`. Elements render by their type: timestamps
+  and dates as text, booleans as `t`/`f`. An array argument is refused
+  (arrays are one-dimensional).
+- `bool_and(b)` / `every(b)`, `bool_or(b)`.
+- `agg(...) FILTER (WHERE cond)` on any aggregate feeds it only the rows
+  where `cond` is true; `count(*) FILTER (WHERE paid)` beside `count(*)` is
+  the usual pivot.
+- `ORDER BY` inside the call decides the order `string_agg` and
+  `array_agg` combine in (ties keep scan order); other aggregates accept
+  and ignore it. With `DISTINCT`, the `ORDER BY` keys must be the
+  argument, as in Postgres.
+
+```sql
+SELECT dept,
+       string_agg(name, ', ' ORDER BY hired DESC) AS names,
+       count(*) FILTER (WHERE remote) AS remote
+FROM emp GROUP BY dept
+```
+
+`string_agg` and `array_agg` hold their inputs until the group closes,
+so the held values count against the result row cap like a `DISTINCT`
+set. The extended forms are not window functions here: `string_agg(...)
+OVER (...)`, `FILTER` with `OVER`, and an `ORDER BY` inside a window
+aggregate are refused.
+
 ### DISTINCT
 
 `SELECT DISTINCT` dedups the projected rows (NULLs compare equal, as in

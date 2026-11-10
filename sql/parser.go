@@ -3291,7 +3291,7 @@ func lowerItem(e Expr) SelectItem {
 	case *ExCol:
 		return SelectItem{Col: n.Col}
 	case *ExAgg:
-		if n.Arg != nil || n.Distinct { // beyond the legacy shape: stays an expression
+		if !n.plainAgg() { // beyond the legacy shape: stays an expression
 			return SelectItem{Ex: e}
 		}
 		return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}
@@ -4220,6 +4220,7 @@ func (p *parser) primary() (Expr, error) {
 		p.advance() // function name
 		p.advance() // (
 		agg := &ExAgg{Fn: fn}
+		var err error
 		if p.acceptKw("distinct") {
 			agg.Distinct = true
 		} else {
@@ -4238,10 +4239,69 @@ func (p *parser) primary() (Expr, error) {
 				agg.Arg = e
 			}
 		}
+		// string_agg(x, delimiter [ORDER BY ...]); any aggregate takes
+		// an ORDER BY, which only string_agg and array_agg observe —
+		// deep-look D-53.
+		if fn == AggStringAgg {
+			if err := p.expectOp(","); err != nil {
+				return nil, err
+			}
+			if agg.Sep, err = p.expression(); err != nil {
+				return nil, err
+			}
+		}
+		if p.cur().kind == tIdent && p.cur().text == "order" {
+			p.advance()
+			if err := p.expectKw("by"); err != nil {
+				return nil, err
+			}
+			for {
+				e, err := p.expression()
+				if err != nil {
+					return nil, err
+				}
+				o := OrderItem{SelectItem: SelectItem{Ex: e}}
+				if p.acceptKw("desc") {
+					o.Desc = true
+				} else {
+					p.acceptKw("asc")
+				}
+				if o.Nulls, err = p.nullsOrder(); err != nil {
+					return nil, err
+				}
+				agg.OrderBy = append(agg.OrderBy, o)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+		}
 		if err := p.expectOp(")"); err != nil {
 			return nil, err
 		}
+		if p.cur().kind == tIdent && p.cur().text == "filter" && p.peekOp("(") {
+			p.advance() // filter
+			p.advance() // (
+			if err := p.expectKw("where"); err != nil {
+				return nil, err
+			}
+			if agg.Filter, err = p.expression(); err != nil {
+				return nil, err
+			}
+			if findAgg(agg.Filter) != AggNone {
+				return nil, serr.New("aggregate functions are not allowed in FILTER")
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
 		if p.cur().kind == tIdent && p.cur().text == "over" {
+			if len(agg.OrderBy) > 0 {
+				return nil, serr.New("aggregate ORDER BY is not implemented for window functions")
+			}
+			if fn > AggMax || agg.Filter != nil {
+				// The window machinery implements the classic five.
+				return nil, serr.New("this aggregate form is not supported as a window function", "function", fn.name())
+			}
 			if agg.Arg != nil && hasWindowExpr(agg.Arg) {
 				return nil, serr.New("window function calls cannot be nested")
 			}
@@ -4258,7 +4318,12 @@ func (p *parser) primary() (Expr, error) {
 			}
 			return p.windowOver(w)
 		}
-		if agg.Arg != nil && findAgg(agg.Arg) != AggNone {
+		nested := agg.Arg != nil && findAgg(agg.Arg) != AggNone ||
+			agg.Sep != nil && findAgg(agg.Sep) != AggNone
+		for _, o := range agg.OrderBy {
+			nested = nested || findAgg(o.Ex) != AggNone
+		}
+		if nested {
 			return nil, serr.New("aggregate function calls cannot be nested")
 		}
 		return agg, nil

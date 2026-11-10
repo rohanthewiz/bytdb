@@ -55,13 +55,66 @@ type accum struct {
 	seen     map[string]bool // per group; allocated by newGroup
 	intSum   bool
 	sawFloat bool // a float value actually arrived at runtime
+	sorted   bool // items are in spec.order's order; collect clears it
+	boolVal  bool // bool_and / bool_or running result once count > 0
 	count    int64
 	sumI     int64
 	sumF     float64
 	min, max any
+
+	// spec holds the call's static parts, shared by pointer: every
+	// group starts from a copy of the template accumulators, so the
+	// per-group copy stays small no matter how much a call carries.
+	// nil for accumulators built outside accumFor (window frames).
+	spec  *accumSpec
+	items []aggItem // string_agg / array_agg inputs, in arrival order
+}
+
+// emptySpec stands in for a nil spec: a call with no extended parts.
+var emptySpec accumSpec
+
+// accumSpec is the per-call, per-query part of an accumulator — the
+// same for every group (deep-look D-53).
+type accumSpec struct {
+	// key identifies the call (function, DISTINCT, argument and every
+	// extended part) so identical calls anywhere in the query share one
+	// accumulator; see accumFor.
+	key string
+	// filter gates each input row before anything else, COUNT(*)
+	// included.
+	filter Expr
+	// sepEx is string_agg's delimiter, evaluated per row like Postgres:
+	// the delimiter that precedes a value is the one from its row.
+	sepEx Expr
+	// order sorts the collected items before value() combines them; its
+	// expressions evaluate per input row, not per group.
+	order []aggSortKey
+	// elemType is array_agg's static element type: timestamps and dates
+	// are int64 at runtime, so only the type knows how to render one.
+	elemType bytdb.ColType
+}
+
+// aggItem is one value collected by string_agg or array_agg, with the
+// row's delimiter and ORDER BY key values.
+type aggItem struct {
+	v    any
+	sep  string
+	keys []any
 }
 
 func (a *accum) add(env *exEnv, vals []any) error {
+	if a.spec != nil && a.spec.filter != nil {
+		// FILTER (WHERE cond) admits only rows where cond is true; NULL
+		// is not true. Checked first so COUNT(*) FILTER (...) counts
+		// only the admitted rows.
+		t, err := evalTruth(env, a.spec.filter)
+		if err != nil {
+			return err
+		}
+		if t != triTrue {
+			return nil
+		}
+	}
 	var v any
 	switch {
 	case a.argEx != nil:
@@ -75,7 +128,9 @@ func (a *accum) add(env *exEnv, vals []any) error {
 		a.count++ // COUNT(*)
 		return nil
 	}
-	if v == nil {
+	// Aggregates skip NULL inputs — except array_agg, whose result keeps
+	// them as NULL elements, as in Postgres.
+	if v == nil && a.fn != AggArrayAgg {
 		return nil
 	}
 	if a.distinct {
@@ -135,8 +190,107 @@ func (a *accum) add(env *exEnv, vals []any) error {
 		if c, ok := compareVals(v, a.max); a.max == nil || (ok && c > 0) {
 			a.max = v
 		}
+	case AggBoolAnd, AggBoolOr:
+		b, ok := v.(bool)
+		if !ok {
+			return serr.New(a.fn.name()+" requires a boolean argument", "got", fmt.Sprintf("%T", v))
+		}
+		switch {
+		case a.count == 1:
+			a.boolVal = b
+		case a.fn == AggBoolAnd:
+			a.boolVal = a.boolVal && b
+		default:
+			a.boolVal = a.boolVal || b
+		}
+	case AggStringAgg, AggArrayAgg:
+		return a.collect(env, v)
 	}
 	return nil
+}
+
+// collect keeps one string_agg / array_agg input: its value, its row's
+// delimiter and its ORDER BY keys. Ordering needs every input before
+// the first output, so these two aggregates hold their inputs, and the
+// held items are charged against the row budget like a DISTINCT set.
+func (a *accum) collect(env *exEnv, v any) error {
+	it := aggItem{v: v}
+	spec := a.spec
+	if spec == nil {
+		spec = &emptySpec
+	}
+	if a.fn == AggStringAgg {
+		if _, ok := v.(string); !ok {
+			return serr.New("string_agg requires a text argument", "got", fmt.Sprintf("%T", v))
+		}
+		sep, err := evalEx(env, spec.sepEx)
+		if err != nil {
+			return err
+		}
+		switch x := sep.(type) {
+		case nil: // a NULL delimiter joins with nothing, as in Postgres
+		case string:
+			it.sep = x
+		default:
+			return serr.New("string_agg requires a text delimiter", "got", fmt.Sprintf("%T", sep))
+		}
+	}
+	if len(spec.order) > 0 {
+		it.keys = make([]any, len(spec.order))
+		for i, o := range spec.order {
+			var err error
+			if it.keys[i], err = evalEx(env, o.ex); err != nil {
+				return err
+			}
+		}
+	}
+	a.items = append(a.items, it)
+	a.sorted = false
+	if env != nil {
+		if err := env.d.budget().check(len(a.items)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sortItems puts the collected items in the call's ORDER BY order,
+// stably, so ties keep arrival order (the scan's order — Postgres
+// leaves ties unspecified, and this choice is the deterministic one).
+func (a *accum) sortItems() {
+	if a.sorted || a.spec == nil || len(a.spec.order) == 0 {
+		return
+	}
+	order := a.spec.order
+	slices.SortStableFunc(a.items, func(x, y aggItem) int {
+		for i, o := range order {
+			if c := keyCmp(x.keys[i], y.keys[i], o.desc, o.nulls); c != 0 {
+				return c
+			}
+		}
+		return 0
+	})
+	a.sorted = true
+}
+
+// elemText renders one array_agg element the way the element type's
+// output function does inside an array: booleans as t/f (array_out's
+// spelling, not ::text's true/false), temporal and uuid values by
+// their static type, the rest as their text form.
+func (a *accum) elemText(v any) any {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case bool:
+		if x {
+			return "t"
+		}
+		return "f"
+	}
+	if a.spec == nil {
+		return valText(v)
+	}
+	return typedText(v, a.spec.elemType)
 }
 
 func (a *accum) value() any {
@@ -163,6 +317,39 @@ func (a *accum) value() any {
 		return a.min
 	case AggMax:
 		return a.max
+	case AggBoolAnd, AggBoolOr:
+		if a.count == 0 {
+			return nil
+		}
+		return a.boolVal
+	case AggStringAgg:
+		// Over zero non-NULL inputs the result is NULL, not ''. Each
+		// value after the first is preceded by its own row's delimiter.
+		if len(a.items) == 0 {
+			return nil
+		}
+		a.sortItems()
+		var b strings.Builder
+		for i, it := range a.items {
+			if i > 0 {
+				b.WriteString(it.sep)
+			}
+			b.WriteString(it.v.(string))
+		}
+		return b.String()
+	case AggArrayAgg:
+		// text[] is the one array type, so every element is rendered to
+		// text: array_agg(int_col) reads {1,2,3} like Postgres's int[],
+		// typed text[] here.
+		if len(a.items) == 0 {
+			return nil
+		}
+		a.sortItems()
+		elems := make([]any, len(a.items))
+		for i, it := range a.items {
+			elems[i] = a.elemText(it.v)
+		}
+		return bytdb.FormatTextArray(elems)
 	}
 	return nil
 }
@@ -548,8 +735,9 @@ func (q *aggQuery) rewrite(e Expr) (Expr, error) {
 // identical calls share one. SUM and AVG over a column require a
 // numeric column; expression arguments are checked at evaluation.
 func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
-	a := accum{fn: n.Fn, ord: -1, distinct: n.Distinct}
+	a := accum{fn: n.Fn, ord: -1, distinct: n.Distinct, spec: &accumSpec{}}
 	key := "*"
+	var argType bytdb.ColType
 	switch {
 	case n.Arg != nil:
 		if findAgg(n.Arg) != AggNone {
@@ -564,7 +752,8 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		a.argEx, a.intSum = n.Arg, exprType(q.sc, n.Arg) == bytdb.TInt
+		argType = exprType(q.sc, n.Arg)
+		a.argEx, a.intSum = n.Arg, argType == bytdb.TInt
 		key = "e:" + txt
 	case !n.Star:
 		ord, err := q.sc.resolve(n.Col)
@@ -577,21 +766,20 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 				"column", n.Col.String(), "type", string(t))
 		}
 		a.ord, a.intSum = ord, t == bytdb.TInt
+		argType = t
 		key = fmt.Sprintf("c%d", ord)
 	}
+	argKey := key
 	key = fmt.Sprintf("%d|%v|%s", n.Fn, n.Distinct, key)
+	ext, err := q.extendAccum(a.spec, n, argType, argKey)
+	if err != nil {
+		return 0, err
+	}
+	a.spec.key = key + ext
+	// The key is built once per accumulator, so matching a call against
+	// the existing ones is a string compare per accumulator.
 	for i, ex := range q.accums {
-		got := fmt.Sprintf("%d|%v|", ex.fn, ex.distinct)
-		switch {
-		case ex.argEx != nil:
-			txt, _ := exprKey(q.sc, ex.argEx)
-			got += "e:" + txt
-		case ex.ord >= 0:
-			got += fmt.Sprintf("c%d", ex.ord)
-		default:
-			got += "*"
-		}
-		if got == key {
+		if ex.spec.key == a.spec.key {
 			return i, nil
 		}
 	}
@@ -599,15 +787,100 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 	return len(q.accums) - 1, nil
 }
 
+// extendAccum fills the deep-look D-53 parts of a call — FILTER,
+// string_agg's delimiter, ORDER BY inside the call — into a, checks
+// them, and returns their contribution to the call's identity key:
+// count(*) and count(*) FILTER (WHERE x) are different accumulators.
+// argKey is the argument's key ("*", "cN" for a column, "e:<expr>"),
+// used to hold DISTINCT's ORDER BY to the argument as Postgres does.
+func (q *aggQuery) extendAccum(a *accumSpec, n *ExAgg, argType bytdb.ColType, argKey string) (string, error) {
+	var b strings.Builder
+	// part renders one sub-expression into the key after checking that
+	// it holds neither an aggregate nor a window function.
+	part := func(tag string, e Expr) (string, error) {
+		if findAgg(e) != AggNone {
+			return "", serr.New("aggregate function calls cannot be nested")
+		}
+		if hasWindowExpr(e) {
+			return "", serr.New("aggregate function calls cannot contain window function calls")
+		}
+		txt, err := exprKey(q.sc, e)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString("|" + tag + txt)
+		return txt, nil
+	}
+	var sepType bytdb.ColType
+	if n.Sep != nil {
+		if _, err := part("s:", n.Sep); err != nil {
+			return "", err
+		}
+		a.sepEx, sepType = n.Sep, exprType(q.sc, n.Sep)
+	}
+	if err := aggArgCheck(n.Fn, argType, sepType); err != nil {
+		return "", err
+	}
+	if n.Fn == AggArrayAgg {
+		a.elemType = argType
+	}
+	if n.Filter != nil {
+		if _, err := part("f:", n.Filter); err != nil {
+			return "", err
+		}
+		a.filter = n.Filter
+	}
+	for _, o := range n.OrderBy {
+		txt, err := part(fmt.Sprintf("o%v%d:", o.Desc, o.Nulls), o.Ex)
+		if err != nil {
+			return "", err
+		}
+		// DISTINCT dedups on the argument alone, so an ORDER BY key that
+		// is not the argument would have no single value per kept item.
+		// exprKey renders a plain column as "cN" — the column argument's
+		// own key — and any other expression as the text after "e:".
+		if n.Distinct && txt != argKey && "e:"+txt != argKey {
+			return "", serr.New("in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list")
+		}
+		// Only the collecting aggregates observe input order; for the
+		// rest (count, sum, min, ...) the clause is accepted and has no
+		// effect, so it costs nothing per row.
+		if n.Fn == AggStringAgg || n.Fn == AggArrayAgg {
+			a.order = append(a.order, aggSortKey{ex: o.Ex, desc: o.Desc, nulls: o.Nulls})
+		}
+	}
+	return b.String(), nil
+}
+
+// aggArgCheck refuses argument types an aggregate has no form for, in
+// Postgres's words (42883, "function string_agg(bigint, text) does not
+// exist"). An unknown type passes: the value is checked per row.
+func aggArgCheck(fn AggFunc, arg, sep bytdb.ColType) error {
+	switch fn {
+	case AggStringAgg:
+		if concrete(arg) && arg != bytdb.TString || concrete(sep) && sep != bytdb.TString {
+			return noFunc(fn.name(), []bytdb.ColType{arg, sep})
+		}
+	case AggBoolAnd, AggBoolOr:
+		if concrete(arg) && arg != bytdb.TBool {
+			return noFunc(fn.name(), []bytdb.ColType{arg})
+		}
+	case AggArrayAgg:
+		if arg == bytdb.TTextArray {
+			// array_agg over an array builds a two-dimensional array in
+			// Postgres; text[] here is one-dimensional.
+			return serr.New("array_agg over an array is not supported: arrays are one-dimensional")
+		}
+	}
+	return nil
+}
+
 // accumType is the result type of accumulator i for call n: COUNT ->
 // int, AVG -> float, SUM/MIN/MAX -> the argument's type (float for
 // SUM over an expression that is not statically integer).
 func (q *aggQuery) accumType(n *ExAgg, i int) bytdb.ColType {
-	switch n.Fn {
-	case AggCount:
-		return bytdb.TInt
-	case AggAvg:
-		return bytdb.TFloat
+	if t, ok := n.Fn.fixedType(); ok { // count, avg and the D-53 aggregates
+		return t
 	}
 	a := q.accums[i]
 	switch {

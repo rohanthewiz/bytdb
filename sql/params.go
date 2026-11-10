@@ -3,6 +3,7 @@ package sql
 import (
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/rohanthewiz/serr"
@@ -426,11 +427,27 @@ func bindExpr(e Expr, b *binder) Expr {
 	case *ExCol:
 		return e
 	case *ExAgg:
-		if n.Arg == nil {
+		if n.plainAgg() {
 			return e
 		}
 		c := *n
-		c.Arg = bindExpr(n.Arg, b)
+		if n.Arg != nil {
+			c.Arg = bindExpr(n.Arg, b)
+		}
+		if n.Sep != nil {
+			c.Sep = bindExpr(n.Sep, b)
+		}
+		if n.Filter != nil {
+			c.Filter = bindExpr(n.Filter, b)
+		}
+		if len(n.OrderBy) > 0 {
+			// A fresh slice: the parsed tree is shared through the parse
+			// cache and must never be written through.
+			c.OrderBy = slices.Clone(n.OrderBy)
+			for i := range c.OrderBy {
+				c.OrderBy[i].Ex = bindExpr(n.OrderBy[i].Ex, b)
+			}
+		}
 		return &c
 	case *ExAnd:
 		c := &ExAnd{Exprs: make([]Expr, len(n.Exprs))}

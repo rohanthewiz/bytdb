@@ -126,6 +126,16 @@ func benchQuery(b *testing.B, q string, args ...any) {
 // D-39: a full scan with two aggregates is dominated by row decoding.
 func BenchmarkDLCountSum100k(b *testing.B) { benchQuery(b, `SELECT count(*), sum(amount) FROM orders`) }
 
+// D-53: grouping into many groups copies the accumulator templates per
+// group, so accumulator size shows here; string_agg holds its inputs.
+func BenchmarkDLGroupBy100k(b *testing.B) {
+	benchQuery(b, `SELECT cust, count(*), sum(amount) FROM orders GROUP BY cust`)
+}
+
+func BenchmarkDLStringAgg100k(b *testing.B) {
+	benchQuery(b, `SELECT cust, string_agg(status, ',' ORDER BY id) FROM orders GROUP BY cust`)
+}
+
 // D-40: point reads, unprepared and prepared.
 func BenchmarkDLPointSelect(b *testing.B) {
 	benchQuery(b, `SELECT amount FROM orders WHERE id = $1`, int64(54321))

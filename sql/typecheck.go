@@ -49,6 +49,7 @@ package sql
 // when there are no parameters), so mutating in place would race.
 
 import (
+	"slices"
 	"strings"
 	"time"
 
@@ -467,11 +468,10 @@ func outputType(t bytdb.ColType) bytdb.ColType {
 }
 
 func (t *typer) aggType(fn AggFunc, star bool, arg bytdb.ColType, _ ColRef) bytdb.ColType {
+	if typ, ok := fn.fixedType(); ok { // count, avg, the D-53 aggregates
+		return typ
+	}
 	switch fn {
-	case AggCount:
-		return bytdb.TInt
-	case AggAvg:
-		return bytdb.TFloat
 	case AggSum:
 		if arg == bytdb.TInt {
 			return bytdb.TInt
@@ -1288,6 +1288,51 @@ func (t *typer) expr(e Expr, ts *tscope) (Expr, bytdb.ColType, error) {
 			}
 		} else if !n.Star {
 			arg = ts.colType(n.Col)
+		}
+		// The D-53 parts type like any expression; the delimiter and the
+		// argument must fit the aggregate's one signature, and FILTER's
+		// condition must be boolean.
+		var sep bytdb.ColType
+		if n.Sep != nil {
+			e, st, err := t.expr(n.Sep, ts)
+			if err != nil {
+				return nil, "", err
+			}
+			sep = st
+			if e != n.Sep {
+				c.Sep, changed = e, true
+			}
+		}
+		if err := aggArgCheck(n.Fn, arg, sep); err != nil {
+			return nil, "", err
+		}
+		if n.Filter != nil {
+			e, ft, err := t.expr(n.Filter, ts)
+			if err != nil {
+				return nil, "", err
+			}
+			if concrete(ft) && ft != bytdb.TBool {
+				return nil, "", serr.New("argument of FILTER must be type boolean, not type " + pgTypeName(ft))
+			}
+			if e != n.Filter {
+				c.Filter, changed = e, true
+			}
+		}
+		if len(n.OrderBy) > 0 {
+			order := slices.Clone(n.OrderBy)
+			orderChanged := false
+			for i := range order {
+				e, _, err := t.expr(order[i].Ex, ts)
+				if err != nil {
+					return nil, "", err
+				}
+				if e != order[i].Ex {
+					order[i].Ex, orderChanged = e, true
+				}
+			}
+			if orderChanged {
+				c.OrderBy, changed = order, true
+			}
 		}
 		typ := t.aggType(n.Fn, n.Star, arg, n.Col)
 		if !changed {
