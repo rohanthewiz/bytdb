@@ -394,3 +394,47 @@ func TestPrefixEnd(t *testing.T) {
 		}
 	}
 }
+
+// Skip passes over one element of every kind without decoding it, and
+// strings decode the same with and without escapes and in both
+// directions (deep-look D-39's one-allocation string path).
+func TestSkipAndStrings(t *testing.T) {
+	vals := []any{nil, true, false, int64(-9), 3.5, "", "plain", "esc\x00aped\x00", []byte{0, 1, 0}}
+	enc, err := Encode(vals...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest := enc
+	for i := range vals {
+		if rest, err = Skip(rest); err != nil {
+			t.Fatalf("skip %d: %v", i, err)
+		}
+	}
+	if len(rest) != 0 {
+		t.Fatalf("%d bytes left after skipping every element", len(rest))
+	}
+	if _, err := Skip(nil); err == nil {
+		t.Fatal("Skip of empty input succeeded")
+	}
+	for _, s := range []string{"", "plain", "esc\x00aped\x00", "\x00\x00"} {
+		for _, desc := range []bool{false, true} {
+			var b []byte
+			if desc {
+				b, err = AppendDesc(nil, s)
+			} else {
+				b, err = Append(nil, s)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, rest, err := DecodeOne(b, desc)
+			if err != nil || v != s || len(rest) != 0 {
+				t.Fatalf("DecodeOne(%q, desc=%v) = %q, %d left, %v", s, desc, v, len(rest), err)
+			}
+		}
+	}
+	plain, _ := Encode("a plain string value")
+	if n := testing.AllocsPerRun(100, func() { DecodeOne(plain, false) }); n > 2 { //nolint:errcheck
+		t.Fatalf("string decode allocates %v times, want <= 2 (string + interface box)", n)
+	}
+}

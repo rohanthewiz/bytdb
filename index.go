@@ -191,7 +191,7 @@ func (e *Engine) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, e
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
-		scanIndexRows(t.tx, desc, idx, from, to)(yield)
+		scanIndexRows(t.tx, desc, idx, from, to, nil)(yield)
 	}
 }
 
@@ -217,14 +217,14 @@ func (e *Engine) ScanIndexRev(table, index string, from, to []any, toIncl bool) 
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
-		scanIndexRowsRev(t.tx, desc, idx, from, to, toIncl)(yield)
+		scanIndexRowsRev(t.tx, desc, idx, from, to, toIncl, nil)(yield)
 	}
 }
 
 // scanIndexRowsRev iterates an index's rows in descending order,
 // mirroring scanIndexRows (and scanRowsRev's bound handling, including
 // toIncl's prefix-group upper bound).
-func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any, toIncl bool) iter.Seq2[Row, error] {
+func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any, toIncl bool, need []bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		prefix := indexPrefix(desc.ID, idx.ID)
 		start := string(prefix)
@@ -254,7 +254,7 @@ func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any,
 			if k < start {
 				return
 			}
-			row, err := rowFromIndexEntry(v, desc, idx, k, val)
+			row, err := rowFromIndexEntry(v, desc, idx, k, val, need)
 			if !yield(row, err) || err != nil {
 				return
 			}
@@ -266,7 +266,7 @@ func scanIndexRowsRev(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any,
 // serves both the entry scan and the entry -> row lookups, so it must
 // be a snapshot or transaction (never the bare DB, whose iteration
 // holds a read lock that the inner lookups would re-enter).
-func scanIndexRows(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any) iter.Seq2[Row, error] {
+func scanIndexRows(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any, need []bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		prefix := indexPrefix(desc.ID, idx.ID)
 		start := string(prefix)
@@ -290,7 +290,7 @@ func scanIndexRows(v kvView, desc *TableDesc, idx *IndexDesc, from, to []any) it
 			if k >= end {
 				return
 			}
-			row, err := rowFromIndexEntry(v, desc, idx, k, val)
+			row, err := rowFromIndexEntry(v, desc, idx, k, val, need)
 			if !yield(row, err) || err != nil {
 				return
 			}
@@ -372,7 +372,7 @@ func indexBound(desc *TableDesc, idx *IndexDesc, prefix []byte, vals []any) (str
 // themselves; unique-form keys carry it in the value. Indexed values
 // decode each with its key column's direction; the pk suffix is always
 // ascending.
-func rowFromIndexEntry(v kvView, desc *TableDesc, idx *IndexDesc, key string, val []byte) (Row, error) {
+func rowFromIndexEntry(v kvView, desc *TableDesc, idx *IndexDesc, key string, val []byte, need []bool) (Row, error) {
 	data := []byte(key)
 	var err error
 	// Skip the (tableID, indexID) header and the indexed values.
@@ -407,5 +407,5 @@ func rowFromIndexEntry(v kvView, desc *TableDesc, idx *IndexDesc, key string, va
 	if !ok {
 		return Row{}, serr.New("index entry points at a missing row", "table", desc.Name, "index", idx.Name)
 	}
-	return decodeRow(desc, rk, rv)
+	return decodeRowCols(desc, rk, rv, need)
 }

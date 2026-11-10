@@ -217,6 +217,13 @@ type joinStep struct {
 	st     scopeTable
 	static []BoolExpr
 	tmpls  []predTmpl
+	// colSel is the SELECT whose column references bound what this
+	// step's scans decode (colneed.go); nil outside a SELECT. cols caches
+	// the mask, computed on first use (colsDone).
+	colSel   *Select
+	cols     []bool
+	colsDone bool
+
 	// probes are IN-list conjuncts on this table's columns (col IN
 	// (constants), col = ANY(array)). They are Conds, so they cannot join
 	// static — the step's scan filter runs without an evaluation
@@ -575,6 +582,9 @@ func (step *joinStep) rowPlan(partial []any) (*plan, error) {
 		if err != nil {
 			return nil, err
 		}
+		if pl.get == nil { // a point get decodes one row; the mask is not worth computing
+			pl.cols = step.needCols()
+		}
 		step.tmplPlan = pl
 		return pl, nil
 	}
@@ -636,6 +646,7 @@ func (j *joinRun) hashStep(k int, partial []any) {
 				j.err = err
 				return
 			}
+			pl.cols = step.needCols()
 			// The build table holds the inner side's matching rows in
 			// memory for the whole join, so it is charged like any other
 			// row set (see rowbudget.go). A virtual table's rows (the branch

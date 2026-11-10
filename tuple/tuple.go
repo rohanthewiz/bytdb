@@ -30,6 +30,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/rohanthewiz/serr"
 )
@@ -214,17 +215,46 @@ func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
 			bits = ^bits
 		}
 		return math.Float64frombits(bits), data[8:], nil
-	case tagBytes, tagString:
+	case tagString:
+		str, rest, err := unescapeString(data, mask)
+		if err != nil {
+			return nil, nil, err
+		}
+		return str, rest, nil
+	case tagBytes:
 		raw, rest, err := unescape(data, mask)
 		if err != nil {
 			return nil, nil, err
 		}
-		if tag == tagString {
-			return string(raw), rest, nil
-		}
 		return raw, rest, nil
 	}
 	return nil, nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
+}
+
+// Skip returns data past its first element (ascending encoding)
+// without materializing the value: no allocation for any type. Row
+// decoding uses it for columns a query does not read (deep-look D-39).
+func Skip(data []byte) (rest []byte, err error) {
+	if len(data) == 0 {
+		return nil, serr.New("tuple: empty input")
+	}
+	tag, data := data[0], data[1:]
+	switch tag {
+	case tagNull, tagFalse, tagTrue:
+		return data, nil
+	case tagInt, tagFloat:
+		if len(data) < 8 {
+			return nil, serr.New("tuple: truncated numeric element")
+		}
+		return data[8:], nil
+	case tagBytes, tagString:
+		_, _, end, err := scanEscaped(data, 0x00)
+		if err != nil {
+			return nil, err
+		}
+		return data[end+2:], nil
+	}
+	return nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
 
 // unescape reads an escaped byte string whose stored bytes are XOR
@@ -238,8 +268,49 @@ func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
 // no-escape case reduces to one allocation plus a copy (or an XOR loop
 // when a descending column's mask is set).
 func unescape(data []byte, mask byte) (raw, rest []byte, err error) {
+	n, escapes, end, err := scanEscaped(data, mask)
+	if err != nil {
+		return nil, nil, err
+	}
+	raw = make([]byte, n)
+	fillUnescaped(raw, data[:end], mask, escapes)
+	return raw, data[end+2:], nil
+}
+
+// unescapeString is unescape producing a string in ONE allocation. A
+// string element used to cost two — the raw bytes, then string(raw)'s
+// copy — for every text column of every row decoded (deep-look D-39).
+// The common case (no escapes, ascending) converts the stored bytes
+// directly; otherwise the bytes are unescaped into a builder sized
+// exactly, whose String() takes them without copying.
+func unescapeString(data []byte, mask byte) (str string, rest []byte, err error) {
+	n, escapes, end, err := scanEscaped(data, mask)
+	if err != nil {
+		return "", nil, err
+	}
+	rest = data[end+2:]
+	if escapes == 0 && mask == 0 {
+		return string(data[:end]), rest, nil
+	}
+	var b strings.Builder
+	b.Grow(n)
+	body := data[:end]
+	for i := 0; i < len(body); i++ {
+		c := body[i] ^ mask
+		if c == escByte {
+			i++ // skip the pair's second byte; the escape byte is the value
+		}
+		b.WriteByte(c)
+	}
+	return b.String(), rest, nil
+}
+
+// scanEscaped locates an escaped byte string's terminator. It returns
+// the logical length n, the number of escape pairs, and end, the index
+// of the terminator pair in data (the element continues at end+2).
+func scanEscaped(data []byte, mask byte) (n, escapes, end int, err error) {
 	esc := escByte ^ mask // the escape byte as it appears in stored form
-	n, escapes, end := 0, 0, -1
+	end = -1
 scan:
 	for i := 0; i < len(data); i++ {
 		if data[i] != esc {
@@ -258,15 +329,18 @@ scan:
 			end = i
 			break scan
 		default:
-			return nil, nil, serr.New("tuple: invalid escape sequence")
+			return 0, 0, 0, serr.New("tuple: invalid escape sequence")
 		}
 	}
 	if end < 0 {
-		return nil, nil, serr.New("tuple: unterminated byte-string element")
+		return 0, 0, 0, serr.New("tuple: unterminated byte-string element")
 	}
-	rest = data[end+2:]
-	body := data[:end]
-	raw = make([]byte, n)
+	return n, escapes, end, nil
+}
+
+// fillUnescaped writes body's logical bytes into raw (len(raw) is the
+// logical length scanEscaped counted).
+func fillUnescaped(raw, body []byte, mask byte, escapes int) {
 	if escapes == 0 {
 		if mask == 0 {
 			copy(raw, body)
@@ -275,7 +349,7 @@ scan:
 				raw[i] = b ^ mask
 			}
 		}
-		return raw, rest, nil
+		return
 	}
 	j := 0
 	for i := 0; i < len(body); i++ {
@@ -286,7 +360,6 @@ scan:
 		raw[j] = b
 		j++
 	}
-	return raw, rest, nil
 }
 
 // Compare orders two tuples element-wise with the same semantics the

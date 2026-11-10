@@ -716,7 +716,7 @@ func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) 
 		desc := old.clone()
 		desc.Checks = append(desc.Checks, ck)
 		if validate != nil {
-			for row, err := range scanRows(tx, old, nil, nil) {
+			for row, err := range scanRows(tx, old, nil, nil, nil) {
 				if err != nil {
 					return nil, err
 				}

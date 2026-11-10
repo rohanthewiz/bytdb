@@ -72,9 +72,21 @@ at 19 µs vs Redis's 32 µs and tmpfs-Postgres's 186 µs.
 
 **Analytical scans: DuckDB wins by ~80×, as it should.** `SELECT count(*),
 sum(amount)` over 100k rows: DuckDB 0.34 ms (columnar, vectorized), Postgres
-4.4 ms, bytdb 26 ms. bytdb executes row-at-a-time over a B-tree with
-interpreted expressions and no parallelism. If your workload is scanning
-millions of rows to aggregate, use DuckDB — or feed it from bytdb.
+4.4 ms, bytdb 26 ms. DuckDB is columnar and vectorized; bytdb reads a B-tree
+row by row with no parallelism. If your workload is scanning millions of rows
+to aggregate, use DuckDB — or feed it from bytdb.
+
+Where bytdb's scan time went is worth stating precisely, because the table
+above predates a fix. A profile of this query (deep-look D-39) put **77% of
+statement time in row decoding** — every column of every row decoded into
+fresh slices, every string built twice — and the expression interpreter at a
+few percent. Since then rows decode straight into place, a string costs one
+allocation, and a `SELECT` decodes only the columns the statement names
+(`bytdb.ScanOptions.Cols`). Re-measured on an Apple M3 with the same harness
+(`go run ./bench -targets bytdb-lazy`): **12.3 ms** for this aggregate (and
+3.2 µs point reads); the in-repo `BenchmarkDLCountSum100k`, on a wider
+five-column table, went from 31.4 ms to 14.5 ms. The other columns of the
+table were not re-run; the gap to Postgres is now about 3×, not 6×.
 
 **The wire tax is visible and honest.** Embedded 5 µs → pgwire 40 µs for the
 identical query on the identical engine: ~35 µs is what TCP loopback plus

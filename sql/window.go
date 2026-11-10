@@ -217,6 +217,7 @@ func (d *DB) execSelectWindow(s *Select) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		fp.readColumnsOf(s) // scans decode only what s can read (D-39)
 		sc := fp.sc
 		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo(), outer: d.outer}
 
@@ -354,6 +355,7 @@ func (d *DB) execSelectAggWindow(s *Select) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		fp.readColumnsOf(s) // scans decode only what s can read (D-39)
 		sc := fp.sc
 		env := &exEnv{d: d, tx: tx, sc: sc, subs: newSubMemo(), outer: d.outer}
 

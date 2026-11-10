@@ -788,6 +788,7 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		fp.readColumnsOf(s) // scans decode only what s can read (D-39)
 		fp.sc.correlated = d.outer != nil
 		q, err := resolveAgg(fp.sc, s, false)
 		if err != nil {

@@ -145,7 +145,7 @@ func validateExistingRefs(tx *btypedb.Tx[string, []byte], child, parent *TableDe
 		refOrds[i] = parent.ColIndex(name)
 	}
 	keys := map[string]bool{}
-	for row, err := range scanRows(tx, parent, nil, nil) {
+	for row, err := range scanRows(tx, parent, nil, nil, nil) {
 		if err != nil {
 			return err
 		}
@@ -166,7 +166,7 @@ func validateExistingRefs(tx *btypedb.Tx[string, []byte], child, parent *TableDe
 		}
 		keys[string(kb)] = true
 	}
-	for row, err := range scanRows(tx, child, nil, nil) {
+	for row, err := range scanRows(tx, child, nil, nil, nil) {
 		if err != nil {
 			return err
 		}

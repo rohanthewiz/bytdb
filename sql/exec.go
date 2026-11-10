@@ -5,7 +5,6 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"iter"
 	"math"
 	"slices"
 	"strings"
@@ -98,19 +97,11 @@ func scanPlanOne(ctx context.Context, tx *bytdb.Txn, table string, p *plan, env 
 	// entry bound (revEnd), and from — the forward entry — becomes where
 	// the engine stops descending. Both edges are then key bounds, so no
 	// stop checks run per row.
-	var seq iter.Seq2[bytdb.Row, error]
-	switch {
-	case p.reverse && p.index == "":
-		to, incl := p.revEnd()
-		seq = tx.ScanRangeRev(table, p.from, to, incl)
-	case p.reverse:
-		to, incl := p.revEnd()
-		seq = tx.ScanIndexRev(table, p.index, p.from, to, incl)
-	case p.index == "":
-		seq = tx.ScanRange(table, p.from, nil)
-	default:
-		seq = tx.ScanIndex(table, p.index, p.from, nil)
+	opts := bytdb.ScanOptions{Index: p.index, From: p.from, Reverse: p.reverse, Cols: p.cols}
+	if p.reverse {
+		opts.To, opts.ToIncl = p.revEnd()
 	}
+	seq := tx.ScanWith(table, opts)
 	n := 0
 	for row, err := range seq {
 		if err != nil {
@@ -484,6 +475,7 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		fp.readColumnsOf(s) // scans decode only what s can read (D-39)
 		sc := fp.sc
 		var exprs []Expr // evaluated per row, appended after the combined columns
 		if proj, exprs, err = projectSelect(sc, s, res); err != nil {
@@ -665,7 +657,11 @@ func orderedScan(fp *fromPlan, s *Select, keys []sortKey) (*plan, bool, error) {
 			return nil, false, nil
 		}
 	}
-	return chooseOrderedPlan(step.st.desc, step.st.name, combineStatic(step.static), keys, s.Limit >= 0, step.probes)
+	p, elim, err := chooseOrderedPlan(step.st.desc, step.st.name, combineStatic(step.static), keys, s.Limit >= 0, step.probes)
+	if err == nil && p.get == nil {
+		p.cols = step.needCols()
+	}
+	return p, elim, err
 }
 
 // combineStatic folds a step's static conjuncts into one condition, as

@@ -59,9 +59,23 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		// its result is checked separately in FuzzTupleOrder.
 		DecodeOne(data, true) //nolint:errcheck
 
+		// Skip must walk exactly the elements Decode decodes (row
+		// decoding skips unread columns with it), and agree on where
+		// the input is malformed.
+		skipped, skipErr := 0, error(nil)
+		for rest := data; len(rest) > 0 && skipErr == nil; skipped++ {
+			rest, skipErr = Skip(rest)
+		}
+
 		vals, err := Decode(data)
+		if (err == nil) != (skipErr == nil) {
+			t.Fatalf("Decode err %v but Skip err %v", err, skipErr)
+		}
 		if err != nil {
 			return // rejected garbage is fine; a panic is a fuzz failure
+		}
+		if skipped != len(vals) {
+			t.Fatalf("Skip walked %d elements, Decode %d", skipped, len(vals))
 		}
 		// Crafted bytes can decode to a NaN other than the canonical one
 		// Encode writes, so re-encoding would not reproduce them; such

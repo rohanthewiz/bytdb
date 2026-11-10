@@ -450,12 +450,12 @@ func (e *Engine) ScanRange(table string, fromPK, toPK []any) iter.Seq2[Row, erro
 			yield(Row{}, err)
 			return
 		}
-		scanRows(t.tx, desc, fromPK, toPK)(yield)
+		scanRows(t.tx, desc, fromPK, toPK, nil)(yield)
 	}
 }
 
 // scanRows iterates a table's rows from any kv view.
-func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, error] {
+func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any, need []bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		prefix := tablePrefix(desc.ID)
 		start := string(prefix)
@@ -482,7 +482,7 @@ func scanRows(v kvView, desc *TableDesc, fromPK, toPK []any) iter.Seq2[Row, erro
 			if k >= end {
 				return
 			}
-			row, err := decodeRow(desc, k, val)
+			row, err := decodeRowCols(desc, k, val, need)
 			if !yield(row, err) || err != nil {
 				return
 			}
@@ -509,7 +509,7 @@ func (e *Engine) ScanRangeRev(table string, fromPK, toPK []any, toIncl bool) ite
 			yield(Row{}, err)
 			return
 		}
-		scanRowsRev(t.tx, desc, fromPK, toPK, toIncl)(yield)
+		scanRowsRev(t.tx, desc, fromPK, toPK, toIncl, nil)(yield)
 	}
 }
 
@@ -519,7 +519,7 @@ func (e *Engine) ScanRangeRev(table string, fromPK, toPK []any, toIncl bool) ite
 // skipped, and the walk stops once it drops below the inclusive lower
 // bound. toIncl widens the upper bound to the end of toPK's prefix
 // group (every key with that prefix sorts below its PrefixEnd).
-func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any, toIncl bool) iter.Seq2[Row, error] {
+func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any, toIncl bool, need []bool) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
 		prefix := tablePrefix(desc.ID)
 		start := string(prefix)
@@ -549,7 +549,7 @@ func scanRowsRev(v kvView, desc *TableDesc, fromPK, toPK []any, toIncl bool) ite
 			if k < start {
 				return
 			}
-			row, err := decodeRow(desc, k, val)
+			row, err := decodeRowCols(desc, k, val, need)
 			if !yield(row, err) || err != nil {
 				return
 			}
@@ -852,31 +852,63 @@ func encodeRowValue(desc *TableDesc, row []any) ([]byte, error) {
 // added after the row was); pairs with unknown IDs are skipped (their
 // column was dropped).
 func decodeRow(desc *TableDesc, key string, val []byte) (Row, error) {
-	keyVals, err := tuple.Decode([]byte(key))
-	if err != nil {
-		return Row{}, serr.Wrap(err, "op", "decode row key", "table", desc.Name)
+	return decodeRowCols(desc, key, val, nil)
+}
+
+// decodeRowCols is decodeRow that leaves a non-key column nil unless
+// need[ord] is set (need nil decodes every column). Key columns are
+// always decoded: they are cheap, identify the row, and drive scan stops.
+//
+// Values are decoded element by element straight into the row (deep-
+// look D-39). The old path decoded the key and the value into
+// intermediate []any slices first — growing each geometrically, boxing
+// every column tag — and built every string twice; decoding was 77% of
+// an aggregate scan's time. Skipped columns cost a pass over their bytes
+// and no allocation (tuple.Skip).
+//
+//	key:    <table id><index id><pk col 1>...<pk col k>
+//	value:  <col id><value> <col id><value> ...      (NULL columns omitted)
+func decodeRowCols(desc *TableDesc, key string, val []byte, need []bool) (Row, error) {
+	vals := make([]any, len(desc.Columns))
+	kb := []byte(key)
+	var err error
+	for range 2 { // table and index IDs
+		if kb, err = tuple.Skip(kb); err != nil {
+			return Row{}, serr.Wrap(err, "op", "decode row key", "table", desc.Name)
+		}
 	}
-	if len(keyVals) != 2+len(desc.PKCols) {
+	for _, ord := range desc.PKCols {
+		if len(kb) == 0 {
+			return Row{}, serr.New("row key has wrong arity", "table", desc.Name)
+		}
+		if vals[ord], kb, err = tuple.DecodeOne(kb, false); err != nil {
+			return Row{}, serr.Wrap(err, "op", "decode row key", "table", desc.Name)
+		}
+	}
+	if len(kb) != 0 {
 		return Row{}, serr.New("row key has wrong arity", "table", desc.Name)
 	}
-	pairs, err := tuple.Decode(val)
-	if err != nil {
-		return Row{}, serr.Wrap(err, "op", "decode row value", "table", desc.Name)
-	}
-	if len(pairs)%2 != 0 {
-		return Row{}, serr.New("row value has dangling column tag", "table", desc.Name)
-	}
-	vals := make([]any, len(desc.Columns))
-	for i, ord := range desc.PKCols {
-		vals[ord] = keyVals[2+i]
-	}
-	for j := 0; j < len(pairs); j += 2 {
-		id, ok := pairs[j].(int64)
+	for len(val) > 0 {
+		var tag any
+		if tag, val, err = tuple.DecodeOne(val, false); err != nil {
+			return Row{}, serr.Wrap(err, "op", "decode row value", "table", desc.Name)
+		}
+		id, ok := tag.(int64)
 		if !ok {
 			return Row{}, serr.New("row value column tag is not an ID", "table", desc.Name)
 		}
-		if ord := desc.colOrdinalByID(uint32(id)); ord >= 0 {
-			vals[ord] = pairs[j+1]
+		if len(val) == 0 {
+			return Row{}, serr.New("row value has dangling column tag", "table", desc.Name)
+		}
+		ord := desc.colOrdinalByID(uint32(id))
+		if ord < 0 || (need != nil && !need[ord]) {
+			if val, err = tuple.Skip(val); err != nil {
+				return Row{}, serr.Wrap(err, "op", "decode row value", "table", desc.Name)
+			}
+			continue
+		}
+		if vals[ord], val, err = tuple.DecodeOne(val, false); err != nil {
+			return Row{}, serr.Wrap(err, "op", "decode row value", "table", desc.Name)
 		}
 	}
 	return Row{Desc: desc, Vals: vals}, nil

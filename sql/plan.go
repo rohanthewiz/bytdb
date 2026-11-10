@@ -24,6 +24,9 @@ type plan struct {
 	filter  BoolExpr // residual filter: the full condition (nil: all rows)
 	binds   binds    // the filter's operand ordinals within this table's rows
 	pushed  []*Pred  // the conjuncts behind get/from/stops (EXPLAIN's Index Cond)
+	// cols, when non-nil, is the column mask the scan decodes with
+	// (bytdb.ScanOptions.Cols; colneed.go). Point gets ignore it.
+	cols []bool
 	// in, when set, runs the plan once per key of an IN-list conjunct
 	// (inlist.go, deep-look D-38): its synthetic equality is in pushed,
 	// and scanPlan rebinds it to each key in turn.

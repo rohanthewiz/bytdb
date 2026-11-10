@@ -739,7 +739,7 @@ func (t *Txn) ScanRange(table string, fromPK, toPK []any) iter.Seq2[Row, error] 
 			yield(Row{}, err)
 			return
 		}
-		scanRows(t.tx, desc, fromPK, toPK)(yield)
+		scanRows(t.tx, desc, fromPK, toPK, nil)(yield)
 	}
 }
 
@@ -757,7 +757,7 @@ func (t *Txn) ScanIndex(table, index string, from, to []any) iter.Seq2[Row, erro
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
-		scanIndexRows(t.tx, desc, idx, from, to)(yield)
+		scanIndexRows(t.tx, desc, idx, from, to, nil)(yield)
 	}
 }
 
@@ -771,7 +771,66 @@ func (t *Txn) ScanRangeRev(table string, fromPK, toPK []any, toIncl bool) iter.S
 			yield(Row{}, err)
 			return
 		}
-		scanRowsRev(t.tx, desc, fromPK, toPK, toIncl)(yield)
+		scanRowsRev(t.tx, desc, fromPK, toPK, toIncl, nil)(yield)
+	}
+}
+
+// ScanOptions selects one of the Txn scans and, optionally, the columns
+// to decode. The zero value scans the whole table in primary-key order.
+type ScanOptions struct {
+	// Index names a secondary index to scan; "" scans the primary key.
+	Index string
+	// From and To bound the scan as ScanRange/ScanIndex's arguments do
+	// (nil is unbounded); with Reverse set they are ScanRangeRev/
+	// ScanIndexRev's, and ToIncl closes the upper bound over its prefix
+	// group.
+	From, To []any
+	ToIncl   bool
+	Reverse  bool
+	// Cols, when non-nil, lists by ordinal the non-key columns to decode:
+	// a column with Cols[ord] false reads as nil, whatever is stored.
+	// Primary-key columns are always decoded. A scan that reads a few
+	// columns of a wide row skips the rest without allocating — decoding
+	// was most of an aggregate scan's cost (deep-look D-39). Rows read
+	// this way are partial: never write one back (Update, or a row image
+	// passed on), and never treat a nil from a skipped column as NULL.
+	Cols []bool
+}
+
+// ScanWith is the general form of the Txn scans: Scan, ScanRange,
+// ScanIndex, and their reverse forms are ScanWith with the matching
+// options and every column decoded.
+func (t *Txn) ScanWith(table string, o ScanOptions) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		desc, err := t.desc(table)
+		if err != nil {
+			yield(Row{}, err)
+			return
+		}
+		need := o.Cols
+		if need != nil && len(need) != len(desc.Columns) {
+			// A mask built for another version of the table (columns added
+			// or dropped since) cannot be trusted; decode everything.
+			need = nil
+		}
+		if o.Index == "" {
+			if o.Reverse {
+				scanRowsRev(t.tx, desc, o.From, o.To, o.ToIncl, need)(yield)
+			} else {
+				scanRows(t.tx, desc, o.From, o.To, need)(yield)
+			}
+			return
+		}
+		idx := desc.Index(o.Index)
+		if idx == nil {
+			yield(Row{}, serr.New("no such index", "table", table, "index", o.Index))
+			return
+		}
+		if o.Reverse {
+			scanIndexRowsRev(t.tx, desc, idx, o.From, o.To, o.ToIncl, need)(yield)
+		} else {
+			scanIndexRows(t.tx, desc, idx, o.From, o.To, need)(yield)
+		}
 	}
 }
 
@@ -789,6 +848,6 @@ func (t *Txn) ScanIndexRev(table, index string, from, to []any, toIncl bool) ite
 			yield(Row{}, serr.New("no such index", "table", table, "index", index))
 			return
 		}
-		scanIndexRowsRev(t.tx, desc, idx, from, to, toIncl)(yield)
+		scanIndexRowsRev(t.tx, desc, idx, from, to, toIncl, nil)(yield)
 	}
 }
