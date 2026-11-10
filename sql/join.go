@@ -70,16 +70,22 @@ func (sc *scope) prefix(n int) *scope {
 }
 
 // resolve maps a column reference to its combined-row ordinal. An
-// unqualified name must be unambiguous across the scope's tables.
+// unqualified name must be unambiguous across the scope's tables, and
+// a name must be unique within its table: stored tables cannot repeat
+// a column name, but a derived table or CTE can (SELECT a.id, b.id
+// FROM a, b), and Postgres then calls any reference to it ambiguous —
+// resolving to the first silently picked a column the query never
+// named (deep-look D-21). TableDesc.ColIndexUnique answers both
+// questions in one pass, through a name index on wide descriptors.
 func (sc *scope) resolve(c ColRef) (int, error) {
 	if c.Table != "" {
 		for _, st := range sc.tables {
 			if st.name == c.Table {
-				ord := st.desc.ColIndex(c.Name)
+				ord, unique := st.desc.ColIndexUnique(c.Name)
 				if ord < 0 {
 					return -1, serr.New("no such column", "table", c.Table, "column", c.Name)
 				}
-				if dupColumn(st.desc, ord) {
+				if !unique {
 					return -1, ambiguousColumn(c.Name)
 				}
 				return st.off + ord, nil
@@ -89,8 +95,8 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 	}
 	found := -1
 	for _, st := range sc.tables {
-		if ord := st.desc.ColIndex(c.Name); ord >= 0 {
-			if found >= 0 || dupColumn(st.desc, ord) {
+		if ord, unique := st.desc.ColIndexUnique(c.Name); ord >= 0 {
+			if found >= 0 || !unique {
 				return -1, ambiguousColumn(c.Name)
 			}
 			found = st.off + ord
@@ -100,21 +106,6 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 		return -1, serr.New("no such column", "column", c.Name)
 	}
 	return found, nil
-}
-
-// dupColumn reports whether a column after ord shares its name. Stored
-// tables cannot have duplicate column names, but a derived table or CTE
-// can (SELECT a.id, b.id FROM a, b), and Postgres then calls any
-// reference to the name ambiguous; resolving to the first silently
-// picked a column the query never named (deep-look D-21).
-func dupColumn(d *bytdb.TableDesc, ord int) bool {
-	name := d.Columns[ord].Name
-	for i := ord + 1; i < len(d.Columns); i++ {
-		if d.Columns[i].Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 func ambiguousColumn(name string) error {
@@ -189,9 +180,17 @@ func evalPreds(e BoolExpr, b binds, base *exEnv, vals []any) (tri, error) {
 			if base == nil {
 				return triUnknown, serr.New("internal: expression condition without an environment")
 			}
-			env := *base
-			env.row = vals
-			return evalTruth(&env, n.Ex)
+			// Point the caller's env at this row for the call instead of
+			// copying it: a copy escaped to the heap, one ~96-byte
+			// allocation per row per Cond (deep-look D-44). Evaluation
+			// never keeps the env past the call (a subquery links it as
+			// its outer scope only while it runs), and the previous row
+			// is restored for whoever set it.
+			prev := base.row
+			base.row = vals
+			t, err := evalTruth(base, n.Ex)
+			base.row = prev
+			return t, err
 		}
 		return triUnknown, serr.New("internal: unknown condition leaf")
 	})
@@ -600,9 +599,20 @@ func (step *joinStep) rowPlan(partial []any) (*plan, error) {
 // to stop the current step's row source.
 func (j *joinRun) stepNext(k int, partial, rowVals []any, matched *bool) bool {
 	step := &j.fp.steps[k]
-	vals := make([]any, len(partial)+len(rowVals))
-	copy(vals, partial)
-	copy(vals[len(partial):], rowVals)
+	var vals []any
+	if len(partial) == 0 && step.st.rows == nil {
+		// The first table of a stored-table scan: the combined row IS the
+		// scanned row, which the engine decoded freshly for this call and
+		// nothing else holds, so it passes through instead of being
+		// copied — about 10% of a one-table scan (deep-look D-44). A
+		// virtual table's rows are shared materializations and are
+		// still copied.
+		vals = rowVals
+	} else {
+		vals = make([]any, len(partial)+len(rowVals))
+		copy(vals, partial)
+		copy(vals[len(partial):], rowVals)
+	}
 	if step.it.On != nil {
 		t, err := evalPreds(step.it.On, j.fp.b, j.env, vals)
 		if err != nil {

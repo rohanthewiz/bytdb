@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
@@ -248,7 +249,7 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 			// of an operand decides, the row-level analogue of operator
 			// resolution. Two untyped literals stay text/numeric, exactly
 			// as an unknown-vs-unknown operator resolves in Postgres.
-			if staticJSONB(env, n.L) || staticJSONB(env, n.R) {
+			if n.Kind == arithJSONB || (n.Kind == arithUndecided && (staticJSONB(env, n.L) || staticJSONB(env, n.R))) {
 				return jsonbArith(n.Op, l, r)
 			}
 		}
@@ -633,32 +634,50 @@ func evalCase(env *exEnv, n *ExCase) (any, error) {
 // eviction.
 const reCacheMax = 1024
 
+// patCache memoizes compiled patterns, regexes and LIKE patterns alike,
+// keyed by the pattern as written plus how it is read. It is a sync.Map
+// (read-mostly: a hit takes no lock), where it was a map behind a global
+// RWMutex that every row of every pattern-matching query in the process
+// read-locked; and LIKE patterns are keyed before their translation to
+// a regex, which used to run per row (deep-look D-44). size counts
+// entries for the reset at reCacheMax.
+type patKey struct {
+	pat         string
+	like        bool // a LIKE pattern, translated by likeRegex
+	insensitive bool
+}
+
 var (
-	reCacheMu sync.RWMutex
-	reCache   = make(map[string]*regexp.Regexp) // pattern (with flags applied) -> compiled
+	patCache sync.Map // patKey -> *regexp.Regexp
+	patSize  atomic.Int64
 )
 
-func compileRegex(pat string, insensitive bool) (*regexp.Regexp, error) {
-	key := pat
-	if insensitive {
-		key = "(?i)" + pat
+// compilePattern returns k's compiled regex, compiling it on a miss.
+func compilePattern(k patKey) (*regexp.Regexp, error) {
+	if re, ok := patCache.Load(k); ok {
+		return re.(*regexp.Regexp), nil
 	}
-	reCacheMu.RLock()
-	re, ok := reCache[key]
-	reCacheMu.RUnlock()
-	if ok {
-		return re, nil
+	src := k.pat
+	if k.like {
+		var err error
+		if src, err = likeRegex(k.pat); err != nil {
+			return nil, err
+		}
 	}
-	re, err := regexp.Compile(key)
+	if k.insensitive {
+		src = "(?i)" + src
+	}
+	re, err := regexp.Compile(src)
 	if err != nil {
-		return nil, serr.New("invalid regular expression", "pattern", pat)
+		return nil, serr.New("invalid regular expression", "pattern", k.pat)
 	}
-	reCacheMu.Lock()
-	if len(reCache) >= reCacheMax {
-		clear(reCache)
+	if patSize.Add(1) > reCacheMax {
+		// Data-driven patterns (WHERE a LIKE b) would grow the cache
+		// without bound; start over. Racing resets only cost recompiles.
+		patCache.Clear()
+		patSize.Store(1)
 	}
-	reCache[key] = re
-	reCacheMu.Unlock()
+	patCache.Store(k, re)
 	return re, nil
 }
 
@@ -666,8 +685,8 @@ func compileRegex(pat string, insensitive bool) (*regexp.Regexp, error) {
 // implements it: % is any run of characters, _ any single character,
 // backslash makes the next character literal, and everything else
 // quotes. (?s) lets % and _ cross newlines, as LIKE does. The result
-// feeds compileRegex, so each distinct pattern compiles once and the
-// per-row cost is the translation plus a cache hit.
+// feeds compilePattern, which caches by the LIKE pattern itself, so each
+// distinct pattern is translated and compiled once.
 //
 // Iteration is by rune: _ must consume one character, not one byte,
 // and a multi-byte rune must quote as a unit.
@@ -828,6 +847,9 @@ func staticJSONB(env *exEnv, e Expr) bool {
 		case "->", "#>": // ->> and #>> produce text, not jsonb
 			return true
 		case "||", "-":
+			if n.Kind != arithUndecided {
+				return n.Kind == arithJSONB
+			}
 			return staticJSONB(env, n.L) || staticJSONB(env, n.R)
 		}
 	case *exGroupRef:

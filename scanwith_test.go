@@ -82,3 +82,39 @@ func TestScanWithColumnMask(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Deep-look D-44: a wide parsed descriptor resolves names through an
+// index; ColIndexUnique reports duplicates on synthesized descriptors.
+func TestColIndexUnique(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	cols := []Column{{Name: "id", Type: TInt}}
+	for i := range 40 {
+		cols = append(cols, Column{Name: fmt.Sprintf("c%02d", i), Type: TInt})
+	}
+	if _, err := e.CreateTable("wide", cols, "id"); err != nil {
+		t.Fatal(err)
+	}
+	d := e.TableShared("wide")
+	if d.ordByName == nil {
+		t.Fatal("wide parsed descriptor has no name index")
+	}
+	for i, c := range cols {
+		if ord, unique := d.ColIndexUnique(c.Name); ord != i || !unique || d.ColIndex(c.Name) != i {
+			t.Fatalf("%s -> %d, %v", c.Name, ord, unique)
+		}
+	}
+	if ord, _ := d.ColIndexUnique("nope"); ord != -1 || d.ColIndex("nope") != -1 {
+		t.Fatal("absent name resolved")
+	}
+	if c := d.Clone(); c.ordByName != nil {
+		t.Fatal("clone kept the name index it may desynchronize")
+	}
+	synth := &TableDesc{Columns: []Column{{Name: "id"}, {Name: "x"}, {Name: "id"}}}
+	if ord, unique := synth.ColIndexUnique("id"); ord != 0 || unique {
+		t.Fatalf("duplicate id -> %d, %v", ord, unique)
+	}
+	if ord, unique := synth.ColIndexUnique("x"); ord != 1 || !unique {
+		t.Fatalf("x -> %d, %v", ord, unique)
+	}
+}

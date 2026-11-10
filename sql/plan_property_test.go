@@ -85,7 +85,7 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 			}
 			ids := []string{"1", "5", "17", "40", "79", "80", "200"}
 			ages := []string{"18", "21", "25", "30", "null"}
-			switch rng.Intn(21) {
+			switch rng.Intn(23) {
 			case 0:
 				return fmt.Sprintf("age = %d", age())
 			case 1:
@@ -126,6 +126,11 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 				return fmt.Sprintf("(day = '%s' or day = '%s')", pick(days), pick(days))
 			case 19:
 				return fmt.Sprintf("age = any('{%s}')", strings.ReplaceAll(some(ages, false), " ", ""))
+			case 20:
+				// LIKE with a literal prefix bounds a scan on city (D-44).
+				return fmt.Sprintf("city like '%s'", pick([]string{"l%", "n_c", "aus%", "sf", "%n", "%", "a%n"}))
+			case 21:
+				return fmt.Sprintf("city like '%s' and age > %d", pick([]string{"l%", "n%", "s%"}), age())
 			default:
 				return fmt.Sprintf("id = %d", 1+rng.Intn(90))
 			}
@@ -171,7 +176,9 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 	for iter := range 400 {
 		where := randWhere()
 		orderBy, keys := randOrder()
-		body := "select id, age, city, score, uid, at, day from %s" + where + orderBy
+		// where may hold LIKE patterns; their % must survive the Sprintf
+		// that fills in the table name.
+		body := "select id, age, city, score, uid, at, day from %s" + strings.ReplaceAll(where, "%", "%%") + orderBy
 
 		ri := exec(t, d, fmt.Sprintf(body, "ti"))
 		rs := exec(t, d, fmt.Sprintf(body, "ts"))

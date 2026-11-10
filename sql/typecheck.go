@@ -1638,11 +1638,24 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	// The jsonb-or-not decision for || and -, as the evaluator's
+	// staticJSONB would make it per row: jsonb when either operand is
+	// statically jsonb, plain when both have a concrete other type, and
+	// left to run time when an operand's type is not known here.
+	kind := n.Kind
+	if n.Op == "||" || n.Op == "-" {
+		switch {
+		case lt == bytdb.TJSONB || rt == bytdb.TJSONB:
+			kind = arithJSONB
+		case concrete(lt) && concrete(rt):
+			kind = arithPlain
+		}
+	}
 	rebuilt := func(typ bytdb.ColType) (Expr, bytdb.ColType, error) {
-		if l == n.L && r == n.R {
+		if l == n.L && r == n.R && kind == n.Kind {
 			return n, typ, nil
 		}
-		return &ExArith{Op: n.Op, L: l, R: r}, typ, nil
+		return &ExArith{Op: n.Op, L: l, R: r, Kind: kind}, typ, nil
 	}
 	switch n.Op {
 	case "->", "#>":

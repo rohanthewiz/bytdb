@@ -265,17 +265,12 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 		if !okS || !okP {
 			return triUnknown, serr.New("pattern match requires text operands")
 		}
-		// LIKE patterns become regexes first; both families then share
-		// one compile cache and match path. Case-insensitivity is a
-		// compile flag, not a pattern rewrite.
-		if op == OpLike || op == OpNotLike || op == OpILike || op == OpNotILike {
-			var err error
-			if pat, err = likeRegex(pat); err != nil {
-				return triUnknown, err
-			}
-		}
+		// LIKE patterns become regexes (once per distinct pattern, in
+		// the compile cache); both families then share one match path.
+		// Case-insensitivity is a compile flag, not a pattern rewrite.
 		insensitive := op == OpRegexI || op == OpNotRegexI || op == OpILike || op == OpNotILike
-		re, err := compileRegex(pat, insensitive)
+		like := op == OpLike || op == OpNotLike || op == OpILike || op == OpNotILike
+		re, err := compilePattern(patKey{pat: pat, like: like, insensitive: insensitive})
 		if err != nil {
 			return triUnknown, err
 		}

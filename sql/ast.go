@@ -203,7 +203,23 @@ type ExIndex struct{ E, Idx Expr }
 type ExArith struct {
 	Op   string
 	L, R Expr
+	// Kind, for the shared spellings || and -, is the typing pass's
+	// decision between the jsonb operator and the text/numeric one
+	// (deep-look D-44). Deciding per row re-derived both operands'
+	// static types at every node of a chain — quadratic in its length.
+	// arithUndecided (what the parser builds) defers to that runtime
+	// derivation (staticJSONB), for trees the pass did not type.
+	Kind arithKind
 }
+
+// arithKind is ExArith.Kind.
+type arithKind uint8
+
+const (
+	arithUndecided arithKind = iota
+	arithJSONB               // jsonb || jsonb, jsonb - key
+	arithPlain               // text concatenation or arithmetic
+)
 
 // ExSub is a scalar subquery, executed lazily per row with the
 // enclosing scopes visible for correlation. Typ is its single output

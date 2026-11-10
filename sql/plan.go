@@ -139,6 +139,30 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 		}
 	}
 
+	// col LIKE 'prefix%' on a text column bounds a scan by its literal
+	// prefix: [prefix, successor(prefix)). The LIKE itself stays in the
+	// residual filter, which decides each row in range (deep-look D-44).
+	for _, pr := range conjuncts(where) {
+		if pr.Op != OpLike || pr.RItem != nil {
+			continue
+		}
+		ord := p.binds[pr].l
+		pat, ok := pr.Val.(string)
+		if !ok || desc.Columns[ord].Type != bytdb.TString {
+			continue
+		}
+		from, to, bounded, ok := likePrefixRange(pat)
+		if !ok {
+			continue
+		}
+		if _, has := lo[ord]; !has {
+			lo[ord] = &Pred{Item: pr.Item, Op: OpGE, Val: from}
+		}
+		if _, has := hi[ord]; !has && bounded {
+			hi[ord] = &Pred{Item: pr.Item, Op: OpLT, Val: to}
+		}
+	}
+
 	// One IN-list (or = ANY constant array) conjunct may act as an
 	// equality whose value varies per probe (inlist.go). probeOrd keeps
 	// its column out of the "pinned to a constant" set the order checks
@@ -370,6 +394,46 @@ func litFits(v any, t bytdb.ColType) bool {
 		return ok && len(b) == 16
 	}
 	return false // TBytes, arrays, jsonb: no ordered key pushdown
+}
+
+// likePrefixRange derives the key range a LIKE pattern's literal prefix
+// confines matches to: every match starts with the bytes before the
+// first unescaped % or _, so it lies in [from, to), where to is the
+// smallest string above every string with that prefix (the prefix with
+// trailing 0xFF bytes dropped and its last byte incremented). bounded
+// is false when no such string exists (a prefix of only 0xFF bytes). ok
+// is false when the pattern has no literal prefix, or a trailing escape
+// (an error the residual LIKE reports). Strings order bytewise, in keys
+// and in comparisons alike, so the range is exact for any UTF-8.
+func likePrefixRange(pat string) (from, to string, bounded, ok bool) {
+	var b []byte
+scan:
+	for i := 0; i < len(pat); i++ {
+		switch c := pat[i]; c {
+		case '%', '_':
+			break scan
+		case '\\':
+			if i+1 >= len(pat) {
+				return "", "", false, false
+			}
+			i++
+			b = append(b, pat[i])
+		default:
+			b = append(b, c)
+		}
+	}
+	if len(b) == 0 {
+		return "", "", false, false
+	}
+	from = string(b)
+	for len(b) > 0 && b[len(b)-1] == 0xFF {
+		b = b[:len(b)-1]
+	}
+	if len(b) == 0 {
+		return from, "", false, true
+	}
+	b[len(b)-1]++
+	return from, string(b), true, true
 }
 
 // pushKind classifies a value by what litFits decides on: its Go type

@@ -331,6 +331,10 @@ folded to the constant by the bind pass and pushes like a bare one. A cast
 on the *column* side (`day < '…'::timestamptz`, where Postgres compares the
 date as a timestamp) is an expression, not a key range, and filters instead.
 
+`col LIKE 'abc%'` on a text column bounds the scan to `[abc, abd)` — the
+pattern's literal prefix and its successor — and the LIKE itself filters
+within that range (`ILIKE` and patterns starting with a wildcard cannot).
+
 **IN lists run as key probes** (deep-look D-38). One conjunct of the form
 `col IN (constants)`, `col = ANY(ARRAY[…])` / `= ANY('{…}')` (including an
 array bound as one parameter), or `col = k1 OR col = k2 …` counts as an

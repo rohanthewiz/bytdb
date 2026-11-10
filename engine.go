@@ -181,7 +181,19 @@ type TableDesc struct {
 	// mutated descriptor is re-parsed (table rebuilt) the next time it
 	// is resolved from storage.
 	ordByID []int32
+
+	// ordByName maps column names to ordinals for wide descriptors
+	// (more than nameIndexMin columns) whose names are unique; nil
+	// otherwise, and ColIndex scans. The SQL layer resolves a column
+	// reference by name for every row an expression reads, and the scan
+	// cost 88 ns for the 40th column (deep-look D-44). Same lifecycle as
+	// ordByID: built by parseDesc, dropped by clone().
+	ordByName map[string]int32
 }
+
+// nameIndexMin is the column count above which a parsed descriptor
+// carries a name index: below it a linear scan beats hashing the name.
+const nameIndexMin = 8
 
 // marshalDesc encodes a descriptor for the system descriptors table,
 // stamping the current format version. Every descriptor write goes
@@ -258,6 +270,7 @@ func (d *TableDesc) clone() *TableDesc {
 	// carried-over lookup table; drop it and let colOrdinalByID fall
 	// back to the linear scan until the descriptor is re-parsed.
 	c.ordByID = nil
+	c.ordByName = nil
 	return &c
 }
 
@@ -274,12 +287,43 @@ func (d *TableDesc) Clone() *TableDesc {
 
 // ColIndex returns the ordinal of the named column, or -1.
 func (d *TableDesc) ColIndex(name string) int {
+	if d.ordByName != nil {
+		if i, ok := d.ordByName[name]; ok {
+			return int(i)
+		}
+		return -1
+	}
 	for i, c := range d.Columns {
 		if c.Name == name {
 			return i
 		}
 	}
 	return -1
+}
+
+// ColIndexUnique is ColIndex that also reports whether the name is
+// unique among the descriptor's columns. A stored table's always are;
+// a descriptor the SQL layer synthesizes for a derived table or CTE
+// need not be (SELECT a.id, b.id ...), and a reference to a duplicated
+// name is ambiguous. One pass answers both, where ColIndex followed by
+// a scan for a second match cost two.
+func (d *TableDesc) ColIndexUnique(name string) (ord int, unique bool) {
+	if d.ordByName != nil { // built only when every name is unique
+		if i, ok := d.ordByName[name]; ok {
+			return int(i), true
+		}
+		return -1, true
+	}
+	ord = -1
+	for i := range d.Columns {
+		if d.Columns[i].Name == name {
+			if ord >= 0 {
+				return ord, false
+			}
+			ord = i
+		}
+	}
+	return ord, true
 }
 
 // colOrdinalByID returns the ordinal of the column with the given
@@ -320,6 +364,17 @@ func (d *TableDesc) buildOrdByID() {
 		t[d.Columns[i].ID] = int32(i)
 	}
 	d.ordByID = t
+
+	if len(d.Columns) > nameIndexMin {
+		m := make(map[string]int32, len(d.Columns))
+		for i := range d.Columns {
+			if _, dup := m[d.Columns[i].Name]; dup {
+				return // ColIndexUnique must keep reporting the duplicate
+			}
+			m[d.Columns[i].Name] = int32(i)
+		}
+		d.ordByName = m
+	}
 }
 
 func (d *TableDesc) isPK(ordinal int) bool {
