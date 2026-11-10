@@ -392,3 +392,83 @@ func TestTypedParamsAndResults(t *testing.T) {
 		t.Errorf("select $1 with an int argument: %q %v", s, err)
 	}
 }
+
+// TestImplicitTransactions (D-32): several statements in one simple
+// Query, or one pgx.Batch pipeline, run as one implicit transaction: a
+// failure rolls back the writes before it. Each statement used to
+// autocommit, so "update ...; insert <duplicate>" kept the update.
+func TestImplicitTransactions(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table acct (id int primary key, bal int)`)
+	mustExec(t, c, `insert into acct values (1, 100), (2, 0)`)
+	balance := func(id int) int64 {
+		t.Helper()
+		var b int64
+		if err := c.QueryRow(ctx, `select bal from acct where id = $1`, id).Scan(&b); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+
+	// Simple protocol: the failing INSERT rolls the UPDATE back.
+	if _, err := c.Exec(ctx, `update acct set bal = bal - 10 where id = 1; insert into acct values (2, 0)`,
+		pgx.QueryExecModeSimpleProtocol); err == nil {
+		t.Fatal("duplicate insert succeeded")
+	}
+	if b := balance(1); b != 100 {
+		t.Fatalf("simple query: balance %d after a failed batch; want 100", b)
+	}
+
+	// pgx.Batch: the same through the extended protocol.
+	b := &pgx.Batch{}
+	b.Queue(`update acct set bal = bal - 10 where id = 1`)
+	b.Queue(`update acct set bal = bal + 10 where id = 2`)
+	b.Queue(`insert into acct values (1, 0)`)
+	if err := c.SendBatch(ctx, b).Close(); err == nil {
+		t.Fatal("batch with a duplicate insert succeeded")
+	}
+	if b1, b2 := balance(1), balance(2); b1 != 100 || b2 != 0 {
+		t.Fatalf("batch: balances %d, %d after a failed batch; want 100, 0", b1, b2)
+	}
+
+	// A successful batch commits as a whole.
+	b = &pgx.Batch{}
+	b.Queue(`update acct set bal = bal - 10 where id = 1`)
+	b.Queue(`update acct set bal = bal + 10 where id = 2`)
+	if err := c.SendBatch(ctx, b).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if b1, b2 := balance(1), balance(2); b1 != 90 || b2 != 10 {
+		t.Fatalf("batch: balances %d, %d; want 90, 10", b1, b2)
+	}
+
+	// COMMIT inside a multi-statement query ends the implicit block: the
+	// write before it stays, the one after the failure does not.
+	if _, err := c.Exec(ctx, `update acct set bal = 1 where id = 1; commit; update acct set bal = 2 where id = 2; select 1/0`,
+		pgx.QueryExecModeSimpleProtocol); err == nil {
+		t.Fatal("division by zero succeeded")
+	}
+	if b1, b2 := balance(1), balance(2); b1 != 1 || b2 != 10 {
+		t.Fatalf("after COMMIT mid-query: balances %d, %d; want 1, 10", b1, b2)
+	}
+
+	// DDL cannot join a block: it commits the writes before it and runs
+	// alone (the documented carve-out), and the query still succeeds.
+	if _, err := c.Exec(ctx, `update acct set bal = 5 where id = 1; create table t2 (id int primary key); insert into t2 values (1)`,
+		pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatalf("query mixing DDL: %v", err)
+	}
+	var n int64
+	if err := c.QueryRow(ctx, `select count(*) from t2`).Scan(&n); err != nil || n != 1 || balance(1) != 5 {
+		t.Fatalf("after the DDL batch: t2 rows %d (%v), balance %d", n, err, balance(1))
+	}
+
+	// The connection is idle again after every unit.
+	if tag := mustExec(t, c, `select 1`); tag.String() != "SELECT 1" {
+		t.Fatalf("follow-up statement: %q", tag)
+	}
+	if st := c.PgConn().TxStatus(); st != 'I' {
+		t.Fatalf("transaction status after the units: %c; want I", st)
+	}
+}

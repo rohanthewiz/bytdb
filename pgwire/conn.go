@@ -310,6 +310,11 @@ func (c *conn) run() (err error) {
 		case msgClose:
 			c.closeTarget(r)
 		case msgSync:
+			// The segment's implicit transaction, if one opened, commits
+			// here — or rolls back, if a statement in it failed.
+			if err := c.sess.EndImplicit(); err != nil {
+				c.send(msgErrorResponse, errorBody(err, "", 0))
+			}
 			c.inErr = false
 			c.ready()
 		case msgFlush:
@@ -610,18 +615,28 @@ func (c *conn) simpleQuery(q string) {
 	defer c.disarmCancel()
 	c.statActive(q)
 	defer c.statIdle()
+	// Several statements in one Query run as one implicit transaction,
+	// as in Postgres (deep-look D-32): a failure rolls back the writes
+	// before it. A single statement keeps plain autocommit (and with it
+	// the optimistic-conflict retry).
+	if len(parts) > 1 {
+		c.sess.ArmImplicit()
+	}
+	failed := false
 	for _, p := range parts {
 		start := time.Now()
 		st, err := c.srv.db.Prepare(p.text)
 		if err != nil {
 			c.logQuery(p.text, start, err)
 			c.sendError(err, q, p.off)
+			failed = true
 			break
 		}
 		res, err := c.sess.ExecStmtCtx(ctx, st)
 		c.logQuery(p.text, start, err)
 		if err != nil {
 			c.sendError(err, q, p.off)
+			failed = true
 			break
 		}
 		if res.Notice != "" {
@@ -635,8 +650,29 @@ func (c *conn) simpleQuery(q string) {
 		}
 		c.sendCommandComplete(st.Command(), res)
 	}
+	if err := c.sess.EndImplicit(); err != nil && !failed {
+		c.sendError(err, q, 0) // the commit itself failed (a conflict, say)
+	}
 	c.inErr = false // simple-query errors end at their own ReadyForQuery
 	c.ready()
+}
+
+// moreBeforeSync reports whether the client has already sent more
+// statement work behind the current Execute in this pipeline segment —
+// the next buffered message is anything but Sync (or Flush, after which
+// a client may wait for results before deciding). pgx.Batch writes the
+// whole segment at once, so its messages are buffered here; a lone
+// Execute is followed by its Sync. Only buffered bytes are inspected:
+// this never blocks on the network.
+func (c *conn) moreBeforeSync() bool {
+	if c.r.Buffered() == 0 {
+		return false
+	}
+	b, err := c.r.Peek(1)
+	if err != nil {
+		return false
+	}
+	return b[0] != msgSync && b[0] != msgFlush
 }
 
 // parse handles Parse: name, query, and optional parameter-type
@@ -840,6 +876,11 @@ func (c *conn) execute(r *rbuf) {
 	if err := c.revalidate(pt.prep, false); err != nil {
 		c.sendError(err, pt.prep.query, 0)
 		return
+	}
+	// A pipeline segment running more than one statement before its Sync
+	// is one implicit transaction (D-32); Sync ends it.
+	if c.moreBeforeSync() {
+		c.sess.ArmImplicit()
 	}
 	ctx := c.armCancel()
 	c.statActive(pt.prep.query)

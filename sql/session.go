@@ -86,6 +86,62 @@ type Session struct {
 	// behavior; remembering them (rather than erroring) is what lets
 	// drivers' connect-time housekeeping SETs succeed.
 	vars map[string]string
+
+	// armed and implicit implement Postgres's implicit transaction for a
+	// unit of several statements — a simple Query holding more than one,
+	// or an extended-protocol pipeline segment up to its Sync (deep-look
+	// D-32). armed marks such a unit in progress (ArmImplicit); the
+	// first data-modifying statement in it then opens a block, and
+	// implicit marks that block as the unit's, which EndImplicit commits
+	// (or rolls back, if it failed). Without it each statement
+	// autocommitted, so in "UPDATE acct ...; INSERT <duplicate>" the
+	// update stayed committed though the batch failed.
+	//
+	// The block opens lazily, at the first write: reads before it run as
+	// they always did, so a read-only batch never takes the writer lock.
+	// DDL cannot join a block in bytdb, so DDL inside a unit commits the
+	// implicit block first and runs on its own (documented in
+	// docs/gotchas.md); the next write opens a fresh block.
+	armed    bool
+	implicit bool
+}
+
+// ArmImplicit marks the start of a multi-statement unit; see
+// Session.armed. A no-op inside an explicit block, which already is the
+// unit's transaction.
+func (s *Session) ArmImplicit() {
+	if s.tx == nil || s.implicit {
+		s.armed = true
+	}
+}
+
+// EndImplicit ends a unit begun with ArmImplicit: an implicit block it
+// opened is committed, or rolled back if a statement in it failed. The
+// error is the commit's (or rollback's); a failed block is rolled back
+// silently, since its error was already reported. Explicit blocks are
+// untouched.
+func (s *Session) EndImplicit() error {
+	s.armed = false
+	if !s.implicit || s.tx == nil {
+		s.implicit = false
+		return nil
+	}
+	s.implicit = false
+	tx, aborted := s.tx, s.aborted
+	s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
+	if aborted {
+		return tx.Rollback()
+	}
+	return tx.Commit()
+}
+
+// beginImplicit opens the unit's implicit block, as BEGIN would.
+func (s *Session) beginImplicit() error {
+	if _, err := s.txnControl(&TxnControl{Kind: TxnBegin, Tag: "BEGIN"}); err != nil {
+		return err
+	}
+	s.implicit = true
+	return nil
 }
 
 // sesSave is one named savepoint in the open block. Names may repeat;
@@ -189,7 +245,29 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 		defer cancel()
 	}
 	if tc, ok := st.(*TxnControl); ok {
+		if s.implicit {
+			// Explicit transaction control takes the implicit block over
+			// (as in Postgres): BEGIN makes it an ordinary block the unit's
+			// end will not commit; COMMIT/ROLLBACK end it here.
+			s.implicit = false
+			if tc.Kind == TxnBegin {
+				return &Result{}, nil
+			}
+		}
 		return s.txnControl(tc)
+	}
+	if s.implicit && s.tx != nil && !s.aborted && (isDDL(st) || isVacuum(st)) {
+		// DDL cannot join a block: commit the unit's writes so far and run
+		// it on its own (the carve-out documented with Session.armed).
+		if err := s.EndImplicit(); err != nil {
+			return nil, err
+		}
+		s.armed = true
+	}
+	if s.armed && s.tx == nil && isWrite(st) && !isDDL(st) {
+		if err := s.beginImplicit(); err != nil {
+			return nil, err
+		}
 	}
 	if s.aborted {
 		return nil, serr.New("current transaction is aborted, " +
@@ -568,6 +646,11 @@ func (s *Session) savepointControl(tc *TxnControl) (*Result, error) {
 	}
 	s.saves, s.aborted = s.saves[:i+1], false
 	return &Result{}, nil
+}
+
+func isVacuum(st Statement) bool {
+	_, ok := st.(*Vacuum)
+	return ok
 }
 
 // isDDL reports whether st changes the schema.

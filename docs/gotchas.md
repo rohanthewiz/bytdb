@@ -67,6 +67,16 @@ worth knowing:
   everything inside `WriteTxn` goes through the `tx` it is given.
 - **DDL cannot run inside a transaction block** — every schema change gets its
   own transaction.
+- **A multi-statement Query or a pipeline is one implicit transaction**, as in
+  Postgres: `UPDATE ...; INSERT ...` sent as one simple-protocol Query, or
+  queued in one `pgx.Batch`, commits as a whole, and a failure rolls back the
+  statements before it. The one difference is DDL, which cannot join a
+  block: a DDL statement inside such a unit commits the writes before it and
+  runs on its own, and the writes after it start a fresh implicit
+  transaction. Keep schema changes out of batches whose writes must be atomic
+  with them. (The implicit transaction opens at the unit's first write, so a
+  read-only batch never takes the writer lock; a single statement still
+  autocommits, with its optimistic-conflict retry.)
 - **Don't write from inside DB-level iteration.** `DB.Ascend`/`All`/etc. hold a
   read lock for the whole loop; a write inside the loop deadlocks. Transaction
   iterators (`Tx.Ascend`, engine `Scan`) are snapshot-based and lock-free —

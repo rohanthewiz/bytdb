@@ -368,13 +368,15 @@ func TestSimpleProtocol(t *testing.T) {
 	if err := c.QueryRow(ctx, `select name from t where id = $1`, int64(2)).Scan(&name); err != nil || name != "b" {
 		t.Fatalf("simple query: %v %q", err, name)
 	}
-	// An error in the middle of a buffer stops the rest.
+	// An error in the middle of a buffer stops the rest, and the buffer
+	// is one implicit transaction (deep-look D-32), so the insert before
+	// the error rolls back too, as in Postgres.
 	if _, err := c.PgConn().Exec(ctx, `insert into t values (3, 'c'); boom; insert into t values (4, 'd')`).ReadAll(); err == nil {
 		t.Fatal("want error")
 	}
 	var n int64
-	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 3 {
-		t.Fatalf("after failed buffer: %v %d", err, n)
+	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("after failed buffer: %v %d; want 2", err, n)
 	}
 }
 
