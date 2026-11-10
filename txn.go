@@ -3,6 +3,7 @@ package bytdb
 import (
 	"context"
 	"iter"
+	"slices"
 
 	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/bytdb/tuple"
@@ -44,6 +45,12 @@ type Txn struct {
 	// lifetime (including nil for absent tables — the snapshot cannot
 	// change underneath, so a miss is a miss for good).
 	descs map[string]*TableDesc
+	// fkRefs memoizes referencingFKs per referenced table, for the same
+	// reason: the catalog a transaction sees cannot change under it
+	// (DDL commits as its own transaction), and the scan walks every
+	// descriptor — 174 µs and 5,027 allocations at 500 tables, once per
+	// UPDATE or DELETE statement (deep-look D-45).
+	fkRefs map[string][]FKRef
 	// dirtySeqPrefixes are counter-key prefixes this transaction
 	// deletes transactionally (today: Truncate's RESTART IDENTITY
 	// range). In concurrent-writes mode the engine's in-memory
@@ -186,10 +193,13 @@ func (e *Engine) writeTxn(ctx context.Context, serializable bool, fn func(tx *Tx
 		}
 		// Default mode: the writer lock is ours from here to commit;
 		// mark the owning goroutine so its own re-entrant writes fail
-		// fast. (In concurrent-writes mode the marker is vestigial —
-		// no lock is held across fn and checkReentrantWrite ignores
-		// it — but storing it is cheaper than branching on the mode.)
-		e.writerGID.Store(curGID())
+		// fast. In concurrent-writes mode no lock is held across fn and
+		// checkReentrantWrite never reads the marker, so it is not
+		// stored: finding the goroutine ID parses a stack trace, 1.35 µs
+		// per transaction for nothing (deep-look D-45).
+		if !e.occ {
+			e.writerGID.Store(curGID())
+		}
 		// btypedb's Update rolls back on an error RETURN but not on a
 		// panic — it has no recover — so a panic in fn would unwind past
 		// it with the writer lock still held, wedging every future write
@@ -287,7 +297,9 @@ func (e *Engine) BeginCtx(ctx context.Context, writable bool) (*Txn, error) {
 			e.releaseWrite()
 			return nil, err
 		}
-		e.writerGID.Store(curGID())
+		if !e.occ { // the marker only means something in single-writer mode (see writeTxn)
+			e.writerGID.Store(curGID())
+		}
 		return &Txn{tx: tx, e: e, releaseW: true, holdsSlot: e.writeSlot != nil}, nil
 	}
 	return e.readSnapshot()
@@ -620,10 +632,21 @@ func (t *Txn) ReferencingFKs(table string) ([]FKRef, error) {
 	if err := t.open("referencing foreign keys"); err != nil {
 		return nil, err
 	}
-	refs, err := t.e.referencingFKs(t.tx, table, false)
-	if err != nil {
-		return nil, err
+	shared, ok := t.fkRefs[table]
+	if !ok {
+		var err error
+		if shared, err = t.e.referencingFKs(t.tx, table, false); err != nil {
+			return nil, err
+		}
+		if t.fkRefs == nil {
+			t.fkRefs = map[string][]FKRef{}
+		}
+		t.fkRefs[table] = shared
 	}
+	if len(shared) == 0 {
+		return nil, nil
+	}
+	refs := slices.Clone(shared) // the memo keeps the shared descriptors; callers get copies
 	// One copy per distinct child table, so two FKs of one child still
 	// share its Child pointer, as they did before the copy.
 	copies := map[*TableDesc]*TableDesc{}

@@ -231,6 +231,15 @@ func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
 	return nil, nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
 
+// AppendInt appends one ascending int64 element: Append(buf, v) without
+// boxing v into an interface (which allocates for values above 255).
+// Key prefixes — table and index IDs — are built this way on every
+// write (deep-look D-45).
+func AppendInt(buf []byte, v int64) []byte {
+	buf = append(buf, tagInt)
+	return binary.BigEndian.AppendUint64(buf, uint64(v)^(1<<63))
+}
+
 // Skip returns data past its first element (ascending encoding)
 // without materializing the value: no allocation for any type. Row
 // decoding uses it for columns a query does not read (deep-look D-39).

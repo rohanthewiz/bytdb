@@ -254,10 +254,19 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 	}
 
 	newVals := slices.Clone(oldRow.Vals)
+	// touched marks the columns SET names, so index maintenance below can
+	// skip every index none of them is in (when the key is unchanged).
+	var touched []bool
+	if len(desc.Indexes) > 0 {
+		touched = make([]bool, len(desc.Columns))
+	}
 	for col, v := range set {
 		ord := desc.ColIndex(col)
 		if ord < 0 {
 			return nil, false, serr.New("no such column", "table", desc.Name, "column", col)
+		}
+		if touched != nil {
+			touched[ord] = true
 		}
 		cv, err := coerce(v, desc.Columns[ord].Type)
 		if err != nil {
@@ -297,8 +306,18 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 		newVal         []byte
 	}
 	var moves []move
+	samePK := newKey == oldKey
 	for i := range desc.Indexes {
 		idx := &desc.Indexes[i]
+		// An entry is built from the index's columns and the primary
+		// key; with the key unchanged and none of its columns in SET it
+		// is the old entry exactly. Computing both entries anyway cost
+		// two key encodings per index per row: 55 allocations and
+		// 2052 ns for an UPDATE of an unindexed column on a table with
+		// two indexes, against 31 and 1448 with none (deep-look D-45).
+		if samePK && !slices.ContainsFunc(idx.Cols, func(ord int) bool { return touched[ord] }) {
+			continue
+		}
 		ok, ov, _, err := indexEntry(desc, idx, oldRow.Vals)
 		if err != nil {
 			return nil, false, err

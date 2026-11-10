@@ -98,7 +98,11 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 			if k >= end {
 				break
 			}
-			row, err := decodeRow(desc, k, v)
+			// Decoded with old, not the clone: the rows' layout is the
+			// same, and old carries the ID->ordinal table the clone
+			// drops, which turned every column of every row into a
+			// linear scan of the columns (deep-look D-45).
+			row, err := decodeRow(old, k, v)
 			if err != nil {
 				return nil, err
 			}
@@ -318,29 +322,43 @@ func appendDirected(buf []byte, idx *IndexDesc, vals []any) ([]byte, error) {
 // indexEntry builds one row's entry for one index from a coerced row.
 // enforced reports whether the entry participates in uniqueness (and
 // so must be collision-checked before writing).
+//
+// Columns are encoded straight from the row into one pre-sized buffer.
+// The entry used to gather the indexed values and the primary key into
+// slices of their own and append to a prefix with no spare capacity —
+// several allocations per index per written row (deep-look D-45).
 func indexEntry(desc *TableDesc, idx *IndexDesc, row []any) (key string, val []byte, enforced bool, err error) {
 	hasNull := false
-	vals := make([]any, len(idx.Cols))
+	buf := appendIndexPrefix(make([]byte, 0, keyBufCap), desc.ID, idx.ID)
 	for i, ord := range idx.Cols {
-		if row[ord] == nil {
+		v := row[ord]
+		if v == nil {
 			hasNull = true
 		}
-		vals[i] = row[ord]
-	}
-	buf, err := appendDirected(indexPrefix(desc.ID, idx.ID), idx, vals)
-	if err != nil {
-		return "", nil, false, serr.Wrap(err, "op", "encode index entry", "index", idx.Name)
-	}
-	pk := pkValues(desc, row)
-	if idx.Unique && !hasNull {
-		pkVal, err := tuple.Encode(pk...)
+		if idx.DescAt(i) {
+			buf, err = tuple.AppendDesc(buf, v)
+		} else {
+			buf, err = tuple.Append(buf, v)
+		}
 		if err != nil {
-			return "", nil, false, serr.Wrap(err, "op", "encode index entry pk", "index", idx.Name)
+			return "", nil, false, serr.Wrap(err, "op", "encode index entry", "index", idx.Name)
+		}
+	}
+	if idx.Unique && !hasNull {
+		// The key is the indexed values alone; the row's primary key is
+		// the entry's value.
+		var pkVal []byte
+		for _, ord := range desc.PKCols {
+			if pkVal, err = tuple.Append(pkVal, row[ord]); err != nil {
+				return "", nil, false, serr.Wrap(err, "op", "encode index entry pk", "index", idx.Name)
+			}
 		}
 		return string(buf), pkVal, true, nil
 	}
-	if buf, err = tuple.Append(buf, pk...); err != nil {
-		return "", nil, false, serr.Wrap(err, "op", "encode index entry pk", "index", idx.Name)
+	for _, ord := range desc.PKCols {
+		if buf, err = tuple.Append(buf, row[ord]); err != nil {
+			return "", nil, false, serr.Wrap(err, "op", "encode index entry pk", "index", idx.Name)
+		}
 	}
 	return string(buf), []byte{}, false, nil
 }

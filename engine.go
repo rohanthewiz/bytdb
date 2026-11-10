@@ -1232,9 +1232,23 @@ func identitySeqTablePrefix(tableID uint64) []byte {
 // rowKey builds a table's primary-index key from already-coerced PK
 // values.
 func rowKey(d *TableDesc, pkVals []any) (string, error) {
-	buf, err := tuple.Append(tablePrefix(d.ID), pkVals...)
+	buf := appendIndexPrefix(make([]byte, 0, keyBufCap), d.ID, primaryIndexID)
+	buf, err := tuple.Append(buf, pkVals...)
 	if err != nil {
 		return "", serr.Wrap(err, "op", "encode primary key")
 	}
 	return string(buf), nil
+}
+
+// keyBufCap sizes the buffer a row or index key is built in: room for
+// the prefix and a few columns, so the common key needs no regrowth.
+// Keys were built by appending to the freshly encoded prefix, a slice
+// with no spare capacity, which reallocated on the first column
+// (deep-look D-45).
+const keyBufCap = 64
+
+// appendIndexPrefix appends indexPrefix(tableID, indexID) to buf
+// without the intermediate allocations of encoding it on its own.
+func appendIndexPrefix(buf []byte, tableID, indexID uint64) []byte {
+	return tuple.AppendInt(tuple.AppendInt(buf, int64(tableID)), int64(indexID))
 }
