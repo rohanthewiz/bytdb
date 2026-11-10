@@ -1,11 +1,13 @@
 package sql
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"slices"
 	"time"
 
+	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -568,5 +570,22 @@ func bindArg(a any) (any, error) {
 	case float32:
 		return float64(v), nil
 	}
-	return nil, serr.New("unsupported parameter type", "type", fmt.Sprintf("%T", a))
+	// Named types, pointers, driver.Valuer, 16-byte arrays and []string
+	// reduce to the kinds above (deep-look D-56); a []string becomes the
+	// text[] literal, the SQL layer's runtime form of an array.
+	nv, err := bytdb.NormalizeValue(a)
+	if errors.Is(err, bytdb.ErrUnsupportedValue) {
+		return nil, serr.New("unsupported parameter type", "type", fmt.Sprintf("%T", a))
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ss, ok := nv.([]string); ok {
+		elems := make([]any, len(ss))
+		for i, s := range ss {
+			elems[i] = s
+		}
+		return bytdb.FormatTextArray(elems), nil
+	}
+	return bindArg(nv)
 }

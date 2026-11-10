@@ -388,7 +388,7 @@ func seqDescIn(tx *btypedb.Tx[string, []byte], name string) (*SeqDesc, error) {
 	}
 	raw, ok := tx.Get(sqlSeqKey(name))
 	if !ok {
-		return nil, serr.New(`relation "` + name + `" does not exist`)
+		return nil, errNoSuchTable(name) // sequences share the relation namespace
 	}
 	desc := &SeqDesc{}
 	if err := json.Unmarshal(raw, desc); err != nil {

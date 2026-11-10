@@ -83,6 +83,13 @@ func TestSplitStatements(t *testing.T) {
 		// when its last byte is a lone backslash.
 		{`select E'x\`, []stmtPart{{`select E'x\`, 0}}},
 		{`select E'x\'; select 2`, []stmtPart{{`select E'x\'; select 2`, 0}}},
+		// Dollar quoting (deep-look D-52): the body is opaque, tags must
+		// match, $1 is a placeholder, and a '$' inside an identifier
+		// opens nothing.
+		{`select $$a;b$$; select 2`, []stmtPart{{`select $$a;b$$`, 0}, {"select 2", 16}}},
+		{`select $f$x;$$;y$f$; select 2`, []stmtPart{{`select $f$x;$$;y$f$`, 0}, {"select 2", 21}}},
+		{`select $1; select a$b; select 3`, []stmtPart{{`select $1`, 0}, {`select a$b`, 11}, {"select 3", 23}}},
+		{`select $$unterminated; select 2`, []stmtPart{{`select $$unterminated; select 2`, 0}}},
 	}
 	for _, c := range cases {
 		got := splitStatements(c.q)

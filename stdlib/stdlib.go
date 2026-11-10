@@ -445,7 +445,31 @@ func (c *conn) ResetSession(ctx context.Context) error {
 	return nil
 }
 
+// ExecContext runs one statement, or a script of several: migration
+// runners (goose, golang-migrate, sql-migrate) hand a whole .sql file
+// to Exec, which Postgres accepts through its simple protocol. A
+// script runs as one unit (Session.ExecScript: an implicit transaction,
+// DDL committing what precedes it) and reports the last statement's
+// rows affected, as lib/pq does. Placeholders cannot span statements,
+// so a script with arguments is Postgres's error for the same request.
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if parts := bsql.SplitScript(query); len(parts) > 1 {
+		if len(args) > 0 {
+			return nil, serr.New("cannot insert multiple commands into a prepared statement")
+		}
+		if c.sess == nil {
+			return nil, driver.ErrBadConn
+		}
+		results, err := c.sess.ExecScriptCtx(ctx, query)
+		if err != nil {
+			return nil, c.wrap(err, query)
+		}
+		n := 0
+		if len(results) > 0 {
+			n = results[len(results)-1].RowsAffected
+		}
+		return result(n), nil
+	}
 	res, err := c.run(ctx, query, args)
 	if err != nil {
 		return nil, err

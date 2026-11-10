@@ -640,6 +640,22 @@ func (d *DB) ExecCtx(ctx context.Context, query string, args ...any) (*Result, e
 	return d.runCtx(ctx, st, args)
 }
 
+// ExecScript runs a script of ;-separated statements as one unit, in a
+// session of its own (Session.ExecScript has the rules: one implicit
+// transaction, DDL committing what precedes it, stop at the first
+// error). The session ends with the script, so SET in a script does not
+// outlive it.
+func (d *DB) ExecScript(script string) ([]*Result, error) {
+	return d.ExecScriptCtx(context.Background(), script)
+}
+
+// ExecScriptCtx is ExecScript bounded by ctx.
+func (d *DB) ExecScriptCtx(ctx context.Context, script string) ([]*Result, error) {
+	s := d.NewSession()
+	defer s.Close()
+	return s.ExecScriptCtx(ctx, script)
+}
+
 // runCtx runs st with ctx as its cancellation scope, on a copy so the
 // shared DB value never carries one statement's context into another.
 func (d *DB) runCtx(ctx context.Context, st Statement, args []any) (*Result, error) {

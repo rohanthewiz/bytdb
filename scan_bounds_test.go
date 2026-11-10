@@ -6,6 +6,7 @@ package bytdb
 // of coerce's accepted widths and rejected mismatches.
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
 )
@@ -156,7 +157,9 @@ func TestCoerceWidthsAndMismatches(t *testing.T) {
 		{[]any{21, 5, 1.0, true, nil}, "int into string"},
 		{[]any{22, "a", "high", true, nil}, "string into float"},
 		{[]any{23, "a", 1.0, true, "blob"}, "string into bytes"},
-		{[]any{uint64(24), "a", 1.0, true, nil}, "uint64 into int"},
+		// An in-range uint64 is accepted (NormalizeValue); one past int64
+		// still is not.
+		{[]any{uint64(math.MaxUint64), "a", 1.0, true, nil}, "uint64 overflowing int64 into int"},
 	}
 	for _, c := range mismatches {
 		if err := e.Insert("users", c.row...); err == nil {

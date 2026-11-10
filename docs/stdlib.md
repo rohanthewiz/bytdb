@@ -120,6 +120,18 @@ back on the way out:
 timestamp literals. `ColumnTypeDatabaseTypeName` and `ColumnTypeScanType`
 report both sides for the ORMs that ask.
 
+## Scripts
+
+`Exec` with several `;`-separated statements runs them as a script — what
+goose, golang-migrate and sql-migrate do with a whole `.sql` file. The
+statements run as one unit: one implicit transaction, so a failure rolls
+back the writes before it, except that DDL (which cannot join a block)
+commits what precedes it and runs on its own. `RowsAffected` reports the
+last statement. Quoted semicolons, `$$` bodies and comments never split a
+statement. A script cannot take arguments; Postgres refuses the same
+request with "cannot insert multiple commands into a prepared statement",
+and so does bytdb. `Query` still takes one statement.
+
 ## What `database/sql` cannot carry
 
 A statement's Notice (bytdb's warning for a redundant `BEGIN`, say) and its

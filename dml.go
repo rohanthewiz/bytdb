@@ -3,8 +3,10 @@ package bytdb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
+	"reflect"
 	"slices"
 	"time"
 
@@ -790,6 +792,18 @@ func coerce(v any, t ColType) (any, error) {
 		case []byte:
 			return CanonJSONB(string(x))
 		}
+	}
+	// The value is not one of the shapes above as is. A named type
+	// (type UserID int64), a pointer, a driver.Valuer, an unsigned or
+	// narrow integer reduces to one by NormalizeValue; retry with that.
+	// Reaching here only on a mismatch keeps reflection off the common
+	// path (deep-look D-56).
+	nv, nerr := NormalizeValue(v)
+	switch {
+	case nerr == nil && reflect.TypeOf(nv) != reflect.TypeOf(v):
+		return coerce(nv, t)
+	case nerr != nil && !errors.Is(nerr, ErrUnsupportedValue):
+		return nil, nerr // a Valuer's error, an unsigned overflow
 	}
 	return nil, serr.New("value does not fit column type",
 		"type", string(t), "value_type", fmt.Sprintf("%T", v))

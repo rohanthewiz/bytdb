@@ -258,6 +258,45 @@ func (s *Session) ExecCtx(ctx context.Context, query string, args ...any) (*Resu
 	return s.runCtx(ctx, st, args)
 }
 
+// ExecScript runs a script of ;-separated statements in order (split by
+// SplitScript, so quoted semicolons and comments are safe) — a
+// migration file, say. Several statements run as one unit, the
+// implicit transaction a multi-statement simple Query gets (deep-look
+// D-32): a failure rolls back the writes before it, except that DDL,
+// which cannot join a block, commits the writes before it and runs on
+// its own. Inside an explicit block the statements simply join it.
+//
+// Execution stops at the first error, which carries the failing
+// statement's 1-based number and byte offset as fields; the results
+// are those of the statements that ran. A script cannot take
+// parameters: placeholders would be ambiguous across statements.
+func (s *Session) ExecScript(script string) ([]*Result, error) {
+	return s.ExecScriptCtx(context.Background(), script)
+}
+
+// ExecScriptCtx is ExecScript bounded by ctx (see ExecCtx); the
+// session's statement_timeout applies to each statement.
+func (s *Session) ExecScriptCtx(ctx context.Context, script string) ([]*Result, error) {
+	parts := SplitScript(script)
+	if len(parts) > 1 {
+		s.ArmImplicit()
+	}
+	var results []*Result
+	var runErr error
+	for i, p := range parts {
+		res, err := s.ExecCtx(ctx, p.Text)
+		if err != nil {
+			runErr = serr.Wrap(err, "statement", strconv.Itoa(i+1), "offset", strconv.Itoa(p.Offset))
+			break
+		}
+		results = append(results, res)
+	}
+	if err := s.EndImplicit(); err != nil && runErr == nil {
+		runErr = err // the unit's commit failed (a conflict, say)
+	}
+	return results, runErr
+}
+
 // Fail marks an open transaction block failed, as an error inside the
 // block does: every later statement except ROLLBACK, COMMIT (which then
 // rolls back) and ROLLBACK TO SAVEPOINT is refused until the block

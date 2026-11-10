@@ -306,6 +306,31 @@ err = e.WriteTxn(func(tx *bytdb.Txn) error {
 })
 ```
 
+Values bind the way Go code holds them: named types (`type OrgID string`),
+pointers (nil is NULL), `driver.Valuer`s (`sql.NullString`, uuid
+libraries), unsigned and narrow integers, 16-byte arrays for `uuid`,
+`[]string` for `text[]`, `time.Time` for `timestamp` and `date`
+(`bytdb.NormalizeValue` is the rule, in SQL parameters too). Rows read
+back with typed getters, and a few one-shots save a transaction:
+
+```go
+n, _ := row.Int("seq")             // ok is false for NULL, a missing column, another type
+at, _ := row.Time("created_at")    // timestamp or date column, as UTC
+m := row.Map()                     // column name -> value
+e.UpdateRow("events", map[string]any{"note": "x"}, "acme", 1) // key last, like Get/Delete
+n, err := e.Count("events")        // walks keys, decodes no row
+ok, err = e.Exists("events", "acme", 1)
+e.Truncate("events", false);  e.NextVal("order_ids");  e.SetVal("order_ids", 100, true)
+desc, err := e.LookupTable("events") // ErrNoSuchTable when absent; a closed engine is its own error
+```
+
+`Table`, `View`, `Sequence` and the `Tables`/`Views`/`Sequences` lists
+return nothing both for an absent object and for a failed read;
+`LookupTable`, `LookupView`, `LookupSequence`, `TableNames`, `ListViews`
+and `ListSequences` tell the two apart. `DB.ExecScript` (and
+`Session.ExecScript`) runs a `;`-separated script — a migration file —
+as one unit, the way a multi-statement simple Query does.
+
 ### Encrypt it, replicate it
 
 ```go
@@ -726,6 +751,13 @@ decodes them back on the way out: a `timestamp` scans into a
 `time.Time`, a `date` and a `uuid` into their text forms, `text[]` and
 `jsonb` into their canonical literals. `ColumnTypeDatabaseTypeName` and
 `ColumnTypeScanType` report both sides for the ORMs that ask.
+
+**Scripts.** `Exec` with several `;`-separated statements — a migration
+runner handing over a whole `.sql` file — runs them as one unit
+(`Session.ExecScript`): one implicit transaction, a failure rolling back
+the writes before it, DDL committing what precedes it. `RowsAffected` is
+the last statement's. A script with arguments is refused, as Postgres
+refuses it ("cannot insert multiple commands into a prepared statement").
 
 ## The wire protocol, in detail
 
