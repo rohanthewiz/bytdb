@@ -364,6 +364,19 @@ type Engine struct {
 	cacheMu   sync.RWMutex
 	descCache map[string]descCacheEntry
 
+	// latest memoizes Engine.TableShared — the descriptor of the latest
+	// committed catalog, absent tables included (nil) — for as long as
+	// the catalog version stays latestVer (deep-look D-40). TableShared
+	// used to open a KV snapshot per call, and the SQL layer resolves
+	// every table a statement names that way before execution: ~9% of a
+	// prepared point read. Every descriptor write commits through
+	// updateDDL, which bumps catalogVer after the commit, so an entry
+	// keyed by the version read BEFORE resolving is current until that
+	// bump (see catalogVer for why the order makes this safe).
+	latestMu  sync.RWMutex
+	latestVer uint64
+	latest    map[string]*TableDesc
+
 	// writerGID is the ID of the goroutine holding the open writable
 	// transaction (from WriteTxn or Begin(true)), or 0. The kv writer
 	// lock is not reentrant, so a one-shot write or DDL issued from
@@ -998,18 +1011,20 @@ func (e *Engine) tableFromView(v kvView, name string) (*TableDesc, error) {
 	if !ok {
 		return nil, nil
 	}
-	bs := string(blob)
 	e.cacheMu.RLock()
 	ent, hit := e.descCache[name]
 	e.cacheMu.RUnlock()
-	if hit && ent.blob == bs {
+	// string(blob) in a comparison does not allocate; the copy is made
+	// only on a miss, to key the new entry (deep-look D-45: every lookup
+	// used to copy the whole descriptor JSON first).
+	if hit && ent.blob == string(blob) {
 		return ent.desc, nil
 	}
 	desc, err := parseDesc(blob)
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "decode table descriptor", "table", name)
 	}
-	e.cacheStore(name, bs, desc)
+	e.cacheStore(name, string(blob), desc)
 	return desc, nil
 }
 

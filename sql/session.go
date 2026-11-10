@@ -198,7 +198,7 @@ func (s *Session) Exec(query string, args ...any) (*Result, error) {
 // the insert, where Postgres answers the COMMIT with ROLLBACK (deep-look
 // D-07).
 func (s *Session) ExecCtx(ctx context.Context, query string, args ...any) (*Result, error) {
-	st, err := Parse(query)
+	st, err := s.db.parse(query)
 	if err != nil {
 		s.Fail()
 		return nil, err

@@ -924,18 +924,56 @@ func (e *Engine) Table(name string) *TableDesc {
 	return desc.Clone()
 }
 
+// maxLatestNames caps Engine.latest; see TableShared.
+const maxLatestNames = 4096
+
 // TableShared is Table without the copy: it returns the engine's shared,
 // cached descriptor, which the caller must treat as read-only — modifying
 // it would change the schema every transaction sees. It exists for
 // read-only callers on hot paths, the SQL layer above all, which resolves
 // a descriptor per statement and paid ~6% of a point read for a copy it
 // never writes to (deep-look D-19).
+//
+// Lookups are memoized per catalog version (Engine.latest): until the
+// next DDL commits, a name resolves without opening a snapshot. A
+// lookup racing a DDL — committed, version not yet bumped — may return
+// the descriptor from just before it, as a lookup a moment earlier
+// would have; the DDL's own caller sees the new one, since updateDDL
+// bumps the version before returning.
 func (e *Engine) TableShared(name string) *TableDesc {
+	ver := e.catalogVer.Load()
+	e.latestMu.RLock()
+	if e.latest != nil && e.latestVer == ver {
+		if desc, ok := e.latest[name]; ok {
+			e.latestMu.RUnlock()
+			return desc
+		}
+	}
+	e.latestMu.RUnlock()
+
 	var desc *TableDesc
-	e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
 		var err error
 		desc, err = e.tableFromView(tx, name)
 		return err
 	})
+	if err != nil {
+		return desc // not memoized: a failed read is not an answer
+	}
+	e.latestMu.Lock()
+	switch {
+	case e.latest == nil || ver > e.latestVer:
+		e.latest = map[string]*TableDesc{name: desc}
+		e.latestVer = ver
+	case ver == e.latestVer:
+		if len(e.latest) >= maxLatestNames {
+			// Absent names are memoized too, so a stream of lookups for
+			// distinct names that do not exist would grow the map until
+			// the next DDL; start over instead.
+			clear(e.latest)
+		}
+		e.latest[name] = desc
+	} // ver < latestVer: a newer catalog is already cached; keep it
+	e.latestMu.Unlock()
 	return desc
 }

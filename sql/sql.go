@@ -454,6 +454,10 @@ import (
 type DB struct {
 	e *bytdb.Engine
 
+	// parses caches parsed statements by SQL text for every session of
+	// this DB (parsecache.go); nil parses every time.
+	parses *parseCache
+
 	// tx, when set, is a Session's open transaction: every statement
 	// runs inside it instead of opening its own.
 	tx *bytdb.Txn
@@ -540,7 +544,9 @@ type vtab struct {
 }
 
 // New wraps an Engine for SQL execution.
-func New(e *bytdb.Engine) *DB { return &DB{e: e, seq: &seqSession{}} }
+func New(e *bytdb.Engine) *DB {
+	return &DB{e: e, seq: &seqSession{}, parses: newParseCache()}
+}
 
 // CatalogVersion is the engine's DDL counter (bytdb.Engine.CatalogVersion):
 // a Stmt's Describe result stays valid while it is unchanged.
@@ -605,7 +611,7 @@ type Result struct {
 // $1-style placeholders (the statement's highest $n and len(args)
 // must agree).
 func (d *DB) Exec(query string, args ...any) (*Result, error) {
-	st, err := Parse(query)
+	st, err := d.parse(query)
 	if err != nil {
 		return nil, err
 	}
@@ -618,7 +624,7 @@ func (d *DB) Exec(query string, args ...any) (*Result, error) {
 // rows). A statement aborted inside a transaction block fails the
 // block like any other error.
 func (d *DB) ExecCtx(ctx context.Context, query string, args ...any) (*Result, error) {
-	st, err := Parse(query)
+	st, err := d.parse(query)
 	if err != nil {
 		return nil, err
 	}
@@ -636,7 +642,7 @@ func (d *DB) runCtx(ctx context.Context, st Statement, args []any) (*Result, err
 // Prepare parses a statement once for repeated execution with
 // per-call parameter values.
 func (d *DB) Prepare(query string) (*Stmt, error) {
-	st, err := Parse(query)
+	st, err := d.parse(query)
 	if err != nil {
 		return nil, err
 	}

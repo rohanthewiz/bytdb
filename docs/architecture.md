@@ -290,6 +290,18 @@ flowchart TD
     ex --> chk[re-check full WHERE per row —<br/>pushdown only narrows, never decides]
 ```
 
+Two caches keep the per-statement front half cheap (deep-look D-40). A
+**parse cache** (512 texts per `sql.DB`, shared by its sessions) hands every
+repeat of a `SELECT`/`INSERT`/`UPDATE`/`DELETE` text the same parsed tree —
+execution binds parameters into a copy and typing rebuilds only what it
+changes, so the shared tree is never written (a test deep-compares cached
+trees after execution). And `Engine.TableShared` memoizes descriptors per
+**catalog version**, so resolving the tables a statement names no longer
+opens a storage snapshot per name; the next DDL commit invalidates it all.
+The typed tree itself is not cached: typing runs after parameters are bound,
+because it converts their values (a text `$1` compared with a `uuid` column
+becomes 16 bytes), so it is redone per execution.
+
 ### The planner's decision ladder
 
 For each table access, using only predicates that are top-level `AND`
