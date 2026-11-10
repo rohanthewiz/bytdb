@@ -85,10 +85,26 @@ CREATE TABLE items (
   `ALTER TABLE t OWNER TO role` is accepted as a no-op — bytdb has no roles —
   so pg_dump/goose DDL runs unmodified. *(verified in `sql/rename_test.go`,
   `sql/owner_test.go`)*
+- **Migration and dump DDL** (deep-look D-54). Run as no-ops, each with its
+  own command tag: `CREATE SCHEMA`, `CREATE EXTENSION`, `COMMENT ON`,
+  `ANALYZE`, `LOCK TABLE` (everything lives in `public`; `gen_random_uuid()`
+  is built in). Accepted and meaningful: `CREATE INDEX` without a name (named
+  `t_col_idx`, numbered on collision as Postgres does), `CONCURRENTLY`,
+  `ON ONLY`, `USING btree` (other access methods are refused), `ALTER TABLE
+  [IF EXISTS] [ONLY]`, `DROP COLUMN IF EXISTS`, `DROP TABLE a, b` (all
+  checked before any is dropped), a trailing `CASCADE`/`RESTRICT` on drops
+  (both run as RESTRICT: a drop something depends on is refused), and `NOT
+  VALID` on `ADD CONSTRAINT` (existing rows are still checked). `CREATE TABLE
+  ... AS` is refused: the table would have no primary key.
 - **`DEFAULT` values** are constant literals *plus exactly the clock markers*:
   `DEFAULT now()` (all `CURRENT_TIMESTAMP`-family spellings normalize to it)
   and `DEFAULT current_date`, evaluated once per INSERT statement so a
-  multi-row insert stamps every row with the same instant. Applied when a
+  multi-row insert stamps every row with the same instant — and `DEFAULT
+  gen_random_uuid()` (or `uuid_generate_v4()`) on a uuid column, a fresh uuid
+  per row, so `id uuid DEFAULT gen_random_uuid() PRIMARY KEY` works. A
+  constant may be parenthesized or carry a cast as pg_dump writes it
+  (`DEFAULT (0)`, `'active'::text`, `''::character varying`); the cast is
+  read as a type annotation and the value converts to the column's type. Applied when a
   column-list insert omits the column, as the `DEFAULT` keyword in `VALUES`,
   and via `INSERT ... DEFAULT VALUES`. General expression defaults stay
   rejected. `ADD COLUMN ... DEFAULT` backfills existing rows; a default the

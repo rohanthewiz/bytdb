@@ -327,6 +327,12 @@ func command(st Statement) string {
 	if sv, ok := st.(*SetVar); ok {
 		return sv.Tag
 	}
+	if ig, ok := st.(*Ignored); ok {
+		return ig.Tag
+	}
+	if ai, ok := st.(*AlterIfExists); ok {
+		return command(ai.Stmt)
+	}
 	switch st.(type) {
 	case *CreateTable:
 		return "CREATE TABLE"

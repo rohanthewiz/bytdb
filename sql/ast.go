@@ -604,6 +604,12 @@ type ExprDefault string
 const (
 	DefaultNow         ExprDefault = "now()"
 	DefaultCurrentDate ExprDefault = "current_date"
+	// DefaultRandomUUID is DEFAULT gen_random_uuid() (or uuid-ossp's
+	// uuid_generate_v4()): a fresh version-4 uuid for every row, which
+	// is what makes id uuid DEFAULT gen_random_uuid() PRIMARY KEY work
+	// (deep-look D-54). Unlike the clock markers it is evaluated per row,
+	// not per statement.
+	DefaultRandomUUID ExprDefault = "gen_random_uuid()"
 )
 
 // CheckDef is one CHECK constraint of a CREATE TABLE: the parsed
@@ -654,6 +660,25 @@ type CreateTable struct {
 type DropTable struct {
 	Table    string
 	IfExists bool
+	// More holds the further names of DROP TABLE a, b, ...: every table
+	// is checked before any is dropped, so a missing one (without IF
+	// EXISTS) drops nothing, as in Postgres.
+	More []string
+}
+
+// Ignored is a statement bytdb accepts and does nothing for, because
+// the thing it configures does not exist in bytdb: CREATE SCHEMA,
+// CREATE EXTENSION, COMMENT ON, ANALYZE, LOCK TABLE (deep-look D-54).
+// Migration tools and pg_dump output send them as a matter of course,
+// and a run that stops at the first one is worse than one that skips
+// it. Tag is the command tag the statement reports.
+type Ignored struct{ Tag string }
+
+// AlterIfExists is ALTER TABLE IF EXISTS t <action>: the action runs
+// only when the table exists; otherwise a notice, as in Postgres.
+type AlterIfExists struct {
+	Table string
+	Stmt  Statement
 }
 
 // Truncate is TRUNCATE [TABLE] t [, ...] [RESTART|CONTINUE IDENTITY]
@@ -726,7 +751,10 @@ type AddColumn struct {
 }
 
 // DropColumn is ALTER TABLE t DROP [COLUMN] col.
-type DropColumn struct{ Table, Col string }
+type DropColumn struct {
+	Table, Col string
+	IfExists   bool // DROP COLUMN IF EXISTS: a missing column is a notice
+}
 
 // RenameTable is ALTER TABLE t RENAME TO u.
 type RenameTable struct{ Table, To string }
@@ -1135,6 +1163,8 @@ func (*DropConstraint) stmt()     {}
 func (*AlterColumnDefault) stmt() {}
 func (*AlterColumnNotNull) stmt() {}
 func (*AlterOwner) stmt()         {}
+func (*Ignored) stmt()            {}
+func (*AlterIfExists) stmt()      {}
 func (*AlterColumnType) stmt()    {}
 func (*AlterColumnNoop) stmt()    {}
 func (*AlterColumnRestart) stmt() {}

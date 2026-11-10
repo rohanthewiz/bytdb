@@ -122,7 +122,7 @@ func TestAddColumnBackfillRejections(t *testing.T) {
 
 	for _, c := range []struct{ name, def string }{
 		{"expr", "1 + 2"},
-		{"call", "gen_random_uuid()"},
+		{"call", "random_thing()"},
 		{"concat", "'a' || 'b'"},
 	} {
 		err := e.AddColumn("people", Column{Name: c.name, Type: TString, Default: c.def})
@@ -389,5 +389,37 @@ func TestDefaultBackfillLimitIsSet(t *testing.T) {
 	defer e.Close()
 	if got := e.BackfillLimit(); got != DefaultBackfillLimit {
 		t.Fatalf("BackfillLimit() = %d; want %d", got, DefaultBackfillLimit)
+	}
+}
+
+// DEFAULT gen_random_uuid() backfills a distinct uuid into every existing
+// row (deep-look D-54), and refuses a non-uuid column.
+func TestAddColumnRandomUUIDBackfill(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
+	defer e.Close()
+	peopleTable(t, e)
+	for i := 1; i <= 20; i++ {
+		insertPeople(t, e, []any{i, "p", 30, "x"})
+	}
+	if err := e.AddColumn("people", Column{Name: "u", Type: TUUID, Default: "gen_random_uuid()"}); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for i := 1; i <= 20; i++ {
+		row, ok, err := e.Get("people", i)
+		if err != nil || !ok {
+			t.Fatal(err)
+		}
+		u, isBytes := row.Col("u").([]byte)
+		if !isBytes || len(u) != 16 || u[6]>>4 != 4 {
+			t.Fatalf("row %d uuid = %#v", i, row.Col("u"))
+		}
+		if seen[string(u)] {
+			t.Fatalf("row %d repeats a uuid", i)
+		}
+		seen[string(u)] = true
+	}
+	if err := e.AddColumn("people", Column{Name: "s", Type: TString, Default: "gen_random_uuid()"}); err == nil {
+		t.Fatal("gen_random_uuid() default accepted on a text column")
 	}
 }

@@ -3,6 +3,7 @@ package bytdb
 import (
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rohanthewiz/btypedb"
@@ -266,7 +267,13 @@ func (e *Engine) AddColumn(table string, col Column) error {
 					return nil, backfillTooLargeErr(table, col.Name, limit)
 				}
 			}
-			if err := backfillColumn(tx, desc, col.ID, fill); err != nil {
+			next := func() (any, error) { return fill, nil }
+			if strings.TrimSpace(col.Default) == defaultRandomUUIDText {
+				// A volatile default: every existing row gets its own value,
+				// as Postgres's ADD COLUMN ... DEFAULT gen_random_uuid() does.
+				next = func() (any, error) { return columnDefaultValue(&col, time.Now().UTC()) }
+			}
+			if err := backfillColumn(tx, desc, col.ID, next); err != nil {
 				return nil, err
 			}
 		}
@@ -292,7 +299,9 @@ func (e *Engine) AddColumn(table string, col Column) error {
 //
 // Keys are collected before any write rather than written during the
 // scan, so the iteration is never walking a tree it is mutating.
-func backfillColumn(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint32, val any) error {
+// next yields each row's value — the same constant for most defaults, a
+// fresh one per row for a volatile default (gen_random_uuid()).
+func backfillColumn(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint32, next func() (any, error)) error {
 	prefix := tablePrefix(desc.ID)
 	end := string(tuple.PrefixEnd(prefix))
 	var keys []string
@@ -307,6 +316,10 @@ func backfillColumn(tx *btypedb.Tx[string, []byte], desc *TableDesc, colID uint3
 		vals = append(vals, v)
 	}
 	for i, k := range keys {
+		val, err := next()
+		if err != nil {
+			return serr.Wrap(err, "op", "backfill column default", "table", desc.Name)
+		}
 		buf, err := tuple.AppendValue(append([]byte(nil), vals[i]...), int64(colID), val)
 		if err != nil {
 			return serr.Wrap(err, "op", "backfill column default", "table", desc.Name)

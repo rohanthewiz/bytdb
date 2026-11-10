@@ -536,6 +536,14 @@ func castDefault(oldCol, newCol *Column) (string, error) {
 		}
 		return oldCol.Default, nil
 	}
+	if text == defaultRandomUUIDText {
+		// Volatile like the clock markers: it stays a marker, valid only
+		// while the column is still a uuid.
+		if newCol.Type != TUUID {
+			return "", fail(nil)
+		}
+		return oldCol.Default, nil
+	}
 	v, err := columnDefaultValue(oldCol, time.Now().UTC())
 	if err != nil {
 		return "", fail(err)

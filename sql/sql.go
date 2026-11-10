@@ -441,6 +441,7 @@ package sql
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -700,6 +701,12 @@ func toEngineColumn(c ColDef) (bytdb.Column, error) {
 // ALTER COLUMN SET DEFAULT, so both accept exactly the same defaults.
 func renderDefault(v any, typ bytdb.ColType, colName string) (string, error) {
 	if ed, ok := v.(ExprDefault); ok {
+		if ed == DefaultRandomUUID {
+			if typ != bytdb.TUUID {
+				return "", serr.New("DEFAULT gen_random_uuid() requires a uuid column", "column", colName)
+			}
+			return string(ed), nil
+		}
 		if typ != bytdb.TTimestamp && typ != bytdb.TDate {
 			return "", serr.New(
 				"DEFAULT "+string(ed)+" requires a timestamp or date column",
@@ -877,13 +884,16 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// IF EXISTS resolves here rather than in the engine: a missing
 		// table becomes a notice, anything else (e.g. a dependent
 		// foreign key) still errors from the engine call below.
-		if s.IfExists && d.e.TableShared(s.Table) == nil {
-			return &Result{Notice: `table "` + s.Table + `" does not exist, skipping`}, nil
+		if len(s.More) == 0 {
+			if s.IfExists && d.e.TableShared(s.Table) == nil {
+				return &Result{Notice: `table "` + s.Table + `" does not exist, skipping`}, nil
+			}
+			if err := d.e.DropTable(s.Table); err != nil {
+				return nil, err
+			}
+			return &Result{}, nil
 		}
-		if err := d.e.DropTable(s.Table); err != nil {
-			return nil, err
-		}
-		return &Result{}, nil
+		return d.execDropTables(s)
 	case *AddColumn:
 		// IF NOT EXISTS is a name check only, as in Postgres: an
 		// existing column of this name skips the statement whatever
@@ -908,6 +918,12 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		}
 		return &Result{}, nil
 	case *DropColumn:
+		if s.IfExists {
+			if desc := d.e.TableShared(s.Table); desc != nil && desc.ColIndex(s.Col) < 0 {
+				return &Result{Notice: `column "` + s.Col + `" of relation "` + s.Table +
+					`" does not exist, skipping`}, nil
+			}
+		}
 		if err := d.checkDropColumn(s.Table, s.Col); err != nil {
 			return nil, err
 		}
@@ -1017,6 +1033,15 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// without touching the catalog — even table existence is not
 		// checked, matching the "ignore" half of parse-and-ignore.
 		return &Result{}, nil
+	case *Ignored:
+		// CREATE SCHEMA/EXTENSION, COMMENT, ANALYZE, LOCK: nothing to do
+		// (see Ignored); the command tag comes from the statement.
+		return &Result{}, nil
+	case *AlterIfExists:
+		if !d.relationExists(s.Table) {
+			return &Result{Notice: `relation "` + s.Table + `" does not exist, skipping`}, nil
+		}
+		return d.dispatch(s.Stmt, nil)
 	case *CreateIndex:
 		// IF NOT EXISTS is a name check only, as with CREATE TABLE: an
 		// index with this name on the target table makes the statement a
@@ -1033,7 +1058,11 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		for i, c := range s.Cols {
 			keys[i] = bytdb.IndexCol{Name: c, Desc: i < len(s.Desc) && s.Desc[i]}
 		}
-		if _, err := d.e.CreateIndexCols(s.Table, s.Name, s.Unique, keys); err != nil {
+		name := s.Name
+		if name == "" {
+			name = d.generatedIndexName(s.Table, s.Cols)
+		}
+		if _, err := d.e.CreateIndexCols(s.Table, name, s.Unique, keys); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
@@ -1144,4 +1173,54 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		return &Result{Tag: s.Tag}, nil
 	}
 	return nil, serr.New("unhandled statement type")
+}
+
+// execDropTables runs DROP TABLE a, b, ...: every name is checked first,
+// so a missing table (without IF EXISTS) refuses the statement before
+// anything is dropped, as Postgres's single-transaction DROP does
+// (deep-look D-54). The drops then run one engine DDL each; a later one
+// failing (a foreign key from outside the list still references it)
+// leaves the earlier ones dropped, which the error says.
+func (d *DB) execDropTables(s *DropTable) (*Result, error) {
+	names := append([]string{s.Table}, s.More...)
+	var present []string
+	var notice []string
+	for _, n := range names {
+		if d.e.TableShared(n) != nil {
+			present = append(present, n)
+			continue
+		}
+		if !s.IfExists {
+			return nil, serr.New(`table "`+n+`" does not exist`, "table", n)
+		}
+		notice = append(notice, `table "`+n+`" does not exist, skipping`)
+	}
+	for i, n := range present {
+		if err := d.e.DropTable(n); err != nil {
+			if i > 0 {
+				return nil, serr.Wrap(err, "dropped_before_error", strings.Join(present[:i], ", "))
+			}
+			return nil, err
+		}
+	}
+	return &Result{Notice: strings.Join(notice, "\n")}, nil
+}
+
+// generatedIndexName names an index created without one the way
+// Postgres does: table_col1_col2_idx, with a number appended
+// (table_col_idx1, ...) when that name is taken by another relation or
+// by one of the table's indexes.
+func (d *DB) generatedIndexName(table string, cols []string) string {
+	base := table + "_" + strings.Join(cols, "_") + "_idx"
+	taken := func(name string) bool {
+		if desc := d.e.TableShared(table); desc != nil && desc.Index(name) != nil {
+			return true
+		}
+		return d.relationExists(name)
+	}
+	name := base
+	for i := 1; taken(name); i++ {
+		name = base + strconv.Itoa(i)
+	}
+	return name
 }

@@ -245,6 +245,16 @@ func (p *parser) statement() (Statement, error) {
 		if p.acceptKw("table") {
 			return p.createTable()
 		}
+		// Statements for things bytdb does not have run as no-ops
+		// (deep-look D-54): a schema (everything lives in public) and
+		// an extension (what pgcrypto and uuid-ossp provide that
+		// migrations use — gen_random_uuid() — is built in).
+		if p.acceptKw("schema") {
+			return p.ignoreRest("CREATE SCHEMA"), nil
+		}
+		if p.acceptKw("extension") {
+			return p.ignoreRest("CREATE EXTENSION"), nil
+		}
 		if p.acceptKw("sequence") {
 			return p.createSequence()
 		}
@@ -265,6 +275,16 @@ func (p *parser) statement() (Statement, error) {
 			return p.createIndex(unique)
 		}
 		return nil, p.unexpected("TABLE, VIEW, SEQUENCE, or [UNIQUE] INDEX")
+	case p.acceptKw("comment"):
+		return p.ignoreRest("COMMENT"), nil
+	case p.acceptKw("analyze"), p.acceptKw("analyse"):
+		return p.ignoreRest("ANALYZE"), nil
+	case p.acceptKw("lock"):
+		// LOCK [TABLE] t [IN mode MODE] [NOWAIT]. In the default mode
+		// writes already serialize on the writer lock; under concurrent
+		// writes a LOCK used for mutual exclusion is NOT honored — see
+		// docs/gotchas.md.
+		return p.ignoreRest("LOCK TABLE"), nil
 	case p.acceptKw("drop"):
 		switch {
 		case p.acceptKw("table"):
@@ -279,6 +299,14 @@ func (p *parser) statement() (Statement, error) {
 			if dt.Table, err = p.tableName(); err != nil {
 				return nil, err
 			}
+			for p.acceptOp(",") {
+				name, err := p.tableName()
+				if err != nil {
+					return nil, err
+				}
+				dt.More = append(dt.More, name)
+			}
+			p.dropBehavior()
 			return dt, nil
 		case p.acceptKw("view"):
 			dv := &DropView{}
@@ -292,6 +320,7 @@ func (p *parser) statement() (Statement, error) {
 			if dv.Name, err = p.tableName(); err != nil {
 				return nil, err
 			}
+			p.dropBehavior()
 			return dv, nil
 		case p.acceptKw("sequence"):
 			return p.dropSequence()
@@ -811,6 +840,12 @@ func (p *parser) createTable() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
+	if t := p.cur(); t.kind == tIdent && t.text == "as" {
+		// CREATE TABLE t AS SELECT makes a table with no primary key,
+		// which a bytdb table cannot be (deep-look D-54, Q5).
+		return nil, serr.New("CREATE TABLE AS is not supported: a bytdb table needs a primary key",
+			"hint", "CREATE TABLE "+name+" (...) with a PRIMARY KEY, then INSERT INTO "+name+" SELECT ...")
+	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
@@ -1091,6 +1126,17 @@ func (p *parser) referencesClause(cols []string) (FKDef, error) {
 // general expressions stay rejected, so a default is still either a
 // stored constant or a marker, never an expression tree.
 func (p *parser) defaultLiteral(col string) (any, error) {
+	// A parenthesized default, DEFAULT (0), is the same constant.
+	if p.acceptOp("(") {
+		v, err := p.defaultLiteral(col)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		return v, p.defaultCasts(col)
+	}
 	if t := p.cur(); t.kind == tIdent {
 		// All timestamp-valued spellings normalize to one marker, the
 		// way Postgres normalizes CURRENT_TIMESTAMP to now(). The
@@ -1112,6 +1158,17 @@ func (p *parser) defaultLiteral(col string) (any, error) {
 		case "current_date":
 			p.advance()
 			return DefaultCurrentDate, nil
+		case "gen_random_uuid", "uuid_generate_v4":
+			// pgcrypto's and uuid-ossp's random-uuid functions; both are
+			// a version-4 uuid per row.
+			p.advance()
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			return DefaultRandomUUID, nil
 		case "current_time", "localtime":
 			return nil, serr.New(
 				"DEFAULT "+t.text+" is not supported: no time-of-day type exists"+
@@ -1125,7 +1182,27 @@ func (p *parser) defaultLiteral(col string) (any, error) {
 	if err != nil {
 		return nil, serr.New("DEFAULT must be a constant", "column", col)
 	}
-	return v, nil
+	return v, p.defaultCasts(col)
+}
+
+// defaultCasts accepts the casts pg_dump and ORMs write on a DEFAULT's
+// constant — 'active'::text, ”::character varying, '{}'::jsonb — as
+// type annotations: the constant is then converted to the column's own
+// type, exactly as an uncast one is, which is what the cast meant in
+// the overwhelming case of it naming that type (deep-look D-54). A
+// regclass or other catalog-lookup cast would make the default depend
+// on the catalog, and is refused like any non-constant.
+func (p *parser) defaultCasts(col string) error {
+	for p.acceptOp("::") {
+		typ, err := p.castType()
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(typ, "reg") {
+			return serr.New("DEFAULT must be a constant", "column", col, "cast", typ)
+		}
+	}
+	return nil
 }
 
 // renderLit renders a constant as the SQL literal text a descriptor
@@ -1342,6 +1419,10 @@ func (p *parser) identList(what string) ([]string, error) {
 }
 
 func (p *parser) createIndex(unique bool) (Statement, error) {
+	// CONCURRENTLY asks Postgres not to block writers while it builds.
+	// bytdb builds an index in one transaction either way, so the word
+	// is accepted and changes nothing (deep-look D-54).
+	p.acceptKw("concurrently")
 	// IF NOT EXISTS is resolved by the executor (skip when the name is
 	// taken on the target table); the parse only records the flag —
 	// same split as createTable's.
@@ -1355,18 +1436,41 @@ func (p *parser) createIndex(unique bool) (Statement, error) {
 		}
 		ifNotExists = true
 	}
-	name, err := p.ident("an index name")
-	if err != nil {
-		return nil, err
+	// The name is optional (CREATE INDEX ON t (c)); the executor then
+	// derives one as Postgres does. ON never names an index, so seeing
+	// it first means the name was left out.
+	name := ""
+	if t := p.cur(); !(t.kind == tIdent && t.text == "on") {
+		var err error
+		if name, err = p.ident("an index name"); err != nil {
+			return nil, err
+		}
+	} else if ifNotExists {
+		return nil, serr.New("IF NOT EXISTS requires that you name the index")
 	}
 	if err := p.expectKw("on"); err != nil {
 		return nil, err
 	}
+	p.acceptKw("only") // no inheritance in bytdb: every table is ONLY itself
 	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
 	ci := &CreateIndex{Name: name, Table: table, Unique: unique, IfNotExists: ifNotExists}
+	if p.acceptKw("using") {
+		// Every bytdb index is an ordered tree, which is what btree asks
+		// for; the other access methods index differently (hash has no
+		// order, gin/gist index inside values) and are refused rather
+		// than silently built as something else.
+		method, err := p.ident("an index access method")
+		if err != nil {
+			return nil, err
+		}
+		if method != "btree" {
+			return nil, serr.New(`access method "`+method+`" is not supported; bytdb indexes are btree`,
+				"index", name)
+		}
+	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
@@ -1420,17 +1524,59 @@ func (p *parser) dropIndex() (Statement, error) {
 			return nil, err
 		}
 	}
+	p.dropBehavior()
 	return di, nil
+}
+
+// dropBehavior accepts a DROP's trailing CASCADE or RESTRICT. bytdb
+// does not cascade a drop into dependent objects; both run as RESTRICT,
+// which refuses a drop something depends on (a foreign key referencing
+// the table) and drops anything else — so a migration's DROP ... CASCADE
+// of an object nothing depends on runs unchanged (deep-look D-54).
+func (p *parser) dropBehavior() {
+	if !p.acceptKw("cascade") {
+		p.acceptKw("restrict")
+	}
+}
+
+// ignoreRest consumes the rest of the statement — up to its ';' or the
+// end of input — for a statement bytdb accepts without acting on it.
+func (p *parser) ignoreRest(tag string) Statement {
+	for t := p.cur(); t.kind != tEOF && !(t.kind == tOp && t.text == ";"); t = p.cur() {
+		p.advance()
+	}
+	return &Ignored{Tag: tag}
 }
 
 func (p *parser) alterTable() (Statement, error) {
 	if err := p.expectKw("table"); err != nil {
 		return nil, err
 	}
+	// IF EXISTS skips the whole statement for a missing table (the
+	// executor decides); ONLY is accepted because bytdb has no table
+	// inheritance — pg_dump writes ALTER TABLE ONLY for constraints
+	// (deep-look D-54).
+	ifExists := false
+	if t, nx := p.cur(), p.tokAt(1); t.kind == tIdent && t.text == "if" && nx.kind == tIdent && nx.text == "exists" {
+		p.advance()
+		p.advance()
+		ifExists = true
+	}
+	p.acceptKw("only")
 	table, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
+	st, err := p.alterTableAction(table)
+	if err != nil || !ifExists {
+		return st, err
+	}
+	return &AlterIfExists{Table: table, Stmt: st}, nil
+}
+
+// alterTableAction parses the action of ALTER TABLE t.
+func (p *parser) alterTableAction(table string) (Statement, error) {
+	var err error
 	switch {
 	case p.acceptKw("add"):
 		// A table constraint: [CONSTRAINT name] CHECK (expr). Other
@@ -1450,6 +1596,7 @@ func (p *parser) alterTable() (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
+			p.notValid()
 			return &AddConstraint{Table: table, Check: CheckDef{Name: cname, Ex: ex, Text: text}}, nil
 		case p.acceptKw("primary"):
 			// Every bytdb table has a primary key from birth, so a lone
@@ -1477,6 +1624,7 @@ func (p *parser) alterTable() (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
+			p.notValid()
 			fk.Name = cname
 			return &AddFK{Table: table, FK: fk}, nil
 		case named:
@@ -1649,11 +1797,19 @@ func (p *parser) alterTable() (Statement, error) {
 			return dc, nil
 		}
 		p.acceptKw("column")
-		name, err := p.ident("a column name")
-		if err != nil {
+		// DROP [COLUMN] IF EXISTS c — two-token lookahead, as for ADD
+		// COLUMN IF NOT EXISTS, keeps a column named "if" droppable.
+		dc := &DropColumn{Table: table}
+		if t, nx := p.cur(), p.tokAt(1); t.kind == tIdent && t.text == "if" && nx.kind == tIdent && nx.text == "exists" {
+			p.advance()
+			p.advance()
+			dc.IfExists = true
+		}
+		if dc.Col, err = p.ident("a column name"); err != nil {
 			return nil, err
 		}
-		return &DropColumn{Table: table, Col: name}, nil
+		p.dropBehavior()
+		return dc, nil
 	case p.acceptKw("owner"):
 		// OWNER TO role — accepted for pg_dump/migration compatibility
 		// and executed as a no-op (bytdb has no roles). The role is any
@@ -1688,6 +1844,18 @@ func (p *parser) alterColumnType(table, col string) (Statement, error) {
 		st.UsingText = strings.TrimSpace(p.src[start:p.cur().pos])
 	}
 	return st, nil
+}
+
+// notValid accepts a constraint's trailing NOT VALID, with which
+// Postgres skips checking the rows already in the table. bytdb checks
+// them anyway: a constraint it records is one every row satisfies, and
+// a NOT VALID constraint pg_dump emits is a valid one being restored in
+// two steps (deep-look D-54).
+func (p *parser) notValid() {
+	if t, nx := p.cur(), p.tokAt(1); t.kind == tIdent && t.text == "not" && nx.kind == tIdent && nx.text == "valid" {
+		p.advance()
+		p.advance()
+	}
 }
 
 // replacePrimaryKey parses the second action of
@@ -3487,9 +3655,45 @@ func (p *parser) castType() (string, error) {
 			return "", err
 		}
 	}
-	if name == "double" {
+	switch name {
+	case "double":
 		p.acceptKw("precision")
 		name = "float8"
+	case "character":
+		if p.acceptKw("varying") {
+			name = "varchar"
+		} else {
+			name = "char"
+		}
+	}
+	// Type modifiers — varchar(10), numeric(10,2), timestamp(3) — parse
+	// and are not applied: a cast converts to the base type (deep-look
+	// D-52; docs/gotchas.md lists it).
+	if p.acceptOp("(") {
+		for {
+			if p.cur().kind != tNumber {
+				return "", p.unexpected("a type modifier")
+			}
+			p.advance()
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return "", err
+		}
+	}
+	// timestamp/time WITH|WITHOUT TIME ZONE. bytdb has one timestamp
+	// type, so both spellings name it.
+	if name == "timestamp" || name == "time" {
+		if p.acceptKw("with") || p.acceptKw("without") {
+			if err := p.expectKw("time"); err != nil {
+				return "", err
+			}
+			if err := p.expectKw("zone"); err != nil {
+				return "", err
+			}
+		}
 	}
 	if p.acceptOp("[") {
 		if err := p.expectOp("]"); err != nil {

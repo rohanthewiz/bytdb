@@ -113,6 +113,8 @@ func sysWriteGuard(table string) error {
 // SELECT (and DROP INDEX without an ON clause).
 func writeTarget(st Statement) string {
 	switch s := st.(type) {
+	case *AlterIfExists:
+		return s.Table
 	case *CreateTable:
 		return s.Table
 	case *DropTable:

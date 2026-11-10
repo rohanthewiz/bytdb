@@ -1,6 +1,7 @@
 package bytdb
 
 import (
+	crand "crypto/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -33,7 +34,21 @@ import (
 const (
 	defaultNowText         = "now()"
 	defaultCurrentDateText = "current_date"
+	// defaultRandomUUIDText mirrors sql.DefaultRandomUUID: a fresh
+	// version-4 uuid per row (each evaluation draws a new one).
+	defaultRandomUUIDText = "gen_random_uuid()"
 )
+
+// newRandomUUID returns a version-4 (random) uuid, RFC 4122 variant.
+func newRandomUUID() ([]byte, error) {
+	b := make([]byte, 16)
+	if _, err := crand.Read(b); err != nil {
+		return nil, serr.Wrap(err, "op", "gen_random_uuid")
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return b, nil
+}
 
 // columnDefaultValue evaluates a column's stored DEFAULT to the value
 // a row would hold, coerced to the column type and length-checked the
@@ -75,6 +90,8 @@ func decodeDefaultLiteral(text string, now time.Time) (any, error) {
 		return now, nil
 	case s == defaultCurrentDateText:
 		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC), nil
+	case s == defaultRandomUUIDText:
+		return newRandomUUID()
 	case strings.EqualFold(s, "true"):
 		return true, nil
 	case strings.EqualFold(s, "false"):

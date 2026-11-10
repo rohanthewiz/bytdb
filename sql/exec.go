@@ -897,6 +897,12 @@ func columnDefaults(desc *bytdb.TableDesc) ([]any, error) {
 		var v any
 		var err error
 		switch c.Default {
+		case string(DefaultRandomUUID):
+			// Per row, not per statement: the insert path evaluates an
+			// expression value for each row it fills (resolveExprValues),
+			// so every row draws its own uuid.
+			out[i] = &ExFunc{Name: "gen_random_uuid"}
+			continue
 		case string(DefaultNow):
 			v = now
 		case string(DefaultCurrentDate):
