@@ -11,6 +11,21 @@ from, and it means **your working set must fit in RAM**. There is no buffer
 pool, no spill-to-disk. Budget memory for the data plus a transient second
 copy of hot tree nodes during writes/snapshots.
 
+Rough figures to budget with (deep-look D-48, D-49):
+
+- **About 280 bytes of heap per row** for a ~45-byte row with one secondary
+  index (measured: 284 B/row). Every key and every value is its own
+  allocation, and each B-tree node entry carries some 40 bytes of headers,
+  so small rows cost several times their encoded size. Wider rows add
+  roughly their encoded size; each further index adds an entry of about the
+  indexed columns plus the primary key, plus the same per-entry overhead. A
+  million such rows is roughly 0.3 GB before the transient copies above.
+- **Startup replays the log:** about 0.8 s per million rows with one index
+  on an Apple M3 (`BenchmarkDLOpen500k`: 389 ms for 500k rows and their
+  index entries, a 78 MB file), single-threaded. A 50M-row database is
+  most of a minute of downtime per restart. Compacted files replay fastest;
+  see the operational notes below.
+
 Three guards stand between a growing heap and an OOM kill. All are on by
 default. The **memory ceiling** applies once `GOMEMLIMIT` is set: past it,
 inserts, updates, index builds and large reads fail with SQLSTATE 53200,
@@ -271,8 +286,9 @@ Easy to confuse:
   ≥100% growth since the last compaction (both tunable via
   `btypedb.WithAutoCompact`, or disable with `btypedb.WithAutoCompactDisabled`
   and run `Engine.Compact()` / SQL `VACUUM` yourself; `Stats().LogBytes -
-  LogBaseBytes` is the growth it measures). Startup replays the whole file; a huge uncompacted log
-  means a slow open. Compaction also rolls the replication generation — see
+  LogBaseBytes` is the growth it measures). Startup replays the whole file
+  (about 0.8 s per million rows, see Sizing); a huge uncompacted log means a
+  slow open. Compaction also rolls the replication generation — see
   [Replication & Backup](replication.md).
 - **One engine per file, enforced.** `Open` takes an exclusive lock on a
   `<path>.lock` sidecar and fails fast with `bytdb.ErrLocked` (carrying the

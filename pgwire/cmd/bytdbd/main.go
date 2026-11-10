@@ -73,7 +73,12 @@ func main() {
 		"encrypt the WAL at rest with the AES-256 key in this environment variable (hex or base64 of 32 bytes)")
 	metricsAddr := flag.String("metrics-addr", "",
 		"serve Prometheus metrics (engine size, heap, GC, connections) at http://<addr>/metrics (empty = disabled)")
-	maxResultRows := flag.Int64("max-result-rows", bytdb.DefaultMaxResultRows,
+	// The server's default is a tenth of the embedded engine's: every
+	// client's result is materialized in full before its first row is
+	// sent (deep-look D-50), so the cap bounds memory per connection,
+	// and a server has many connections. An embedded caller has one
+	// process's worth of queries and keeps bytdb.DefaultMaxResultRows.
+	maxResultRows := flag.Int64("max-result-rows", defaultServerMaxResultRows,
 		"maximum rows one query may hold in memory (0 or negative = no cap); larger queries fail with 54000")
 	maxTxnWrites := flag.Int64("max-txn-writes", bytdb.DefaultMaxTxnWrites,
 		"maximum row inserts and updates one transaction may stage before commit (0 or negative = no cap); "+
@@ -249,6 +254,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "bytdbd: %v\n", err)
 	}
 }
+
+// defaultServerMaxResultRows is -max-result-rows' default (plan Q6).
+const defaultServerMaxResultRows = 1_000_000
 
 // portOf is the port a Unix socket is named after: -addr's, or 5433
 // (bytdbd's default) when there is no TCP listener.

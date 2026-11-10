@@ -210,7 +210,7 @@ returns XX000 instead of killing the process.
 | `-sync` | `always` | WAL fsync policy: `always` or `never` |
 | `-idle-tx-timeout` | `0` (= 5 min) | Negative disables |
 | `-max-conns` | `0` (= 100) | Connection cap |
-| `-max-result-rows` | `10000000` | Rows one query may hold in memory; `0` disables (54000 when exceeded) |
+| `-max-result-rows` | `1000000` | Rows one query may hold in memory; `0` disables (54000 when exceeded). A tenth of the embedded engine's 10M default: the server materializes each client's whole result before sending it, so this bounds memory per connection |
 | `-max-txn-writes` | `10000000` | Row inserts and updates one transaction may stage; `0` disables (54000 when exceeded) |
 | `-memory-ceiling` | `auto` | Refuse inserts, updates and large results past this live heap: `auto` (90% of `GOMEMLIMIT`), `off`, or a size like `6GiB` (53200 when exceeded) |
 | `-log-queries` | false | Log SQL, duration, and outcome per statement |

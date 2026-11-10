@@ -888,10 +888,12 @@ Three guards turn "about to be OOM-killed" into ordinary statement errors:
   subquery value sets, hash-join build tables, GROUP BY groups, window
   inputs and RETURNING lists. A query over the cap fails with SQLSTATE
   54000. Streaming aggregates (`COUNT(*)` over any number of rows) and
-  LIMITs the scan can stop at are unaffected. An unindexed
-  `ORDER BY … LIMIT n` still sorts every matching row, so it counts them
-  all. Change the cap with `Engine.SetMaxResultRows(n)`; `0` or less
-  disables it.
+  LIMITs the scan can stop at are unaffected, and an unindexed
+  `ORDER BY … LIMIT n` keeps only its best `n` (plus `OFFSET`) rows. Change
+  the cap with `Engine.SetMaxResultRows(n)`; `0` or less disables it.
+  `bytdbd` defaults to 1M instead: it materializes each client's whole
+  result before sending it, so there the cap is a per-connection memory
+  bound.
 - **Transaction write cap.** No transaction may stage more than
   `DefaultMaxTxnWrites` (10M) row inserts and updates before it commits.
   At roughly 350 B to 1 KB of heap per staged row, that is 3.5 to 10 GB.
