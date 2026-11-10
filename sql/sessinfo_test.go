@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rohanthewiz/bytdb"
 )
 
 // sexec runs q in session s, failing the test on error.
@@ -411,5 +413,38 @@ func TestApplyStartupParams(t *testing.T) {
 	}
 	if err := d.NewSession().ApplyStartupParams(map[string]string{"statement_timeout": "soon"}); err == nil {
 		t.Error("invalid startup statement_timeout accepted")
+	}
+}
+
+// A bare placeholder in a session function Describes with the
+// argument's type, and a text-bound value still works: goose binds
+// pg_try_advisory_lock's key as an untyped $1.
+func TestSessionFuncParamTypes(t *testing.T) {
+	d := openDB(t)
+	for q, want := range map[string][]bytdb.ColType{
+		`select pg_try_advisory_lock($1)`: {bytdb.TInt},
+		`select pg_advisory_lock($1, $2)`: {bytdb.TInt, bytdb.TInt},
+		`select current_setting($1, $2)`:  {"", bytdb.TBool},
+		`select extract(year from $1)`:    {bytdb.TTimestamp},
+	} {
+		st, err := d.Prepare(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := st.Describe()
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if fmt.Sprint(info.Params) != fmt.Sprint(want) {
+			t.Errorf("%s: params %v, want %v", q, info.Params, want)
+		}
+	}
+	s := d.NewSession()
+	defer s.Close()
+	if r, err := s.Exec(`select pg_try_advisory_lock($1)`, "42"); err != nil || r.Rows[0][0] != true {
+		t.Fatalf("text-bound key: %v %v", r, err)
+	}
+	if r, err := s.Exec(`select pg_advisory_unlock($1)`, int64(42)); err != nil || r.Rows[0][0] != true {
+		t.Fatalf("unlock: %v %v", r, err)
 	}
 }

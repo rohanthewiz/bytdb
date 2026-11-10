@@ -363,6 +363,34 @@ func goTypeName(v any) string {
 	return "text"
 }
 
+// argKinds is a typing rule for the session functions: kinds[i] names
+// argument i's type — "bigint", "bool", or "" for text — and an untyped
+// argument (a literal or a placeholder) is cast to it, so a placeholder
+// Describes with that type and a text-bound value still arrives as one.
+// goose binds pg_try_advisory_lock's key as a bare $1, which used to
+// reach the function as a string. A typed argument of another type is
+// Postgres's 42883.
+func argKinds(ret bytdb.ColType, kinds ...string) func(f *funcCall) (bytdb.ColType, error) {
+	want := map[string]bytdb.ColType{"bigint": bytdb.TInt, "bool": bytdb.TBool, "": bytdb.TString}
+	return func(f *funcCall) (bytdb.ColType, error) {
+		for i, t := range f.types {
+			k := ""
+			if i < len(kinds) {
+				k = kinds[i]
+			}
+			switch {
+			case t == tyNull || t == want[k]:
+			case t == tyUnknown && k != "":
+				f.castArg(i, k)
+			case t == tyUnknown:
+			default:
+				return "", noFunc(f.name, f.types)
+			}
+		}
+		return ret, nil
+	}
+}
+
 // registerSessionFuncs adds the D-51 functions to the library; called
 // at the end of the library's own init so the registry exists.
 func registerSessionFuncs() {
@@ -370,11 +398,11 @@ func registerSessionFuncs() {
 	alwaysTrue := &scalarFunc{min: 1, max: 3, ret: bytdb.TBool, nullSafe: true,
 		envEval: func(env *exEnv, a []any) (any, error) { return true, nil }}
 	for name, f := range map[string]*scalarFunc{
-		"pg_advisory_lock":          {min: 1, max: 2, ret: bytdb.TString, envEval: advisoryFunc(false, false)},
-		"pg_try_advisory_lock":      {min: 1, max: 2, ret: bytdb.TBool, envEval: advisoryFunc(false, true)},
-		"pg_advisory_xact_lock":     {min: 1, max: 2, ret: bytdb.TString, envEval: advisoryFunc(true, false)},
-		"pg_try_advisory_xact_lock": {min: 1, max: 2, ret: bytdb.TBool, envEval: advisoryFunc(true, true)},
-		"pg_advisory_unlock": {min: 1, max: 2, ret: bytdb.TBool, envEval: func(env *exEnv, a []any) (any, error) {
+		"pg_advisory_lock":          {min: 1, max: 2, ret: bytdb.TString, typ: argKinds(bytdb.TString, "bigint", "bigint"), envEval: advisoryFunc(false, false)},
+		"pg_try_advisory_lock":      {min: 1, max: 2, ret: bytdb.TBool, typ: argKinds(bytdb.TBool, "bigint", "bigint"), envEval: advisoryFunc(false, true)},
+		"pg_advisory_xact_lock":     {min: 1, max: 2, ret: bytdb.TString, typ: argKinds(bytdb.TString, "bigint", "bigint"), envEval: advisoryFunc(true, false)},
+		"pg_try_advisory_xact_lock": {min: 1, max: 2, ret: bytdb.TBool, typ: argKinds(bytdb.TBool, "bigint", "bigint"), envEval: advisoryFunc(true, true)},
+		"pg_advisory_unlock": {min: 1, max: 2, ret: bytdb.TBool, typ: argKinds(bytdb.TBool, "bigint", "bigint"), envEval: func(env *exEnv, a []any) (any, error) {
 			k, err := advArgs(a)
 			if err != nil {
 				return nil, err
@@ -390,7 +418,7 @@ func registerSessionFuncs() {
 		}},
 		// current_setting(name [, missing_ok]): an unknown parameter is
 		// Postgres's error unless missing_ok, which makes it NULL.
-		"current_setting": {min: 1, max: 2, ret: bytdb.TString, nullSafe: true, envEval: func(env *exEnv, a []any) (any, error) {
+		"current_setting": {min: 1, max: 2, ret: bytdb.TString, nullSafe: true, typ: argKinds(bytdb.TString, "", "bool"), envEval: func(env *exEnv, a []any) (any, error) {
 			if a[0] == nil {
 				return nil, nil
 			}
@@ -406,7 +434,7 @@ func registerSessionFuncs() {
 		// set_config(name, value, is_local) is SET name = value, with the
 		// SET's semantics (statement_timeout takes effect); is_local
 		// degrades to session scope, as SET LOCAL does here.
-		"set_config": {min: 3, max: 3, ret: bytdb.TString, nullSafe: true, envEval: func(env *exEnv, a []any) (any, error) {
+		"set_config": {min: 3, max: 3, ret: bytdb.TString, nullSafe: true, typ: argKinds(bytdb.TString, "", "", "bool"), envEval: func(env *exEnv, a []any) (any, error) {
 			if a[0] == nil {
 				return nil, serr.New("SET requires parameter name")
 			}
@@ -425,7 +453,7 @@ func registerSessionFuncs() {
 			v, _ := env.d.settingValue(name)
 			return v, nil
 		}},
-		"current_schemas": {min: 1, max: 1, ret: bytdb.TTextArray, envEval: func(env *exEnv, a []any) (any, error) {
+		"current_schemas": {min: 1, max: 1, ret: bytdb.TTextArray, typ: argKinds(bytdb.TTextArray, "bool"), envEval: func(env *exEnv, a []any) (any, error) {
 			if a[0] == true {
 				return "{pg_catalog,public}", nil
 			}

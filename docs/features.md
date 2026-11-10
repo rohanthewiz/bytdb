@@ -991,6 +991,14 @@ Tested against real clients, not just protocol specs:
   (`information_schema.tables`), SQLAlchemy's `select pg_catalog.version()`,
   ActiveRecord/SQLAlchemy column introspection over
   `pg_attribute`/`pg_class`/`pg_type` (`pgwire/orm_test.go`)
+- **Migration tools and drivers**, statements copied verbatim from their
+  sources (`pgwire/orm_verbatim_test.go`): goose v3's version table,
+  `pg_tables` probe and advisory session lock; lib/pq's startup parameters
+  and `target_session_attrs` probes; pgx's `DeallocateAll`. goose's newer
+  table locker needs `interval`, which bytdb does not have.
+- **Protocol 3.2 clients** (libpq 18, lib/pq with `max_protocol_version`):
+  answered with NegotiateProtocolVersion and served as 3.0; `_pq_.` protocol
+  options are reported as unrecognized
 - **`database/sql`** via the pgx stdlib adapter — or, without a server at all,
   through the embedded [`bytdb/stdlib` driver](stdlib.md)
 

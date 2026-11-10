@@ -88,6 +88,10 @@ const (
 	msgParamDesc       = 't'
 	msgNoData          = 'n'
 	msgNoticeResponse  = 'N'
+	// msgNegotiateProtocol answers a startup that asked for a newer
+	// 3.x minor version or sent _pq_. protocol options: the newest
+	// minor version served and the options not recognized.
+	msgNegotiateProtocol = 'v'
 )
 
 // readMessage reads one typed frontend frame: type byte, int32 length

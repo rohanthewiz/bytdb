@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -471,7 +472,16 @@ func (c *conn) startup() error {
 			return err
 		}
 		r := &rbuf{b: body}
-		switch code := r.u32(); code {
+		code := r.u32()
+		// A 3.x request with x > 0 (libpq 18 asks for 3.2) is served as
+		// 3.0 after a NegotiateProtocolVersion, as Postgres serves a
+		// minor version it does not have; it used to close the
+		// connection without a word (deep-look D-51).
+		minorAsked := uint32(0)
+		if code>>16 == 3 && code&0xffff != 0 {
+			minorAsked, code = code&0xffff, protoVersion3
+		}
+		switch code {
 		case codeSSLRequest:
 			if err := c.maybeStartTLS(); err != nil {
 				return err
@@ -501,6 +511,9 @@ func (c *conn) startup() error {
 			// cstring pairs. The engine has no databases, so only user
 			// matters, and only when authenticating.
 			params := startupParams(r)
+			if err := c.negotiateProtocol(minorAsked, params); err != nil {
+				return err
+			}
 			if c.overLimit {
 				// Postgres's exact message and SQLSTATE (53300
 				// too_many_connections); pgx and libpq both surface it
@@ -609,6 +622,35 @@ func (c *conn) maybeStartTLS() error {
 	c.r = bufio.NewReader(tc)
 	c.w = bufio.NewWriterSize(stallWriter{c}, writeBufSize)
 	c.tlsOn = true
+	return nil
+}
+
+// negotiateProtocol sends NegotiateProtocolVersion when the client
+// asked for a minor version above 3.0 or sent protocol options (startup
+// parameters named _pq_.*, reserved for protocol extensions): bytdb
+// serves 3.0 and recognizes no options, so the message names 0 as the
+// newest minor version and lists every option. The options are removed
+// from params; they are not configuration parameters. The client then
+// either continues on 3.0 or disconnects.
+func (c *conn) negotiateProtocol(minorAsked uint32, params map[string]string) error {
+	var opts []string
+	for k := range params {
+		if strings.HasPrefix(k, "_pq_.") {
+			opts = append(opts, k)
+		}
+	}
+	if minorAsked == 0 && len(opts) == 0 {
+		return nil
+	}
+	slices.Sort(opts)
+	var b wbuf
+	b.int32(0) // newest minor version supported: 3.0
+	b.int32(len(opts))
+	for _, o := range opts {
+		b.cstr(o)
+		delete(params, o)
+	}
+	c.send(msgNegotiateProtocol, b)
 	return nil
 }
 

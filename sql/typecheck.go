@@ -487,6 +487,25 @@ func (t *typer) aggType(fn AggFunc, star bool, arg bytdb.ColType, _ ColRef) bytd
 	return arg
 }
 
+// noteCastParams notes each untyped placeholder argument a function's
+// typing rule wrapped in a cast with the cast's type.
+func (t *typer) noteCastParams(args []Expr, types []bytdb.ColType) {
+	if t.note == nil {
+		return
+	}
+	for i, a := range args {
+		c, ok := a.(*ExCast)
+		if !ok || types[i] != tyUnknown {
+			continue
+		}
+		if lit, ok := c.E.(*ExLit); ok {
+			if p, ok := lit.Val.(Param); ok {
+				t.note(p, castColType(c.Type))
+			}
+		}
+	}
+}
+
 // --- DML ---
 
 func (t *typer) insert(s *Insert) (Statement, error) {
@@ -1735,6 +1754,12 @@ func (t *typer) funcExpr(n *ExFunc, ts *tscope) (Expr, bytdb.ColType, error) {
 				}
 				if fc.changed {
 					args, changed = fc.args, true
+					// A placeholder the rule cast takes the cast's type, as
+					// a placeholder under an explicit cast does: Describe
+					// then reports pg_advisory_lock($1)'s $1 as bigint and
+					// extract(year from $1)'s as a timestamp, so a client
+					// binds a value of that type, not text.
+					t.noteCastParams(fc.args, argTypes)
 				}
 			}
 			break
