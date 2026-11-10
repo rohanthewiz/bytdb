@@ -86,7 +86,11 @@ plan's recommendations.
   release notes must list the newly refused shapes (`1 < 'a'`,
   `timestamp + 1`, `integer || integer`, `1 = true`), the CHECKs that start
   being enforced (run `VACUUM (VERIFY)` after upgrading), and the
-  implicit-transaction change for batches (D-32).
+  implicit-transaction change for batches (D-32). *Updated
+  `2026-1110-0512-deep-look-phase7-part1` (later the same session):*
+  btypedb main now also carries D-48's faster replay (389 -> 104 ms for
+  500k rows, commit `ad77fd8`), which bytdb gets only through a btypedb
+  tag (v0.10.0) and a `go.mod` bump — a second release decision.
 
 ## Validate
 

@@ -21,9 +21,12 @@ Rough figures to budget with (deep-look D-48, D-49):
   indexed columns plus the primary key, plus the same per-entry overhead. A
   million such rows is roughly 0.3 GB before the transient copies above.
 - **Startup replays the log:** about 0.8 s per million rows with one index
-  on an Apple M3 (`BenchmarkDLOpen500k`: 389 ms for 500k rows and their
-  index entries, a 78 MB file), single-threaded. A 50M-row database is
-  most of a minute of downtime per restart. Compacted files replay fastest;
+  on an Apple M3 with btypedb v0.9.0 (`BenchmarkDLOpen500k`: 389 ms for 500k
+  rows and their index entries, a 78 MB file), single-threaded — a 50M-row
+  database is most of a minute of downtime per restart. btypedb's main
+  branch replays the same file in 104 ms (about 0.2 s per million rows:
+  a reused read buffer and in-order appends, deep-look D-48); bytdb picks
+  that up with the next btypedb release. Compacted files replay fastest;
   see the operational notes below.
 
 Three guards stand between a growing heap and an OOM kill. All are on by
