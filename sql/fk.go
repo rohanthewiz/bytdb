@@ -226,7 +226,7 @@ func (d *DB) fkDeleteMatching(tx *bytdb.Txn, desc *bytdb.TableDesc, cols []strin
 // primary key or index on the columns makes this a point get or
 // bounded scan rather than a full scan.
 func (d *DB) fkRowExists(tx *bytdb.Txn, table string, cols []string, vals []any) (bool, error) {
-	desc := tx.Table(table)
+	desc := tx.TableShared(table)
 	if desc == nil {
 		return false, serr.New("no such table", "table", table)
 	}
@@ -362,7 +362,7 @@ func resolveFK(desc *bytdb.TableDesc, def FKDef) (bytdb.FKDesc, error) {
 // validates the shape and every existing row in the transaction that
 // publishes the constraint.
 func (d *DB) execAddFK(s *AddFK) (*Result, error) {
-	desc := d.e.Table(s.Table)
+	desc := d.e.TableShared(s.Table)
 	if desc == nil {
 		return nil, serr.New("no such table", "table", s.Table)
 	}

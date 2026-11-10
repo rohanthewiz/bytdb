@@ -136,7 +136,7 @@ func prepareSubFrom(env *exEnv, sel *Select) (fp *fromPlan, empty bool, err erro
 // it also extracts correlated templates and attaches them to their
 // steps; with sp nil it is exactly the legacy preparation.
 func buildSubFrom(env *exEnv, sel *Select, sp *subPrep) (*fromPlan, error) {
-	lk := env.d.lookup(env.tx.Table)
+	lk := env.d.lookup(env.tx.TableShared)
 	sc, err := buildScope(lk, sel.From)
 	if err != nil {
 		return nil, err

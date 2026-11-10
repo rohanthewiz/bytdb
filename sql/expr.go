@@ -894,7 +894,7 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 				return n, nil
 			}
 			name := strings.TrimPrefix(strings.TrimSpace(x), "public.")
-			if desc := env.d.e.Table(name); desc != nil {
+			if desc := env.d.e.TableShared(name); desc != nil {
 				return int64(desc.ID), nil
 			}
 			// Sequences share the relation namespace: 'name'::regclass

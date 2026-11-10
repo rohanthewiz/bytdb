@@ -437,6 +437,16 @@ func (t *Txn) Table(name string) *TableDesc {
 	return d.Clone()
 }
 
+// TableShared is Table without the copy; see Engine.TableShared. The
+// result must be treated as read-only.
+func (t *Txn) TableShared(name string) *TableDesc {
+	if t.done {
+		return nil
+	}
+	d, _ := t.table(name)
+	return d
+}
+
 // table resolves and memoizes one descriptor from the transaction's
 // snapshot; nil means the table does not exist there.
 func (t *Txn) table(name string) (*TableDesc, error) {

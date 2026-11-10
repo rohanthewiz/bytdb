@@ -28,7 +28,7 @@ import (
 // converted to their column's value kind, copying whatever it
 // changes; statements with nothing to coerce pass through as is.
 func (d *DB) coerceLiterals(st Statement) (Statement, error) {
-	lk := d.lookup(d.e.Table)
+	lk := d.lookup(d.e.TableShared)
 	switch s := st.(type) {
 	case *Explain:
 		inner, err := d.coerceLiterals(s.Stmt)

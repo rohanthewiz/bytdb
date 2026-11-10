@@ -431,7 +431,7 @@ func (d *DB) execSelect(s *Select) (*Result, error) {
 	var proj []projEntry // projected column ordinals and literals
 	var keys []sortKey
 	err := d.read(func(tx *bytdb.Txn) error {
-		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
+		fp, err := prepareFrom(d.lookup(tx.TableShared), s.From, s.Where)
 		if err != nil {
 			return err
 		}
@@ -913,7 +913,7 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 	res := &Result{}
 	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
-		desc := tx.Table(s.Table)
+		desc := tx.TableShared(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
@@ -1109,7 +1109,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 	res := &Result{}
 	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
-		desc := tx.Table(s.Table)
+		desc := tx.TableShared(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
@@ -1278,7 +1278,7 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 	res := &Result{}
 	affected := 0
 	err := d.write(func(tx *bytdb.Txn) error {
-		desc := tx.Table(s.Table)
+		desc := tx.TableShared(s.Table)
 		if desc == nil {
 			return serr.New("no such table", "table", s.Table)
 		}
@@ -1694,7 +1694,7 @@ func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
 	vacuumable := len(s.Tables) == 0
 	for _, t := range s.Tables {
 		switch {
-		case d.e.Table(t) != nil, sysLookup(t) != nil:
+		case d.e.TableShared(t) != nil, sysLookup(t) != nil:
 			vacuumable = true
 		case d.e.View(t) != nil, d.e.Sequence(t) != nil:
 			notices = append(notices, `skipping "`+t+`" --- cannot vacuum non-tables or special system tables`)
@@ -1766,7 +1766,7 @@ func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 	if table == "" {
 		var found []string
 		for _, tn := range d.e.Tables() {
-			if d.e.Table(tn).Index(s.Name) != nil {
+			if d.e.TableShared(tn).Index(s.Name) != nil {
 				found = append(found, tn)
 			}
 		}
@@ -1782,7 +1782,7 @@ func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 			return nil, serr.New("index name is ambiguous; use DROP INDEX name ON table", "index", s.Name)
 		}
 	} else if s.IfExists {
-		if t := d.e.Table(table); t == nil || t.Index(s.Name) == nil {
+		if t := d.e.TableShared(table); t == nil || t.Index(s.Name) == nil {
 			return notFound, nil
 		}
 	}

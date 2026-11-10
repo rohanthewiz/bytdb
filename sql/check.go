@@ -159,7 +159,7 @@ func checkRow(env *exEnv, table string, checks []namedCheck, vals []any) error {
 // transaction that publishes the descriptor, so no write slips in
 // between.
 func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
-	desc := d.e.Table(s.Table)
+	desc := d.e.TableShared(s.Table)
 	if desc == nil {
 		return nil, serr.New("no such table", "table", s.Table)
 	}
@@ -211,7 +211,7 @@ func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
 // drops in its own engine transaction; only the first match runs, so
 // no statement ever touches two kinds.
 func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
-	desc := d.e.Table(s.Table)
+	desc := d.e.TableShared(s.Table)
 	if desc == nil {
 		return nil, serr.New("no such table", "table", s.Table)
 	}
@@ -267,7 +267,7 @@ func (d *DB) checkDropColumn(table, col string) error {
 // check constraint mentions: check expressions are stored as text, so
 // either change would silently orphan the constraint.
 func (d *DB) checkColumnUnmentioned(table, col, verb string) error {
-	desc := d.e.Table(table)
+	desc := d.e.TableShared(table)
 	if desc == nil {
 		return nil // the engine reports the missing table
 	}

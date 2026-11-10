@@ -47,7 +47,7 @@ func (s *Stmt) Describe() (*StmtInfo, error) {
 // describeInto infers a statement's parameter types and output shape
 // into info.
 func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *StmtInfo) error {
-	lk := d.lookup(d.e.Table)
+	lk := d.lookup(d.e.TableShared)
 	switch st := st.(type) {
 	case *Explain:
 		// Parameters are the inner statement's; the output is always
@@ -187,7 +187,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		if dd, err = dd.staticWith(st); err != nil {
 			return err
 		}
-		lk = dd.lookup(dd.e.Table)
+		lk = dd.lookup(dd.e.TableShared)
 		res := &Result{}
 		if err := describeSelect(lk, st, note, res); err != nil {
 			return err

@@ -779,7 +779,7 @@ func aggScanGroups(tx *bytdb.Txn, fp *fromPlan, q *aggQuery, env *exEnv) ([]*gro
 func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 	res := &Result{}
 	err := d.read(func(tx *bytdb.Txn) error {
-		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
+		fp, err := prepareFrom(d.lookup(tx.TableShared), s.From, s.Where)
 		if err != nil {
 			return err
 		}

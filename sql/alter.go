@@ -22,7 +22,7 @@ import (
 // its evaluation scope from the row's own descriptor, rebuilding it only
 // when that pointer changes (in practice: once).
 func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
-	desc := d.e.Table(s.Table)
+	desc := d.e.TableShared(s.Table)
 	if desc == nil {
 		return nil, serr.New("no such table", "table", s.Table)
 	}
@@ -88,7 +88,7 @@ func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 // adding a second key — so refusing it is the same outcome, minus the
 // dropped constraint.
 func (d *DB) execReplacePrimaryKey(s *ReplacePrimaryKey) (*Result, error) {
-	if d.e.Table(s.Table) == nil {
+	if d.e.TableShared(s.Table) == nil {
 		return nil, serr.New("no such table", "table", s.Table)
 	}
 	if want := bytdb.PKConstraintName(s.Table); s.Dropped != want {

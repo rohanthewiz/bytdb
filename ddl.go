@@ -923,3 +923,19 @@ func (e *Engine) Table(name string) *TableDesc {
 	})
 	return desc.Clone()
 }
+
+// TableShared is Table without the copy: it returns the engine's shared,
+// cached descriptor, which the caller must treat as read-only — modifying
+// it would change the schema every transaction sees. It exists for
+// read-only callers on hot paths, the SQL layer above all, which resolves
+// a descriptor per statement and paid ~6% of a point read for a copy it
+// never writes to (deep-look D-19).
+func (e *Engine) TableShared(name string) *TableDesc {
+	var desc *TableDesc
+	e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
+		var err error
+		desc, err = e.tableFromView(tx, name)
+		return err
+	})
+	return desc
+}

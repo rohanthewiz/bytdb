@@ -93,7 +93,7 @@ type explainer struct {
 // --- statement nodes ---
 
 func (x *explainer) insertNode(s *Insert) (*planNode, error) {
-	if x.tx.Table(s.Table) == nil {
+	if x.tx.TableShared(s.Table) == nil {
 		return nil, serr.New("no such table", "table", s.Table)
 	}
 	return &planNode{
@@ -105,7 +105,7 @@ func (x *explainer) insertNode(s *Insert) (*planNode, error) {
 // writeNode explains an UPDATE or DELETE: the write on top of the
 // scan that finds its rows.
 func (x *explainer) writeNode(verb, table string, where BoolExpr) (*planNode, error) {
-	desc := x.tx.Table(table)
+	desc := x.tx.TableShared(table)
 	if desc == nil {
 		return nil, serr.New("no such table", "table", table)
 	}
@@ -190,7 +190,7 @@ func (x *explainer) coreNode(s *Select) (*planNode, error) {
 	if len(s.From) == 0 {
 		return &planNode{title: "Result"}, nil
 	}
-	fp, err := prepareFrom(x.d.lookup(x.tx.Table), s.From, s.Where)
+	fp, err := prepareFrom(x.d.lookup(x.tx.TableShared), s.From, s.Where)
 	if err != nil {
 		return nil, err
 	}

@@ -725,7 +725,7 @@ var testInjectConflicts atomic.Int64
 // their table rather than to the schema, so an index name never
 // collides with a relation name in the first place.
 func (d *DB) relationExists(name string) bool {
-	return d.e.Table(name) != nil || d.e.Sequence(name) != nil || d.e.View(name) != nil
+	return d.e.TableShared(name) != nil || d.e.Sequence(name) != nil || d.e.View(name) != nil
 }
 
 // run binds args into st, adapts quoted literals to their column
@@ -818,14 +818,14 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 				return nil, err
 			}
 			// Keep later name-collision checks accurate within this loop.
-			desc = d.e.Table(s.Table)
+			desc = d.e.TableShared(s.Table)
 		}
 		return &Result{}, nil
 	case *DropTable:
 		// IF EXISTS resolves here rather than in the engine: a missing
 		// table becomes a notice, anything else (e.g. a dependent
 		// foreign key) still errors from the engine call below.
-		if s.IfExists && d.e.Table(s.Table) == nil {
+		if s.IfExists && d.e.TableShared(s.Table) == nil {
 			return &Result{Notice: `table "` + s.Table + `" does not exist, skipping`}, nil
 		}
 		if err := d.e.DropTable(s.Table); err != nil {
@@ -842,7 +842,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// the engine call surfaces as the plain "already exists"
 		// error, the same window CREATE TABLE IF NOT EXISTS has.
 		if s.IfNotExists {
-			if desc := d.e.Table(s.Table); desc != nil && desc.ColIndex(s.Col.Name) >= 0 {
+			if desc := d.e.TableShared(s.Table); desc != nil && desc.ColIndex(s.Col.Name) >= 0 {
 				return &Result{Notice: `column "` + s.Col.Name + `" of relation "` +
 					s.Table + `" already exists, skipping`}, nil
 			}
@@ -897,7 +897,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 			}
 			return &Result{}, nil
 		}
-		desc := d.e.Table(s.Table)
+		desc := d.e.TableShared(s.Table)
 		if desc == nil {
 			return nil, serr.New("no such table", "table", s.Table)
 		}
@@ -950,7 +950,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 	case *AlterColumnNoop:
 		// Unlike OWNER TO, the column is named, so a typo in it is
 		// reported rather than silently accepted — Postgres checks it too.
-		desc := d.e.Table(s.Table)
+		desc := d.e.TableShared(s.Table)
 		if desc == nil {
 			return nil, serr.New("no such table", "table", s.Table)
 		}
@@ -973,7 +973,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// schema-wide relation namespace) — the same name on another
 		// table would not have collided anyway.
 		if s.IfNotExists {
-			if t := d.e.Table(s.Table); t != nil && t.Index(s.Name) != nil {
+			if t := d.e.TableShared(s.Table); t != nil && t.Index(s.Name) != nil {
 				return &Result{Notice: `relation "` + s.Name + `" already exists, skipping`}, nil
 			}
 		}

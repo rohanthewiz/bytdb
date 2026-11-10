@@ -276,7 +276,7 @@ func udtName(t bytdb.ColType) string {
 func (d *DB) userDescs() []*bytdb.TableDesc {
 	var descs []*bytdb.TableDesc
 	for _, name := range d.e.Tables() {
-		if desc := d.e.Table(name); desc != nil {
+		if desc := d.e.TableShared(name); desc != nil {
 			descs = append(descs, desc)
 		}
 	}
@@ -725,7 +725,7 @@ var sysTables = map[string]*sysTableDef{
 					fk := &desc.ForeignKeys[i]
 					confrelid := int64(0)
 					var confkey any
-					if p := d.e.Table(fk.RefTable); p != nil {
+					if p := d.e.TableShared(fk.RefTable); p != nil {
 						confrelid = int64(p.ID)
 						confkey = refAttnums(p, fk.RefCols)
 					}

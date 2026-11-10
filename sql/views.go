@@ -288,7 +288,7 @@ func (d *DB) staticWith(s *Select) (*DB, error) {
 	}
 	for _, cte := range s.With {
 		res := &Result{}
-		if err := describeSelect(dw.lookup(dw.e.Table), cte.Sel,
+		if err := describeSelect(dw.lookup(dw.e.TableShared), cte.Sel,
 			func(any, bytdb.ColType) {}, res); err != nil {
 			return nil, serr.Wrap(err, "with_query", displayCTEName(cte.Name))
 		}
@@ -353,7 +353,7 @@ func (d *DB) staticView(name string, depth int) (*DB, error) {
 		return nil, err
 	}
 	res := &Result{}
-	if err := describeSelect(cteDW.lookup(cteDW.e.Table), sel,
+	if err := describeSelect(cteDW.lookup(cteDW.e.TableShared), sel,
 		func(any, bytdb.ColType) {}, res); err != nil {
 		return nil, serr.Wrap(err, "view", name)
 	}

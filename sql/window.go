@@ -214,7 +214,7 @@ func (d *DB) execSelectWindow(s *Select) (*Result, error) {
 	var proj []projEntry // projection into the combined rows
 	var keys []sortKey
 	err := d.read(func(tx *bytdb.Txn) error {
-		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
+		fp, err := prepareFrom(d.lookup(tx.TableShared), s.From, s.Where)
 		if err != nil {
 			return err
 		}
@@ -351,7 +351,7 @@ func (q *aggQuery) rewriteWindow(w *ExWindow) (*ExWindow, error) {
 func (d *DB) execSelectAggWindow(s *Select) (*Result, error) {
 	res := &Result{}
 	err := d.read(func(tx *bytdb.Txn) error {
-		fp, err := prepareFrom(d.lookup(tx.Table), s.From, s.Where)
+		fp, err := prepareFrom(d.lookup(tx.TableShared), s.From, s.Where)
 		if err != nil {
 			return err
 		}
