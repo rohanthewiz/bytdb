@@ -57,6 +57,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -171,6 +172,17 @@ type Config struct {
 	// Options are the bytdb open options the DSN asked for.
 	Options []btypedb.Option
 
+	// Memory makes the database a private temporary file, removed when
+	// the *sql.DB closes: the DSN ":memory:" (bytdb itself always has a
+	// file; the data still lives in memory, as it always does).
+	Memory bool
+
+	// Settings applied to the engine after it opens (deep-look D-57);
+	// nil leaves the engine's default. See ParseDSN.
+	MemoryCeiling *int64
+	MaxResultRows *int64
+	MaxTxnWrites  *int64
+
 	// signature identifies the option set, so two DSNs on one path can be
 	// compared without holding on to the closures. It never contains key
 	// material.
@@ -199,6 +211,24 @@ type Config struct {
 //	encryption_key=<hex>    encrypt the WAL at rest, keyed by 32 bytes given
 //	                        as 64 hex digits. Opening with the wrong key, or
 //	                        without one, fails.
+//	encryption_key_file=<path>
+//	                        the same key read from a file (32 raw bytes, 64
+//	                        hex characters, or base64) — the preferred form:
+//	                        a DSN travels through configs and logs, a key in
+//	                        it with them.
+//	memory_ceiling=<size>   Engine.SetMemoryCeiling: auto (the default), off,
+//	                        or a size with GOMEMLIMIT's suffixes (6GiB).
+//	max_result_rows=<n>     Engine.SetMaxResultRows (0 = no cap).
+//	max_txn_writes=<n>      Engine.SetMaxTxnWrites (0 = no cap).
+//	auto_compact=false      turn background log compaction off.
+//	compact_min_bytes=<n>, compact_growth_pct=<n>
+//	                        tune it: compact once the log is at least n bytes
+//	                        and has grown that many percent since the last
+//	                        compaction (defaults 32 MiB and 100).
+//
+// The path ":memory:" opens a private database in a temporary file that
+// is removed when the *sql.DB closes; each sql.Open of it is a database
+// of its own. Error messages never repeat an encryption_key value.
 //
 // An unrecognized option is an error rather than a silent no-op: a typo in a
 // durability or encryption setting should not be something you discover from
@@ -208,17 +238,28 @@ func ParseDSN(dsn string) (*Config, error) {
 	path, query, _ := strings.Cut(raw, "?")
 	if path == "" {
 		return nil, serr.New("bytdb DSN has no path (it should name the database file)",
-			"dsn", dsn)
+			"dsn", redactDSN(dsn))
 	}
-	cfg := &Config{Path: path}
+	cfg := &Config{Path: path, Memory: path == ":memory:"}
 	if query == "" {
 		return cfg, nil
 	}
 
 	vals, err := url.ParseQuery(query)
 	if err != nil {
-		return nil, serr.Wrap(err, "op", "parse bytdb DSN options", "options", query)
+		return nil, serr.Wrap(err, "op", "parse bytdb DSN options", "options", redactDSN(query))
 	}
+	if vals.Has("encryption_key") && vals.Has("encryption_key_file") {
+		return nil, serr.New("set only one of encryption_key and encryption_key_file")
+	}
+	nonNegInt := func(name, v string) (*int64, error) {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return nil, serr.New(name+" must be a non-negative integer", name, v)
+		}
+		return &n, nil
+	}
+	compactMin, compactGrowth := int64(0), 0
 
 	var sig []string
 	for _, name := range sortedKeys(vals) {
@@ -254,13 +295,109 @@ func ParseDSN(dsn string) (*Config, error) {
 			cfg.Options = append(cfg.Options, bytdb.WithEncryptionKey(key))
 			sig = append(sig, "encryption_key=set") // never the key itself
 
+		case "encryption_key_file":
+			key, err := bytdb.ReadEncryptionKeyFile(v)
+			if err != nil {
+				return nil, err
+			}
+			cfg.Options = append(cfg.Options, bytdb.WithEncryptionKey(key))
+			// Same signature as an inline key: what matters for sharing an
+			// engine is that it is encrypted, and the key is never recorded.
+			sig = append(sig, "encryption_key=set")
+
+		case "memory_ceiling":
+			n, err := bytdb.ParseMemoryCeiling(v)
+			if err != nil {
+				return nil, err
+			}
+			cfg.MemoryCeiling = &n
+			sig = append(sig, "memory_ceiling="+strconv.FormatInt(n, 10))
+
+		case "max_result_rows":
+			if cfg.MaxResultRows, err = nonNegInt(name, v); err != nil {
+				return nil, err
+			}
+			sig = append(sig, "max_result_rows="+v)
+
+		case "max_txn_writes":
+			if cfg.MaxTxnWrites, err = nonNegInt(name, v); err != nil {
+				return nil, err
+			}
+			sig = append(sig, "max_txn_writes="+v)
+
+		case "auto_compact":
+			on, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, serr.New("auto_compact must be a boolean", "auto_compact", v)
+			}
+			if !on {
+				compactMin = -1
+			}
+			sig = append(sig, "auto_compact="+strconv.FormatBool(on))
+
+		case "compact_min_bytes":
+			n, err := nonNegInt(name, v)
+			if err != nil {
+				return nil, err
+			}
+			if compactMin >= 0 {
+				compactMin = *n
+			}
+			sig = append(sig, "compact_min_bytes="+v)
+
+		case "compact_growth_pct":
+			n, err := nonNegInt(name, v)
+			if err != nil {
+				return nil, err
+			}
+			compactGrowth = int(*n)
+			sig = append(sig, "compact_growth_pct="+v)
+
 		default:
 			return nil, serr.New("unknown bytdb DSN option", "option", name,
-				"known", "sync, concurrent_writes, encryption_key")
+				"known", "sync, concurrent_writes, encryption_key, encryption_key_file, "+
+					"memory_ceiling, max_result_rows, max_txn_writes, auto_compact, "+
+					"compact_min_bytes, compact_growth_pct")
 		}
+	}
+	// Compaction is one btypedb option built from up to three settings,
+	// the way bytdbd builds it from its flags.
+	switch {
+	case compactMin < 0:
+		cfg.Options = append(cfg.Options, btypedb.WithAutoCompactDisabled())
+	case compactMin > 0 || compactGrowth > 0:
+		if compactMin == 0 {
+			compactMin = 32 << 20
+		}
+		if compactGrowth == 0 {
+			compactGrowth = 100
+		}
+		cfg.Options = append(cfg.Options, btypedb.WithAutoCompact(compactMin, compactGrowth))
 	}
 	cfg.signature = strings.Join(sig, "&")
 	return cfg, nil
+}
+
+// redactDSN blanks encryption_key values, so a DSN echoed into an error
+// (and from there into a log) never carries key material.
+func redactDSN(s string) string {
+	const k = "encryption_key="
+	var b strings.Builder
+	for {
+		i := strings.Index(s, k)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		b.WriteString(s[:i+len(k)])
+		s = s[i+len(k):]
+		end := strings.IndexByte(s, '&')
+		if end < 0 {
+			end = len(s)
+		}
+		b.WriteString("REDACTED")
+		s = s[end:]
+	}
 }
 
 func sortedKeys(v url.Values) []string {
@@ -312,6 +449,10 @@ type shared struct {
 	db *bsql.DB
 
 	refs int // connectors holding this open; guarded by enginesMu
+
+	// tempDir is a ":memory:" database's directory: the engine is this
+	// connector's alone, and release closes it and removes the directory.
+	tempDir string
 }
 
 var (
@@ -322,9 +463,13 @@ var (
 // acquire opens the engine cfg names, or takes another reference to the one
 // already open on that path.
 func acquire(cfg *Config) (*shared, error) {
+	if cfg.Memory {
+		return openMemory(cfg)
+	}
 	// Two DSNs spelling one file differently must land on the same engine, or
-	// the second open fails on bytdb's file lock (ErrLocked).
-	abs, err := filepath.Abs(cfg.Path)
+	// the second open fails on bytdb's file lock (ErrLocked). Symlinks count
+	// as spellings too: a link and its target are one file.
+	abs, err := resolvePath(cfg.Path)
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "resolve bytdb path", "path", cfg.Path)
 	}
@@ -348,9 +493,58 @@ func acquire(cfg *Config) (*shared, error) {
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "open bytdb", "path", abs)
 	}
+	applySettings(e, cfg)
 	sh := &shared{path: abs, signature: cfg.signature, e: e, db: bsql.New(e), refs: 1}
 	engines[abs] = sh
 	return sh, nil
+}
+
+// applySettings applies the DSN's engine settings to a fresh engine.
+func applySettings(e *bytdb.Engine, cfg *Config) {
+	if cfg.MemoryCeiling != nil {
+		e.SetMemoryCeiling(*cfg.MemoryCeiling)
+	}
+	if cfg.MaxResultRows != nil {
+		e.SetMaxResultRows(*cfg.MaxResultRows)
+	}
+	if cfg.MaxTxnWrites != nil {
+		e.SetMaxTxnWrites(*cfg.MaxTxnWrites)
+	}
+}
+
+// resolvePath makes a DSN path absolute with symlinks resolved. The file
+// may not exist yet (first open creates it), so a missing file resolves
+// through its directory instead.
+func resolvePath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		return r, nil
+	}
+	dir, base := filepath.Split(abs)
+	if r, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Join(r, base), nil
+	}
+	return abs, nil
+}
+
+// openMemory opens a ":memory:" database: an engine on a file in a fresh
+// temporary directory, outside the path registry (every open is its own
+// database), removed when its last reference goes.
+func openMemory(cfg *Config) (*shared, error) {
+	dir, err := os.MkdirTemp("", "bytdb-memory-")
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "create :memory: database")
+	}
+	e, err := bytdb.Open(filepath.Join(dir, "memory.bytdb"), cfg.Options...)
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, serr.Wrap(err, "op", "open :memory: database")
+	}
+	applySettings(e, cfg)
+	return &shared{tempDir: dir, signature: cfg.signature, e: e, db: bsql.New(e), refs: 1}, nil
 }
 
 func orNone(sig string) string {
@@ -365,6 +559,21 @@ func orNone(sig string) string {
 // gets a fresh engine rather than a stale one. An engine the caller owns
 // (OpenEngine) is never closed here.
 func (s *shared) release() error {
+	if s.tempDir != "" {
+		enginesMu.Lock()
+		s.refs--
+		last := s.refs <= 0
+		enginesMu.Unlock()
+		if !last {
+			return nil
+		}
+		err := s.e.Close()
+		os.RemoveAll(s.tempDir)
+		if err != nil {
+			return serr.Wrap(err, "op", "close :memory: database")
+		}
+		return nil
+	}
 	if s.path == "" {
 		return nil // caller's engine, caller's Close
 	}
@@ -551,7 +760,18 @@ func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
 	}
 	v, err := driver.DefaultParameterConverter.ConvertValue(nv.Value)
 	if err != nil {
-		return err
+		// The shapes database/sql's converter refuses but bytdb binds:
+		// []string for text[], [16]byte (and named 16-byte arrays, the
+		// usual uuid types) for uuid (deep-look D-57).
+		nv2, nerr := bytdb.NormalizeValue(nv.Value)
+		if nerr != nil {
+			return err
+		}
+		if t, ok := nv2.(time.Time); ok {
+			nv2 = t.UTC().Format("2006-01-02 15:04:05.999999")
+		}
+		nv.Value = nv2
+		return nil
 	}
 	nv.Value = v
 	return nil
@@ -788,9 +1008,9 @@ func (r *rows) ColumnTypeScanType(i int) reflect.Type {
 		return reflect.TypeFor[float64]()
 	case bytdb.TBytes:
 		return reflect.TypeFor[[]byte]()
-	case bytdb.TTimestamp:
+	case bytdb.TTimestamp, bytdb.TDate:
 		return reflect.TypeFor[time.Time]()
-	case bytdb.TString, bytdb.TDate, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB:
+	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB:
 		return reflect.TypeFor[string]()
 	}
 	return reflect.TypeFor[any]()
@@ -826,8 +1046,11 @@ func convert(v any, t bytdb.ColType) (driver.Value, error) {
 			return time.UnixMicro(n).UTC(), nil
 		}
 	case bytdb.TDate:
+		// A date scans as midnight UTC of that day, the time.Time pgx's and
+		// lib/pq's drivers give, so `var d time.Time; row.Scan(&d)` works
+		// (deep-look D-57; it used to be the text form, 2026-08-04).
 		if n, ok := v.(int64); ok {
-			return bytdb.FormatDate(n), nil // a bare date, not a midnight instant
+			return time.Unix(n*86400, 0).UTC(), nil
 		}
 	case bytdb.TUUID:
 		if b, ok := v.([]byte); ok {

@@ -22,14 +22,22 @@ db, err := sql.Open("bytdb", "app.bytdb?concurrent_writes=true")
 ## The DSN
 
 A filesystem path, optionally followed by engine options —
-`app.bytdb`, `file:app.bytdb`, `/var/lib/app.bytdb?sync=never`. bytdb has no
-in-memory mode, so a path is always a real file, created on first open.
+`app.bytdb`, `file:app.bytdb`, `/var/lib/app.bytdb?sync=never`. A path is a
+real file, created on first open; the special path `:memory:` gives a
+private database in a temporary file removed when the `*sql.DB` closes
+(each `sql.Open(":memory:")` is a database of its own — handy in tests).
 
 | Option | Effect |
 |---|---|
 | `sync=never` | Leave WAL fsyncs to the OS: much faster writes, at the risk of losing recently acknowledged transactions to a power loss (not a process crash). Omitted, the engine's `SyncAlways` default stands. |
 | `concurrent_writes=true` | Optimistic concurrency instead of the single-writer lock — commits may then fail with `bytdb.ErrTxConflict`, and sequences become gap-tolerant. See [Concurrency & Isolation](concurrency.md). |
-| `encryption_key=<64 hex digits>` | Encrypt the WAL at rest with the 32-byte key. Opening with the wrong key, or without one, fails. See [Encryption & Security](security.md). |
+| `encryption_key_file=<path>` | **Preferred.** Encrypt the WAL at rest with the 32-byte key in the file (raw bytes, 64 hex characters, or base64 — the forms bytdbd's `-encryption-key-file` takes). See [Encryption & Security](security.md). |
+| `encryption_key=<64 hex digits>` | The same key inline. A DSN travels through configuration and logs, so prefer the file form; bytdb itself never repeats the value in an error. |
+| `memory_ceiling=<auto\|off\|size>` | `Engine.SetMemoryCeiling`, with GOMEMLIMIT's units (`6GiB`). See [Monitoring memory](../README.md#monitoring-memory). |
+| `max_result_rows=<n>` | `Engine.SetMaxResultRows` (0 = no cap). |
+| `max_txn_writes=<n>` | `Engine.SetMaxTxnWrites` (0 = no cap). |
+| `auto_compact=false` | Turn background log compaction off. |
+| `compact_min_bytes=<n>`, `compact_growth_pct=<n>` | Tune it: compact once the log is at least n bytes and has grown that many percent since the last compaction (defaults 32 MiB, 100). |
 
 An unrecognized option is an error rather than a silent no-op: a typo in a
 durability or encryption setting should not be something you discover from
@@ -59,7 +67,9 @@ flowchart LR
 ```
 
 Opening the same path twice with *different* options is an error rather than
-a silent adoption of whichever option set got there first.
+a silent adoption of whichever option set got there first. Paths are compared
+after resolving symlinks, so a link and its target share the engine instead
+of the second open failing on the file lock.
 
 Two functions bridge to the rest of the Go API:
 
@@ -111,13 +121,15 @@ back on the way out:
 | Column type | Scans as |
 |---|---|
 | `timestamp` / `timestamptz` | `time.Time` (UTC) |
-| `date` | its text form, `2026-08-04` |
+| `date` | `time.Time` at midnight UTC of the day, as pgx and lib/pq give it (scanned into a `string`, database/sql formats it as RFC 3339) |
 | `uuid` | its canonical text form |
 | `text[]` | the canonical Postgres array literal |
 | `jsonb` | the canonical (compact, keys-sorted) document |
 
 `time.Time` arguments are accepted on the way in and formatted as UTC
-timestamp literals. `ColumnTypeDatabaseTypeName` and `ColumnTypeScanType`
+timestamp literals. Beyond what database/sql's converter takes, `[]string`
+binds to `text[]` and `[16]byte` (and named 16-byte arrays, the usual uuid
+types) to `uuid`. `ColumnTypeDatabaseTypeName` and `ColumnTypeScanType`
 report both sides for the ORMs that ask.
 
 ## Scripts

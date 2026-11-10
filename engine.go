@@ -15,11 +15,14 @@ package bytdb
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"os"
 	"runtime"
 	"slices"
 	"strings"
@@ -807,6 +810,38 @@ func WithSyncNever() btypedb.Option {
 // embedders and bytdbd need not import btypedb.
 func WithEncryptionKey(key []byte) btypedb.Option {
 	return btypedb.WithEncryptionKey(key)
+}
+
+// DecodeEncryptionKey interprets raw key material for WithEncryptionKey:
+// exactly 32 bytes is used verbatim (a raw binary key file); otherwise
+// the trimmed text is decoded as hex (64 characters) or base64, and must
+// yield 32 bytes. bytdbd's -encryption-key-file and the database/sql
+// DSN's encryption_key_file accept the same forms.
+func DecodeEncryptionKey(raw []byte) ([]byte, error) {
+	if len(raw) == 32 {
+		return raw, nil
+	}
+	s := strings.TrimSpace(string(raw))
+	if len(s) == 64 {
+		if k, err := hex.DecodeString(s); err == nil && len(k) == 32 {
+			return k, nil
+		}
+	}
+	if k, err := base64.StdEncoding.DecodeString(s); err == nil && len(k) == 32 {
+		return k, nil
+	}
+	return nil, serr.New("encryption key must be 32 raw bytes, 64 hex characters, or base64 of 32 bytes")
+}
+
+// ReadEncryptionKeyFile reads and decodes a key file (DecodeEncryptionKey's
+// forms). A key in a file stays out of DSNs, command lines and the logs
+// that echo them.
+func ReadEncryptionKeyFile(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "read encryption key file", "path", path)
+	}
+	return DecodeEncryptionKey(b)
 }
 
 // WithConcurrentWrites lets write transactions run concurrently under

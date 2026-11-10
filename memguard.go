@@ -32,6 +32,7 @@ import (
 	"runtime"
 	"runtime/metrics"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -373,4 +374,39 @@ func txnTooLargeErr(limit int64) error {
 			"hundred thousand rows (for an UPDATE, one statement per key range: "+
 			"UPDATE ... WHERE id >= $1 AND id < $2; for a load, COMMIT between chunks); "+
 			"or raise the limit: Engine.SetMaxTxnWrites, bytdbd -max-txn-writes")
+}
+
+// ParseMemoryCeiling reads a memory-ceiling setting in the vocabulary
+// SetMemoryCeiling encodes: "auto" (or "") is 0, "off" is -1, and a
+// size is a positive byte count with GOMEMLIMIT's unit suffixes (B,
+// KiB, MiB, GiB, TiB — binary multiples), so one vocabulary serves
+// GOMEMLIMIT=7GiB, bytdbd's -memory-ceiling 6GiB and the database/sql
+// DSN's memory_ceiling=6GiB.
+func ParseMemoryCeiling(v string) (int64, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "auto":
+		return 0, nil
+	case "off":
+		return -1, nil
+	}
+	units := []struct {
+		suffix string
+		mult   int64
+	}{
+		// Longest suffixes first: "B" would otherwise match "GiB".
+		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1},
+	}
+	num, mult := v, int64(1)
+	for _, u := range units {
+		if strings.HasSuffix(v, u.suffix) {
+			num, mult = strings.TrimSuffix(v, u.suffix), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
+	if err != nil || n <= 0 || n > math.MaxInt64/mult {
+		return 0, serr.New("memory ceiling must be auto, off, or a positive size such as 6GiB",
+			"value", v)
+	}
+	return n * mult, nil
 }

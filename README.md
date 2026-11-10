@@ -718,12 +718,15 @@ if _, err := db.Exec(`insert into users values (1, 'ada')`); errors.Is(err, bytd
 **DSN.** A filesystem path, optionally followed by engine options —
 `app.bytdb`, `file:app.bytdb`, `/var/lib/app.bytdb?sync=never`. The
 options are `sync=never` (leave WAL fsyncs to the OS),
-`concurrent_writes=true` (OCC instead of the single-writer lock), and
-`encryption_key=<64 hex digits>`. An unrecognized option is an error
-rather than a silent no-op: a typo in a durability or encryption
-setting should not be something you discover from its consequences.
-bytdb has no in-memory mode, so a path is always a real file, created
-on first open.
+`concurrent_writes=true` (OCC instead of the single-writer lock),
+`encryption_key_file=<path>` (preferred) or `encryption_key=<64 hex
+digits>`, the engine limits `memory_ceiling`, `max_result_rows` and
+`max_txn_writes`, and compaction's `auto_compact`, `compact_min_bytes` and
+`compact_growth_pct` ([the full table](docs/stdlib.md#the-dsn)). An
+unrecognized option is an error rather than a silent no-op: a typo in a
+durability or encryption setting should not be something you discover
+from its consequences. A path is a real file, created on first open; the
+path `:memory:` is a private temporary database removed on Close.
 
 **One engine per file.** btypedb takes the database file for itself, so
 every `*sql.DB` on a path shares one engine and each pooled connection
@@ -748,8 +751,10 @@ one.
 **Types.** The date/time and UUID types ride on `int64` and `[]byte`
 runtime representations so they sort in the key encoding, so the driver
 decodes them back on the way out: a `timestamp` scans into a
-`time.Time`, a `date` and a `uuid` into their text forms, `text[]` and
-`jsonb` into their canonical literals. `ColumnTypeDatabaseTypeName` and
+`time.Time`, a `date` into a `time.Time` at midnight UTC (as pgx and
+lib/pq give it), a `uuid` into its text form, `text[]` and `jsonb` into
+their canonical literals. `[]string` and `[16]byte` arguments bind to
+`text[]` and `uuid`. `ColumnTypeDatabaseTypeName` and
 `ColumnTypeScanType` report both sides for the ORMs that ask.
 
 **Scripts.** `Exec` with several `;`-separated statements — a migration

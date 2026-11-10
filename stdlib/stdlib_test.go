@@ -47,9 +47,9 @@ func exec(t *testing.T, db *sql.DB, stmts ...string) {
 // is.
 func refs(t *testing.T, path string) int {
 	t.Helper()
-	abs, err := filepath.Abs(path)
+	abs, err := resolvePath(path) // the registry's key: absolute, symlinks resolved
 	if err != nil {
-		t.Fatalf("abs: %v", err)
+		t.Fatalf("resolve: %v", err)
 	}
 	enginesMu.Lock()
 	defer enginesMu.Unlock()
@@ -173,12 +173,12 @@ func TestValueConversion(t *testing.T) {
 			'\x0102', true, 1.5)`)
 
 	var (
-		at             time.Time
-		day, uid, tags string
-		meta           string
-		raw            []byte
-		ok             bool
-		ratio          float64
+		at, day   time.Time
+		uid, tags string
+		meta      string
+		raw       []byte
+		ok        bool
+		ratio     float64
 	)
 	err := db.QueryRow("SELECT at, day, uid, tags, meta, raw, ok, ratio FROM ev").
 		Scan(&at, &day, &uid, &tags, &meta, &raw, &ok, &ratio)
@@ -189,8 +189,10 @@ func TestValueConversion(t *testing.T) {
 	if want := time.Date(2024, 3, 5, 10, 30, 0, 0, time.UTC); !at.Equal(want) {
 		t.Errorf("at = %v, want %v", at, want)
 	}
-	if day != "1815-12-10" {
-		t.Errorf("day = %q — a date should not be a midnight instant", day)
+	// A date scans as midnight UTC of its day, as pgx and lib/pq give it
+	// (deep-look D-57; it was the text form before).
+	if want := time.Date(1815, 12, 10, 0, 0, 0, 0, time.UTC); !day.Equal(want) {
+		t.Errorf("day = %v, want %v", day, want)
 	}
 	if uid != "11111111-2222-3333-4444-555555555555" {
 		t.Errorf("uid = %q", uid)
@@ -227,7 +229,7 @@ func TestColumnTypes(t *testing.T) {
 	// the types that ride on another representation scan as what the driver
 	// decodes them into, not as what they are stored as
 	wantScan := []string{"int64", "time.Time", "string", "bool", "float64", "[]uint8",
-		"string", "string", "string", "string"}
+		"time.Time", "string", "string", "string"}
 	for i, ct := range types {
 		if ct.DatabaseTypeName() != wantName[i] {
 			t.Errorf("column %d type name = %q, want %q", i, ct.DatabaseTypeName(), wantName[i])
@@ -485,12 +487,12 @@ func TestTimeParameterIntoDate(t *testing.T) {
 		}
 	}
 	for i, w := range want {
-		var got string
+		var got time.Time
 		if err := db.QueryRow("SELECT day FROM ev WHERE id = $1", i).Scan(&got); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
-		if got != w {
-			t.Errorf("date from %v = %s, want %s", args[i], got, w)
+		if got.Format("2006-01-02") != w || got.Location() != time.UTC || got.Hour() != 0 {
+			t.Errorf("date from %v = %v, want %s at midnight UTC", args[i], got, w)
 		}
 	}
 }

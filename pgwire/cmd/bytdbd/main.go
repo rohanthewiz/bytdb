@@ -26,13 +26,10 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -342,20 +339,10 @@ func loadEncryptionKey(file, env string) ([]byte, error) {
 // decodeEncryptionKey interprets raw key material. Exactly 32 bytes is used
 // verbatim (a raw binary key file); otherwise the trimmed text is decoded as
 // hex (64 chars) or base64, and must yield 32 bytes.
+// The rule is the engine's (bytdb.DecodeEncryptionKey), so the server
+// and the database/sql DSN accept the same key files.
 func decodeEncryptionKey(raw []byte) ([]byte, error) {
-	if len(raw) == 32 {
-		return raw, nil
-	}
-	s := strings.TrimSpace(string(raw))
-	if len(s) == 64 {
-		if k, err := hex.DecodeString(s); err == nil && len(k) == 32 {
-			return k, nil
-		}
-	}
-	if k, err := base64.StdEncoding.DecodeString(s); err == nil && len(k) == 32 {
-		return k, nil
-	}
-	return nil, serr.New("encryption key must be 32 raw bytes, 64 hex characters, or base64 of 32 bytes")
+	return bytdb.DecodeEncryptionKey(raw)
 }
 
 // loadTLS builds the server TLS config from a cert/key pair; both
@@ -419,31 +406,14 @@ func loadAuthFile(path string) (*pgwire.Credentials, error) {
 // GOMEMLIMIT (B, KiB, MiB, GiB, TiB — binary multiples), so an operator
 // can write both settings in one vocabulary: GOMEMLIMIT=7GiB with
 // -memory-ceiling 6GiB.
+//
+// The parsing is the engine's (bytdb.ParseMemoryCeiling, shared with the
+// database/sql DSN's memory_ceiling); the flag keeps its own wording.
 func parseMemCeiling(v string) (int64, error) {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "", "auto":
-		return 0, nil
-	case "off":
-		return -1, nil
-	}
-	units := []struct {
-		suffix string
-		mult   int64
-	}{
-		// Longest suffixes first: "B" would otherwise match "GiB".
-		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1},
-	}
-	num, mult := v, int64(1)
-	for _, u := range units {
-		if strings.HasSuffix(v, u.suffix) {
-			num, mult = strings.TrimSuffix(v, u.suffix), u.mult
-			break
-		}
-	}
-	n, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
-	if err != nil || n <= 0 || n > math.MaxInt64/mult {
+	n, err := bytdb.ParseMemoryCeiling(v)
+	if err != nil {
 		return 0, serr.New("-memory-ceiling must be auto, off, or a positive size such as 6GiB",
 			"value", v)
 	}
-	return n * mult, nil
+	return n, nil
 }
