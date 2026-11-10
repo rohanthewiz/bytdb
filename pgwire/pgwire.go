@@ -65,12 +65,16 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/rohanthewiz/bytdb/sql"
+	"github.com/rohanthewiz/serr"
 )
 
 // DefaultIdleTxTimeout is the idle-in-transaction timeout applied when
@@ -126,8 +130,10 @@ type Server struct {
 
 	// RequireTLS refuses startup on connections that have not upgraded
 	// to TLS, the way a hostssl-only pg_hba.conf does. Meaningless
-	// without TLSConfig — every client would be refused. Set before
-	// Serve.
+	// without TLSConfig — every client would be refused. Connections on
+	// a Unix-domain socket are exempt, as Postgres's "local" lines are:
+	// they never leave the host, and clients do not offer TLS on them.
+	// Set before Serve.
 	RequireTLS bool
 
 	// Auth, when non-nil, requires clients to prove a password via
@@ -203,7 +209,7 @@ type Server struct {
 	wg           sync.WaitGroup
 
 	mu       sync.Mutex
-	ln       net.Listener
+	lns      []net.Listener // every listener Serve runs on (TCP, a Unix socket, ...)
 	conns    map[net.Conn]struct{}
 	backends map[int32]*conn // BackendKeyData PID → live connection, for CancelRequest
 	closed   bool
@@ -329,6 +335,52 @@ func (s *Server) ListenAndServe(addr string) error {
 	return s.Serve(ln)
 }
 
+// SocketPath is where a Postgres server with Unix sockets in dir listens
+// for port: dir/.s.PGSQL.<port>. Clients find it from the directory and
+// port alone — psql -h dir -p port, pgx host=dir port=port — so the
+// name is fixed by the protocol's conventions, not chosen here.
+func SocketPath(dir string, port int) string {
+	return filepath.Join(dir, ".s.PGSQL."+strconv.Itoa(port))
+}
+
+// ListenUnix opens the Unix-domain socket SocketPath(dir, port) for
+// Serve (deep-look D-42). On loopback a point read spends most of its
+// time in the TCP round trip — 24-27 µs over TCP against 11-13 µs over
+// a Unix socket — so local clients should use one.
+//
+// A socket file left by a process that died without closing it is
+// removed; one that still accepts connections belongs to a running
+// server, and ListenUnix fails rather than steal its address. Anything
+// at the path that is not a socket is left alone and reported. The
+// socket is world-connectable (mode 0777), as Postgres's default
+// unix_socket_permissions is: who may connect is decided by Server.Auth
+// and the directory's own permissions, exactly as for a loopback TCP
+// port. Closing the listener (Close, Shutdown) removes the file.
+func ListenUnix(dir string, port int) (net.Listener, error) {
+	path := SocketPath(dir, port)
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSocket == 0 {
+			return nil, serr.New("socket path exists and is not a socket", "path", path)
+		}
+		if c, err := net.DialTimeout("unix", path, time.Second); err == nil {
+			c.Close()
+			return nil, serr.New("another server is listening on the socket", "path", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, serr.Wrap(err, "op", "remove stale socket", "path", path)
+		}
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "listen", "path", path)
+	}
+	if err := os.Chmod(path, 0o777); err != nil {
+		ln.Close()
+		return nil, serr.Wrap(err, "op", "chmod socket", "path", path)
+	}
+	return ln, nil
+}
+
 // Serve accepts connections on ln until Close, one goroutine per
 // connection. After Close it returns nil. A temporary accept error (the
 // process out of file descriptors, a connection reset before accept) is
@@ -345,7 +397,10 @@ func (s *Server) Serve(ln net.Listener) error {
 		ln.Close()
 		return nil
 	}
-	s.ln = ln
+	// Serve may run on several listeners at once (TCP plus a Unix
+	// socket, say), each on its own goroutine; Close and Shutdown close
+	// them all.
+	s.lns = append(s.lns, ln)
 	s.mu.Unlock()
 	var backoff time.Duration
 	for {
@@ -433,8 +488,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.shuttingDown.Store(true)
 	s.mu.Lock()
 	s.closed = true
-	if s.ln != nil {
-		s.ln.Close()
+	for _, ln := range s.lns {
+		ln.Close()
 	}
 	conns := make([]net.Conn, 0, len(s.conns))
 	for nc := range s.conns {
@@ -495,10 +550,13 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
-	var err error
-	if s.ln != nil {
-		err = s.ln.Close()
+	var errs []error
+	for _, ln := range s.lns {
+		if err := ln.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	err := errors.Join(errs...)
 	for nc := range s.conns {
 		nc.Close()
 	}

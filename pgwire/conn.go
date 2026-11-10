@@ -511,7 +511,7 @@ func (c *conn) startup() error {
 				return serr.New("connection limit reached",
 					"max", fmt.Sprint(c.srv.MaxConns))
 			}
-			if c.srv.RequireTLS && !c.tlsOn {
+			if c.srv.RequireTLS && !c.tlsOn && !localSocket(c.nc) {
 				// What a hostssl-only pg_hba.conf answers, with its
 				// SQLSTATE (28000 invalid_authorization_specification).
 				c.send(msgErrorResponse, fatalBody(
@@ -935,6 +935,12 @@ func (c *conn) execute(r *rbuf) {
 		return
 	}
 	c.sendCommandComplete(pt.prep.info.Command, res)
+}
+
+// localSocket reports whether nc arrived on a Unix-domain socket.
+func localSocket(nc net.Conn) bool {
+	la := nc.LocalAddr()
+	return la != nil && la.Network() == "unix"
 }
 
 // statConnected records the startup identity for pg_stat_activity.

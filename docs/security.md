@@ -201,10 +201,11 @@ returns XX000 instead of killing the process.
 | Flag | Default | Meaning |
 |---|---|---|
 | `-db` | *(required)* | Database file, created if absent |
-| `-addr` | `127.0.0.1:5433` | Listen address |
+| `-addr` | `127.0.0.1:5433` | TCP listen address; empty disables TCP (then `-socket` is required) |
+| `-socket` | — | Also listen on a Unix-domain socket in this directory, named `.s.PGSQL.<port>` with `-addr`'s port (5433 without TCP), so `psql -h <dir>` and pgx `host=<dir>` find it. Mode 0777 like Postgres's default: who may connect is `-auth-file`'s and the directory's call. A stale socket file is replaced; a live one is an error. Exempt from `-require-tls`, as Postgres's `local` lines are |
 | `-auth-file` | *(trust)* | `user:password` or `user:SCRAM-SHA-256$...` per line; `#` comments |
 | `-tls-cert` / `-tls-key` | — | PEM pair; enables the `SSLRequest` upgrade |
-| `-require-tls` | false | Refuse non-TLS sessions |
+| `-require-tls` | false | Refuse non-TLS sessions (TCP only; see `-socket`) |
 | `-encryption-key-file` / `-encryption-key-env` | — | WAL encryption key (32 raw bytes, 64 hex, or base64) |
 | `-sync` | `always` | WAL fsync policy: `always` or `never` |
 | `-idle-tx-timeout` | `0` (= 5 min) | Negative disables |

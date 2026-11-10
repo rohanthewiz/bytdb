@@ -4,6 +4,12 @@
 //	bytdbd -db app.bytdb -addr 127.0.0.1:5433
 //	psql "postgres://any@127.0.0.1:5433/any?sslmode=disable"
 //
+// Local clients are faster over a Unix-domain socket (no TCP round
+// trip); -socket adds one, named the way psql and pgx look for it:
+//
+//	bytdbd -db app.bytdb -addr 127.0.0.1:5433 -socket /tmp
+//	psql -h /tmp -p 5433
+//
 // With TLS and SCRAM authentication:
 //
 //	bytdbd -db app.bytdb -tls-cert server.crt -tls-key server.key \
@@ -27,6 +33,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -44,7 +51,9 @@ import (
 
 func main() {
 	dbPath := flag.String("db", "", "database file (created if absent)")
-	addr := flag.String("addr", "127.0.0.1:5433", "listen address")
+	addr := flag.String("addr", "127.0.0.1:5433", "TCP listen address (empty = no TCP listener; then -socket is required)")
+	socketDir := flag.String("socket", "",
+		"also listen on a Unix-domain socket in this directory, named .s.PGSQL.<port> with the port of -addr (5433 when -addr is empty); psql -h <dir> connects to it")
 	idleTx := flag.Duration("idle-tx-timeout", 0,
 		"terminate connections idle in a transaction this long (0 = server default, negative = disabled)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate (PEM); with -tls-key, the server accepts SSL connections")
@@ -112,6 +121,13 @@ func main() {
 		engineOpts = append(engineOpts, bytdb.WithEncryptionKey(encKey))
 	}
 	ceiling, err := parseMemCeiling(*memCeiling)
+	if err != nil {
+		log.Fatalf("bytdbd: %s", serr.StringFromErr(err))
+	}
+	if *addr == "" && *socketDir == "" {
+		log.Fatal("bytdbd: -addr is empty and no -socket is set: nothing to listen on")
+	}
+	socketPort, err := portOf(*addr)
 	if err != nil {
 		log.Fatalf("bytdbd: %s", serr.StringFromErr(err))
 	}
@@ -202,12 +218,53 @@ func main() {
 		}
 	}()
 
+	// The Unix socket opens after the engine, like the TCP listener, so
+	// a failure here still unwinds through the deferred e.Close. Each
+	// listener serves on its own goroutine; Close and Shutdown stop all.
+	var unixLn net.Listener
+	if *socketDir != "" {
+		if unixLn, err = pgwire.ListenUnix(*socketDir, socketPort); err != nil {
+			fmt.Fprintf(os.Stderr, "bytdbd: %s\n", serr.StringFromErr(err))
+			return
+		}
+		fmt.Printf("bytdbd: serving %s on %s\n", *dbPath, pgwire.SocketPath(*socketDir, socketPort))
+	}
+	if *addr == "" {
+		if err := srv.Serve(unixLn); err != nil {
+			fmt.Fprintf(os.Stderr, "bytdbd: %v\n", err)
+		}
+		return
+	}
+	if unixLn != nil {
+		go func() {
+			if err := srv.Serve(unixLn); err != nil {
+				fmt.Fprintf(os.Stderr, "bytdbd: unix socket: %v\n", err)
+			}
+		}()
+	}
 	fmt.Printf("bytdbd: serving %s on %s (tls: %v, auth: %v)\n",
 		*dbPath, *addr, tlsConfig != nil, creds != nil)
 	if err := srv.ListenAndServe(*addr); err != nil {
 		// Not Fatalf: the engine still needs its deferred Close.
 		fmt.Fprintf(os.Stderr, "bytdbd: %v\n", err)
 	}
+}
+
+// portOf is the port a Unix socket is named after: -addr's, or 5433
+// (bytdbd's default) when there is no TCP listener.
+func portOf(addr string) (int, error) {
+	if addr == "" {
+		return 5433, nil
+	}
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, serr.Wrap(err, "flag", "-addr")
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 0 || n > 65535 {
+		return 0, serr.New("-addr needs a numeric port to name the Unix socket", "addr", addr)
+	}
+	return n, nil
 }
 
 // loadEncryptionKey sources the 32-byte WAL encryption key from a file or an

@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -22,8 +23,14 @@ import (
 const wireBenchRows = 100_000
 
 // wireBenchServer serves a fresh database holding wireBenchRows rows of
-// five columns and returns a pgx connection to it.
+// five columns and returns a pgx connection to it over TCP loopback.
 func wireBenchServer(b *testing.B) *pgx.Conn {
+	return wireBenchServerOn(b, false)
+}
+
+// wireBenchServerOn is wireBenchServer over a Unix-domain socket when
+// unix is set (deep-look D-42).
+func wireBenchServerOn(b *testing.B, unix bool) *pgx.Conn {
 	b.Helper()
 	e, err := bytdb.Open(filepath.Join(b.TempDir(), "w.db"), bytdb.WithSyncNever())
 	if err != nil {
@@ -46,9 +53,23 @@ func wireBenchServer(b *testing.B) *pgx.Conn {
 	}); err != nil {
 		b.Fatal(err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatal(err)
+	var ln net.Listener
+	var conninfo string
+	if unix {
+		dir, err := os.MkdirTemp("", "bsk") // short: sun_path is 104 bytes on macOS
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { os.RemoveAll(dir) })
+		if ln, err = pgwire.ListenUnix(dir, 5433); err != nil {
+			b.Fatal(err)
+		}
+		conninfo = fmt.Sprintf("host=%s port=5433 user=bench dbname=bench", dir)
+	} else {
+		if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			b.Fatal(err)
+		}
+		conninfo = fmt.Sprintf("postgres://bench@%s/bench", ln.Addr())
 	}
 	srv := pgwire.NewServer(bsql.New(e))
 	go srv.Serve(ln)
@@ -56,7 +77,7 @@ func wireBenchServer(b *testing.B) *pgx.Conn {
 		srv.Close()
 		e.Close()
 	})
-	c, err := pgx.Connect(context.Background(), fmt.Sprintf("postgres://bench@%s/bench", ln.Addr()))
+	c, err := pgx.Connect(context.Background(), conninfo)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -95,8 +116,12 @@ func BenchmarkDLWireScan100kBinary(b *testing.B) {
 	benchScan(b, pgx.QueryExecModeCacheStatement)
 }
 
-func BenchmarkDLWirePointRead(b *testing.B) {
-	c := wireBenchServer(b)
+func BenchmarkDLWirePointRead(b *testing.B) { benchPointRead(b, false) }
+
+func BenchmarkDLWirePointReadUnix(b *testing.B) { benchPointRead(b, true) }
+
+func benchPointRead(b *testing.B, unix bool) {
+	c := wireBenchServerOn(b, unix)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -820,6 +820,12 @@ replication cursor — see [Replication & Backup](replication.md).
 go run github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@latest -db app.db -addr 127.0.0.1:5433
 ```
 
+Clients on the same host should add `-socket <dir>` and connect through the
+Unix-domain socket (`psql -h <dir> -p 5433`, pgx `host=<dir>`): a point read
+takes about half as long as over TCP loopback (12 µs against 24 µs on an
+Apple M3), since the loopback round trip is most of it. `pgwire.ListenUnix`
+does the same for an embedded server.
+
 Tested against real clients, not just protocol specs:
 
 - **pgx v5** end-to-end, including its statement cache and simple-protocol mode
