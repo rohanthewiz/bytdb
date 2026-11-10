@@ -39,21 +39,127 @@ var tsLayouts = []string{
 	"2006-01-02T15:04:05.999999999Z0700",
 	"2006-01-02T15:04:05.999999999-07",
 	"2006-01-02T15:04:05.999999999",
+	// Without seconds, as Postgres also accepts ('2024-02-29 12:00').
+	"2006-01-02 15:04Z07:00",
+	"2006-01-02 15:04-07",
+	"2006-01-02 15:04",
+	"2006-01-02T15:04Z07:00",
+	"2006-01-02T15:04",
 	"2006-01-02",
+	// Unpadded month and day ('2024-2-9'), and the compact ISO date.
+	"2006-1-2 15:04:05.999999999",
+	"2006-1-2",
+	"20060102",
+}
+
+// Timestamp sentinels for Postgres's special values. 'infinity' and
+// '-infinity' are the extreme instants, so they order after and before
+// every finite timestamp exactly as Postgres orders them, and render
+// back as the words; the wire's binary format uses the same two int64
+// values for them.
+const (
+	TimestampInfinity    = math.MaxInt64
+	TimestampNegInfinity = math.MinInt64
+)
+
+// specialTime reads Postgres's special date/time input words, relative
+// to now. ok is false for anything else.
+func specialTime(s string, now time.Time) (micros int64, ok bool) {
+	day := func(offset int) int64 {
+		u := now.UTC()
+		return time.Date(u.Year(), u.Month(), u.Day()+offset, 0, 0, 0, 0, time.UTC).UnixMicro()
+	}
+	switch strings.ToLower(s) {
+	case "epoch":
+		return 0, true
+	case "infinity", "+infinity":
+		return TimestampInfinity, true
+	case "-infinity":
+		return TimestampNegInfinity, true
+	case "now":
+		return now.UnixMicro(), true
+	case "today":
+		return day(0), true
+	case "tomorrow":
+		return day(1), true
+	case "yesterday":
+		return day(-1), true
+	}
+	return 0, false
+}
+
+// splitZoneName splits a trailing zone name off a timestamp: ' UTC',
+// ' GMT', ' Z', or an IANA name (' America/New_York'). loc is nil when
+// there is none, or the trailing word is not a zone.
+func splitZoneName(s string) (rest string, loc *time.Location) {
+	i := strings.LastIndexByte(s, ' ')
+	if i < 0 {
+		return s, nil
+	}
+	name := s[i+1:]
+	switch strings.ToUpper(name) {
+	case "UTC", "GMT", "Z", "ZULU":
+		return strings.TrimSpace(s[:i]), time.UTC
+	}
+	if strings.Contains(name, "/") {
+		if l, err := time.LoadLocation(name); err == nil {
+			return strings.TrimSpace(s[:i]), l
+		}
+	}
+	return s, nil
 }
 
 // ParseTimestamp reads Postgres-style timestamp text ('2024-01-02
 // 03:04:05.123456+00', T-separated ISO 8601, or a bare date) to
 // microseconds since the Unix epoch. Text without a zone is read as
 // UTC — bytdb stores instants, not local wall clocks.
+//
+// Beyond those (deep-look D-55): the time without seconds, unpadded
+// dates, a trailing zone name (UTC, GMT, Z, or an IANA name such as
+// America/New_York, which places a zone-less time in that zone), and the
+// special words epoch, infinity, -infinity, now, today, tomorrow and
+// yesterday.
 func ParseTimestamp(s string) (int64, error) {
 	s = strings.TrimSpace(s)
+	if v, ok := specialTime(s, time.Now()); ok {
+		return v, nil
+	}
+	in := time.UTC
+	if rest, loc := splitZoneName(s); loc != nil {
+		s, in = rest, loc
+	}
 	for _, layout := range tsLayouts {
-		if t, err := time.Parse(layout, s); err == nil {
+		if t, err := time.ParseInLocation(layout, s, in); err == nil {
 			return t.UnixMicro(), nil
 		}
 	}
 	return 0, serr.New("invalid input syntax for type timestamp", "value", s)
+}
+
+// ParseBool reads Postgres's boolean input forms, case-insensitively and
+// ignoring surrounding space: true/false, yes/no, on/off, 1/0, and any
+// unique prefix of true, false, yes or no ('t', 'fa', 'y'), which is
+// what Postgres's boolin accepts. strconv.ParseBool, used before,
+// refused yes/no/on/off (deep-look D-55).
+func ParseBool(s string) (bool, error) {
+	t := strings.ToLower(strings.TrimSpace(s))
+	switch t {
+	case "1", "on":
+		return true, nil
+	case "0", "off":
+		return false, nil
+	}
+	if t != "" {
+		for _, w := range []struct {
+			word string
+			val  bool
+		}{{"true", true}, {"false", false}, {"yes", true}, {"no", false}} {
+			if strings.HasPrefix(w.word, t) {
+				return w.val, nil
+			}
+		}
+	}
+	return false, serr.New("invalid input syntax for type boolean", "value", s)
 }
 
 // FormatFloat renders a float64 the way Postgres's float8 output does
@@ -115,6 +221,12 @@ func FormatTimestamp(micros int64) string {
 
 // AppendTimestamp appends FormatTimestamp's rendering to dst.
 func AppendTimestamp(dst []byte, micros int64) []byte {
+	switch micros {
+	case TimestampInfinity:
+		return append(dst, "infinity"...)
+	case TimestampNegInfinity:
+		return append(dst, "-infinity"...)
+	}
 	dst = time.UnixMicro(micros).UTC().AppendFormat(dst, "2006-01-02 15:04:05")
 	if frac := ((micros % 1e6) + 1e6) % 1e6; frac != 0 {
 		// ".%06d" with its trailing zeros trimmed: .5 for 500000µs.
@@ -143,6 +255,15 @@ func AppendTimestamp(dst []byte, micros int64) []byte {
 // lands on the UTC day, the same day the Go API truncates a time.Time to.
 func ParseDate(s string) (int64, error) {
 	s = strings.TrimSpace(s)
+	if v, ok := specialTime(s, time.Now()); ok {
+		switch v {
+		case TimestampInfinity:
+			return DateInfinity, nil
+		case TimestampNegInfinity:
+			return DateNegInfinity, nil
+		}
+		return floorDiv(v, 86400e6), nil
+	}
 	// The bare date first: by far the common input, and otherwise it
 	// would be tried last, after every timestamp layout had failed.
 	t, err := time.Parse("2006-01-02", s)
@@ -166,6 +287,22 @@ func ParseDate(s string) (int64, error) {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400, nil
 }
 
+// Date sentinels for 'infinity' and '-infinity', as for timestamps;
+// the wire's binary date format uses int32's extremes for them.
+const (
+	DateInfinity    = math.MaxInt32
+	DateNegInfinity = math.MinInt32
+)
+
+// floorDiv is integer division rounding toward negative infinity.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
+}
+
 // FormatDate renders days-since-epoch as 'YYYY-MM-DD'.
 func FormatDate(days int64) string {
 	return string(AppendDate(nil, days))
@@ -173,6 +310,12 @@ func FormatDate(days int64) string {
 
 // AppendDate appends FormatDate's rendering to dst.
 func AppendDate(dst []byte, days int64) []byte {
+	switch days {
+	case DateInfinity:
+		return append(dst, "infinity"...)
+	case DateNegInfinity:
+		return append(dst, "-infinity"...)
+	}
 	return time.Unix(days*86400, 0).UTC().AppendFormat(dst, "2006-01-02")
 }
 
@@ -180,6 +323,10 @@ func AppendDate(dst []byte, days int64) []byte {
 // the undashed 32-hex form is also accepted) to its 16 bytes.
 func ParseUUID(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
+	// Postgres also accepts the braced form, '{a0eebc99-...}'.
+	if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
+		s = s[1 : len(s)-1]
+	}
 	bad := func() ([]byte, error) {
 		return nil, serr.New("invalid input syntax for type uuid", "value", s)
 	}

@@ -56,7 +56,7 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 		}
 		return f, nil
 	case bytdb.TBool:
-		b, err := strconv.ParseBool(strings.TrimSpace(strings.ToLower(s)))
+		b, err := bytdb.ParseBool(s)
 		if err != nil {
 			return nil, serr.New("invalid input syntax for type bool", "value", s)
 		}

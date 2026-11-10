@@ -152,14 +152,14 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 			if format == fmtText {
 				return bytdb.AppendTimestamp(dst, x), nil
 			}
-			return binary.BigEndian.AppendUint64(dst, uint64(x-pgEpochMicros)), nil
+			return binary.BigEndian.AppendUint64(dst, uint64(timestampToWire(x))), nil
 		}
 	case bytdb.TDate:
 		if x, ok := v.(int64); ok {
 			if format == fmtText {
 				return bytdb.AppendDate(dst, x), nil
 			}
-			return binary.BigEndian.AppendUint32(dst, uint32(int32(x-pgEpochDays))), nil
+			return binary.BigEndian.AppendUint32(dst, uint32(dateToWire(x))), nil
 		}
 	case bytdb.TUUID:
 		if x, ok := v.([]byte); ok && len(x) == 16 {
@@ -193,6 +193,42 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 		}
 	}
 	return appendByKind(dst, v, format)
+}
+
+// The binary timestamp and date formats count from 2000-01-01, and
+// reserve their type's extremes for infinity and -infinity — the same
+// extremes bytdb stores for them (bytdb.TimestampInfinity and friends),
+// which the epoch shift would otherwise overflow or move (deep-look
+// D-55).
+func timestampToWire(x int64) int64 {
+	if x == bytdb.TimestampInfinity || x == bytdb.TimestampNegInfinity {
+		return x
+	}
+	return x - pgEpochMicros
+}
+
+func timestampFromWire(x int64) int64 {
+	if x == math.MaxInt64 || x == math.MinInt64 {
+		return x
+	}
+	return x + pgEpochMicros
+}
+
+func dateToWire(x int64) int32 {
+	switch x {
+	case bytdb.DateInfinity:
+		return math.MaxInt32
+	case bytdb.DateNegInfinity:
+		return math.MinInt32
+	}
+	return int32(x - pgEpochDays)
+}
+
+func dateFromWire(x int32) int64 {
+	if x == math.MaxInt32 || x == math.MinInt32 {
+		return int64(x)
+	}
+	return int64(x) + pgEpochDays
 }
 
 // kindFits reports whether v's Go kind is the runtime representation of
@@ -273,7 +309,7 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 		s := string(raw)
 		switch oid {
 		case oidBool:
-			v, err := strconv.ParseBool(s)
+			v, err := bytdb.ParseBool(s)
 			if err != nil {
 				return nil, serr.New("bad boolean parameter", "value", s)
 			}
@@ -355,12 +391,12 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 		if len(raw) != 8 {
 			return nil, serr.New("bad binary timestamp parameter")
 		}
-		return int64(binary.BigEndian.Uint64(raw)) + pgEpochMicros, nil
+		return timestampFromWire(int64(binary.BigEndian.Uint64(raw))), nil
 	case oidDate:
 		if len(raw) != 4 {
 			return nil, serr.New("bad binary date parameter")
 		}
-		return int64(int32(binary.BigEndian.Uint32(raw))) + pgEpochDays, nil
+		return dateFromWire(int32(binary.BigEndian.Uint32(raw))), nil
 	case oidUUID:
 		if len(raw) != 16 {
 			return nil, serr.New("bad binary uuid parameter")

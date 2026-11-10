@@ -13,11 +13,11 @@ Ten storage types, with the Postgres aliases you'd expect
 | `INT`, `INTEGER`, `BIGINT`, `INT2/4/8`, `SMALLINT` | `int64` | |
 | `FLOAT`, `FLOAT4/8`, `REAL`, `DOUBLE PRECISION` | `float64` | `numeric` casts land here — there is no decimal type |
 | `TEXT`, `STRING`, `VARCHAR(n)` | `string` | the `(n)` limit is **enforced** on every write, Postgres wording, SQLSTATE 22001 |
-| `BOOL`, `BOOLEAN` | `bool` | an integer `0`/`1` is also accepted (SQLite booleans, `database/sql`'s `driver.Bool` rule); any other integer is refused. Unlike Postgres, this includes a literal `VALUES (1)` |
+| `BOOL`, `BOOLEAN` | `bool` | text input as Postgres reads it: `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`, and unique prefixes (`t`, `fa`, `y`); an integer `0`/`1` is also accepted (SQLite booleans, `database/sql`'s `driver.Bool` rule); any other integer is refused. Unlike Postgres, this includes a literal `VALUES (1)` |
 | `BYTEA`, `BYTES` | `[]byte` | |
-| `TIMESTAMP`, `TIMESTAMPTZ` | `int64` µs since epoch, UTC | one type: the `WITH/WITHOUT TIME ZONE` distinction parses and folds away; presents as `timestamptz` on the wire |
-| `DATE` | `int64` days since epoch | timestamp text is accepted as in Postgres: the date as written, time and zone dropped (`'2024-01-02 23:30:00-05'` is 2024-01-02); so a `time.Time` binds to a date column as its UTC day |
-| `UUID` | 16 bytes | dashed or 32-hex input; lowercase dashed output; `gen_random_uuid()` |
+| `TIMESTAMP`, `TIMESTAMPTZ` | `int64` µs since epoch, UTC | one type: the `WITH/WITHOUT TIME ZONE` distinction parses and folds away; presents as `timestamptz` on the wire. Text input: ISO 8601 with or without seconds, fraction or offset, a trailing `UTC`/`Z` or IANA zone name (`'2024-02-29 12:00 America/New_York'`), and `epoch`, `now`, `today`, `tomorrow`, `yesterday`, `infinity`, `-infinity` (stored as the extreme instants, so they sort last and first) |
+| `DATE` | `int64` days since epoch | timestamp text is accepted as in Postgres: the date as written, time and zone dropped (`'2024-01-02 23:30:00-05'` is 2024-01-02); so a `time.Time` binds to a date column as its UTC day. Also `'2024-2-9'`, `'20240229'` and the special words above |
+| `UUID` | 16 bytes | dashed, braced (`{…}`) or 32-hex input; lowercase dashed output; `gen_random_uuid()` |
 | `JSONB` (`JSON` is an alias) | canonical document text | compact, keys sorted — one spelling per document, so `=` is document equality |
 | `TEXT[]` (`VARCHAR[]`) | canonical Postgres array-literal text | one-dimensional; OID 1009 in both wire formats |
 

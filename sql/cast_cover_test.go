@@ -58,7 +58,7 @@ func TestCastValErrors(t *testing.T) {
 		{`select 'missing'::regclass`, "relation does not exist"},
 		// reg* types other than regclass do not resolve names.
 		{`select 'pg_type'::regtype`, "unsupported cast"},
-		{`select 'yes'::bool`, "invalid input syntax for type bool"},
+		{`select 'maybe'::bool`, "invalid input syntax for type bool"},
 		{`select 'abc'::float8`, "invalid input syntax for type float"},
 		{`select '{1}'::int[]`, "array casts are not supported"},
 		{`select 1::json`, "unsupported cast"},
