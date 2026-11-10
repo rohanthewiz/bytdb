@@ -64,7 +64,7 @@ func main() {
 	syncMode := flag.String("sync", "always",
 		"WAL fsync policy: always (durable through power loss) or never (faster; the OS decides when to flush)")
 	maxConns := flag.Int("max-conns", 0,
-		"maximum concurrent client connections (0 = unlimited); excess clients get FATAL 53300")
+		"maximum concurrent client connections (0 = the default, 100; negative = unlimited); excess clients get FATAL 53300")
 	logQueries := flag.Bool("log-queries", false,
 		"log every executed statement with its duration and outcome to stderr")
 	encKeyFile := flag.String("encryption-key-file", "",
@@ -88,6 +88,20 @@ func main() {
 	memCeiling := flag.String("memory-ceiling", "auto",
 		"refuse inserts, updates and large results with 53200 once the live heap passes this: "+
 			"auto (90% of GOMEMLIMIT; inactive without it), off, or a size like 6GiB")
+	// Server I/O bounds and engine modes that previously needed a Go
+	// program to set (deep-look D-58). Zero keeps each library default.
+	writeTimeout := flag.Duration("write-timeout", 0,
+		"max time blocked writing one statement's output to a client that stopped reading (0 = default 60s, negative = off)")
+	readTimeout := flag.Duration("read-timeout", 0,
+		"max time to read one message body once it has started arriving (0 = default 60s, negative = off)")
+	idleTimeout := flag.Duration("idle-timeout", 0,
+		"close a session idle between statements this long, FATAL 57P05 (0 = never)")
+	concurrent := flag.Bool("concurrent-writes", false,
+		"optimistic concurrent write transactions (snapshot isolation, 40001 on conflict) instead of one writer at a time")
+	compactMin := flag.Int64("compact-min-bytes", 0,
+		"auto-compaction: minimum log size before it runs (0 = default 32 MB; negative disables auto-compaction)")
+	compactGrowth := flag.Int("compact-growth-pct", 0,
+		"auto-compaction: growth since the last compaction that triggers it, in percent (0 = default 100)")
 	flag.Parse()
 	if *dbPath == "" {
 		log.Fatal("bytdbd: -db is required")
@@ -115,6 +129,25 @@ func main() {
 		engineOpts = append(engineOpts, bytdb.WithSyncNever())
 	default:
 		log.Fatalf("bytdbd: -sync must be always or never (got %q)", *syncMode)
+	}
+	if *concurrent {
+		engineOpts = append(engineOpts, bytdb.WithConcurrentWrites())
+	}
+	switch {
+	case *compactMin < 0:
+		engineOpts = append(engineOpts, btypedb.WithAutoCompactDisabled())
+	case *compactMin > 0 || *compactGrowth > 0:
+		minSize, growth := *compactMin, *compactGrowth
+		if minSize == 0 {
+			minSize = 32 << 20
+		}
+		if growth == 0 {
+			growth = 100
+		}
+		if growth < 0 {
+			log.Fatal("bytdbd: -compact-growth-pct must not be negative")
+		}
+		engineOpts = append(engineOpts, btypedb.WithAutoCompact(minSize, growth))
 	}
 	// The key is sourced from a file or env var, never argv — a key on the
 	// command line would leak through ps and shell history.
@@ -150,6 +183,9 @@ func main() {
 
 	srv := pgwire.NewServer(sql.New(e))
 	srv.IdleTxTimeout = *idleTx
+	srv.WriteTimeout = *writeTimeout
+	srv.ReadTimeout = *readTimeout
+	srv.IdleTimeout = *idleTimeout
 	srv.TLSConfig = tlsConfig
 	srv.RequireTLS = *requireTLS
 	srv.Auth = creds

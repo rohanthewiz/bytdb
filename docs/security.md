@@ -209,6 +209,10 @@ returns XX000 instead of killing the process.
 | `-encryption-key-file` / `-encryption-key-env` | — | WAL encryption key (32 raw bytes, 64 hex, or base64) |
 | `-sync` | `always` | WAL fsync policy: `always` or `never` |
 | `-idle-tx-timeout` | `0` (= 5 min) | Negative disables |
+| `-idle-timeout` | `0` (off) | Close a session idle *between* statements this long (FATAL 57P05); a slowloris backstop for untrusted clients |
+| `-write-timeout` / `-read-timeout` | `0` (= 60 s) | Max time blocked writing one statement's output to a client that stopped reading / reading one message body once started; negative disables |
+| `-concurrent-writes` | false | Optimistic concurrent write transactions (snapshot isolation, 40001 on conflict) — see [Concurrency](concurrency.md) |
+| `-compact-min-bytes` / `-compact-growth-pct` | `0` (= 32 MB / 100%) | Auto-compaction thresholds; a negative `-compact-min-bytes` disables auto-compaction |
 | `-max-conns` | `0` (= 100) | Connection cap |
 | `-max-result-rows` | `1000000` | Rows one query may hold in memory; `0` disables (54000 when exceeded). A tenth of the embedded engine's 10M default: the server materializes each client's whole result before sending it, so this bounds memory per connection |
 | `-max-txn-writes` | `10000000` | Row inserts and updates one transaction may stage; `0` disables (54000 when exceeded) |

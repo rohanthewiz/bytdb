@@ -1,11 +1,11 @@
 package bytdb
 
 // Regression: WriteTxn's doc promises the transaction is "rolled back on
-// error or panic." The underlying btypedb Update rolls back on an error
-// return but has no recover, so a panic in the closure used to unwind
-// with the single-writer lock still held — wedging every future write
-// process-wide (reads keep working, which hides it). WriteTxn now
-// recovers, rolls back to release the lock, and re-panics.
+// error or panic." btypedb's Update had no recover before v0.6.1, so a
+// panic in the closure used to unwind with the single-writer lock still
+// held — wedging every future write process-wide (reads keep working,
+// which hides it). WriteTxn recovers, rolls back to release the lock,
+// and re-panics, whatever the btypedb version.
 
 import (
 	"path/filepath"

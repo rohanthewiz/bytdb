@@ -200,13 +200,14 @@ func (e *Engine) writeTxn(ctx context.Context, serializable bool, fn func(tx *Tx
 		if !e.occ {
 			e.writerGID.Store(curGID())
 		}
-		// btypedb's Update rolls back on an error RETURN but not on a
-		// panic — it has no recover — so a panic in fn would unwind past
-		// it with the writer lock still held, wedging every future write
-		// process-wide (reads still work, masking it). Roll back here to
-		// release the lock, then re-panic so the original failure and its
-		// stack are preserved for the caller. This is what makes the doc's
-		// "rolled back on error or panic" guarantee true for WriteTxn.
+		// A panic in fn must not unwind with the writer lock held, which
+		// would wedge every future write process-wide (reads still work,
+		// masking it). btypedb's Update recovers, rolls back and re-panics
+		// since v0.6.1; this guard predates that and is kept so WriteTxn's
+		// "rolled back on error or panic" guarantee does not depend on
+		// the dependency's version. Rollback is idempotent, so the two
+		// compose: the first to run releases the lock, and the original
+		// panic and its stack reach the caller.
 		defer func() {
 			if r := recover(); r != nil {
 				tx.Rollback()
@@ -236,11 +237,12 @@ func (e *Engine) writeTxn(ctx context.Context, serializable bool, fn func(tx *Tx
 }
 
 // guardPanic wraps a kv transaction closure with the recover→rollback→
-// re-panic pattern writeTxn documents: btypedb's Update/UpdateExclusive
-// have no recover of their own, so an escaping panic would hold the
-// writer lock forever. Used by updateDDL, whose closures can run
-// caller-supplied callbacks (AddCheck's validate, AlterSequence's
-// mutate) that this package cannot vouch for.
+// re-panic pattern writeTxn documents. btypedb's Update and
+// UpdateExclusive recover on their own since v0.6.1; the guard keeps
+// the lock-release guarantee local all the same (see writeTxn). Used by
+// updateDDL, whose closures can run caller-supplied callbacks
+// (AddCheck's validate, AlterSequence's mutate) that this package
+// cannot vouch for.
 func guardPanic(fn func(tx *btypedb.Tx[string, []byte]) error) func(tx *btypedb.Tx[string, []byte]) error {
 	return func(tx *btypedb.Tx[string, []byte]) error {
 		defer func() {
