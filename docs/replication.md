@@ -67,6 +67,35 @@ plus two fields that show how exposed the latest writes are:
   size minus watermark). It jumps to the whole log size at a roll and falls as
   chunks upload.
 
+## From bytdbd
+
+The daemon replicates and restores without a Go program:
+
+```sh
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+bytdbd -db site.db \
+    -restore-from s3://db-replicas/sites/stjohns \
+    -replicate-s3 s3://db-replicas/sites/stjohns \
+    -s3-endpoint https://us-east-1.linodeobjects.com -s3-region us-east-1 \
+    -metrics-addr 127.0.0.1:9090
+```
+
+`-restore-from` runs before the database opens and only when `-db` does not
+exist yet, so the same command line restores a lost machine and starts an
+existing one unchanged. `-replicate-s3` starts the replicator after the
+engine opens and closes it before the engine does, so the final ship on
+SIGTERM sees every committed write. Credentials come only from the
+environment (`AWS_SESSION_TOKEN` too, for temporary ones), never from
+flags, where `ps` would show them.
+
+With `-metrics-addr`, `/metrics` adds `bytdb_replication_lag_bytes`,
+`_watermark_bytes`, `_sealed`, `_last_ship_timestamp_seconds` and
+`_failing`, and `/healthz` answers 200 `{"status":"ok"}` while the engine
+reads and replication keeps up, or 503 with a reason once ships have failed
+for more than three intervals (one failed tick is ordinary: the loop
+retries). Both carry the generation, `Sealed`, `LagBytes`, the last ship time
+and the last error.
+
 ## What gets shipped
 
 **Raw byte ranges of the single log file** — not logical records, not WAL

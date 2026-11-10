@@ -219,6 +219,11 @@ returns XX000 instead of killing the process.
 | `-memory-ceiling` | `auto` | Refuse inserts, updates and large results past this live heap: `auto` (90% of `GOMEMLIMIT`), `off`, or a size like `6GiB` (53200 when exceeded) |
 | `-log-queries` | false | Log SQL, duration, and outcome per statement |
 | `-shutdown-grace` | `10s` | On SIGTERM/SIGINT: idle sessions end at once (FATAL 57P01); running statements get this long to finish and reply before they are canceled. A second signal stops at once |
+| `-metrics-addr` | — | Serve Prometheus `/metrics` (engine, connections, replication) and `/healthz` here; unauthenticated, so bind it privately |
+| `-replicate-s3` | — | Ship the log to `s3://bucket/prefix` while serving ([Replication](replication.md#from-bytdbd)); credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` |
+| `-restore-from` | — | At startup, if `-db` does not exist, restore it from `s3://bucket/prefix` first; an existing file is never replaced |
+| `-replicate-interval` | `5s` | How often the log ships: the replica's data-loss window |
+| `-s3-endpoint` / `-s3-region` / `-s3-virtual-host` | AWS regional endpoint / `$AWS_REGION` or `us-east-1` / false | Where the bucket lives, for S3-compatible stores (MinIO, Linode, R2, ...) |
 
 Configuration is validated before the database opens, so a bad flag can never
 strand a half-open engine.

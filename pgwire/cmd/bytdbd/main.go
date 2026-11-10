@@ -42,6 +42,7 @@ import (
 	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/pgwire"
+	"github.com/rohanthewiz/bytdb/replicate"
 	"github.com/rohanthewiz/bytdb/sql"
 	"github.com/rohanthewiz/serr"
 )
@@ -69,7 +70,7 @@ func main() {
 	encKeyEnv := flag.String("encryption-key-env", "",
 		"encrypt the WAL at rest with the AES-256 key in this environment variable (hex or base64 of 32 bytes)")
 	metricsAddr := flag.String("metrics-addr", "",
-		"serve Prometheus metrics (engine size, heap, GC, connections) at http://<addr>/metrics (empty = disabled)")
+		"serve Prometheus metrics (engine size, heap, GC, connections, replication) at http://<addr>/metrics and health at /healthz (empty = disabled)")
 	// The server's default is a tenth of the embedded engine's: every
 	// client's result is materialized in full before its first row is
 	// sent (deep-look D-50), so the cap bounds memory per connection,
@@ -99,6 +100,19 @@ func main() {
 		"auto-compaction: minimum log size before it runs (0 = default 32 MB; negative disables auto-compaction)")
 	compactGrowth := flag.Int("compact-growth-pct", 0,
 		"auto-compaction: growth since the last compaction that triggers it, in percent (0 = default 100)")
+	// Replication (deep-look D-58; see replication.go). Credentials come
+	// from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN.
+	replicateTo := flag.String("replicate-s3", "",
+		"ship the log to s3://bucket/prefix while serving (credentials from AWS_* env vars)")
+	restoreFrom := flag.String("restore-from", "",
+		"at startup, if -db does not exist, restore it from s3://bucket/prefix first")
+	replicateInterval := flag.Duration("replicate-interval", 5*time.Second,
+		"how often the log ships: the replica's data-loss window")
+	s3Endpoint := flag.String("s3-endpoint", "",
+		"S3-compatible endpoint URL (default https://s3.<region>.amazonaws.com)")
+	s3Region := flag.String("s3-region", "", "S3 region (default $AWS_REGION, else us-east-1)")
+	s3VirtualHost := flag.Bool("s3-virtual-host", false,
+		"virtual-hosted-style addressing (bucket.endpoint) instead of path-style")
 	flag.Parse()
 	if *dbPath == "" {
 		log.Fatal("bytdbd: -db is required")
@@ -166,6 +180,42 @@ func main() {
 	if err != nil {
 		log.Fatalf("bytdbd: %s", serr.StringFromErr(err))
 	}
+	s3cfg := s3Settings{endpoint: *s3Endpoint, region: *s3Region, virtualHost: *s3VirtualHost}
+	var replStore replicate.Storage
+	var replLoc s3Location
+	if *replicateTo != "" {
+		if replLoc, err = parseS3URL(*replicateTo); err != nil {
+			log.Fatalf("bytdbd: -replicate-s3: %s", serr.StringFromErr(err))
+		}
+		client, err := s3cfg.client(replLoc)
+		if err != nil {
+			log.Fatalf("bytdbd: -replicate-s3: %s", serr.StringFromErr(err))
+		}
+		replStore = client
+	}
+	// Restore runs before the engine opens (it writes the file Open will
+	// read) and only when the file is missing: an existing database is
+	// never replaced from the replica.
+	if *restoreFrom != "" {
+		loc, err := parseS3URL(*restoreFrom)
+		if err != nil {
+			log.Fatalf("bytdbd: -restore-from: %s", serr.StringFromErr(err))
+		}
+		client, err := s3cfg.client(loc)
+		if err != nil {
+			log.Fatalf("bytdbd: -restore-from: %s", serr.StringFromErr(err))
+		}
+		ran, info, err := restoreIfMissing(context.Background(), client, loc.prefix, *dbPath)
+		switch {
+		case err != nil:
+			log.Fatalf("bytdbd: restore from %s: %s", *restoreFrom, serr.StringFromErr(err))
+		case ran:
+			fmt.Printf("bytdbd: restored %s from %s (generation %s, %d bytes, %d objects)\n",
+				*dbPath, *restoreFrom, info.Generation, info.Bytes, info.Chunks)
+		default:
+			fmt.Printf("bytdbd: %s exists; not restoring from %s\n", *dbPath, *restoreFrom)
+		}
+	}
 
 	e, err := bytdb.Open(*dbPath, engineOpts...)
 	if err != nil {
@@ -177,6 +227,17 @@ func main() {
 	e.SetMaxResultRows(*maxResultRows)
 	e.SetMaxTxnWrites(*maxTxnWrites)
 	e.SetMemoryCeiling(ceiling)
+
+	// The replicator starts after the engine and closes before it (defers
+	// run in reverse), so its final ship sees every committed write.
+	var repl replication
+	if replStore != nil {
+		r := replicate.New(e, replStore, replicate.Options{Interval: *replicateInterval, Prefix: replLoc.prefix})
+		r.Start()
+		defer r.Close()
+		repl = replication{r: r, interval: *replicateInterval, started: time.Now()}
+		fmt.Printf("bytdbd: replicating to %s every %v\n", *replicateTo, *replicateInterval)
+	}
 
 	srv := pgwire.NewServer(sql.New(e))
 	srv.IdleTxTimeout = *idleTx
@@ -213,7 +274,9 @@ func main() {
 			// format, same prefix, so one scrape config covers both.
 			fmt.Fprintf(w, "# HELP bytdb_pgwire_connections Open client connections.\n"+
 				"# TYPE bytdb_pgwire_connections gauge\nbytdb_pgwire_connections %d\n", srv.ConnCount())
+			repl.writeMetrics(w)
 		}))
+		mux.Handle("/healthz", healthHandler(e, repl))
 		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
