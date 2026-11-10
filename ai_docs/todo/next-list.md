@@ -35,51 +35,12 @@ through all 74 docs.
 
 ## Open
 
-All nine items below come from one audit and share one plan,
+N-040 to N-044 come from one audit and share one plan,
 `ai_docs/todo/2026-1109-deep-look-remediation-plan.md`. Each is a phase of
 it; the `D-xx` numbers are that plan's item IDs. The user asked for the plan
 to be implemented as written, so its six decisions (Q1–Q6) are taken at the
 plan's recommendations.
 
-- **N-037** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
-  **One static typing pass over the whole statement (plan Phase 2, D-23 to
-  D-26).** Timestamps, dates and uuids lose their SQL type at runtime, and
-  `coerceLiterals` types only top-level `Pred` leaves, so anything else is
-  compared by Go kind and a failed coercion is swallowed
-  (`sql/exec.go:293-318`). Today `WHERE due > now()` returns nothing for a
-  future date, `ts::date` returns microseconds, `CHECK (day >=
-  '2000-01-01')` is not enforced, and date predicates inside subqueries,
-  CTEs and views match nothing. The pass annotates every expression node
-  with its type, coerces untyped literals and params from their sibling,
-  inserts explicit conversions, rejects the rest at bind, and replaces
-  `coerceLiterals`. It also fixes pgx's parameter-encode and result-scan
-  failures. Existing databases may hold rows that violate a previously inert
-  CHECK; ship a validation helper with the release. Every "What breaks"
-  bullet of the plan is a `-- @todo D-23..26` line in
-  `sql/difftest/corpus/` (verified against Postgres 16.6), so the corpus is
-  the exit test. Since D-17, pgwire renders a non-string value under a
-  text-described column as text in both formats, which makes today's
-  "described as text" results decode correctly in binary too.
-- **N-038** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
-  **Subqueries through the real SELECT path (plan Phase 3, D-27, D-28).**
-  The four subquery runners in `sql/expr.go:1323-1590` ignore `ORDER BY`,
-  `LIMIT` and `OFFSET` and reject `GROUP BY`, `HAVING` and `UNION`.
-  `(SELECT amt FROM o ORDER BY amt DESC LIMIT 1)` returns the first row, not
-  the largest. Run uncorrelated subqueries once through `runSelectBody` and
-  memoize, as the CTE path does; run correlated ones through the same
-  executor with the outer row bound. Removes the interim reject from N-036
-  (D-09, landed: `rejectSubLimit` in `sql/subcache.go` refuses only the
-  ORDER BY/LIMIT/OFFSET shapes the runners answer wrongly) and adds a hash
-  set for `IN (subquery)`.
-- **N-039** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
-  **One statement, one snapshot, none of its own writes (plan Phase 4, D-29
-  to D-32).** `UPDATE ... SET x = (subquery)` sees rows the same statement
-  already updated (`sql/exec.go:1172-1247`); a plain `UNION` reads two
-  snapshots (`sql/sql.go:1027`); child-side FK checks run per row, so a
-  self-referential bulk insert depends on row order (`sql/exec.go:1044-1048`);
-  multi-statement queries and `pgx.Batch` commit per statement
-  (`pgwire/conn.go:521-545`). Also closes N-029 on the way, since the
-  two-pass UPDATE is where the row budget gets charged.
 - **N-040** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
   **Interruptible writer-lock waits (plan Phase 5, D-33).** Context,
   `statement_timeout` and `CancelRequest` do not bound the wait for the
@@ -104,9 +65,11 @@ plan's recommendations.
   allocations each; startup replay is 0.9 s per million rows. Correct
   `docs/benchmarks.md`, which blames interpreted execution for the scan gap.
   Memory per row (D-49) and streamed results (D-50) are recorded in the plan
-  but not scheduled. Done already: D-40 step 2 (`Engine.CatalogVersion`,
-  with D-16) and the baseline benchmarks (`BenchmarkDL*` in root, `sql/`
-  and `pgwire/`, D-04).
+  but not scheduled. Done already: D-40 steps 1 and 2 (`Engine.HasViews`,
+  `Engine.CatalogVersion`), D-28 (hash set for `IN (subquery)`, 957 ms ->
+  72 ms) and the baseline benchmarks (`BenchmarkDL*` in root, `sql/` and
+  `pgwire/`, D-04). The typed bind pass costs ~4%% on a prepared point read
+  until D-40 step 3 caches typed statements per catalog version.
 - **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
   **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
   tables that clients and migration tools send (advisory locks, `DISCARD
@@ -127,7 +90,14 @@ plan's recommendations.
   allowed-to-fail. The plan calls release A patch-level, but it adds API
   and SQL behavior (hex literals, `= NULL`, refused subquery shapes), so
   the `release` skill's rule says minor: `v0.23.0`. Tagging publishes to the
-  module proxy for good, so it waits for the user's go-ahead.
+  module proxy for good, so it waits for the user's go-ahead. *Updated
+  `2026-1109-2330-deep-look-phases-2-to-4`:* main now also carries the plan's release B (Phases 2 and 3) and
+  most of release C (Phase 4); only Phase 5 (D-33) needs a btypedb tag
+  first. One release of everything on main is the simpler choice now; the
+  release notes must list the newly refused shapes (`1 < 'a'`,
+  `timestamp + 1`, `integer || integer`, `1 = true`), the CHECKs that start
+  being enforced (run `VACUUM (VERIFY)` after upgrading), and the
+  implicit-transaction change for batches (D-32).
 
 ## Validate
 
@@ -181,24 +151,6 @@ arrives.
   commit `dd7a25d` (closing N-022) deleted the whole Roadmap and Non-goals
   sections with no closing line. Premise re-checked against btypedb then:
   still absent, and both citations still hold.*
-- **N-029** · raised `2026-1015-1609-txn-write-cap` · value low
-  **UPDATE's pre-write materialization skips the result row budget.**
-  `execUpdate` in `sql/exec.go` collects every matching row into `rows`
-  before writing (so updates can move rows under a live scan), but unlike
-  every other in-memory row set it never calls `budget.check`, so neither
-  `MaxResultRows` nor the periodic `CheckMemory` poll applies there. Since
-  N-028 the transaction write cap bounds it (each collected row is charged
-  through `Txn.CheckWrites`), so it is no longer unbounded by default. It
-  is still the one materialization that ignores the row cap and the
-  ceiling poll while it grows. Fix: charge `d.budget()` in the scan
-  callback next to `CheckWrites`. With both defaults at 10M, the row cap
-  adds nothing there by default. The gain is the `CheckMemory` poll while
-  the set grows, on hosts with `GOMEMLIMIT` set. *`/next-list`
-  2026-10-15: checked `execDelete` as this item asked. `collectPKs` is
-  unbudgeted too, but leave it: charging the row cap there would refuse a
-  `DELETE FROM big` of more than 10M rows, against DELETE's deliberate
-  exemptions (`DB.freeing` skips the ceiling, and the write cap doesn't
-  count deletes). Scope is UPDATE only.*
 
 ## Non-goals
 
@@ -248,6 +200,46 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   imports it.
 
 ## Closed
+
+- **N-039** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-09, `2026-1109-2330-deep-look-phases-2-to-4`. **One statement, one snapshot, none of its own
+  writes (plan Phase 4, D-29 to D-32).** D-29: UPDATE evaluates every SET
+  and CHECK before writing, DELETE computes RETURNING before deleting
+  (UPDATE ... RETURNING still evaluates after each write: its values come
+  from the engine). D-30: UNIONs read one snapshot; DML materializes the
+  views it uses inside its write transaction. D-31: child-side FK checks
+  queue to end of statement (only when SET touches an FK column), and the
+  parent side accepts a key that still exists afterwards; the plan's
+  key-swap example fails on the primary key in Postgres too. D-32: a
+  multi-statement Query or pipeline segment is one implicit transaction,
+  opened lazily at the first write; DDL in a unit commits and runs alone
+  (documented). The difftest corpus has no Phase 4 annotation left.
+- **N-038** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-09, `2026-1109-2330-deep-look-phases-2-to-4`. **Subqueries through the real SELECT path (plan
+  Phase 3, D-27, D-28).** Every shape the reduced runners do not implement
+  runs through `runSelectBody` with the outer row as correlation scope
+  (`DB.outer`, decorrelated body cached per statement); simple shapes keep
+  the runners' plan cache. D-09's interim refusal is gone. `IN
+  (uncorrelated subquery)` probes a memoized hash set. All twelve D-27
+  corpus annotations removed.
+- **N-037** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-09, `2026-1109-2330-deep-look-phases-2-to-4`. **One static typing pass (plan Phase 2, D-23 to
+  D-26).** `sql/typecheck.go` types every statement, subquery, CTE, view
+  body, CHECK and USING expression; untyped literals take their context's
+  type, dates are cast to timestamps where compared, impossible pairings
+  are 42883; `coerceLiterals` is removed and the runtime fallback reports
+  22P02. Casts know their operand type (`ExCast.From`), floats render as
+  Postgres does (`bytdb.FormatFloat`), result and parameter descriptions
+  come from the pass (untyped parameters are OID 0), and grouping/dedup
+  keys follow SQL equality. Exit test met: every "What breaks" bullet
+  matches Postgres 16.6 in the corpus, FuzzExec ran 10 minutes clean
+  (18.2M executions), the pgx probes pass. `VACUUM (VERIFY)` /
+  `DB.VerifyChecks` find rows a previously inert CHECK admitted.
+- **N-029** · raised `2026-1015-1609-txn-write-cap` · closed 2026-11-09,
+  `2026-1109-2330-deep-look-phases-2-to-4`. **UPDATE's pre-write materialization skipped the row budget.**
+  Fixed with deep-look D-29: the scan callback now charges `d.budget()`
+  next to `CheckWrites`, so the row cap and the `CheckMemory` poll apply
+  (`TestStatementSeesItsStartingState`).
 
 - **N-036** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
   2026-11-09, `2026-1109-2243-deep-look-phase0-phase1`. **Small isolated correctness and outage fixes (plan
