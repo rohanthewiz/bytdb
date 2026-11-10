@@ -1,0 +1,224 @@
+# Continuous integration for bytdb (deep-look plan D-03).
+#
+# Module layout this workflow has to respect:
+#   .           github.com/rohanthewiz/bytdb           (released, vX.Y.Z)
+#   pgwire/     github.com/rohanthewiz/bytdb/pgwire    (released, pgwire/vX.Y.Z)
+#   bench/      benchmarks, never released, own nested go.work
+#   sql/difftest/  Postgres differential harness, own nested go.work
+#
+# The committed go.work also `use`s ../btypedb, a sibling checkout that
+# only exists on a developer machine. CI therefore drops that entry and
+# builds against the btypedb version go.mod pins, which is exactly what
+# a user of a tagged bytdb gets. A separate, allowed-to-fail job checks
+# out btypedb main beside bytdb to catch cross-repo breakage early.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly fuzzing only; the other jobs skip scheduled runs.
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            pgwire/go.sum
+      - name: Workspace without the sibling btypedb checkout
+        run: go work edit -dropuse=../btypedb
+      - name: vet (root)
+        run: go vet ./...
+      - name: vet (pgwire)
+        working-directory: pgwire
+        run: go vet ./...
+      - name: test -race (root)
+        run: go test -race -count=1 ./...
+      - name: test -race (pgwire)
+        working-directory: pgwire
+        run: go test -race -count=1 ./...
+      # Benchmarks run once each as a smoke test (deep-look plan D-04):
+      # shared runners are far too noisy to gate on timings, so the gate
+      # is a benchstat before/after in each performance PR instead.
+      - name: benchmark smoke (root)
+        run: go test -run='^$' -bench=. -benchtime=1x ./...
+      - name: benchmark smoke (pgwire)
+        working-directory: pgwire
+        run: go test -run='^$' -bench=. -benchtime=1x ./...
+
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            pgwire/go.sum
+      - name: Workspace without the sibling btypedb checkout
+        run: go work edit -dropuse=../btypedb
+      - name: gofmt
+        # ai_docs/ holds reference material (audit repros), not code that
+        # ships; everything else must be gofmt-clean.
+        run: |
+          out=$(gofmt -l $(git ls-files '*.go' | grep -v '^ai_docs/'))
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"; echo "$out"; exit 1
+          fi
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          staticcheck ./...
+          (cd pgwire && staticcheck ./...)
+
+  # pgwire deliberately has no `replace` for bytdb (next-list N-031): the
+  # toolchain refuses `go install …@version` of a module that carries
+  # one. The no-replace rule is a hard check. The GOWORK=off build that
+  # follows compiles pgwire against the *released* bytdb its go.mod pins,
+  # so it legitimately fails between a pgwire change that needs new root
+  # API and the next release tag; it is reported but allowed to fail.
+  pgwire-no-replace:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pgwire/go.mod must not carry a replace directive
+        run: |
+          if grep -nE '^\s*replace\b|^\s*replace\s*\(' pgwire/go.mod; then
+            echo "pgwire/go.mod must not use replace (see next-list N-031)"; exit 1
+          fi
+
+  pgwire-released-pin:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pgwire/go.mod
+          cache-dependency-path: pgwire/go.sum
+      - name: build and test pgwire against its pinned bytdb
+        working-directory: pgwire
+        run: |
+          go build ./...
+          go test -count=1 ./...
+
+  # Differential tests against a real Postgres (deep-look plan D-02).
+  difftest:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BYTDB_DIFF_PG_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: sql/difftest/go.sum
+      - name: differential corpus
+        working-directory: sql/difftest
+        run: go test -count=1 -v ./...
+
+  # Cross-repo canary: bytdb's working tree against btypedb main, using
+  # the committed go.work exactly as a developer machine does.
+  btypedb-main:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bytdb
+      - uses: actions/checkout@v4
+        with:
+          repository: rohanthewiz/btypedb
+          ref: main
+          path: btypedb
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bytdb/go.mod
+          cache-dependency-path: |
+            bytdb/go.sum
+            bytdb/pgwire/go.sum
+      - name: test (root) against btypedb main
+        working-directory: bytdb
+        run: go test -count=1 ./...
+      - name: test (pgwire) against btypedb main
+        working-directory: bytdb/pgwire
+        run: go test -count=1 ./...
+
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dir: ".", pkg: ".", target: FuzzTextArrayCanon }
+          - { dir: ".", pkg: ".", target: FuzzJSONBCanon }
+          - { dir: ".", pkg: ".", target: FuzzTimestampRoundTrip }
+          - { dir: ".", pkg: ".", target: FuzzUUIDRoundTrip }
+          - { dir: ".", pkg: "./tuple", target: FuzzTupleRoundTrip }
+          - { dir: ".", pkg: "./tuple", target: FuzzTupleOrder }
+          - { dir: ".", pkg: "./sql", target: FuzzParse }
+          - { dir: ".", pkg: "./sql", target: FuzzExec }
+          - { dir: "pgwire", pkg: ".", target: FuzzMessageParse }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            pgwire/go.sum
+      - name: Workspace without the sibling btypedb checkout
+        run: go work edit -dropuse=../btypedb
+      - name: fuzz ${{ matrix.target }} for 60s
+        working-directory: ${{ matrix.dir }}
+        run: go test -run='^$' -fuzz='^${{ matrix.target }}$' -fuzztime=60s ${{ matrix.pkg }}
+      # A failing input lands under testdata/fuzz/<target>/; ship it so it
+      # can be committed as a permanent seed once the bug is fixed.
+      - name: upload new corpus entries
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: "**/testdata/fuzz/${{ matrix.target }}/"
+          if-no-files-found: ignore

@@ -305,11 +305,11 @@ func compareValues(av, bv any) int {
 }
 
 func rank(v any) int {
-	switch v.(type) {
+	switch v := v.(type) {
 	case nil:
 		return int(tagNull)
 	case bool:
-		if v.(bool) {
+		if v {
 			return int(tagTrue)
 		}
 		return int(tagFalse)

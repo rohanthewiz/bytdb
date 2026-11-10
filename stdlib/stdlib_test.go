@@ -982,12 +982,14 @@ func TestPreContextDriverInterfaces(t *testing.T) {
 	if ddl.NumInput() != 0 {
 		t.Errorf("NumInput = %d, want 0", ddl.NumInput())
 	}
+	//lint:ignore SA1019 this test exercises the pre-context driver interfaces on purpose
 	if _, err = ddl.Exec(nil); err != nil {
 		t.Fatalf("exec ddl: %v", err)
 	}
 	_ = ddl.Close()
 
 	// a transaction through the pre-context Begin
+	//lint:ignore SA1019 this test exercises the pre-context driver interfaces on purpose
 	tx, err := cn.Begin()
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -999,6 +1001,7 @@ func TestPreContextDriverInterfaces(t *testing.T) {
 	if ins.NumInput() != 1 {
 		t.Errorf("NumInput = %d, want 1", ins.NumInput())
 	}
+	//lint:ignore SA1019 this test exercises the pre-context driver interfaces on purpose
 	if _, err = ins.Exec([]driver.Value{int64(7)}); err != nil {
 		t.Fatalf("exec insert: %v", err)
 	}
@@ -1012,6 +1015,7 @@ func TestPreContextDriverInterfaces(t *testing.T) {
 		t.Fatalf("prepare select: %v", err)
 	}
 	defer func() { _ = sel.Close() }()
+	//lint:ignore SA1019 this test exercises the pre-context driver interfaces on purpose
 	rows, err := sel.Query([]driver.Value{int64(7)})
 	if err != nil {
 		t.Fatalf("query: %v", err)

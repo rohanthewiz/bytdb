@@ -86,6 +86,71 @@ mapping works by message text. `pgwire/orm_test.go` and `sql/psql_test.go`
 replay **verbatim** introspection queries captured from psql 17, GORM,
 SQLAlchemy, and ActiveRecord.
 
+### Differential tests against real Postgres
+
+The pinned tests above cover the divergences somebody thought of.
+`sql/difftest/` (its own module, so pgx stays out of the root module) finds
+the rest: it runs a corpus of `.sql` files through bytdb and through a real
+Postgres side by side, both driven by the same pgx client in the text
+protocol, and compares every value and every column's type class (number,
+text, bool, date, …). Rows compare as a multiset unless the entry says
+`-- @ordered`.
+
+Each known divergence carries an annotation on the line before it:
+
+- `-- @todo D-xx: why` is a bug with a plan item. The run fails once the
+  result starts matching Postgres, so the fix has to delete the line.
+- `-- @bytdb: why` is a deliberate, documented divergence (the gotchas),
+  with the same mechanics, meant to stay.
+
+So the corpus is the living list of every known difference from Postgres,
+and nothing starts or stops diverging silently. The file format is
+documented at the top of `sql/difftest/corpus.go`.
+
+The comparison runs only when `BYTDB_DIFF_PG_URL` names a Postgres to
+compare against; each corpus file gets a fresh schema there, dropped
+afterwards. Without the variable the suite still checks that every corpus
+file parses.
+
+```sh
+# any disposable Postgres 16 will do, e.g.
+docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=pg postgres:16
+cd sql/difftest
+BYTDB_DIFF_PG_URL='postgres://postgres:pg@127.0.0.1:55432/postgres?sslmode=disable' go test -v
+```
+
+## Continuous integration
+
+`.github/workflows/ci.yml` (and the same file in btypedb) runs on every push
+to `main` and every pull request:
+
+| Job | What it checks |
+|---|---|
+| `test` | `go vet` and `go test -race` for the root module and `pgwire/`, on Linux and macOS, plus every benchmark once (`-benchtime=1x`) as a smoke test |
+| `lint` | `gofmt -l` (outside `ai_docs/`) and `staticcheck` |
+| `pgwire-no-replace` | `pgwire/go.mod` carries no `replace` (next-list N-031) |
+| `pgwire-released-pin` | `GOWORK=off` build and test of `pgwire/` against the bytdb version it pins; **allowed to fail**, since a pgwire change that needs unreleased root API stays red until the next tag |
+| `difftest` | the Postgres differential corpus against a `postgres:16` service container |
+| `btypedb-main` | bytdb against btypedb `main` checked out beside it; **allowed to fail**, an early warning for cross-repo breakage |
+| `fuzz` | nightly (and on manual dispatch): every fuzz target for 60 s; a failing input is uploaded as an artifact to commit as a seed |
+
+The committed `go.work` names `../btypedb`, a sibling checkout that only
+exists on a developer machine, so CI drops that entry and builds against
+the btypedb version `go.mod` pins.
+
+### Benchmarks are not a CI gate
+
+Shared runners are too noisy to gate on timings, so CI only runs each
+benchmark once to prove it still builds and runs. A change that claims a
+performance win (or risks a loss) carries a `benchstat` comparison in its
+commit or pull request instead:
+
+```sh
+go test -run='^$' -bench=BenchmarkX -count=10 ./sql > old.txt   # on the base commit
+go test -run='^$' -bench=BenchmarkX -count=10 ./sql > new.txt   # with the change
+benchstat old.txt new.txt
+```
+
 ## Running the suite
 
 ```sh
