@@ -163,13 +163,16 @@ func TestJSONBConcatDelete(t *testing.T) {
 			`{"name":"ana","tags":["go","db"]}`},
 		{`select body - 'nope' from docs where id = 2`,
 			`{"name":"bo","tags":[]}`},
-		{`select body -> 'tags' - 'go' from docs where id = 1`,
+		// The parentheses are required, as in Postgres: '-' binds
+		// tighter than '->', so body -> 'tags' - 'go' would subtract
+		// two strings.
+		{`select (body -> 'tags') - 'go' from docs where id = 1`,
 			`["db"]`},
 		// - integer drops by index, negative from the end, out of range
 		// is a no-op.
-		{`select body -> 'tags' - 0 from docs where id = 1`, `["db"]`},
+		{`select (body -> 'tags') - 0 from docs where id = 1`, `["db"]`},
 		{`select body - -1 from docs where id = 3`, `[1,2]`},
-		{`select body -> 'tags' - 5 from docs where id = 1`, `["go","db"]`},
+		{`select (body -> 'tags') - 5 from docs where id = 1`, `["go","db"]`},
 		// The shared spellings keep their old meanings when nothing is
 		// statically jsonb.
 		{`select 'a' || 'b' from docs where id = 1`, `ab`},

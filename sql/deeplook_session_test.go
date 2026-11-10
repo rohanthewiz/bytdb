@@ -216,3 +216,48 @@ func TestSmallSQLCorrectness(t *testing.T) {
 		t.Fatalf("join probe across a type change: %v", res.Rows)
 	}
 }
+
+// TestLexerParserDivergences (D-22): literal forms, escapes, signs and
+// precedence that silently differed from Postgres 16. The difftest
+// corpus checks the same lines against a real Postgres.
+func TestLexerParserDivergences(t *testing.T) {
+	d := openDB(t)
+	for q, want := range map[string]any{
+		`select 0x1F`:                 int64(31),
+		`select 0o17`:                 int64(15),
+		`select 0b101`:                int64(5),
+		`select 1_000`:                int64(1000),
+		`select 0x_ff`:                int64(255),
+		`select 1_000.000_5`:          1000.0005,
+		`select -0x10`:                int64(-16),
+		`select E'\x41'`:              "A",
+		`select E'\101'`:              "A",
+		`select E'café'`:              "café",
+		`select E'\U0001F600'`:        "😀",
+		`select -1::int`:              int64(-1),
+		`select - - 1`:                int64(1),
+		`select 1+-+1`:                int64(0),
+		`select -9223372036854775808`: int64(-9223372036854775808),
+		`select 'a' || 3 + 4`:         "a7",
+		`select 1 = any(null::int[])`: nil,
+		`select 1 = any('{}'::int[])`: false,
+		`select count(*) from (select 1 as v) s where v = null`: int64(0),
+	} {
+		res, err := d.Exec(q)
+		if err != nil {
+			t.Errorf("%s: %v", q, err)
+			continue
+		}
+		if got := res.Rows[0][0]; got != want {
+			t.Errorf("%s = %#v, want %#v", q, got, want)
+		}
+	}
+	for _, q := range []string{
+		`select 1a`, `select 0x`, `select 1__000`, `select 1_`, `select 0b2`,
+		`select E'\xff'`, `select E'\u12'`,
+	} {
+		if _, err := d.Exec(q); err == nil {
+			t.Errorf("%s: accepted", q)
+		}
+	}
+}

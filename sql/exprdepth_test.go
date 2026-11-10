@@ -25,7 +25,10 @@ func TestExprChainDepthRefused(t *testing.T) {
 		"cast":        "select 1" + strings.Repeat("::int", 50_000),
 		"is null":     "select 1" + strings.Repeat(" is null", 50_000),
 		"comparisons": "select 1" + strings.Repeat(" = 1", 50_000),
-		"unary minus": "select " + strings.Repeat("-(", 900) + "1" + strings.Repeat(" +1", 20_000) + strings.Repeat(")", 900),
+		// Each -( costs two nesting levels (the sign and the paren), so
+		// 400 stay under maxParseDepth while the chain inside exceeds the
+		// depth bound.
+		"unary minus": "select " + strings.Repeat("-(", 400) + "1" + strings.Repeat(" +1", 20_000) + strings.Repeat(")", 400),
 		// 900 nested parens (under maxParseDepth), each level the left
 		// operand of a 20-term chain: no single loop is long, but the
 		// left spine through all of them is 18,000 deep.

@@ -305,7 +305,6 @@ func TestParseErrors(t *testing.T) {
 	}
 
 	for _, src := range []string{
-		`select * from t where a = null`,      // must use IS NULL
 		`select * from t limit -1`,            // negative limit
 		`select * from t; select * from t`,    // one statement per call
 		`insert into t (a, a) values (1, 2)`,  // duplicate column
@@ -428,7 +427,6 @@ func TestParseAggregates(t *testing.T) {
 func TestParseAggregateErrors(t *testing.T) {
 	for _, src := range []string{
 		`select * from t where count(*) > 1`,          // aggregates belong in HAVING
-		`select count(*) from t having sum(v) = null`, // must use IS NULL
 		`select sum() from t`,                         // missing argument
 		`select sum(*) from t`,                        // * only for count
 		`select city from t group by 1.5`,             // non-integer constant

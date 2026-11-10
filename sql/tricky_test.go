@@ -90,12 +90,12 @@ func TestTrickyThreeValuedLogic(t *testing.T) {
 	d := openDB(t)
 	seedEmp(t, d)
 
-	// A literal `= NULL` comparison is rejected at parse time — a
-	// deliberate divergence from Postgres (which silently returns
-	// nothing) in favor of pointing the user at IS [NOT] NULL.
-	if msg := execErr(t, d, `select count(*) from emp where dept = null`); !strings.Contains(msg, "IS [NOT] NULL") {
-		t.Fatalf("= NULL error = %q; want the IS [NOT] NULL guidance", msg)
-	}
+	// A literal `= NULL` comparison is NULL for every row, so nothing
+	// matches — Postgres's answer. (It used to be refused at parse time
+	// in favor of pointing at IS [NOT] NULL; deep-look D-22 dropped that
+	// divergence.)
+	wantRows(t, d, `select count(*) from emp where dept = null`, [][]any{{int64(0)}})
+	wantRows(t, d, `select count(*) from emp where null <> dept`, [][]any{{int64(0)}})
 
 	// UNKNOWN filtering through a column self-comparison: dept = dept
 	// is UNKNOWN (not true) for the two NULL rows, and NOT(UNKNOWN) is
@@ -104,11 +104,10 @@ func TestTrickyThreeValuedLogic(t *testing.T) {
 	wantRows(t, d, `select count(*) from emp where dept = dept`, [][]any{{int64(4)}})
 	wantRows(t, d, `select count(*) from emp where not (dept = dept)`, [][]any{{int64(0)}})
 
-	// A literal NULL as a BETWEEN bound gets the same parse-time
-	// rejection as `= NULL`.
-	if msg := execErr(t, d, `select count(*) from emp where sal between null and 200`); !strings.Contains(msg, "IS [NOT] NULL") {
-		t.Fatalf("BETWEEN NULL error = %q; want the IS [NOT] NULL guidance", msg)
-	}
+	// A literal NULL as a BETWEEN bound makes that half UNKNOWN, so no
+	// row can pass (Postgres's answer; it used to be refused, like
+	// `= NULL`, until deep-look D-22).
+	wantRows(t, d, `select count(*) from emp where sal between null and 200`, [][]any{{int64(0)}})
 
 	// A NULL that arrives through a column is UNKNOWN at runtime:
 	// sal >= bonus is UNKNOWN for the two NULL-bonus rows, so BETWEEN
@@ -151,9 +150,14 @@ func TestTrickyIntegerArithmetic(t *testing.T) {
 		t.Fatalf("MinInt64/-1 error = %q; want a range error", msg)
 	}
 	// MinInt64 % -1 is 0, not a trap (both Go and Postgres guarantee
-	// this), and the oversized literal path yields a float quotient.
+	// this). The literal -9223372036854775808 is a bigint, as in
+	// Postgres (it used to become a float), so dividing it by -1
+	// overflows exactly as Postgres reports.
 	wantRows(t, d, `select (-9223372036854775807 - 1) % -1`, [][]any{{int64(0)}})
-	wantRows(t, d, `select -9223372036854775808 / -1`, [][]any{{9.223372036854776e+18}})
+	wantRows(t, d, `select -9223372036854775808`, [][]any{{int64(-9223372036854775808)}})
+	if msg := execErr(t, d, `select -9223372036854775808 / -1`); !strings.Contains(msg, "range") {
+		t.Fatalf("MinInt64 literal / -1 = %q; want a range error", msg)
+	}
 }
 
 // TestTrickyDeepArithChain pins type derivation as linear in expression

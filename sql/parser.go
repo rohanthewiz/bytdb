@@ -2868,13 +2868,18 @@ func lowerBool(e Expr) (BoolExpr, error) {
 			r := rIt
 			return &Pred{Item: lIt, Op: n.Op, RItem: &r}, nil
 		case lOK && rIsLit:
+			// x = NULL is legal SQL whose answer is NULL for every row,
+			// so the query returns nothing, as in Postgres; it was a hard
+			// error (deep-look D-22). It evaluates per row as a Cond,
+			// which also keeps the NULL away from the planner's key
+			// encoding.
 			if rLit.Val == nil {
-				return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
+				return &Cond{Ex: n}, nil
 			}
 			return &Pred{Item: lIt, Op: n.Op, Val: rLit.Val}, nil
 		case rOK && lIsLit && flippable(n.Op):
 			if lLit.Val == nil {
-				return nil, serr.New("cannot compare with NULL; use IS [NOT] NULL")
+				return &Cond{Ex: n}, nil
 			}
 			return &Pred{Item: rIt, Op: flip(n.Op), Val: lLit.Val}, nil
 		}
@@ -3026,7 +3031,7 @@ func (p *parser) exprNot() (Expr, error) {
 // (...), and one comparison operator — plain or OPERATOR-qualified —
 // whose right side may be ANY(...).
 func (p *parser) exprCmp() (Expr, error) {
-	e, err := p.exprAdd()
+	e, err := p.exprOther()
 	if err != nil {
 		return nil, err
 	}
@@ -3147,7 +3152,7 @@ func (p *parser) exprCmp() (Expr, error) {
 				}
 				continue
 			}
-			r, err := p.exprAdd()
+			r, err := p.exprOther()
 			if err != nil {
 				return nil, err
 			}
@@ -3197,7 +3202,7 @@ func (p *parser) inTail(e Expr, not bool) (Expr, error) {
 // implemented; a different character is rejected rather than silently
 // matching with the wrong escape semantics.
 func (p *parser) likeTail(e Expr, ilike, not bool) (Expr, error) {
-	r, err := p.exprAdd()
+	r, err := p.exprOther()
 	if err != nil {
 		return nil, err
 	}
@@ -3244,14 +3249,14 @@ func (p *parser) betweenTail(e Expr, not bool) (Expr, error) {
 	if !sym {
 		p.acceptKw("asymmetric") // the explicit spelling of the default
 	}
-	lo, err := p.exprAdd()
+	lo, err := p.exprOther()
 	if err != nil {
 		return nil, err
 	}
 	if err := p.expectKw("and"); err != nil {
 		return nil, err
 	}
-	hi, err := p.exprAdd()
+	hi, err := p.exprOther()
 	if err != nil {
 		return nil, err
 	}
@@ -3302,10 +3307,43 @@ func (p *parser) exprList() ([]Expr, error) {
 	return out, p.expectOp(")")
 }
 
-// exprAdd parses the additive level, which also hosts || and the
-// jsonb accessors (-> ->> #> #>>) — Postgres puts every "other"
-// operator between + - and the comparisons, and one shared level keeps
-// chains like j->'a'->>'b' and j->'a' || j->'b' left-associative.
+// exprOther parses Postgres's "any other operator" level: || and the
+// jsonb accessors (-> ->> #> #>>). Postgres puts it below + and - and
+// above the comparisons (and LIKE, BETWEEN, IN), so 2 || 3 + 4 is
+// 2 || (3 + 4) = '27'. It used to share the additive level, which read
+// that as (2 || 3) + 4 and failed (deep-look D-22). One level for all of
+// them keeps chains like j->'a'->>'b' and j->'a' || j->'b'
+// left-associative.
+func (p *parser) exprOther() (Expr, error) {
+	e, err := p.exprAdd()
+	if err != nil {
+		return nil, err
+	}
+	d := p.lastDepth
+	for {
+		t := p.cur()
+		if t.kind != tOp {
+			return e, p.done(d)
+		}
+		switch t.text {
+		case "||", "->", "->>", "#>", "#>>":
+		default:
+			return e, p.done(d)
+		}
+		p.advance()
+		r, err := p.exprAdd()
+		if err != nil {
+			return nil, err
+		}
+		e = &ExArith{Op: t.text, L: e, R: r}
+		d = max(d, p.lastDepth) + 1
+		if err := p.done(d); err != nil { // per term: see exprCmp
+			return nil, err
+		}
+	}
+}
+
+// exprAdd parses the additive level: binary + and -.
 func (p *parser) exprAdd() (Expr, error) {
 	e, err := p.exprMul()
 	if err != nil {
@@ -3318,7 +3356,7 @@ func (p *parser) exprAdd() (Expr, error) {
 			return e, p.done(d)
 		}
 		switch t.text {
-		case "+", "-", "||", "->", "->>", "#>", "#>>":
+		case "+", "-":
 		default:
 			return e, p.done(d)
 		}
@@ -3362,17 +3400,28 @@ func (p *parser) exprMul() (Expr, error) {
 func (p *parser) exprUnary() (Expr, error) {
 	t := p.cur()
 	if t.kind == tOp && (t.text == "-" || t.text == "+") {
-		// A signed number folds to a literal; any other operand
-		// becomes 0 - E (or passes through for unary +).
+		// A signed number folds to a literal, which then takes postfix
+		// operators like any primary: -1::int is a cast of -1. (Postgres
+		// binds :: tighter than unary minus, -(1::int), which is the same
+		// value for every number.) The fold used to return before the
+		// postfix loop, so -1::int was a syntax error (deep-look D-22).
 		if p.tokAt(1).kind == tNumber {
 			v, err := p.literal()
 			if err != nil {
 				return nil, err
 			}
-			return &ExLit{Val: v}, p.done(1)
+			return p.postfixLoop(&ExLit{Val: v}, 1)
 		}
+		// Any other operand becomes 0 - E (or passes through for unary
+		// +). The operand is itself a unary expression, so signs repeat:
+		// - - 1 and 1+-+1 parse as in Postgres (they were syntax errors).
+		// Each sign recurses, so each counts a level of nesting.
 		p.advance()
-		e, err := p.exprPostfix()
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
+		e, err := p.exprUnary()
 		if err != nil {
 			return nil, err
 		}
@@ -3389,7 +3438,12 @@ func (p *parser) exprPostfix() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := p.lastDepth
+	return p.postfixLoop(e, p.lastDepth)
+}
+
+// postfixLoop applies the :: cast and [] subscript postfixes to e, a
+// tree of depth d.
+func (p *parser) postfixLoop(e Expr, d int) (Expr, error) {
 	for {
 		switch {
 		case p.acceptOp("::"):
@@ -4019,10 +4073,15 @@ func (p *parser) literal() (any, error) {
 	switch t.kind {
 	case tNumber:
 		p.advance()
-		if n, err := strconv.ParseInt(t.text, 10, 64); err == nil {
-			if neg {
-				n = -n
-			}
+		// The sign is parsed with the digits, not applied afterwards:
+		// -9223372036854775808 is in int64's range though its magnitude
+		// is not, and negating after the range check made it a float
+		// (deep-look D-22).
+		text := t.text
+		if neg {
+			text = "-" + text
+		}
+		if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 			return n, nil
 		}
 		f, err := strconv.ParseFloat(t.text, 64)

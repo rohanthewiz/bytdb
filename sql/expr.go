@@ -362,6 +362,12 @@ func evalAnyAll(env *exEnv, n *ExAny) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if elems == nil {
+		// A NULL array (not an empty one): the comparison has no answer,
+		// so x = ANY(NULL) is NULL, as in Postgres, not false (deep-look
+		// D-22). anyElements returns nil only for NULL.
+		return nil, nil
+	}
 	if len(elems) == 0 {
 		return n.All, nil // ANY→false, ALL→true, even for a NULL left side
 	}
@@ -394,33 +400,51 @@ func evalAnyAll(env *exEnv, n *ExAny) (any, error) {
 // values: an ARRAY[...] constructor, a subquery's single column, an
 // already-materialized []any, or a Postgres '{...}' array-literal
 // string (whose elements stay text for checkPred to coerce).
+//
+// The result is nil exactly when the array itself is NULL; an empty
+// array (or a subquery with no rows) is a non-nil empty slice, since the
+// two answer ANY/ALL differently.
 func anyElements(env *exEnv, r Expr) ([]any, error) {
+	vals, isNull, err := anyElems(env, r)
+	if err != nil || isNull {
+		return nil, err
+	}
+	if vals == nil {
+		vals = []any{}
+	}
+	return vals, nil
+}
+
+func anyElems(env *exEnv, r Expr) (vals []any, isNull bool, err error) {
 	switch n := r.(type) {
 	case *ExArray:
-		return arrayElems(env, n)
+		vals, err = arrayElems(env, n)
+		return vals, false, err
 	case *ExSub:
-		return collectSubColumn(env, n.Sel)
+		vals, err = collectSubColumn(env, n.Sel)
+		return vals, false, err
 	case *ExCast:
 		// An array-typed cast (ARRAY[...]::int[], '{1,2}'::int[]) is only
 		// a type annotation here — the elements coerce during comparison,
 		// so evaluate the operand directly and skip the unsupported cast.
 		if strings.HasSuffix(n.Type, "[]") {
-			return anyElements(env, n.E)
+			return anyElems(env, n.E)
 		}
 	}
 	v, err := evalEx(env, r)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	switch v := v.(type) {
 	case nil:
-		return nil, nil
+		return nil, true, nil
 	case []any:
-		return v, nil
+		return v, false, nil
 	case string:
-		return parseArrayLiteral(v)
+		vals, err = parseArrayLiteral(v)
+		return vals, false, err
 	}
-	return nil, serr.New("ANY/ALL requires an array on the right-hand side")
+	return nil, false, serr.New("ANY/ALL requires an array on the right-hand side")
 }
 
 func arrayElems(env *exEnv, n *ExArray) ([]any, error) {

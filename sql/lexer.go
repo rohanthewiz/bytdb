@@ -2,7 +2,9 @@ package sql
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/rohanthewiz/serr"
 )
@@ -79,8 +81,16 @@ func lex(src string) ([]token, error) {
 			i += n
 		case isDigit(c) || (c == '.' && i+1 < len(src) && isDigit(src[i+1])):
 			start := i
-			i = scanNumber(src, i)
-			toks = append(toks, token{tNumber, src[start:i], start})
+			end, err := scanNumber(src, i)
+			if err != nil {
+				return nil, serr.Wrap(err, "pos", fmt.Sprint(start))
+			}
+			i = end
+			text, err := normalizeNumber(src[start:i])
+			if err != nil {
+				return nil, serr.Wrap(err, "pos", fmt.Sprint(start))
+			}
+			toks = append(toks, token{tNumber, text, start})
 		case c == '$' && i+1 < len(src) && isDigit(src[i+1]):
 			start := i
 			i++
@@ -170,21 +180,52 @@ func scanEString(s string) (string, int, error) {
 				i += 2
 				continue
 			}
+			// Octal and hex escapes write raw bytes, which can spell
+			// something that is not UTF-8; Postgres refuses that too.
+			if !utf8.ValidString(b.String()) {
+				return "", 0, serr.New("invalid byte sequence for encoding \"UTF8\"")
+			}
 			return b.String(), i + 1, nil
 		case s[i] == '\\' && i+1 < len(s):
-			switch s[i+1] {
-			case 'n':
+			switch c := s[i+1]; {
+			case c == 'n':
 				b.WriteByte('\n')
-			case 't':
+			case c == 't':
 				b.WriteByte('\t')
-			case 'r':
+			case c == 'r':
 				b.WriteByte('\r')
-			case 'b':
+			case c == 'b':
 				b.WriteByte('\b')
-			case 'f':
+			case c == 'f':
 				b.WriteByte('\f')
+			// The numeric escapes Postgres defines (deep-look D-22): they
+			// used to fall to the default, so E'\x41' stored "x41" and
+			// E'\u00e9' stored "u00e9" — silently changed data.
+			case c >= '0' && c <= '7': // \o, \oo, \ooo: an octal byte value
+				n, j := digitsValue(s, i+1, 3, 8)
+				b.WriteByte(byte(n))
+				i = j
+				continue
+			case c == 'x' && i+2 < len(s) && isHexDigit(s[i+2]): // \xh, \xhh: a hex byte value
+				n, j := digitsValue(s, i+2, 2, 16)
+				b.WriteByte(byte(n))
+				i = j
+				continue
+			case c == 'u' || c == 'U': // \uXXXX, \UXXXXXXXX: a Unicode code point
+				width := 4
+				if c == 'U' {
+					width = 8
+				}
+				n, j := digitsValue(s, i+2, width, 16)
+				if j-(i+2) != width || !utf8.ValidRune(rune(n)) || n == 0 {
+					return "", 0, serr.New("invalid Unicode escape",
+						"hint", `Unicode escapes must be \uXXXX or \UXXXXXXXX`)
+				}
+				b.WriteRune(rune(n))
+				i = j
+				continue
 			default: // \\ \' and any other char stand for themselves
-				b.WriteByte(s[i+1])
+				b.WriteByte(c)
 			}
 			i += 2
 		default:
@@ -195,15 +236,77 @@ func scanEString(s string) (string, int, error) {
 	return "", 0, serr.New("unterminated string literal")
 }
 
-// scanNumber consumes digits [. digits] [e[+-]digits] starting at i.
-func scanNumber(src string, i int) int {
-	for i < len(src) && isDigit(src[i]) {
+// digitsValue reads up to max digits of the given base starting at
+// s[i], returning their value and the index after the last one read.
+func digitsValue(s string, i, max, base int) (int, int) {
+	n := 0
+	for k := 0; k < max && i < len(s); k++ {
+		d := digitValue(s[i])
+		if d < 0 || d >= base {
+			break
+		}
+		n = n*base + d
 		i++
 	}
-	if i < len(src) && src[i] == '.' {
+	return n, i
+}
+
+// digitValue is a hex digit's value, or -1.
+func digitValue(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	}
+	return -1
+}
+
+func isHexDigit(c byte) bool { return digitValue(c) >= 0 }
+
+// scanNumber consumes a numeric literal starting at i and returns the
+// index after it. Postgres 16's forms (deep-look D-22):
+//
+//	123  1_000_000  1.5  .5  1e10  1.5E-3   decimal, underscores between digits
+//	0x1F  0o17  0b101  0x_FF_FF              integer with a base prefix
+//
+// A literal followed directly by an identifier character is an error,
+// "trailing junk after numeric literal", as in Postgres 15+. Before,
+// 0x1F lexed as 0 followed by the alias x1F, 1_000 as 1 aliased _000,
+// and 1a as 1 aliased a — each a silently wrong answer.
+func scanNumber(src string, i int) (int, error) {
+	start := i
+	if src[i] == '0' && i+1 < len(src) {
+		base := 0
+		switch src[i+1] {
+		case 'x', 'X':
+			base = 16
+		case 'o', 'O':
+			base = 8
+		case 'b', 'B':
+			base = 2
+		}
+		if base != 0 {
+			j, ok := scanDigits(src, i+2, base, true)
+			if !ok || j == i+2 {
+				return i, serr.New("trailing junk after numeric literal", "text", src[start:min(j+1, len(src))])
+			}
+			return endOfNumber(src, start, j)
+		}
+	}
+	j, ok := scanDigits(src, i, 10, false)
+	if !ok {
+		return i, serr.New("trailing junk after numeric literal", "text", src[start:min(j+1, len(src))])
+	}
+	i = j
+	if i < len(src) && src[i] == '.' && !(i+1 < len(src) && src[i+1] == '.') {
 		i++
-		for i < len(src) && isDigit(src[i]) {
-			i++
+		if i < len(src) && isDigit(src[i]) {
+			if i, ok = scanDigits(src, i, 10, false); !ok {
+				return i, serr.New("trailing junk after numeric literal", "text", src[start:min(i+1, len(src))])
+			}
 		}
 	}
 	if i < len(src) && (src[i] == 'e' || src[i] == 'E') {
@@ -212,13 +315,78 @@ func scanNumber(src string, i int) int {
 			j++
 		}
 		if j < len(src) && isDigit(src[j]) {
-			i = j
-			for i < len(src) && isDigit(src[i]) {
-				i++
+			if i, ok = scanDigits(src, j, 10, false); !ok {
+				return i, serr.New("trailing junk after numeric literal", "text", src[start:min(i+1, len(src))])
 			}
 		}
 	}
-	return i
+	return endOfNumber(src, start, i)
+}
+
+// scanDigits consumes digits of base from i, allowing single
+// underscores between digits (and, after a base prefix, before the
+// first). ok is false for a misplaced underscore.
+func scanDigits(src string, i, base int, afterPrefix bool) (int, bool) {
+	first := true
+	for i < len(src) {
+		c := src[i]
+		if c == '_' {
+			// An underscore must sit between two digits (or right after
+			// a base prefix, before a digit).
+			if (first && !afterPrefix) || i+1 >= len(src) {
+				return i, false
+			}
+			if d := digitValue(src[i+1]); d < 0 || d >= base {
+				return i, false
+			}
+			i++
+			continue
+		}
+		if d := digitValue(c); d < 0 || d >= base || (base == 10 && !isDigit(c)) {
+			break
+		}
+		first = false
+		i++
+	}
+	return i, true
+}
+
+// endOfNumber refuses an identifier character directly after a numeric
+// literal and otherwise returns end.
+func endOfNumber(src string, start, end int) (int, error) {
+	if end < len(src) && isIdentPart(src[end]) {
+		return end, serr.New("trailing junk after numeric literal",
+			"text", src[start:end+1])
+	}
+	return end, nil
+}
+
+// normalizeNumber rewrites a scanned literal into the plain decimal text
+// every consumer of a number token parses with strconv: underscores
+// dropped, a base-prefixed integer converted to decimal (beyond int64 it
+// stays exact as decimal text, which then parses as a float, as an
+// oversized decimal integer does).
+func normalizeNumber(text string) (string, error) {
+	text = strings.ReplaceAll(text, "_", "")
+	if len(text) > 2 && text[0] == '0' {
+		base := 0
+		switch text[1] {
+		case 'x', 'X':
+			base = 16
+		case 'o', 'O':
+			base = 8
+		case 'b', 'B':
+			base = 2
+		}
+		if base != 0 {
+			n, ok := new(big.Int).SetString(text[2:], base)
+			if !ok {
+				return "", serr.New("bad numeric literal", "text", text)
+			}
+			return n.String(), nil
+		}
+	}
+	return text, nil
 }
 
 // scanOp recognizes the operator starting at src[i], longest first, or
