@@ -31,39 +31,16 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-044
+**Next ID:** N-045
 
 ## Open
 
 All nine items below come from one audit and share one plan,
 `ai_docs/todo/2026-1109-deep-look-remediation-plan.md`. Each is a phase of
-it; the `D-xx` numbers are that plan's item IDs. Six decisions (Q1–Q6 at the
-top of the plan) are waiting on the user and shape N-036 to N-039 and N-043.
+it; the `D-xx` numbers are that plan's item IDs. The user asked for the plan
+to be implemented as written, so its six decisions (Q1–Q6) are taken at the
+plan's recommendations.
 
-- **N-035** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
-  **Safety net before any fix (plan Phase 0, D-01 to D-04).** Neither bytdb
-  nor btypedb has CI, and nothing checks SQL results against real Postgres.
-  Port the audit's repros into the tree as skipped failing tests, add
-  `.github/workflows/ci.yml` to both repos (vet, race, `GOWORK=off` pgwire
-  build, staticcheck, nightly fuzz), and add a differential harness
-  (`sql/difftest/`, own module, skipped without `BYTDB_DIFF_PG_URL`). Do the
-  repro port first: the runnable originals are in
-  `ai_docs/todo/deep-look-repros/` (six standalone modules, outside
-  `go.work`), to be deleted once ported.
-- **N-036** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
-  **Small isolated correctness and outage fixes (plan Phase 1, D-05 to
-  D-22).** Eighteen independent fixes, each under half a day. The ones that
-  lose data or take the server down: a replication generation made
-  unrestorable by an ambiguous PUT followed by log growth
-  (`replicate/restore.go:191-200`); a 1M-term expression chain that
-  overflows the stack (`sql/parser.go:3220-3261`); a syntax error inside
-  `BEGIN` that does not abort the block (`sql/session.go:130-136`); pgx's
-  `-- ping` rejected as a syntax error (`pgwire/split.go:39-45`); an upsert
-  that skips the parent-side FK check (`sql/exec.go:1001-1012`);
-  SERIALIZABLE missing write skew through a failed uniqueness probe
-  (`dml.go:121-146`); a DDL-callback deadlock (`engine.go:408-449`); a
-  `CACHE 2^50` sequence spin (`seqalloc.go:454-468`); `Serve` exiting on a
-  transient accept error (`pgwire/pgwire.go:336-345`).
 - **N-037** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
   **One static typing pass over the whole statement (plan Phase 2, D-23 to
   D-26).** Timestamps, dates and uuids lose their SQL type at runtime, and
@@ -77,7 +54,12 @@ top of the plan) are waiting on the user and shape N-036 to N-039 and N-043.
   inserts explicit conversions, rejects the rest at bind, and replaces
   `coerceLiterals`. It also fixes pgx's parameter-encode and result-scan
   failures. Existing databases may hold rows that violate a previously inert
-  CHECK; ship a validation helper with the release.
+  CHECK; ship a validation helper with the release. Every "What breaks"
+  bullet of the plan is a `-- @todo D-23..26` line in
+  `sql/difftest/corpus/` (verified against Postgres 16.6), so the corpus is
+  the exit test. Since D-17, pgwire renders a non-string value under a
+  text-described column as text in both formats, which makes today's
+  "described as text" results decode correctly in binary too.
 - **N-038** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value high
   **Subqueries through the real SELECT path (plan Phase 3, D-27, D-28).**
   The four subquery runners in `sql/expr.go:1323-1590` ignore `ORDER BY`,
@@ -86,7 +68,9 @@ top of the plan) are waiting on the user and shape N-036 to N-039 and N-043.
   the largest. Run uncorrelated subqueries once through `runSelectBody` and
   memoize, as the CTE path does; run correlated ones through the same
   executor with the outer row bound. Removes the interim reject from N-036
-  (D-09) and adds a hash set for `IN (subquery)`.
+  (D-09, landed: `rejectSubLimit` in `sql/subcache.go` refuses only the
+  ORDER BY/LIMIT/OFFSET shapes the runners answer wrongly) and adds a hash
+  set for `IN (subquery)`.
 - **N-039** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
   **One statement, one snapshot, none of its own writes (plan Phase 4, D-29
   to D-32).** `UPDATE ... SET x = (subquery)` sees rows the same statement
@@ -120,7 +104,9 @@ top of the plan) are waiting on the user and shape N-036 to N-039 and N-043.
   allocations each; startup replay is 0.9 s per million rows. Correct
   `docs/benchmarks.md`, which blames interpreted execution for the scan gap.
   Memory per row (D-49) and streamed results (D-50) are recorded in the plan
-  but not scheduled.
+  but not scheduled. Done already: D-40 step 2 (`Engine.CatalogVersion`,
+  with D-16) and the baseline benchmarks (`BenchmarkDL*` in root, `sql/`
+  and `pgwire/`, D-04).
 - **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
   **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
   tables that clients and migration tools send (advisory locks, `DISCARD
@@ -131,6 +117,17 @@ top of the plan) are waiting on the user and shape N-036 to N-039 and N-043.
   replication flags and a Unix socket for `bytdbd`. Which tool needs which
   statement is from memory: capture each tool's real statements before
   prioritizing by it.
+
+- **N-044** · raised `2026-1109-2243-deep-look-phase0-phase1` · value medium
+  **Cut "release A" of the deep-look plan (Phase 0 + Phase 1).** Every
+  Phase 1 fix is on `main`, but nothing is tagged: the last tags are bytdb
+  and pgwire `v0.22.0`. pgwire now uses unreleased root API
+  (`Session.Fail`, `DB.CatalogVersion`, and N-032's `PeekIdentity`), so its
+  `GOWORK=off` build fails until the root is tagged; CI reports that job as
+  allowed-to-fail. The plan calls release A patch-level, but it adds API
+  and SQL behavior (hex literals, `= NULL`, refused subquery shapes), so
+  the `release` skill's rule says minor: `v0.23.0`. Tagging publishes to the
+  module proxy for good, so it waits for the user's go-ahead.
 
 ## Validate
 
@@ -252,6 +249,45 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-036** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-09, `2026-1109-2243-deep-look-phase0-phase1`. **Small isolated correctness and outage fixes (plan
+  Phase 1, D-05 to D-22).** All eighteen landed, one commit each (two
+  pairs), each with its audit repro ported as a test that fails before the
+  fix: D-05 restore tolerates overlapping chunks; D-06 the parser bounds
+  expression-tree *depth* at 10,000 (54001), not a statement-wide count, so
+  wide statements are unaffected; D-07 any error in a block fails it
+  (`Session.Fail`, pgwire's `sendError`), BEGIN in a failed block is 25P02;
+  D-08 comment-only queries are empty; D-09 interim refusal of the subquery
+  shapes the runner answers wrongly (narrower than the plan: `EXISTS (...
+  LIMIT 1)` and `ARRAY(... ORDER BY x)` stay accepted); D-10 upsert checks the
+  parent side through a shared `parentKeyRecheck`; D-11 failed uniqueness
+  probes are serializable reads; D-12 DDL callbacks that write are refused
+  (writerGID in default mode, a DDL goroutine set under OCC); D-13 CACHE
+  batches reserve in O(1), CACHE capped at 1,000,000; D-14 accept backoff
+  and a 2x MaxConns hard ceiling; D-15 the write deadline is re-armed per
+  socket write; D-16 prepared statements revalidate on
+  `Engine.CatalogVersion` (0A000); D-17 the wire never sends a value under a
+  type it contradicts; D-18 sequence functions refused in CHECK/USING; D-19
+  closed-Txn `ErrTxClosed`, deep-copied descriptors from the accessors
+  (Row.Desc stays shared; DDL builds on the stored bytes), identity bump on
+  UPDATE, and three smaller fixes; D-20 OCC allocator leaks; D-21 eight SQL
+  items; D-22 hex/octal/binary and underscore literals, E-string escapes,
+  signs, the `||` precedence level, `= NULL`, `ANY(NULL)`. Tests that pinned
+  old non-Postgres behavior were updated to Postgres 16.6's answers.
+- **N-035** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-09, `2026-1109-2243-deep-look-phase0-phase1`. **Safety net (plan Phase 0, D-01 to D-04).** D-03:
+  `.github/workflows/ci.yml` in bytdb and btypedb (vet, race on Linux and
+  macOS, gofmt, staticcheck, a hard no-`replace` check on pgwire, an
+  allowed-to-fail `GOWORK=off` pgwire build and btypedb-main canary, the
+  difftest job, nightly fuzzing); both repos' first runs green. D-02:
+  `sql/difftest/` drives bytdb and Postgres through one pgx client and
+  compares values and type classes; `-- @todo D-xx` annotations make the
+  corpus the list of open divergences (a run fails when one starts
+  matching). D-04: `BenchmarkDL*` baselines. D-01 was done differently from
+  the plan, on purpose: with fixes landing in the same session, each repro
+  was ported test-first into the fix's commit rather than parked behind a
+  `Skip` line first. The audit repros for later phases stay in
+  `ai_docs/todo/deep-look-repros/` until their phase ports them.
 - **N-034** · raised `2026-1104-1351-n030-n031-estring-split-pgwire-replace` · closed
   2026-11-04, `2026-1104-1401-n032-n034-identity-restart-nested-comments`. **The lexer did not nest block comments.**
   Fixed: `lex` (`sql/lexer.go`) now hands each `/*` to `blockCommentLen`,
