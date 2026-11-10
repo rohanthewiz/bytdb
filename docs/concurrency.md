@@ -152,6 +152,27 @@ Semantics to know:
   concurrent writes by default, `serializable` in the single-writer mode or
   inside an opted-up transaction.
 
+## `SELECT ... FOR UPDATE` / `FOR SHARE`
+
+The row-locking clauses parse in every form Postgres has (`FOR UPDATE |
+NO KEY UPDATE | SHARE | KEY SHARE`, `OF t`, `NOWAIT`, `SKIP LOCKED`), and what
+they do depends on the write mode, because bytdb has no row locks:
+
+- **Single-writer (default):** a no-op. The block holding the writer lock is
+  the only writer, so nothing can change a row it read before it commits —
+  the guarantee `FOR UPDATE` exists to give is already there.
+- **Concurrent writes:** the rows the block reads with `FOR UPDATE` become
+  serializable reads — validated at commit like an opted-up transaction's.
+  A concurrent writer of those rows makes the block's `COMMIT` fail with
+  40001 instead of both proceeding on stale data; re-run the block. Reads
+  without the clause stay snapshot reads.
+
+`NOWAIT` and `SKIP LOCKED` change nothing: there is no lock to wait for or
+skip. A worker queue that relies on `SKIP LOCKED` to hand different rows to
+different workers needs another way to claim rows under concurrent writes
+(an `UPDATE ... WHERE claimed_by IS NULL ... RETURNING`, whose conflicts
+retry).
+
 ## Sequences and identity under concurrent writes
 
 `WithConcurrentWrites` also switches sequence and identity allocation to

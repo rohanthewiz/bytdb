@@ -114,7 +114,20 @@ GROUP BY/HAVING, window functions with full frame support, WITH CTEs,
 derived tables, UNION, `SELECT DISTINCT`, `LIKE`/`ILIKE`, `BETWEEN`,
 `ANY`/`ALL`, regex operators,
 CASE, casts, correlated subqueries, EXISTS, EXPLAIN, transaction blocks
-with savepoints, TRUNCATE, VACUUM (on-demand compaction; VERBOSE reports bytes reclaimed), SET/SHOW. Uncorrelated subqueries evaluate
+with savepoints, TRUNCATE, VACUUM (on-demand compaction; VERBOSE reports bytes reclaimed), SET/SHOW.
+Also the everyday forms: `CAST`, typed literals, `IS [NOT] DISTINCT
+FROM`, row comparisons, dollar quoting, `NULLS FIRST/LAST`, `FETCH FIRST`,
+`FOR UPDATE` (a no-op single-writer; serializable reads under concurrent
+writes), `JOIN ... USING`, `INTERSECT`/`EXCEPT`, `VALUES` as a query,
+`INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`, `SET col =
+DEFAULT`; a scalar function library (math, text, date/time incl.
+`date_trunc`/`to_char`/`AT TIME ZONE`, jsonb) with unknown functions
+refused at prepare (42883); aggregates `string_agg`, `array_agg`,
+`bool_and/or`, `FILTER (WHERE ...)`, `ORDER BY` inside the call; and the
+session surface tools send — advisory locks (`pg_advisory_lock` and
+friends), `DISCARD ALL`, `DEALLOCATE`, `current_setting`/`set_config`,
+`pg_backend_pid`, dotted `SET app.x`, `pg_tables`/`pg_indexes`/
+`pg_settings`/information_schema views, `regclass` names. Uncorrelated subqueries evaluate
 once per statement (Postgres InitPlan semantics), so
 `WHERE x >= (SELECT min(x) FROM t)` costs one inner scan, not one per
 outer row. `$n` placeholders bind in
@@ -128,11 +141,16 @@ with `-> ->> #> #>> @> <@ ? ?| ?& || -` and canonical-text equality.
 Constraints: PRIMARY KEY, NOT NULL, CHECK, UNIQUE, and foreign keys
 (MATCH SIMPLE; NO ACTION/RESTRICT or `ON DELETE CASCADE` — cascades
 are transitive and still blocked by a NO ACTION constraint
-downstream). Errors carry Postgres wording and SQLSTATEs.
+downstream). Errors carry Postgres wording and SQLSTATEs; branch with
+`errors.Is` on `bytdb.ErrNoSuchTable`, `ErrNoSuchColumn`,
+`ErrUniqueViolation` (`ErrDuplicateKey` for the primary key),
+`ErrNotNull`, `ErrForeignKey`, `ErrCheck` rather than on text.
 
-`DEFAULT` takes constants plus `now()`/`current_date` (evaluated once
-per INSERT statement). `serial` draws from a durable per-column
-counter; read generated keys back with `RETURNING id`.
+`DEFAULT` takes constants (pg_dump's `(0)` and `'x'::text` spellings
+too) plus `now()`/`current_date` (evaluated once per INSERT statement)
+and `gen_random_uuid()` (a fresh uuid per row). `serial` draws from a
+durable per-column counter; read generated keys back with `RETURNING
+id`, and `setval(pg_get_serial_sequence('t','id'), n)` moves it.
 
 ## Concurrent writes (opt-in)
 
@@ -260,9 +278,10 @@ bytes, 64 hex chars, or base64 of 32).
   (`DefaultBackfillLimit`) rather than OOM-killing mid-migration;
   `Engine.SetBackfillLimit(n)` raises it, `0` disables it.
 - **A DEFAULT that backfills must be something the engine can evaluate**
-  — a constant, `now()`, or `current_date`. Anything else (an
-  expression, a cast, `gen_random_uuid()`) *fails the ALTER* rather
-  than leaving old rows NULL while new inserts get a value.
+  — a constant, `now()`, `current_date`, or `gen_random_uuid()` (a
+  fresh uuid per existing row). Anything else (a general expression)
+  *fails the ALTER* rather than leaving old rows NULL while new inserts
+  get a value.
 - **`ALTER COLUMN TYPE` and the primary-key replacement rewrite the
   whole table** (rows, keys, every index) in one transaction, under the
   same 1M-row `DefaultBackfillLimit`. Without `USING` only Postgres's
