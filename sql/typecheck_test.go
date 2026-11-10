@@ -149,3 +149,26 @@ func TestTypedResultDescriptions(t *testing.T) {
 		t.Error("execution rewrote the prepared statement's tree")
 	}
 }
+
+// TestHashKeysBySQLEquality (D-26): 1 and 1.0 are equal in SQL, so they
+// collapse under UNION, DISTINCT, GROUP BY and count(DISTINCT); NaN
+// groups with NaN instead of failing the statement.
+func TestHashKeysBySQLEquality(t *testing.T) {
+	d := openDB(t)
+	if res := exec(t, d, `select 1 union select 1.0`); len(res.Rows) != 1 {
+		t.Errorf("1 UNION 1.0: %v", res.Rows)
+	}
+	if res := exec(t, d, `select count(*) from (select distinct x from (select 1 as x union all select 1.0) s) s2`); res.Rows[0][0] != int64(1) {
+		t.Errorf("DISTINCT over 1 and 1.0: %v", res.Rows)
+	}
+	// NaN cannot be stored yet (D-36), so the values are derived.
+	const vals = `(select 1.0::float8 as x union all select 1::float8 union all
+		select 'NaN'::float8 union all select 'NaN'::float8 union all select 2.5::float8) f`
+	res := exec(t, d, `select x, count(*) from `+vals+` group by x order by x`)
+	if len(res.Rows) != 3 || res.Rows[0][1] != int64(2) || res.Rows[2][1] != int64(2) {
+		t.Errorf("GROUP BY over 1.0, 1, NaN, NaN, 2.5: %v", res.Rows)
+	}
+	if res := exec(t, d, `select count(distinct x) from `+vals); res.Rows[0][0] != int64(3) {
+		t.Errorf("count(DISTINCT x) = %v, want 3", res.Rows[0][0])
+	}
+}

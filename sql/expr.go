@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
-	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -1518,7 +1517,7 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 				if v, evalErr = evalEx(&rowEnv, itemEx); evalErr != nil {
 					return false
 				}
-				kb, e := tuple.Encode(v)
+				kb, e := hashKey(v)
 				if e != nil {
 					evalErr = serr.Wrap(e, "op", "encode row for dedup")
 					return false
@@ -1598,7 +1597,7 @@ func dedupScalars(vals []any) ([]any, error) {
 	seen := make(map[string]bool, len(vals))
 	out := vals[:0]
 	for _, v := range vals {
-		kb, err := tuple.Encode(v)
+		kb, err := hashKey(v)
 		if err != nil {
 			return nil, serr.Wrap(err, "op", "encode value for dedup")
 		}

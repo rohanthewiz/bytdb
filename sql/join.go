@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"math"
 	"reflect"
 	"strings"
 
@@ -361,23 +362,24 @@ func indexServes(d *bytdb.TableDesc, ord int) bool {
 }
 
 // hashCompatible reports whether equal values of the two column types
-// always encode to the same hash key. Identical types do; the numeric
-// class (ints, floats, and the int64-backed date/time types) does via
-// the float64 normalization in hashJoinKey. Everything else — notably
+// always encode to the same hash key. Identical types do; ints and
+// floats do via the float64 normalization in hashJoinKey, and so does an
+// int against a date or timestamp (compared as the day or microsecond
+// count, which the typed bind pass accepts). A date against a timestamp
+// does not: their int64s count different units, so they must never
+// share a bucket (deep-look D-26) — the bind pass casts one side, which
+// takes such a join off the hash path anyway. Everything else — notably
 // text against a non-text — compares through coercion the key cannot
 // reproduce.
 func hashCompatible(a, b bytdb.ColType) bool {
 	if a == b {
 		return true
 	}
-	num := func(t bytdb.ColType) bool {
-		switch t {
-		case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp, bytdb.TDate:
-			return true
-		}
-		return false
+	num := func(t bytdb.ColType) bool { return t == bytdb.TInt || t == bytdb.TFloat }
+	if num(a) && num(b) {
+		return true
 	}
-	return num(a) && num(b)
+	return (a == bytdb.TInt && temporalType(b)) || (b == bytdb.TInt && temporalType(a))
 }
 
 // hashJoinKey encodes one side's key values; ok is false when any
@@ -393,8 +395,13 @@ func hashJoinKey(vals []any, ord func(hashEqKey) int, keys []hashEqKey) (string,
 		if v == nil {
 			return "", false
 		}
-		if n, isInt := v.(int64); isInt {
+		switch n := v.(type) {
+		case int64:
 			v = float64(n)
+		case float64:
+			if math.IsNaN(n) {
+				v = nanKey // NaN = NaN in SQL ordering semantics (cmpFloat)
+			}
 		}
 		ks[i] = v
 	}

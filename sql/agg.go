@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
-	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -80,7 +79,7 @@ func (a *accum) add(env *exEnv, vals []any) error {
 		return nil
 	}
 	if a.distinct {
-		kb, err := tuple.Encode(v)
+		kb, err := hashKey(v)
 		if err != nil {
 			return serr.Wrap(err, "op", "encode DISTINCT value")
 		}
@@ -737,7 +736,7 @@ func aggScanGroups(tx *bytdb.Txn, fp *fromPlan, q *aggQuery, env *exEnv) ([]*gro
 		// The order-preserving tuple encoding makes group values a
 		// map key (NULLs group together) whose byte order is the
 		// groups' semantic order.
-		kb, err := tuple.Encode(keyVals...)
+		kb, err := hashKey(keyVals...)
 		if err != nil {
 			scanErr = serr.Wrap(err, "op", "encode group key")
 			return false

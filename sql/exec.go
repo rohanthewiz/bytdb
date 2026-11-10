@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
-	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -1622,7 +1621,7 @@ func dedupRows(rows [][]any) ([][]any, error) {
 	seen := make(map[string]bool, len(rows))
 	out := rows[:0]
 	for _, r := range rows {
-		kb, err := tuple.Encode(r...)
+		kb, err := hashKey(r...)
 		if err != nil {
 			return nil, serr.Wrap(err, "op", "encode row for dedup")
 		}

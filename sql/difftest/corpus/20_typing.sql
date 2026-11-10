@@ -34,9 +34,7 @@ select nullif(n, 2) from ev;
 select exists (select 1 from ev);
 select case when n = 1 then null else n end from ev;
 select (select max(n) from ev);
--- @todo D-26: 1 and 1.0 hash apart under UNION
 select 1 union select 1.0;
--- @todo D-26: 1 and 1.0 hash apart under DISTINCT
 select count(*) from (select distinct x from (select 1 as x union all select 1.0) s) s2;
 -- @error
 select 1 < 'a';

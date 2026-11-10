@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
-	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -543,7 +542,7 @@ func partitionKey(env *exEnv, part []Expr, row []any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	kb, err := tuple.Encode(vals...)
+	kb, err := hashKey(vals...)
 	if err != nil {
 		return "", serr.Wrap(err, "op", "encode window partition key")
 	}
