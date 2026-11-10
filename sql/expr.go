@@ -1121,7 +1121,7 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 func evalFunc(env *exEnv, name string, args []any) (any, error) {
 	// The function library (funcs.go) first; the switch below holds the
 	// functions that predate it.
-	if v, ok, err := callScalarFunc(name, args); ok {
+	if v, ok, err := callScalarFunc(env, name, args); ok {
 		return v, err
 	}
 	argN := func(i int) any {
@@ -1335,6 +1335,21 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 		}
 		if env.tx == nil { // see nextval
 			return nil, serr.New("setval is not allowed here", "sequence", s)
+		}
+		if table, col, ok := identityBySeqName(env.d.e, s); ok {
+			// An identity column's implied sequence (t_id_seq — what
+			// information_schema and pg_get_serial_sequence report, and
+			// what pg_dump's setval lines name): move the column's counter
+			// so the next draw follows v, or is v when is_called is false.
+			next := v
+			if called {
+				next = v + 1
+			}
+			if err := env.tx.RestartIdentity(table, col, next); err != nil {
+				return nil, err
+			}
+			env.d.seq.record(identitySeqName(table, col), v)
+			return v, nil
 		}
 		if err := env.tx.SetVal(s, v, called); err != nil {
 			return nil, err

@@ -1245,6 +1245,10 @@ const (
 type TxnControl struct {
 	Kind     TxnKind
 	ReadOnly bool
+	// ReadWrite records an explicit READ WRITE, which overrides
+	// default_transaction_read_only (ReadOnly false alone means the
+	// BEGIN named no access mode).
+	ReadWrite bool
 	// Isolation is the normalized requested level ("serializable",
 	// "repeatable read", "read committed") or "" when the BEGIN named
 	// none — distinct from an explicit weaker level, because "" defers
@@ -1273,7 +1277,20 @@ type SetVar struct {
 	Value     string
 	IsDefault bool
 	Tag       string // command tag: SET or RESET
+	// Also holds further parameters the same statement sets, applied
+	// first: SET TRANSACTION ISOLATION LEVEL x, READ ONLY lowers to two.
+	Also []*SetVar
 }
+
+// Discard is DISCARD ALL | PLANS | SEQUENCES | TEMP[ORARY]; What is the
+// lowercased target, TEMPORARY folded to "temp".
+type Discard struct{ What string }
+
+// Deallocate is DEALLOCATE [PREPARE] name | ALL; Name "" means ALL.
+type Deallocate struct{ Name string }
+
+func (*Discard) stmt()    {}
+func (*Deallocate) stmt() {}
 
 func (*CreateTable) stmt()        {}
 func (*Explain) stmt()            {}

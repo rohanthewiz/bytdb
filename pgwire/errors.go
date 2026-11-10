@@ -167,8 +167,19 @@ func sqlstate(msg string, hasPos bool) string {
 		return "2201X" // invalid_row_count_in_result_offset_clause
 	case strings.Contains(msg, "current transaction is aborted"):
 		return "25P02" // in_failed_sql_transaction
-	case strings.Contains(msg, "read-only transaction"):
+	case strings.Contains(msg, "read-only transaction"),
+		strings.HasPrefix(msg, "cannot make a READ ONLY transaction block writable"):
 		return "25006" // read_only_sql_transaction
+	// The session surface (deep-look D-51): DEALLOCATE of an unknown
+	// name, SHOW / current_setting of an unknown parameter, and a bad
+	// parameter value.
+	case strings.HasPrefix(msg, `prepared statement "`) && strings.HasSuffix(msg, `" does not exist`):
+		return "26000" // invalid_sql_statement_name
+	case strings.HasPrefix(msg, "unrecognized configuration parameter"):
+		return "42704" // undefined_object
+	case strings.HasPrefix(msg, "invalid value for parameter"),
+		strings.HasPrefix(msg, "parameter \"") && strings.HasSuffix(msg, "requires a Boolean value"):
+		return "22023" // invalid_parameter_value
 	case strings.Contains(msg, "cannot run inside a transaction block"),
 		strings.Contains(msg, "must be called before any query"):
 		return "25001" // active_sql_transaction (late SET TRANSACTION)

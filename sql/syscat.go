@@ -1062,3 +1062,14 @@ var sysFuncs = map[string]string{
 	"current_user":     sysDatabase,
 	"session_user":     sysDatabase,
 }
+
+// bareSysWords are the functions SQL spells without parentheses, with
+// their constants (sysFuncs' values where both exist).
+var bareSysWords = map[string]string{
+	"current_user":    sysDatabase,
+	"session_user":    sysDatabase,
+	"current_role":    sysDatabase,
+	"user":            sysDatabase,
+	"current_schema":  "public",
+	"current_catalog": sysDatabase,
+}

@@ -370,11 +370,28 @@ func (p *parser) statement() (Statement, error) {
 		if p.acceptKw("all") {
 			return &SetVar{Name: "all", IsDefault: true, Tag: "RESET"}, nil
 		}
-		name, err := p.ident("configuration parameter")
+		if p.cur().kind == tIdent && p.cur().text == "session" && p.tokAt(1).text == "authorization" {
+			p.i += 2
+			return &SetVar{Name: "session_authorization", IsDefault: true, Tag: "RESET"}, nil
+		}
+		name, err := p.paramName()
 		if err != nil {
 			return nil, err
 		}
 		return &SetVar{Name: name, IsDefault: true, Tag: "RESET"}, nil
+	case p.acceptKw("discard"):
+		return p.discardStmt()
+	case p.acceptKw("deallocate"):
+		// DEALLOCATE [PREPARE] name | ALL (deep-look D-51).
+		p.acceptKw("prepare")
+		if p.acceptKw("all") {
+			return &Deallocate{}, nil
+		}
+		name, err := p.ident("a prepared statement name")
+		if err != nil {
+			return nil, err
+		}
+		return &Deallocate{Name: name}, nil
 	case p.acceptKw("begin"):
 		if !p.acceptKw("work") {
 			p.acceptKw("transaction")
@@ -421,36 +438,55 @@ func (p *parser) setStmt() (Statement, error) {
 	if !session {
 		p.acceptKw("local")
 	}
-	// SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL x is
-	// the statement JDBC's setTransactionIsolation issues: it sets the
-	// session default, so it lowers to default_transaction_isolation.
+	// SET SESSION CHARACTERISTICS AS TRANSACTION <modes> is the
+	// statement JDBC's setTransactionIsolation issues: it sets the
+	// session defaults, so it lowers to the default_transaction_*
+	// parameters.
 	if session && p.acceptKw("characteristics") {
-		for _, kw := range []string{"as", "transaction", "isolation", "level"} {
+		for _, kw := range []string{"as", "transaction"} {
 			if err := p.expectKw(kw); err != nil {
 				return nil, err
 			}
 		}
-		lvl, err := p.isolationLevel()
-		if err != nil {
-			return nil, err
-		}
-		return &SetVar{Name: "default_transaction_isolation", Value: lvl, Tag: "SET"}, nil
+		return p.setTxnModes("default_")
 	}
-	// SET TRANSACTION ISOLATION LEVEL x scopes to the open block only;
-	// it lowers to the transaction_isolation parameter, which the
-	// Session treats transactionally (Postgres defines the parameter
-	// and the statement as equivalent).
-	if p.acceptKw("transaction") {
-		for _, kw := range []string{"isolation", "level"} {
-			if err := p.expectKw(kw); err != nil {
-				return nil, err
-			}
+	// SET SESSION AUTHORIZATION name | DEFAULT: bytdb has no roles, so
+	// the name is remembered for SHOW and otherwise changes nothing.
+	if session && p.acceptKw("authorization") {
+		if p.acceptKw("default") {
+			return &SetVar{Name: "session_authorization", IsDefault: true, Tag: "SET"}, nil
 		}
-		lvl, err := p.isolationLevel()
+		v, err := p.setValue()
 		if err != nil {
 			return nil, err
 		}
-		return &SetVar{Name: "transaction_isolation", Value: lvl, Tag: "SET"}, nil
+		return &SetVar{Name: "session_authorization", Value: v, Tag: "SET"}, nil
+	}
+	// SET TRANSACTION <modes> scopes to the open block only; each mode
+	// lowers to its parameter (transaction_isolation,
+	// transaction_read_only), which the Session treats transactionally
+	// (Postgres defines the parameters and the statement as equivalent).
+	if p.acceptKw("transaction") {
+		return p.setTxnModes("")
+	}
+	// SET NAMES 'enc' is the standard spelling of client_encoding.
+	if p.acceptKw("names") {
+		if p.acceptKw("default") {
+			return &SetVar{Name: "client_encoding", IsDefault: true, Tag: "SET"}, nil
+		}
+		v, err := p.setValue()
+		if err != nil {
+			return nil, err
+		}
+		return &SetVar{Name: "client_encoding", Value: v, Tag: "SET"}, nil
+	}
+	// SET ROLE name | NONE: remembered, like SESSION AUTHORIZATION.
+	if p.acceptKw("role") {
+		v, err := p.setValue()
+		if err != nil {
+			return nil, err
+		}
+		return &SetVar{Name: "role", Value: v, Tag: "SET"}, nil
 	}
 	if p.acceptKw("time") {
 		if err := p.expectKw("zone"); err != nil {
@@ -462,7 +498,7 @@ func (p *parser) setStmt() (Statement, error) {
 		}
 		return &SetVar{Name: "timezone", Value: v, Tag: "SET"}, nil
 	}
-	name, err := p.ident("a configuration parameter")
+	name, err := p.paramName()
 	if err != nil {
 		return nil, err
 	}
@@ -486,6 +522,87 @@ func (p *parser) setStmt() (Statement, error) {
 		}
 	}
 	return &SetVar{Name: name, Value: strings.Join(vals, ", "), Tag: "SET"}, nil
+}
+
+// paramName reads a configuration parameter name, including a dotted
+// custom one (SET app.user_id = '5' — the placeholder namespace
+// extensions and applications use, readable through current_setting).
+func (p *parser) paramName() (string, error) {
+	name, err := p.ident("a configuration parameter")
+	if err != nil {
+		return "", err
+	}
+	for p.acceptOp(".") {
+		part, err := p.ident("a configuration parameter")
+		if err != nil {
+			return "", err
+		}
+		name += "." + part
+	}
+	return strings.ToLower(name), nil
+}
+
+// setTxnModes parses the transaction modes after SET TRANSACTION (prefix
+// "") or SET SESSION CHARACTERISTICS AS TRANSACTION (prefix "default_")
+// into the SETs of the parameters they stand for. Several modes chain
+// through SetVar.Also. [NOT] DEFERRABLE is accepted and remembered: it
+// only matters for serializable read-only waits Postgres performs and
+// bytdb does not need.
+func (p *parser) setTxnModes(prefix string) (Statement, error) {
+	var vars []*SetVar
+	set := func(name, v string) {
+		vars = append(vars, &SetVar{Name: prefix + name, Value: v, Tag: "SET"})
+	}
+	for {
+		switch {
+		case p.acceptKw("isolation"):
+			if err := p.expectKw("level"); err != nil {
+				return nil, err
+			}
+			lvl, err := p.isolationLevel()
+			if err != nil {
+				return nil, err
+			}
+			set("transaction_isolation", lvl)
+		case p.acceptKw("read"):
+			switch {
+			case p.acceptKw("only"):
+				set("transaction_read_only", "on")
+			case p.acceptKw("write"):
+				set("transaction_read_only", "off")
+			default:
+				return nil, p.unexpected("ONLY or WRITE")
+			}
+		case p.acceptKw("not"):
+			if err := p.expectKw("deferrable"); err != nil {
+				return nil, err
+			}
+			set("transaction_deferrable", "off")
+		case p.acceptKw("deferrable"):
+			set("transaction_deferrable", "on")
+		default:
+			if len(vars) == 0 {
+				return nil, p.unexpected("a transaction mode")
+			}
+			last := vars[len(vars)-1]
+			last.Also = vars[:len(vars)-1]
+			return last, nil
+		}
+		p.acceptOp(",")
+	}
+}
+
+// discardStmt parses the target after DISCARD.
+func (p *parser) discardStmt() (Statement, error) {
+	for _, w := range []string{"all", "plans", "sequences", "temp", "temporary"} {
+		if p.acceptKw(w) {
+			if w == "temporary" {
+				w = "temp"
+			}
+			return &Discard{What: w}, nil
+		}
+	}
+	return nil, p.unexpected("ALL, PLANS, SEQUENCES, or TEMP")
 }
 
 // setValue consumes one SET value: a literal, an identifier (on, off,
@@ -733,11 +850,15 @@ func (p *parser) showStmt() (Statement, error) {
 		}
 		return &ShowVar{Name: "transaction_isolation"}, nil
 	}
-	name, err := p.ident("a configuration parameter")
+	if p.cur().kind == tIdent && p.cur().text == "session" && p.tokAt(1).text == "authorization" {
+		p.i += 2
+		return &ShowVar{Name: "session_authorization"}, nil
+	}
+	name, err := p.paramName()
 	if err != nil {
 		return nil, err
 	}
-	return &ShowVar{Name: strings.ToLower(name)}, nil
+	return &ShowVar{Name: name}, nil
 }
 
 // txnModes parses BEGIN's transaction modes, in any order with
@@ -764,7 +885,7 @@ func (p *parser) txnModes(tc *TxnControl) (Statement, error) {
 			case p.acceptKw("only"):
 				tc.ReadOnly = true
 			case p.acceptKw("write"):
-				tc.ReadOnly = false
+				tc.ReadOnly, tc.ReadWrite = false, true
 			default:
 				return nil, p.unexpected("ONLY or WRITE")
 			}
@@ -3122,6 +3243,13 @@ func (p *parser) sysFuncCall() (val, name string, ok bool, err error) {
 	name, at := t.text, 0
 	if name == "pg_catalog" && p.peekOpAt(1, ".") && p.tokAt(2).kind == tIdent {
 		name, at = p.tokAt(2).text, 2
+	}
+	if v, bare := bareSysWords[name]; bare && at == 0 && !p.peekOpAt(1, "(") && !p.peekOpAt(1, ".") {
+		// current_user, session_user, user, current_role, current_schema,
+		// current_catalog: SQL's parenthesis-free functions (reserved
+		// words in Postgres, so never a column there) — deep-look D-51.
+		p.advance()
+		return v, name, true, nil
 	}
 	v, isFn := sysFuncs[name]
 	if !isFn || !p.peekOpAt(at+1, "(") {

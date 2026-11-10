@@ -847,9 +847,17 @@ VACUUM (VERIFY) events;            -- bytdb: re-check every CHECK on stored rows
 SET search_path TO public, other;  -- SESSION/LOCAL both scope to session
 SET time zone 'UTC';
 SET statement_timeout = '5s';      -- bounds every statement (57014 on expiry)
+SET app.user_id = '5';             -- dotted custom parameter: current_setting reads it
+SET NAMES 'UTF8';  SET ROLE admin;  SET SESSION AUTHORIZATION 'alice';  -- remembered
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY;  -- inside a block
+SET default_transaction_read_only = on;  -- blocks begin READ ONLY; autocommit writes refused
 RESET search_path;  RESET ALL;
 SHOW server_version;               -- 16.0 (bytdb)
+SHOW server_version_num;           -- 160000
 SHOW ALL;
+DISCARD ALL;                       -- a pool's reset: SET state, prepared statements,
+                                   -- advisory locks, lastval/currval
+DEALLOCATE ps1;  DEALLOCATE ALL;   -- protocol-level prepared statements, by name
 ```
 
 TRUNCATE is transactional (it can roll back). VACUUM is not: like Postgres it
@@ -872,8 +880,60 @@ compare `Stats().LogBytes` with `LogBaseBytes` (see Monitoring memory in the
 README). On a replicated database each VACUUM rolls the replication
 generation, re-shipping the compacted file. `SET`/`SHOW` overlay session
 values on Postgres-shaped defaults; an unknown, never-set parameter gets
-Postgres's `unrecognized configuration parameter` error, and everything but
-`statement_timeout`, `search_path`, and `time zone` is accepted and ignored.
+Postgres's `unrecognized configuration parameter` error (42704). The
+parameters with semantics are `statement_timeout`, `search_path`, `time
+zone`, the isolation pair (`transaction_isolation`,
+`default_transaction_isolation`) and the read-only pair
+(`transaction_read_only`, `default_transaction_read_only`); everything else
+is remembered for `SHOW` and `current_setting` and otherwise ignored. A wire
+connection's startup parameters (`application_name`, a driver's `DateStyle`,
+...) apply as `SET` does, and an invalid one fails the connection, as in
+Postgres. The defaults describe bytdb as it is: `lc_collate` is `C` (text
+compares bytewise), `is_superuser` is `on` (there are no roles),
+`lock_timeout` and `idle_in_transaction_session_timeout` are `0`.
+
+`SET TRANSACTION READ WRITE` cannot make a `READ ONLY` block writable (25006):
+the block began without the writer lock. Begin it `READ WRITE` instead.
+
+## Session functions and advisory locks
+
+The functions tools call on connect and around migrations:
+
+| Function | Result |
+|---|---|
+| `current_user`, `session_user`, `user`, `current_role`, `current_catalog` | `bytdb` (no roles); bare or with `()` |
+| `current_schema` / `current_schema()`, `current_schemas(bool)` | `public` / `{public}` (`{pg_catalog,public}` with true) |
+| `pg_backend_pid()` | the connection's pid (the BackendKeyData pid, the one in `pg_stat_activity`) |
+| `current_setting(name [, missing_ok])` | what `SHOW` reports; with missing_ok, NULL for an unknown name |
+| `set_config(name, value, is_local)` | `SET name = value` (is_local scopes to the session, like `SET LOCAL`) |
+| `txid_current()`, `pg_current_xact_id()` | an id stable within a block, fresh per autocommit statement; unique within the process, not durable |
+| `to_regclass(text)` | the relation's oid, or NULL |
+| `pg_get_serial_sequence(table, column)` | `public.t_id_seq` for a serial or identity column, else NULL |
+| `has_table_privilege(...)` and the schema/database/sequence/column forms | true (no roles) |
+| `quote_ident(text)`, `pg_typeof(x)`, `pg_is_in_recovery()` | as in Postgres (`pg_typeof` names bytdb's types: `bigint`, `double precision`, ...) |
+
+`setval` accepts an identity column's implied sequence name, which is what
+`pg_get_serial_sequence` and `information_schema.columns.column_default`
+report and what pg_dump writes (`SELECT pg_catalog.setval('public.t_id_seq',
+42, true)`): it moves the column's counter so the next insert draws 43.
+
+**Advisory locks.** `pg_advisory_lock`, `pg_try_advisory_lock`,
+`pg_advisory_unlock`, `pg_advisory_unlock_all`, and the transaction-level
+`pg_advisory_xact_lock` / `pg_try_advisory_xact_lock`, each with one bigint
+key or two int4 keys (separate key spaces, as in Postgres). Locks are
+exclusive and reentrant: a session that locks twice unlocks twice.
+Session-level locks last until unlocked or the session closes (a dropped
+connection releases them); transaction-level ones until the block ends — or
+the statement, in autocommit. This is what golang-migrate, goose and similar
+tools take around a migration run.
+
+- The lock table is shared by the sessions of one `DB` value — a wire
+  server's connections all share one. Two `DB` values opened over the same
+  engine do not see each other's locks.
+- A blocked `pg_advisory_lock` waits until the lock frees, the statement
+  times out (`statement_timeout`) or the client cancels; there is no deadlock
+  detector, so two sessions waiting on each other's locks wait for a timeout.
+- Shared locks (`pg_advisory_lock_shared` and friends) are not implemented.
 
 ## The Go APIs
 

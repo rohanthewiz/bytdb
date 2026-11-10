@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"strings"
+
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
@@ -329,6 +331,18 @@ func command(st Statement) string {
 	}
 	if ig, ok := st.(*Ignored); ok {
 		return ig.Tag
+	}
+	switch st := st.(type) {
+	case *Discard:
+		if st.What == "temp" {
+			return "DISCARD TEMP"
+		}
+		return "DISCARD " + strings.ToUpper(st.What)
+	case *Deallocate:
+		if st.Name == "" {
+			return "DEALLOCATE ALL"
+		}
+		return "DEALLOCATE"
 	}
 	if ai, ok := st.(*AlterIfExists); ok {
 		return command(ai.Stmt)

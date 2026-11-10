@@ -40,6 +40,34 @@ var showDefaults = map[string]string{
 	"default_transaction_isolation": "serializable",
 	"statement_timeout":             "0",
 	"max_identifier_length":         "63",
+
+	// What tools probe before ever setting (deep-look D-51), with the
+	// values that describe bytdb truthfully: byte-order collation ("C"),
+	// no roles (every session acts as a superuser), no lock or idle
+	// timeouts unless the server sets them. application_name is filled
+	// from the connection's startup parameters.
+	"server_version_num":                  "160000",
+	"application_name":                    "",
+	"lock_timeout":                        "0",
+	"idle_in_transaction_session_timeout": "0",
+	"max_connections":                     "100",
+	"is_superuser":                        "on",
+	"session_authorization":               sysDatabase,
+	"role":                                "none",
+	"transaction_read_only":               "off",
+	"transaction_deferrable":              "off",
+	"default_transaction_deferrable":      "off",
+	"default_transaction_read_only":       "off",
+	"bytea_output":                        "hex",
+	"extra_float_digits":                  "1",
+	"lc_collate":                          "C",
+	"lc_ctype":                            "C",
+	"lc_messages":                         "C",
+	"lc_monetary":                         "C",
+	"lc_numeric":                          "C",
+	"lc_time":                             "C",
+	"intervalstyle":                       "postgres",
+	"in_hot_standby":                      "off",
 }
 
 // isoDefault is the isolation level the engine actually provides when
@@ -53,27 +81,34 @@ func isoDefault(occ bool) string {
 	return "serializable"
 }
 
-// execShow answers SHOW name / SHOW ALL from the session's SET state
-// (vars, and the parsed statement_timeout) over the defaults. iso
-// overlays the two isolation parameters with their live values — SET
-// never lands them in vars (the Session gives them real semantics),
-// so they must be supplied. An unknown, never-SET parameter is the
-// Postgres error, wording and all.
-func execShow(sv *ShowVar, vars map[string]string, timeout time.Duration,
-	iso map[string]string) (*Result, error) {
-	get := func(name string) (string, bool) {
-		if name == "statement_timeout" && timeout > 0 {
-			return strconv.FormatInt(timeout.Milliseconds(), 10) + "ms", true
-		}
-		if v, ok := iso[name]; ok {
-			return v, true
-		}
-		if v, ok := vars[name]; ok {
-			return v, true
-		}
-		v, ok := showDefaults[name]
-		return v, ok
+// showValue is one parameter's current value: the parsed
+// statement_timeout, then live (the parameters a Session gives real
+// semantics and therefore never stores as text — isolation, read-only
+// state), then the session's SET text, then the defaults. ok is false
+// for a parameter nothing defines.
+func showValue(name string, vars map[string]string, timeout time.Duration,
+	live map[string]string) (string, bool) {
+	if name == "statement_timeout" && timeout > 0 {
+		return strconv.FormatInt(timeout.Milliseconds(), 10) + "ms", true
 	}
+	if v, ok := live[name]; ok {
+		return v, true
+	}
+	if v, ok := vars[name]; ok {
+		return v, true
+	}
+	v, ok := showDefaults[name]
+	return v, ok
+}
+
+// execShow answers SHOW name / SHOW ALL from the session's SET state
+// (vars, and the parsed statement_timeout) over the defaults. live
+// overlays the parameters with live values (see showValue) — SET never
+// lands them in vars, so they must be supplied. An unknown, never-SET
+// parameter is the Postgres error, wording and all.
+func execShow(sv *ShowVar, vars map[string]string, timeout time.Duration,
+	live map[string]string) (*Result, error) {
+	get := func(name string) (string, bool) { return showValue(name, vars, timeout, live) }
 	if sv.Name == "all" {
 		names := make(map[string]bool, len(showDefaults)+len(vars))
 		for n := range showDefaults {

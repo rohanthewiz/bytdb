@@ -1699,6 +1699,17 @@ func (t *typer) funcExpr(n *ExFunc, ts *tscope) (Expr, bytdb.ColType, error) {
 		}
 	case "exists":
 		typ = bytdb.TBool
+	case "pg_typeof":
+		// The argument's static type is the answer, so the call folds to
+		// it here; at run time a date is an int64 and could not tell.
+		if len(argTypes) == 1 {
+			name := "unknown"
+			if concrete(argTypes[0]) {
+				name = pgTypeName(argTypes[0])
+			}
+			return &ExLit{Val: name, Name: "pg_typeof"}, bytdb.TString, nil
+		}
+		return nil, "", noFunc(n.Name, argTypes)
 	case "lower", "upper":
 		// Text in, text out: upper(1) is a type error, not NULL.
 		if len(argTypes) != 1 || !textOrUnknown(argTypes[0]) {

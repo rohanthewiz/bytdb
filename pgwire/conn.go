@@ -524,6 +524,14 @@ func (c *conn) startup() error {
 					return err
 				}
 			}
+			// Startup parameters apply as SET would (application_name,
+			// DateStyle, statement_timeout, ...), as in Postgres; a bad
+			// value fails the connection, as it does there.
+			if err := c.sess.ApplyStartupParams(params); err != nil {
+				c.send(msgErrorResponse, errorBody(err, "", 0))
+				c.w.Flush()
+				return err
+			}
 			var auth wbuf
 			auth.int32(authOK) // AuthenticationOk
 			c.send(msgAuth, auth)
@@ -935,6 +943,23 @@ func (c *conn) execute(r *rbuf) {
 		return
 	}
 	c.sendCommandComplete(pt.prep.info.Command, res)
+}
+
+// deallocate is the session's DEALLOCATE / DISCARD ALL hook: it drops
+// one named protocol-level statement, or all of them for name "". The
+// statement namespace is shared with Parse/Close, as in Postgres, so
+// a pgx statement cache's names are what DEALLOCATE takes. Portals stay:
+// each holds what it needs to run.
+func (c *conn) deallocate(name string) error {
+	if name == "" {
+		clear(c.stmts)
+		return nil
+	}
+	if _, ok := c.stmts[name]; !ok {
+		return serr.New(`prepared statement "` + name + `" does not exist`)
+	}
+	delete(c.stmts, name)
+	return nil
 }
 
 // localSocket reports whether nc arrived on a Unix-domain socket.

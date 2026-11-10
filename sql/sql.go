@@ -467,6 +467,13 @@ type DB struct {
 	// Sessions each carry their own; a bare DB is one shared session.
 	seq *seqSession
 
+	// ss is the session state the session information functions read
+	// (pg_backend_pid, current_setting, advisory lock ownership); adv is
+	// the advisory lock table every session created from this DB shares.
+	// Both ride the copies like seq; see sessinfo.go.
+	ss  *sessState
+	adv *advLocks
+
 	// ctx, when set, is the running statement's cancellation scope
 	// (ExecCtx, a Session statement timeout, a wire CancelRequest).
 	// Row pumps poll it and abort the statement with its error. It
@@ -546,7 +553,8 @@ type vtab struct {
 
 // New wraps an Engine for SQL execution.
 func New(e *bytdb.Engine) *DB {
-	return &DB{e: e, seq: &seqSession{}, parses: newParseCache()}
+	return &DB{e: e, seq: &seqSession{}, parses: newParseCache(),
+		ss: newSessState(nil), adv: newAdvLocks()}
 }
 
 // CatalogVersion is the engine's DDL counter (bytdb.Engine.CatalogVersion):
@@ -763,6 +771,11 @@ func (d *DB) relationExists(name string) bool {
 // types, and dispatches it — re-running on optimistic-conflict loss
 // when it is safe to (see autocommitRetries).
 func (d *DB) run(st Statement, args []any) (*Result, error) {
+	if d.tx == nil {
+		// An autocommit statement is its own transaction, so its
+		// transaction-level advisory locks end with it.
+		defer d.endXact()
+	}
 	attempt := func() (*Result, error) {
 		res, err := d.dispatch(st, args)
 		if err == nil && d.tx == nil &&
@@ -1171,6 +1184,22 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// transaction state to control.
 		return nil, serr.New("transaction control statements require a Session",
 			"statement", s.Tag)
+	case *Discard:
+		// A bare DB is one shared session: DISCARD resets what it has —
+		// sequence-function state and its advisory locks (no SET state,
+		// no protocol-level statements).
+		if s.What == "all" || s.What == "sequences" {
+			d.seq.reset()
+		}
+		if s.What == "all" {
+			d.adv.releaseOwner(d.ss, true, false)
+		}
+		return &Result{Tag: command(s)}, nil
+	case *Deallocate:
+		if s.Name != "" {
+			return nil, noPrepared(s.Name)
+		}
+		return &Result{Tag: command(s)}, nil
 	case *SetVar:
 		// Sessions intercept SET to give statement_timeout meaning; a
 		// bare DB has no session state, so honoring the timeout is

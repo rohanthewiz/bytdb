@@ -465,6 +465,11 @@ func (s *Server) Serve(ln net.Listener) error {
 				s.mu.Unlock()
 			}()
 			defer c.sess.Close() // a dropped connection rolls back
+			// pg_backend_pid() reports the BackendKeyData pid, and SQL
+			// DEALLOCATE / DISCARD ALL reach the protocol-level statements
+			// this connection holds (deep-look D-51).
+			c.sess.SetBackendPID(c.pid)
+			c.sess.OnDeallocate(c.deallocate)
 			c.run()
 		}()
 	}

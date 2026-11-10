@@ -4,6 +4,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
@@ -196,7 +197,9 @@ func (d *DB) execAlterSequence(s *AlterSequence) (*Result, error) {
 func seqByArg(env *exEnv, v any) (string, error) {
 	switch a := v.(type) {
 	case string:
-		return a, nil
+		// public. is the one schema; pg_dump qualifies every name with it
+		// (SELECT pg_catalog.setval('public.s', 42, true)).
+		return strings.TrimPrefix(a, "public."), nil
 	case int64:
 		for _, sd := range env.d.e.Sequences() {
 			if int64(sd.ID) == a {

@@ -52,6 +52,10 @@ type scalarFunc struct {
 	typ  func(f *funcCall) (bytdb.ColType, error)
 	ret  bytdb.ColType
 	eval func(args []any) (any, error)
+	// envEval replaces eval for functions that read the statement's
+	// environment — session state, the catalog, the statement's context
+	// (sessinfo.go). Exactly one of eval and envEval is set.
+	envEval func(env *exEnv, args []any) (any, error)
 }
 
 // funcCall is a call being typed: its name, argument expressions and
@@ -732,6 +736,7 @@ func init() {
 	scalarFuncs["substr"] = scalarFuncs["substring"]
 	scalarFuncs["json_typeof"] = scalarFuncs["jsonb_typeof"]
 	scalarFuncs["json_array_length"] = scalarFuncs["jsonb_array_length"]
+	registerSessionFuncs()
 }
 
 // resultType is the call's result type for a result description: the
@@ -1056,7 +1061,7 @@ func isKnownFunc(name string) bool {
 }
 
 // callScalarFunc evaluates a registry function, or reports ok=false.
-func callScalarFunc(name string, args []any) (v any, ok bool, err error) {
+func callScalarFunc(env *exEnv, name string, args []any) (v any, ok bool, err error) {
 	f, found := scalarFuncs[name]
 	if !found {
 		return nil, false, nil
@@ -1071,6 +1076,10 @@ func callScalarFunc(name string, args []any) (v any, ok bool, err error) {
 			}
 		}
 	}
-	v, err = f.eval(args)
+	if f.envEval != nil {
+		v, err = f.envEval(env, args)
+	} else {
+		v, err = f.eval(args)
+	}
 	return v, true, err
 }

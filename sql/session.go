@@ -104,6 +104,53 @@ type Session struct {
 	// docs/gotchas.md); the next write opens a fresh block.
 	armed    bool
 	implicit bool
+
+	// defReadOnly is default_transaction_read_only: blocks that name no
+	// access mode begin READ ONLY, and autocommit writes are refused, as
+	// in Postgres (deep-look D-51).
+	defReadOnly bool
+
+	// deallocate is the wire server's hook for DEALLOCATE and DISCARD
+	// ALL: protocol-level prepared statements live in the server, not
+	// here, but SQL can name them. name "" means all. nil (no server):
+	// there are no named statements to drop.
+	deallocate func(name string) error
+}
+
+// SetBackendPID makes pg_backend_pid() report the wire server's
+// BackendKeyData pid, so it matches pg_stat_activity.pid.
+func (s *Session) SetBackendPID(pid int32) { s.db.ss.pid = pid }
+
+// OnDeallocate installs the hook DEALLOCATE and DISCARD ALL call to
+// drop protocol-level prepared statements; name "" means all of them.
+// The hook runs on the session's goroutine (the connection's).
+func (s *Session) OnDeallocate(f func(name string) error) { s.deallocate = f }
+
+// ApplyStartupParams applies a connection's startup parameters as SET
+// would, as Postgres does: application_name (and a driver's DateStyle,
+// TimeZone, extra_float_digits, ...) become visible to SHOW and
+// current_setting, and statement_timeout or
+// default_transaction_isolation take effect. The protocol's own keys
+// are skipped. An invalid value is an error, which fails the
+// connection, as in Postgres.
+func (s *Session) ApplyStartupParams(params map[string]string) error {
+	for k, v := range params {
+		switch k = strings.ToLower(k); k {
+		case "user", "database", "replication", "options", "":
+			continue
+		}
+		if _, err := s.setVar(&SetVar{Name: k, Value: v, Tag: "SET"}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// endBlock clears the open block's state after it commits or rolls
+// back; its transaction-level advisory locks end with it.
+func (s *Session) endBlock() {
+	s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
+	s.db.endXact()
 }
 
 // ArmImplicit marks the start of a multi-statement unit; see
@@ -128,7 +175,7 @@ func (s *Session) EndImplicit() error {
 	}
 	s.implicit = false
 	tx, aborted := s.tx, s.aborted
-	s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
+	s.endBlock()
 	if aborted {
 		return tx.Rollback()
 	}
@@ -157,7 +204,9 @@ type sesSave struct {
 func (d *DB) NewSession() *Session {
 	sdb := *d
 	sdb.seq = &seqSession{}
-	return &Session{db: &sdb}
+	s := &Session{db: &sdb}
+	sdb.ss = newSessState(s) // its own pid, settings and lock ownership
+	return s
 }
 
 // Status reports the session's transaction state.
@@ -171,11 +220,14 @@ func (s *Session) Status() TxStatus {
 	return TxActive
 }
 
-// Close rolls back any open transaction block. The session is not
-// usable afterward.
+// Close rolls back any open transaction block and releases the
+// session's advisory locks — at both levels, as Postgres does when a
+// client disconnects, gracefully or not. The session is not usable
+// afterward.
 func (s *Session) Close() error {
 	tx := s.tx
-	s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
+	s.endBlock()
+	s.db.adv.releaseOwner(s.db.ss, true, true)
 	if tx != nil {
 		return tx.Rollback()
 	}
@@ -276,10 +328,21 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 	if sv, ok := st.(*SetVar); ok {
 		return s.setVar(sv)
 	}
+	switch st := st.(type) {
+	case *Discard:
+		return s.discard(st)
+	case *Deallocate:
+		return s.deallocateStmt(st)
+	}
+	if s.tx == nil && s.defReadOnly && isWrite(st) {
+		// default_transaction_read_only: an autocommit statement is a
+		// transaction of its own, and it starts read-only.
+		return nil, serr.New("cannot execute " + command(st) + " in a read-only transaction")
+	}
 	if sv, ok := st.(*ShowVar); ok {
 		// SHOW reads the session's SET state over the defaults; the
 		// isolation parameters report live state, not stored text.
-		return execShow(sv, s.vars, s.timeout, s.isoShow())
+		return execShow(sv, s.vars, s.timeout, s.liveParams())
 	}
 	if s.tx == nil {
 		return s.db.runCtx(ctx, st, args)
@@ -324,18 +387,29 @@ func (s *Session) sessionIso() string {
 	return isoDefault(s.db.e.ConcurrentWrites())
 }
 
-// isoShow computes the live values SHOW reports for the two isolation
-// parameters: the open block's level while one is open, the session
-// default otherwise.
-func (s *Session) isoShow() map[string]string {
+// liveParams computes the live values SHOW and current_setting report
+// for the parameters the session gives semantics: the isolation levels
+// (the open block's while one is open, the session default otherwise)
+// and the read-only state, likewise.
+func (s *Session) liveParams() map[string]string {
 	cur := s.sessionIso()
+	ro := s.defReadOnly
 	if s.tx != nil {
-		cur = s.txIso
+		cur, ro = s.txIso, s.readOnly
 	}
 	return map[string]string{
 		"transaction_isolation":         cur,
 		"default_transaction_isolation": s.sessionIso(),
+		"transaction_read_only":         onOff(ro),
+		"default_transaction_read_only": onOff(s.defReadOnly),
 	}
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 // normalizeIso validates an isolation-parameter value, tolerating case
@@ -363,6 +437,11 @@ func normalizeIso(v string) (string, bool) {
 // transactional parameters, unwinding on ROLLBACK has nothing to
 // restore.
 func (s *Session) setVar(sv *SetVar) (*Result, error) {
+	for _, more := range sv.Also { // SET TRANSACTION with several modes
+		if _, err := s.setVar(more); err != nil {
+			return nil, err
+		}
+	}
 	if sv.Name == "transaction_isolation" {
 		return s.setTxnIso(sv)
 	}
@@ -380,10 +459,28 @@ func (s *Session) setVar(sv *SetVar) (*Result, error) {
 		s.timeout = d
 		return &Result{Tag: sv.Tag}, nil
 	}
+	switch sv.Name {
+	case "transaction_read_only":
+		return s.setTxnReadOnly(sv)
+	case "default_transaction_read_only":
+		ro := false
+		if !sv.IsDefault {
+			var err error
+			if ro, err = boolParam(sv); err != nil {
+				if s.tx != nil {
+					s.aborted = true
+				}
+				return nil, err
+			}
+		}
+		s.defReadOnly = ro
+		return &Result{Tag: sv.Tag}, nil
+	}
 	if sv.Name == "all" && sv.IsDefault { // RESET ALL
 		s.timeout = 0
 		s.vars = nil
 		s.defIso = ""
+		s.defReadOnly = false
 		s.db.serial = false
 		return &Result{Tag: sv.Tag}, nil
 	}
@@ -396,6 +493,101 @@ func (s *Session) setVar(sv *SetVar) (*Result, error) {
 	}
 	s.vars[sv.Name] = sv.Value
 	return &Result{Tag: sv.Tag}, nil
+}
+
+// setTxnReadOnly applies SET TRANSACTION READ ONLY / READ WRITE
+// (equivalently SET transaction_read_only). Outside a block it warns,
+// as SET TRANSACTION does. READ ONLY may come at any point of a block
+// (later writes are refused). READ WRITE in a READ ONLY block is
+// refused: such a block began without the writer lock (or, under
+// concurrent writes, without a write transaction), so it cannot become
+// writable — Postgres allows it before the first query; bytdb cannot.
+func (s *Session) setTxnReadOnly(sv *SetVar) (*Result, error) {
+	ro := s.defReadOnly // RESET transaction_read_only
+	if !sv.IsDefault {
+		var err error
+		if ro, err = boolParam(sv); err != nil {
+			if s.tx != nil {
+				s.aborted = true
+			}
+			return nil, err
+		}
+	}
+	if s.tx == nil {
+		return &Result{Tag: sv.Tag,
+			Notice: "SET TRANSACTION can only be used in transaction blocks"}, nil
+	}
+	if !ro && s.readOnly {
+		s.aborted = true
+		return nil, serr.New("cannot make a READ ONLY transaction block writable",
+			"hint", "begin the block READ WRITE instead")
+	}
+	s.readOnly = ro
+	return &Result{Tag: sv.Tag}, nil
+}
+
+// boolParam reads an on/off parameter value with bytdb.ParseBool, which
+// accepts Postgres's spellings (on, off, true, false, yes, no, 1, 0).
+func boolParam(sv *SetVar) (bool, error) {
+	b, err := bytdb.ParseBool(sv.Value)
+	if err != nil {
+		return false, serr.New(`parameter "`+sv.Name+`" requires a Boolean value`, "value", sv.Value)
+	}
+	return b, nil
+}
+
+// discard runs DISCARD: ALL resets everything a session carries — SET
+// state, protocol-level prepared statements, session-level advisory
+// locks, sequence-function state — as a connection pool's reset query
+// expects; SEQUENCES resets the last of these alone. PLANS and TEMP
+// have nothing to drop (no plan cache per session, no temporary
+// tables) and are accepted.
+func (s *Session) discard(st *Discard) (*Result, error) {
+	switch st.What {
+	case "all":
+		if s.tx != nil {
+			s.aborted = true
+			return nil, serr.New("DISCARD ALL cannot run inside a transaction block")
+		}
+		if _, err := s.setVar(&SetVar{Name: "all", IsDefault: true}); err != nil {
+			return nil, err
+		}
+		if s.deallocate != nil {
+			if err := s.deallocate(""); err != nil {
+				return nil, err
+			}
+		}
+		s.db.adv.releaseOwner(s.db.ss, true, false)
+		s.db.seq.reset()
+	case "sequences":
+		s.db.seq.reset()
+	}
+	return &Result{Tag: command(st)}, nil
+}
+
+// deallocateStmt runs DEALLOCATE [PREPARE] name | ALL against the wire
+// server's protocol-level statements (SQL PREPARE does not exist here,
+// so those are the only named statements there are).
+func (s *Session) deallocateStmt(st *Deallocate) (*Result, error) {
+	var err error
+	switch {
+	case s.deallocate != nil:
+		err = s.deallocate(st.Name)
+	case st.Name != "":
+		err = noPrepared(st.Name)
+	}
+	if err != nil {
+		if s.tx != nil {
+			s.aborted = true
+		}
+		return nil, err
+	}
+	return &Result{Tag: command(st)}, nil
+}
+
+// noPrepared is Postgres's error for DEALLOCATE of an unknown name.
+func noPrepared(name string) error {
+	return serr.New(`prepared statement "` + name + `" does not exist`)
 }
 
 // setTxnIso applies SET TRANSACTION ISOLATION LEVEL (equivalently SET
@@ -548,6 +740,8 @@ func (s *Session) txnControl(ctx context.Context, tc *TxnControl) (*Result, erro
 		if iso == "" {
 			iso = s.sessionIso()
 		}
+		// A block naming no access mode takes default_transaction_read_only.
+		readOnly := tc.ReadOnly || (s.defReadOnly && !tc.ReadWrite)
 		// A serializable writable block under concurrent writes gets
 		// read tracking from the start; anywhere else — weaker levels,
 		// read-only blocks (which always commit), or the single-writer
@@ -555,24 +749,28 @@ func (s *Session) txnControl(ctx context.Context, tc *TxnControl) (*Result, erro
 		// delivers at least the level asked for.
 		var tx *bytdb.Txn
 		var err error
-		if iso == "serializable" && !tc.ReadOnly && s.db.e.ConcurrentWrites() {
+		if iso == "serializable" && !readOnly && s.db.e.ConcurrentWrites() {
 			tx, err = s.db.e.BeginSerializableCtx(ctx)
 		} else {
-			tx, err = s.db.e.BeginCtx(ctx, !tc.ReadOnly)
+			tx, err = s.db.e.BeginCtx(ctx, !readOnly)
 		}
 		if err != nil {
 			return nil, err
 		}
-		s.tx, s.readOnly, s.aborted, s.saves = tx, tc.ReadOnly, false, nil
+		s.tx, s.readOnly, s.aborted, s.saves = tx, readOnly, false, nil
 		s.txIso, s.txStmts = iso, false
-		s.sdb = &DB{e: s.db.e, tx: tx, seq: s.db.seq}
+		// The block's DB carries the session's per-connection state along
+		// with the transaction: sequence functions, session functions and
+		// advisory locks, and pg_stat_activity's provider.
+		s.sdb = &DB{e: s.db.e, tx: tx, seq: s.db.seq, ss: s.db.ss, adv: s.db.adv,
+			activity: s.db.activity}
 		return &Result{}, nil
 	case TxnCommit:
 		if s.tx == nil {
 			return &Result{Notice: "there is no transaction in progress"}, nil
 		}
 		tx, aborted := s.tx, s.aborted
-		s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
+		s.endBlock()
 		if aborted {
 			if err := tx.Rollback(); err != nil {
 				return nil, err
@@ -588,7 +786,7 @@ func (s *Session) txnControl(ctx context.Context, tc *TxnControl) (*Result, erro
 			return &Result{Notice: "there is no transaction in progress"}, nil
 		}
 		tx := s.tx
-		s.tx, s.sdb, s.aborted, s.saves = nil, nil, false, nil
+		s.endBlock()
 		if err := tx.Rollback(); err != nil {
 			return nil, err
 		}

@@ -97,6 +97,14 @@ worth knowing:
   with them. (The implicit transaction opens at the unit's first write, so a
   read-only batch never takes the writer lock; a single statement still
   autocommits, with its optimistic-conflict retry.)
+- **Advisory locks have no deadlock detector.** `pg_advisory_lock` waits until
+  the lock frees, the statement times out, or the client cancels; two
+  sessions waiting on each other's locks wait for a timeout, where Postgres
+  would break the cycle. Taking an advisory lock inside a writable block in
+  the default mode also holds the writer lock while waiting. Set
+  `statement_timeout` (or use `pg_try_advisory_lock`) where that matters. The
+  lock table belongs to one `DB` value, shared by its sessions — every
+  connection of one wire server.
 - **Don't write from inside DB-level iteration.** `DB.Ascend`/`All`/etc. hold a
   read lock for the whole loop; a write inside the loop deadlocks. Transaction
   iterators (`Tx.Ascend`, engine `Scan`) are snapshot-based and lock-free —

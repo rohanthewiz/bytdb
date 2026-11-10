@@ -9,8 +9,10 @@ package sql
 // back block: nextval state is session-local, not transactional.
 
 import (
+	"strings"
 	"sync"
 
+	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -22,6 +24,17 @@ type seqSession struct {
 	last int64
 	ok   bool
 	curr map[string]int64
+}
+
+// reset forgets every draw, as DISCARD SEQUENCES (and DISCARD ALL)
+// do: lastval() and currval() then error until the next nextval().
+func (s *seqSession) reset() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.last, s.ok, s.curr = 0, false, nil
+	s.mu.Unlock()
 }
 
 // record notes one identity draw under its implied sequence name.
@@ -72,4 +85,31 @@ func (s *seqSession) currval(name string) (any, error) {
 // matching the nextval('...') default information_schema reports.
 func identitySeqName(table, column string) string {
 	return table + "_" + column + "_seq"
+}
+
+// identityBySeqName resolves an implied identity sequence name (with an
+// optional public. qualifier) to its table and column. A real sequence
+// of that name wins, so ok is false when one exists. The scan walks the
+// catalog, which only setval and pg_get_serial_sequence-style lookups
+// pay for.
+func identityBySeqName(e *bytdb.Engine, name string) (table, column string, ok bool) {
+	name = strings.TrimPrefix(name, "public.")
+	if !strings.HasSuffix(name, "_seq") || e.Sequence(name) != nil {
+		return "", "", false
+	}
+	for _, tn := range e.Tables() {
+		if !strings.HasPrefix(name, tn+"_") {
+			continue
+		}
+		desc := e.TableShared(tn)
+		if desc == nil {
+			continue
+		}
+		for _, c := range desc.Columns {
+			if c.Identity && identitySeqName(tn, c.Name) == name {
+				return tn, c.Name, true
+			}
+		}
+	}
+	return "", "", false
 }
