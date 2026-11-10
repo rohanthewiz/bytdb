@@ -409,6 +409,19 @@ type Engine struct {
 	// mem is the memory-ceiling admission control; see memguard.go.
 	mem memGuard
 
+	// catalogVer counts committed DDL: every successful updateDDL bumps
+	// it once, after its commit. It is the cheap "has the schema changed
+	// since I looked?" test for anything that caches schema-derived
+	// state (a wire-protocol prepared statement's result description
+	// today; plans and typing later). The protocol for a cache is: read
+	// the version BEFORE resolving the catalog, store the two together,
+	// and treat a different version later as possibly stale. Bumping
+	// after the commit is what makes that safe — a reader that sees
+	// version v resolves a catalog at least as new as v's DDL; bumping
+	// before would let a reader record the new version against the old
+	// schema and never look again.
+	catalogVer atomic.Uint64
+
 	// testCommitErr, when non-nil, replaces a successful DDL commit's
 	// result (see updateDDL). Only tests set it, to simulate a WAL
 	// append or fsync failing after the transaction closure ran.
@@ -456,6 +469,23 @@ const ddlOptimisticTries = 2
 // costs those writers one stall (plus a retry for the transactions the
 // wildcard aborts), never the DDL its progress.
 func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error {
+	err := e.runDDL(fn)
+	if err == nil {
+		e.catalogVer.Add(1)
+	}
+	return err
+}
+
+// CatalogVersion reports how many DDL transactions have committed since
+// Open. It changes after every schema change (tables, indexes,
+// constraints, views, sequences) and at no other time, so a caller
+// holding schema-derived state can revalidate only when it moved: read
+// it before resolving the catalog, and compare later. Equal versions
+// mean no DDL committed in between.
+func (e *Engine) CatalogVersion() uint64 { return e.catalogVer.Load() }
+
+// runDDL is updateDDL's body; see updateDDL.
+func (e *Engine) runDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error {
 	if err := e.checkReentrantWrite("ddl"); err != nil {
 		return err
 	}

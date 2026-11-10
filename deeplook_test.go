@@ -599,3 +599,39 @@ func TestOCCAllocatorLeaks(t *testing.T) {
 		t.Fatalf("a key outlived DROP TABLE (orphan identity counter): %d -> %d", keysAfterDrop, k)
 	}
 }
+
+// TestCatalogVersion (D-16, D-40 step 2): the DDL counter moves on every
+// committed schema change and on nothing else.
+func TestCatalogVersion(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	v0 := e.CatalogVersion()
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	v1 := e.CatalogVersion()
+	if v1 <= v0 {
+		t.Fatalf("CREATE TABLE left the version at %d", v1)
+	}
+	if err := e.Insert("t", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.NextSeq("s"); err != nil {
+		t.Fatal(err)
+	}
+	if v := e.CatalogVersion(); v != v1 {
+		t.Fatalf("DML moved the version %d -> %d", v1, v)
+	}
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt}}, "id"); err == nil {
+		t.Fatal("duplicate CREATE TABLE succeeded")
+	}
+	if v := e.CatalogVersion(); v != v1 {
+		t.Fatalf("a failed DDL moved the version %d -> %d", v1, v)
+	}
+	if err := e.AddColumn("t", Column{Name: "v", Type: TInt}); err != nil {
+		t.Fatal(err)
+	}
+	if v := e.CatalogVersion(); v <= v1 {
+		t.Fatalf("ADD COLUMN left the version at %d", v)
+	}
+}

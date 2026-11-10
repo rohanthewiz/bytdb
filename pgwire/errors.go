@@ -92,7 +92,8 @@ func sqlstate(msg string, hasPos bool) string {
 		return "0A000" // feature_not_supported (Postgres's code for it sans CASCADE)
 	// Subquery shapes the subquery executor does not run (LIMIT/OFFSET
 	// until deep-look D-27; UNION and GROUP BY in a scalar subquery).
-	case strings.Contains(msg, "subquery is not supported"):
+	case strings.Contains(msg, "subquery is not supported"),
+		strings.Contains(msg, "cached plan must not change result type"):
 		return "0A000" // feature_not_supported
 	// Schema changes refused because another object depends on the
 	// target: a foreign key, a CHECK, or an index. Postgres reports its

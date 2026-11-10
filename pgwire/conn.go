@@ -145,6 +145,60 @@ type prepared struct {
 	info      *sql.StmtInfo
 	query     string
 	paramOIDs []uint32 // client-declared in Parse; 0 = infer
+	// catVer is the catalog version info was described under (read
+	// before the Describe). A different version at Execute means DDL
+	// committed since, and info may describe a result the statement no
+	// longer produces; see revalidate.
+	catVer uint64
+}
+
+// errResultTypeChanged is Postgres's refusal to run a prepared statement
+// whose result shape a schema change altered (SQLSTATE 0A000). Drivers
+// with a statement cache (pgx) re-prepare on it.
+const errResultTypeChanged = "cached plan must not change result type"
+
+// revalidate re-describes a prepared statement when DDL has committed
+// since it was described, and refuses it when its result columns would
+// no longer decode as the client was told: a different column count or
+// any column's type. The client decodes DataRows by the RowDescription
+// it was sent at Describe time, so running anyway after, say, ALTER
+// COLUMN n TYPE text sent text bytes the client read as int8, and after
+// ADD COLUMN under SELECT * the extra column indexed past the described
+// types and panicked the connection (deep-look D-16). A changed
+// description that still decodes the same (a renamed column) is
+// adopted silently, and so is any change when adopt is set: a Describe
+// of the statement itself is where the client learns the shape, so it
+// gets the new one. Costs one atomic load when nothing changed.
+func (c *conn) revalidate(p *prepared, adopt bool) error {
+	if p.stmt == nil || p.info == nil {
+		return nil
+	}
+	v := c.srv.db.CatalogVersion()
+	if v == p.catVer {
+		return nil
+	}
+	info, err := p.stmt.Describe()
+	if err != nil {
+		return err // what executing would report (a dropped table, say)
+	}
+	if !adopt && !sameResultShape(p.info, info) {
+		return serr.New(errResultTypeChanged)
+	}
+	p.info, p.catVer = info, v
+	return nil
+}
+
+// sameResultShape reports whether two descriptions decode alike.
+func sameResultShape(a, b *sql.StmtInfo) bool {
+	if len(a.Types) != len(b.Types) {
+		return false
+	}
+	for i := range a.Types {
+		if a.Types[i] != b.Types[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // portal is one named (or unnamed) Bind result: a prepared statement
@@ -606,7 +660,9 @@ func (c *conn) parse(r *rbuf) {
 			return
 		}
 	}
-	p := &prepared{query: query, paramOIDs: oids}
+	// The version is read before Describe resolves the catalog: see
+	// bytdb.Engine.CatalogVersion for why that order is the safe one.
+	p := &prepared{query: query, paramOIDs: oids, catVer: c.srv.db.CatalogVersion()}
 	// A query of only comments is an empty statement (Execute answers
 	// EmptyQueryResponse), not a syntax error — see splitStatements.
 	if q := strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"); q != "" && !isEmptyQuery(q) {
@@ -719,6 +775,10 @@ func (c *conn) describe(r *rbuf) {
 			c.sendError(serr.New("prepared statement does not exist", "name", name), "", 0)
 			return
 		}
+		if err := c.revalidate(p, true); err != nil {
+			c.sendError(err, p.query, 0)
+			return
+		}
 		var b wbuf
 		n := 0
 		if p.stmt != nil {
@@ -738,6 +798,10 @@ func (c *conn) describe(r *rbuf) {
 		pt, ok := c.portals[name]
 		if !ok {
 			c.sendError(serr.New("portal does not exist", "name", name), "", 0)
+			return
+		}
+		if err := c.revalidate(pt.prep, false); err != nil {
+			c.sendError(err, pt.prep.query, 0)
 			return
 		}
 		if pt.prep.info == nil || len(pt.prep.info.Cols) == 0 {
@@ -764,6 +828,10 @@ func (c *conn) execute(r *rbuf) {
 		c.send(msgEmptyQuery, nil)
 		return
 	}
+	if err := c.revalidate(pt.prep, false); err != nil {
+		c.sendError(err, pt.prep.query, 0)
+		return
+	}
 	ctx := c.armCancel()
 	c.statActive(pt.prep.query)
 	start := time.Now()
@@ -777,6 +845,14 @@ func (c *conn) execute(r *rbuf) {
 	}
 	if res.Notice != "" {
 		c.sendNotice(res.Notice)
+	}
+	// A DDL can still commit between revalidate and the statement's own
+	// snapshot. The rows then carry a shape the client was never
+	// described; refuse rather than send bytes it would misread (the
+	// statement has run, but the reply is the client's only view of it).
+	if pt.prep.info != nil && len(res.Cols) > 0 && len(res.Cols) != len(pt.prep.info.Cols) {
+		c.sendError(serr.New(errResultTypeChanged), pt.prep.query, 0)
+		return
 	}
 	if len(res.Cols) > 0 && !c.sendDataRows(res.Rows, pt.formats, res.Types) {
 		return

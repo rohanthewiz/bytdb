@@ -535,6 +535,10 @@ type vtab struct {
 // New wraps an Engine for SQL execution.
 func New(e *bytdb.Engine) *DB { return &DB{e: e, seq: &seqSession{}} }
 
+// CatalogVersion is the engine's DDL counter (bytdb.Engine.CatalogVersion):
+// a Stmt's Describe result stays valid while it is unchanged.
+func (d *DB) CatalogVersion() uint64 { return d.e.CatalogVersion() }
+
 // read runs fn over the open session transaction, or a fresh
 // read-only snapshot in autocommit.
 func (d *DB) read(fn func(*bytdb.Txn) error) error {

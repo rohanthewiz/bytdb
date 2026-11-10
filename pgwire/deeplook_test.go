@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/pgwire"
@@ -245,5 +246,74 @@ func TestHardConnectionCeiling(t *testing.T) {
 	nc.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := nc.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("connection past the hard ceiling: read err = %v, want EOF (closed at once)", err)
+	}
+}
+
+// TestPreparedStatementAfterSchemaChange (D-16): a prepared statement's
+// result description was fixed at Parse. After another connection's
+// ALTER COLUMN n TYPE text the client decoded text bytes as int8, and
+// after ADD COLUMN a SELECT * indexed past the described types and the
+// connection died in the panic fence. Execute now refuses with 0A000
+// "cached plan must not change result type", which pgx answers by
+// re-preparing, so the retry sees the new shape.
+func TestPreparedStatementAfterSchemaChange(t *testing.T) {
+	ctx := context.Background()
+	url := startServer(t)
+	a, b := connect(t, url), connect(t, url)
+	mustExec(t, a, `create table t (id int primary key, n int)`)
+	mustExec(t, a, `insert into t values (1, 4702111234474983745)`)
+
+	var n int64
+	if err := a.QueryRow(ctx, `select n from t`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, b, `alter table t alter column n type text using n::text`)
+
+	// The first run after the change may fail with 0A000 (pgx then drops
+	// its cached statement); it must never deliver misdecoded bytes.
+	var s string
+	err := a.QueryRow(ctx, `select n from t`).Scan(&s)
+	if err != nil {
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != "0A000" {
+			t.Fatalf("after ALTER TYPE: %v; want success or 0A000", err)
+		}
+		if err := a.QueryRow(ctx, `select n from t`).Scan(&s); err != nil {
+			t.Fatalf("retry after 0A000: %v", err)
+		}
+	}
+	if s != "4702111234474983745" {
+		t.Fatalf("after ALTER TYPE: n = %q", s)
+	}
+
+	// SELECT * across ADD COLUMN.
+	countCols := func() (int, error) {
+		rows, err := a.Query(ctx, `select * from t`)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		cols := len(rows.FieldDescriptions())
+		for rows.Next() {
+		}
+		return cols, rows.Err()
+	}
+	if _, err := countCols(); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, b, `alter table t add column extra int default 5`)
+	cols, err := countCols()
+	if err != nil {
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != "0A000" {
+			t.Fatalf("after ADD COLUMN: %v; want success or 0A000", err)
+		}
+		cols, err = countCols()
+	}
+	if err != nil || cols != 3 {
+		t.Fatalf("after ADD COLUMN: %d columns, err %v; want 3", cols, err)
+	}
+	if a.IsClosed() {
+		t.Fatal("the schema change on another connection closed this one")
 	}
 }
