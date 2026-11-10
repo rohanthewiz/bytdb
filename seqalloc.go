@@ -83,6 +83,15 @@ var errSeqReset = errors.New("bytdb: sequence counter was reset concurrently")
 // snapshot (re-read everything it depends on), because a retry runs it
 // again from scratch.
 func (e *Engine) seqPut(fn func(tx *btypedb.Tx[string, []byte]) error) error {
+	// A reservation is a commit of its own. Issued from a DDL callback
+	// it would invalidate the DDL's optimistic attempt every time and
+	// then wait on the escalated attempt's writer lock forever, so it is
+	// refused like any other write from a DDL callback (deep-look D-12).
+	// DDL closures that need counters write them into their own
+	// transaction instead (see backfillIdentity).
+	if e.inOwnDDL() {
+		return reentrantWriteErr("sequence reservation")
+	}
 	var err error
 	for range seqConflictRetries {
 		err = e.kv.Update(fn)

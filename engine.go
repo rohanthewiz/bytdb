@@ -337,6 +337,22 @@ type Engine struct {
 	// error into an error return (see checkReentrantWrite).
 	writerGID atomic.Uint64
 
+	// ddlGoroutines holds the IDs of goroutines currently inside a DDL
+	// transaction in concurrent-writes mode, and ddlActive counts them.
+	// writerGID cannot serve there: it is one slot, and under OCC many
+	// write transactions (and several optimistic DDL attempts) can be
+	// open at once, each storing and clearing it. The set exists for
+	// DDL callbacks (AddCheck's validate, AlterColumnType's Using,
+	// AlterSequence's mutate) that issue an engine write: the nested
+	// commit invalidates every optimistic attempt, forcing escalation to
+	// UpdateExclusive, which then waits on its own nested commit forever
+	// (deep-look D-12). ddlActive keeps the common path to one atomic
+	// load: the goroutine-ID parse (curGID) runs only while some DDL is
+	// in flight.
+	ddlMu         sync.Mutex
+	ddlGoroutines map[uint64]struct{}
+	ddlActive     atomic.Int32
+
 	// backfillLimit caps how many rows ALTER TABLE ADD COLUMN with a
 	// DEFAULT will rewrite in one transaction; 0 or less disables the
 	// guard. Atomic rather than a plain field because it is a knob a
@@ -410,13 +426,29 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 		return err
 	}
 	// Some DDL closures run caller-supplied callbacks inside the
-	// transaction — AddCheck's per-row validate, AlterSequence's
-	// mutate — so a panic can originate outside this package. As with
-	// WriteTxn (see writeTxn), btypedb's Update has no recover: the
-	// panic would unwind with the writer lock held (or, under
-	// UpdateExclusive, with the head frozen), wedging every future
-	// write process-wide. Guard every path the same way: roll back to
-	// release, then re-panic with the original value.
+	// transaction — AddCheck's per-row validate, AlterColumnType's
+	// Using/Validate, AlterSequence's mutate — and a callback may issue
+	// an engine write. The writer lock is not reentrant, so that write
+	// would wait forever on the DDL that is waiting for it (deep-look
+	// D-12). Mark the goroutine for the guard:
+	//   - default mode: the closure holds the writer lock, so writerGID
+	//     is exactly right — set it inside the closure, as writeTxn
+	//     does, and checkReentrantWrite refuses the nested write;
+	//   - concurrent writes: register in the DDL goroutine set for the
+	//     whole call (optimistic attempts and the exclusive escalation
+	//     alike), which checkReentrantWrite and seqPut consult.
+	if e.occ {
+		defer e.enterDDL()()
+	} else {
+		fn = markWriter(e, fn)
+	}
+	// The same callbacks mean a panic can originate outside this
+	// package. btypedb's Update recovers, rolls back and re-panics
+	// since v0.6.1, but this guard predates that and costs nothing; it
+	// keeps the lock-release guarantee local rather than depending on
+	// the dependency's version. Roll back to release, then re-panic
+	// with the original value. guardPanic wraps markWriter, so on a
+	// panic the marker is cleared before Rollback releases the lock.
 	fn = guardPanic(fn)
 	if e.testCommitErr != nil {
 		// Simulate the failed commit: run the closure, then roll the
@@ -456,21 +488,79 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 // normal, correct behavior.
 func (e *Engine) checkReentrantWrite(op string) error {
 	if e.occ {
-		// The hazard does not exist in concurrent-writes mode: Begin
-		// holds no lock across the transaction, so a same-goroutine
-		// one-shot write cannot block behind it — it just commits as
-		// its own transaction (and conflicts like any other writer).
-		// The writerGID marker is also meaningless here: it is a single
-		// slot, and occ mode allows many open writable transactions.
+		// The open-transaction hazard does not exist in concurrent-
+		// writes mode: Begin holds no lock across the transaction, so a
+		// same-goroutine one-shot write cannot block behind it — it just
+		// commits as its own transaction (and conflicts like any other
+		// writer). The writerGID marker is also meaningless here: it is
+		// a single slot, and occ mode allows many open writable
+		// transactions. DDL is the exception: it can escalate to holding
+		// the writer lock across its closure, so a write from a DDL
+		// callback is refused (see Engine.ddlGoroutines).
+		if e.inOwnDDL() {
+			return reentrantWriteErr(op)
+		}
 		return nil
 	}
 	// Cheap common case first: no writable transaction open at all.
 	// The stack parse in curGID only runs while one is.
 	if g := e.writerGID.Load(); g != 0 && g == curGID() {
-		return serr.New("engine write inside the goroutine's own open write transaction would deadlock",
-			"op", op, "hint", "use the Txn methods instead")
+		return reentrantWriteErr(op)
 	}
 	return nil
+}
+
+func reentrantWriteErr(op string) error {
+	return serr.New("engine write inside the goroutine's own open write transaction would deadlock",
+		"op", op, "hint", "use the Txn methods instead; DDL callbacks must not write")
+}
+
+// markWriter wraps a default-mode kv write closure so the goroutine
+// running it is recorded as the writer-lock holder for the closure's
+// duration — the same marker writeTxn sets, with the same ordering:
+// cleared by a defer before the closure returns, so before the commit
+// (or a panic's rollback) releases the lock to the next writer.
+func markWriter(e *Engine, fn func(tx *btypedb.Tx[string, []byte]) error) func(tx *btypedb.Tx[string, []byte]) error {
+	return func(tx *btypedb.Tx[string, []byte]) error {
+		e.writerGID.Store(curGID())
+		defer e.writerGID.Store(0)
+		return fn(tx)
+	}
+}
+
+// enterDDL registers the calling goroutine as running a DDL
+// transaction (concurrent-writes mode) and returns the matching exit.
+// A goroutine is in at most one DDL at a time — checkReentrantWrite
+// refuses a nested one before it gets here — so a set suffices.
+func (e *Engine) enterDDL() (exit func()) {
+	gid := curGID()
+	e.ddlMu.Lock()
+	if e.ddlGoroutines == nil {
+		e.ddlGoroutines = map[uint64]struct{}{}
+	}
+	e.ddlGoroutines[gid] = struct{}{}
+	e.ddlMu.Unlock()
+	e.ddlActive.Add(1)
+	return func() {
+		e.ddlActive.Add(-1)
+		e.ddlMu.Lock()
+		delete(e.ddlGoroutines, gid)
+		e.ddlMu.Unlock()
+	}
+}
+
+// inOwnDDL reports whether the calling goroutine is inside a DDL
+// transaction (concurrent-writes mode). One atomic load when no DDL is
+// in flight, which is nearly always.
+func (e *Engine) inOwnDDL() bool {
+	if e.ddlActive.Load() == 0 {
+		return false
+	}
+	gid := curGID()
+	e.ddlMu.Lock()
+	_, ok := e.ddlGoroutines[gid]
+	e.ddlMu.Unlock()
+	return ok
 }
 
 // curGID returns the current goroutine's ID, parsed from the runtime

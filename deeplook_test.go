@@ -253,3 +253,90 @@ func TestSerializableFailedProbeIsARead(t *testing.T) {
 		})
 	}
 }
+
+// TestDDLCallbackWriteIsRefused (D-12): updateDDL never marked its
+// goroutine, so a DDL callback that issued an engine write waited on
+// the writer lock its own DDL held — forever, in default mode; under
+// concurrent writes the nested commit forced the UpdateExclusive
+// escalation, which then waited on the nested commit. The write must
+// come back as an error, promptly, and the DDL must fail with it.
+func TestDDLCallbackWriteIsRefused(t *testing.T) {
+	for _, occ := range []bool{false, true} {
+		name := "default"
+		if occ {
+			name = "occ"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db")
+			var e *Engine
+			if occ {
+				e = openOCCEngine(t, path)
+			} else {
+				e = openEngine(t, path)
+			}
+			defer e.Close()
+			if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt}, {Name: "v", Type: TString}}, "id"); err != nil {
+				t.Fatal(err)
+			}
+			for i := range 50 {
+				if err := e.Insert("t", i, "x"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Each callback runs inside a DDL transaction and writes
+			// through the engine; each must be refused.
+			cases := map[string]func() error{
+				"AddCheck validate → NextSeq": func() error {
+					var inner error
+					err := e.AddCheck("t", CheckDesc{Name: "c", Expr: "v <> ''"}, func(Row) error {
+						_, inner = e.NextSeq("audit")
+						return inner
+					})
+					if inner == nil {
+						return nil
+					}
+					return err
+				},
+				"AlterColumnType Using → NextSeq": func() error {
+					return e.AlterColumnType("t", "v", ColumnTypeChange{
+						Type: TInt,
+						Using: func(Row) (any, error) {
+							v, err := e.NextSeq("renumber")
+							return int64(v), err
+						},
+					})
+				},
+				"AddCheck validate → Insert": func() error {
+					return e.AddCheck("t", CheckDesc{Name: "c2", Expr: "v <> ''"}, func(Row) error {
+						return e.Insert("t", 1000, "y")
+					})
+				},
+				"AddCheck validate → WriteTxn": func() error {
+					return e.AddCheck("t", CheckDesc{Name: "c3", Expr: "v <> ''"}, func(Row) error {
+						return e.WriteTxn(func(*Txn) error { return nil })
+					})
+				},
+			}
+			for what, run := range cases {
+				var err error
+				if !finishesWithin(5*time.Second, func() { err = run() }) {
+					t.Fatalf("%s: DDL hung (callback write deadlocked)", what)
+				}
+				if err == nil || !strings.Contains(err.Error(), "would deadlock") {
+					t.Fatalf("%s: err = %v, want the reentrant-write refusal", what, err)
+				}
+			}
+			// The guard must not outlive the DDL: ordinary writes from
+			// this goroutine work afterwards, in both modes.
+			if err := e.Insert("t", 2000, "z"); err != nil {
+				t.Fatalf("insert after the refused DDLs: %v", err)
+			}
+			if _, err := e.NextSeq("after"); err != nil {
+				t.Fatalf("NextSeq after the refused DDLs: %v", err)
+			}
+			if d := e.Table("t"); len(d.Checks) != 0 || d.Columns[1].Type != TString {
+				t.Fatalf("a refused DDL left schema behind: %+v", d)
+			}
+		})
+	}
+}
