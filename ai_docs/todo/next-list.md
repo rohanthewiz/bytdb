@@ -35,27 +35,12 @@ through all 74 docs.
 
 ## Open
 
-N-040 to N-044 come from one audit and share one plan,
+N-042 to N-044 come from one audit and share one plan,
 `ai_docs/todo/2026-1109-deep-look-remediation-plan.md`. Each is a phase of
 it; the `D-xx` numbers are that plan's item IDs. The user asked for the plan
 to be implemented as written, so its six decisions (Q1–Q6) are taken at the
 plan's recommendations.
 
-- **N-040** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
-  **Interruptible writer-lock waits (plan Phase 5, D-33).** Context,
-  `statement_timeout` and `CancelRequest` do not bound the wait for the
-  writer lock (`txn.go:230-243`, `sql/session.go:175-177`); a timed-out
-  write still commits once the lock frees. Needs `BeginCtx`/`UpdateCtx` in
-  btypedb (the writer mutex becomes a one-slot channel) and a btypedb tag
-  before bytdb can use it.
-- **N-041** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
-  **Replication and server hardening (plan Phase 6, D-34 to D-36).**
-  Generations ordered by wall-clock name; `Status` cannot show that new
-  writes are unprotected after a restart or compaction; no bound on a
-  stalled S3 transfer; unbounded chunk count per generation; no session
-  token for temporary credentials; `Close` does not drain connections; NaN
-  cannot be stored in a float column. Most of these were found by reading,
-  not reproduced.
 - **N-042** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
   **Performance (plan Phase 7, D-37 to D-50).** UUID, timestamp and date
   keys never push down (`sql/plan.go:302-320`; do after N-037); `IN`-lists
@@ -93,7 +78,10 @@ plan's recommendations.
   module proxy for good, so it waits for the user's go-ahead. *Updated
   `2026-1109-2330-deep-look-phases-2-to-4`:* main now also carries the plan's release B (Phases 2 and 3) and
   most of release C (Phase 4); only Phase 5 (D-33) needs a btypedb tag
-  first. One release of everything on main is the simpler choice now; the
+  first. *Updated `2026-1109-2355-deep-look-phases-5-6`:* D-33 landed engine-side, so no btypedb tag is
+  needed, and Phase 6 is on main too; the release notes must add the new
+  replication generation naming (old buckets still restore: legacy names
+  count as older than any new one). One release of everything on main is the simpler choice now; the
   release notes must list the newly refused shapes (`1 < 'a'`,
   `timestamp + 1`, `integer || integer`, `1 = true`), the CHECKs that start
   being enforced (run `VACUUM (VERIFY)` after upgrading), and the
@@ -201,6 +189,30 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-041** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-09, `2026-1109-2355-deep-look-phases-5-6`. **Replication and server hardening (plan Phase 6,
+  D-34 to D-36).** D-34: generation names lead with a sequence number (one
+  past the store's largest at roll time) and restore/pruning order by it,
+  not the wall clock; `Status.Sealed` and `Status.LagBytes`; per-operation
+  store deadlines scaled by payload (`OpTimeout`, `MinTransferRate`);
+  size-tiered chunk merging (`MergeChunks`, parts deleted after a 10-minute
+  grace); restore downloads 6 chunks at a time and re-lists once if a chunk
+  vanishes; s3 `SessionToken` and an error for a truncated page without a
+  continuation token. D-35: `pgwire.Server.Shutdown(ctx)` drains (idle
+  connections get 57P01, running statements finish), `bytdbd
+  -shutdown-grace`. D-36: float columns store NaN (sorting above +Inf, as
+  Postgres does) and keep -0. Exporting `Sealed`/`LagBytes` as metrics is
+  left to D-58 (N-043).
+- **N-040** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-09, `2026-1109-2355-deep-look-phases-5-6`. **Interruptible writer-lock waits (plan Phase 5,
+  D-33).** Done engine-side, without the btypedb `BeginCtx`/`UpdateCtx`
+  release the plan assumed: in single-writer mode the engine holds a
+  one-slot write semaphore (`Engine.acquireWrite`) around every btypedb
+  write transaction, and the wait for it honors the statement's context, so
+  `statement_timeout`, `CancelRequest` and a canceled `ExecContext` end the
+  wait with the context's error and the write never runs. New
+  `WriteTxnCtx`, `WriteTxnSerializableCtx`, `BeginCtx`,
+  `BeginSerializableCtx`; the SQL layer uses them. No btypedb tag needed.
 - **N-039** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
   2026-11-09, `2026-1109-2330-deep-look-phases-2-to-4`. **One statement, one snapshot, none of its own
   writes (plan Phase 4, D-29 to D-32).** D-29: UPDATE evaluates every SET
