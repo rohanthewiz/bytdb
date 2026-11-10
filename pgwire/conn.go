@@ -846,7 +846,15 @@ func (c *conn) ready() {
 
 // sendError sends an ErrorResponse and enters the discard-until-Sync
 // state.
+// sendError reports err to the client. Any error inside a transaction
+// block fails the block, whichever protocol step raised it: errors from
+// Execute already fail it in the session, but a Parse, Bind or Describe
+// error never reaches the session, and used to leave the block healthy
+// — so a typo inside BEGIN ... COMMIT still committed (deep-look D-07).
 func (c *conn) sendError(err error, query string, base int) {
+	if c.sess != nil {
+		c.sess.Fail()
+	}
 	c.send(msgErrorResponse, errorBody(err, query, base))
 	c.inErr = true
 }

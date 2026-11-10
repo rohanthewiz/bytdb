@@ -128,22 +128,38 @@ func (s *Session) Close() error {
 // Exec parses and executes one statement in the session, like DB.Exec
 // but honoring the open transaction block.
 func (s *Session) Exec(query string, args ...any) (*Result, error) {
-	st, err := Parse(query)
-	if err != nil {
-		return nil, err
-	}
-	return s.run(st, args)
+	return s.ExecCtx(context.Background(), query, args...)
 }
 
 // ExecCtx is Exec bounded by ctx: cancellation aborts the statement
 // mid-execution (see DB.ExecCtx). The session's statement_timeout, if
 // set, applies on top as a deadline.
+//
+// A statement that fails to parse fails an open block exactly as one
+// that fails at run time does. It used to return before reaching the
+// block's bookkeeping, so BEGIN; INSERT ...; <typo>; COMMIT committed
+// the insert, where Postgres answers the COMMIT with ROLLBACK (deep-look
+// D-07).
 func (s *Session) ExecCtx(ctx context.Context, query string, args ...any) (*Result, error) {
 	st, err := Parse(query)
 	if err != nil {
+		s.Fail()
 		return nil, err
 	}
 	return s.runCtx(ctx, st, args)
+}
+
+// Fail marks an open transaction block failed, as an error inside the
+// block does: every later statement except ROLLBACK, COMMIT (which then
+// rolls back) and ROLLBACK TO SAVEPOINT is refused until the block
+// ends. Outside a block it does nothing. It exists for errors that
+// happen before a statement reaches the session — a Parse, Bind or
+// Describe failure on the wire — which Postgres treats like any other
+// error in the block.
+func (s *Session) Fail() {
+	if s.tx != nil {
+		s.aborted = true
+	}
 }
 
 // ExecStmt executes a prepared statement in the session. The Stmt
@@ -429,6 +445,12 @@ func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 	switch tc.Kind {
 	case TxnBegin:
 		if s.tx != nil {
+			// Postgres refuses BEGIN in a failed block like any other
+			// command (25P02) and only warns in a healthy one.
+			if s.aborted {
+				return nil, serr.New("current transaction is aborted, " +
+					"commands ignored until end of transaction block")
+			}
 			return &Result{Notice: "there is already a transaction in progress"}, nil
 		}
 		iso := tc.Isolation
