@@ -71,6 +71,13 @@ adds its *reads* (point gets, scan ranges, index probes) to commit validation,
 so it commits only if it could have run alone. The cost is a higher conflict
 rate, which is why it is per-transaction, as in Postgres.
 
+A uniqueness probe that *fails* counts as a read too. An insert or update
+that hits a duplicate key or a unique index writes nothing and leaves the
+transaction committable, so "that key is taken" is information the
+transaction may act on; it is validated at commit like any other read. A
+probe that passes is not added: the key is then written, and write-write
+validation already covers it, so bulk loads do not grow a read set.
+
 Embedded:
 
 ```go

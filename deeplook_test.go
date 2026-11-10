@@ -174,3 +174,82 @@ func equalInt64s(a, b []int64) bool {
 	}
 	return true
 }
+
+// TestSerializableFailedProbeIsARead (D-11): a failed duplicate or
+// unique probe leaves the transaction committable, so "this key is
+// taken" is a read. Two SERIALIZABLE transactions each learn of the
+// other's row through a failed insert (or update), then delete it. No
+// serial order produces "both rows gone" — whichever ran second would
+// have seen its probe succeed — so one of them must fail to commit.
+func TestSerializableFailedProbeIsARead(t *testing.T) {
+	setup := func(t *testing.T) *Engine {
+		e := openOCCEngine(t, filepath.Join(t.TempDir(), "db"))
+		t.Cleanup(func() { e.Close() })
+		for _, n := range []string{"a", "b"} {
+			if _, err := e.CreateTable(n, []Column{{Name: "id", Type: TInt}, {Name: "email", Type: TString}}, "id"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.CreateIndex(n, n+"_email", true, "email"); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.Insert(n, 1, n+"@x"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return e
+	}
+	// Each probe makes tx learn that table `seen`'s row 1 exists, by a
+	// failing write against `seen`; the transaction then deletes the
+	// other table's row.
+	probes := map[string]func(tx *Txn, seen string) error{
+		"insert duplicate primary key": func(tx *Txn, seen string) error {
+			return tx.Insert(seen, 1, "fresh@x")
+		},
+		"insert unique violation": func(tx *Txn, seen string) error {
+			return tx.Insert(seen, 2, seen+"@x")
+		},
+		"update onto an existing key": func(tx *Txn, seen string) error {
+			if err := tx.Insert(seen, 3, "three@x"); err != nil {
+				return nil // setup inside the txn failed; report "no error" so the test fails loudly
+			}
+			_, err := tx.Update(seen, []any{3}, map[string]any{"id": 1})
+			return err
+		},
+		"update unique violation": func(tx *Txn, seen string) error {
+			if err := tx.Insert(seen, 3, "three@x"); err != nil {
+				return nil
+			}
+			_, err := tx.Update(seen, []any{3}, map[string]any{"email": seen + "@x"})
+			return err
+		},
+	}
+	for name, probe := range probes {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			t1, err := e.BeginSerializable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t2, err := e.BeginSerializable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := probe(t1, "a"); err == nil {
+				t.Fatal("t1's probe unexpectedly succeeded")
+			}
+			if _, err := t1.Delete("b", 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := probe(t2, "b"); err == nil {
+				t.Fatal("t2's probe unexpectedly succeeded")
+			}
+			if _, err := t2.Delete("a", 1); err != nil {
+				t.Fatal(err)
+			}
+			err1, err2 := t1.Commit(), t2.Commit()
+			if err1 == nil && err2 == nil {
+				t.Fatal("write skew under SERIALIZABLE: both transactions committed")
+			}
+		})
+	}
+}

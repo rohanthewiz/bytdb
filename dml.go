@@ -119,10 +119,17 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 		return nil, err
 	}
 	// The duplicate probes here (this one and the unique-index ones
-	// below) are deliberately NOT marked as serializable reads: on the
-	// only path that commits, the probed key is itself written, so
-	// write-write validation already catches any concurrent writer of
-	// it — marking would only bloat bulk loads' read sets.
+	// below) are NOT marked as serializable reads on success: on that
+	// path the probed key is itself written, so write-write validation
+	// already catches any concurrent writer of it — marking would only
+	// bloat bulk loads' read sets. The FAILURE path is different: the
+	// insert writes nothing, the transaction stays committable, and
+	// "this key is taken" is information the caller may act on (an
+	// application that inserts to test existence, then deletes some
+	// other row). That is a read with no covering write, so the error
+	// branches mark it; without the mark two SERIALIZABLE transactions
+	// could each learn of the other's row this way, delete it, and both
+	// commit — write skew (deep-look D-11).
 	if tx.Contains(key) {
 		// An occupant under a key the engine itself drew is a lost race
 		// with concurrent counter movement, not bad caller data — report
@@ -131,6 +138,7 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 			return nil, serr.Wrap(btypedb.ErrTxConflict,
 				"reason", "identity draw raced a concurrent counter reset", "table", desc.Name)
 		}
+		tx.MarkRead(key) // failed probe: see above
 		return nil, serr.New("duplicate primary key", "table", desc.Name)
 	}
 	type entry struct {
@@ -152,6 +160,7 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 					"reason", "identity draw raced a concurrent counter reset",
 					"table", desc.Name, "index", desc.Indexes[i].Name)
 			}
+			tx.MarkRead(ek) // failed probe: see the primary-key probe above
 			return nil, serr.New("unique index violation", "table", desc.Name, "index", desc.Indexes[i].Name)
 		}
 		entries[i] = entry{ek, ev}
@@ -211,8 +220,11 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 	// derives every new value from this row's contents, and a miss IS
 	// the statement's result — a row inserted here concurrently must
 	// conflict, not silently escape the update. (The newKey and
-	// unique-probe reads below stay unmarked: each is written on every
-	// committing path, so write-write validation covers them.)
+	// unique-probe reads below stay unmarked when they pass: each is
+	// written on every committing path, so write-write validation
+	// covers them. When they FAIL nothing is written and the
+	// transaction stays committable, so they are marked then — the same
+	// reasoning as insertRow's probes, deep-look D-11.)
 	tx.MarkRead(oldKey)
 	oldVal, ok := tx.Get(oldKey)
 	if !ok {
@@ -256,6 +268,7 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 		return nil, false, err
 	}
 	if newKey != oldKey && tx.Contains(newKey) {
+		tx.MarkRead(newKey) // failed probe: see above
 		return nil, false, serr.New("duplicate primary key", "table", desc.Name)
 	}
 	// Index entries that change: compute and uniqueness-check them all
@@ -280,6 +293,7 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 			continue
 		}
 		if enforced && nk != ok && tx.Contains(nk) {
+			tx.MarkRead(nk) // failed probe: see above
 			return nil, false, serr.New("unique index violation", "table", desc.Name, "index", idx.Name)
 		}
 		moves = append(moves, move{ok, nk, nv})
