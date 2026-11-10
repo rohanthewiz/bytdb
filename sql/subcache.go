@@ -159,7 +159,7 @@ func subqueryLocalOnly(env *exEnv, sel *Select) bool {
 	if env.tx == nil || selectWritesSequences(sel) {
 		return false
 	}
-	sc, err := buildScope(env.d.lookup(env.tx.TableShared), sel.From)
+	sc, err := buildScope(env.d.shapeLookup(env.tx.TableShared), sel.From)
 	if err != nil {
 		return false
 	}

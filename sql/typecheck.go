@@ -132,7 +132,7 @@ func (d *DB) newTyper(note func(any, bytdb.ColType)) *typer {
 	if d.tx != nil {
 		tableFn = d.tx.TableShared
 	}
-	return &typer{d: d, base: d.lookup(tableFn), note: note}
+	return &typer{d: d, base: d.shapeLookup(tableFn), note: note}
 }
 
 // lookup resolves a FROM name: statement CTEs first (they shadow real

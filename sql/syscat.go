@@ -68,6 +68,18 @@ func (d *DB) lookup(base func(string) *bytdb.TableDesc) tableLookup {
 	}
 }
 
+// shapeLookup is lookup for callers that need only the shape of what a
+// name resolves to — typing, Describe, scope checks — never its rows:
+// system tables resolve with their descriptors and no rows. A catalog
+// table's rows are built from the whole catalog (pg_attribute over 200
+// tables, 3 ms), and typing a statement used to build them once more
+// before execution built them for real (deep-look D-47).
+func (d *DB) shapeLookup(base func(string) *bytdb.TableDesc) tableLookup {
+	sd := *d
+	sd.catalogShapes = true
+	return sd.lookup(base)
+}
+
 // sysLookup finds a system table by canonical name
 // ("pg_catalog.pg_class", "information_schema.tables") or by bare
 // name for pg_catalog members — pg_catalog is on the search path, as

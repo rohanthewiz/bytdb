@@ -179,3 +179,35 @@ func BenchmarkDLIndexNLJoin(b *testing.B) {
 func BenchmarkDLInSubquery(b *testing.B) {
 	benchQuery(b, `SELECT count(*) FROM orders WHERE cust IN (SELECT id FROM cust WHERE id < 500)`)
 }
+
+// D-47: catalog introspection at ORM startup, one table at a time, in a
+// schema of 200 tables. Catalog tables are built from the whole catalog
+// per query, so this is linear in schema size per call.
+func benchCatalog(b *testing.B, q string) {
+	e, err := bytdb.Open(filepath.Join(b.TempDir(), "cat.db"), bytdb.WithSyncNever())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer e.Close()
+	d := New(e)
+	for i := range 200 {
+		if _, err := d.Exec(fmt.Sprintf(`create table t%03d (id int primary key, name text, amount float, created timestamp, note text)`, i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		if _, err := d.Exec(q, fmt.Sprintf("t%03d", i%200)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDLCatalogColumns200(b *testing.B) {
+	benchCatalog(b, `select column_name, data_type from information_schema.columns where table_name = $1`)
+}
+
+func BenchmarkDLCatalogAttributes200(b *testing.B) {
+	benchCatalog(b, `select a.attname from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname = $1 and a.attnum > 0`)
+}

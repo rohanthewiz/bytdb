@@ -57,7 +57,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		return err
 	}
 	st = typed
-	lk := d.lookup(d.e.TableShared)
+	lk := d.shapeLookup(d.e.TableShared)
 	switch st := st.(type) {
 	case *Explain:
 		// Parameters are the inner statement's; the output is always
@@ -197,7 +197,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		if dd, err = dd.staticWith(st); err != nil {
 			return err
 		}
-		lk = dd.lookup(dd.e.TableShared)
+		lk = dd.shapeLookup(dd.e.TableShared)
 		res := &Result{}
 		if err := describeSelect(lk, st, note, res); err != nil {
 			return err

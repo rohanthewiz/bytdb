@@ -105,7 +105,7 @@ func decorrelatedBody(env *exEnv, sel *Select) (*Select, error) {
 }
 
 func decorrelateSelect(env *exEnv, sel *Select) *Select {
-	sc, err := buildScope(env.d.lookup(env.tx.TableShared), sel.From)
+	sc, err := buildScope(env.d.shapeLookup(env.tx.TableShared), sel.From)
 	if err != nil {
 		return sel // an unknown table: the executor reports it
 	}
