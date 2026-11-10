@@ -1654,7 +1654,40 @@ func (t *typer) funcExpr(n *ExFunc, ts *tscope) (Expr, bytdb.ColType, error) {
 		}
 	case "exists":
 		typ = bytdb.TBool
+	case "lower", "upper":
+		// Text in, text out: upper(1) is a type error, not NULL.
+		if len(argTypes) != 1 || !textOrUnknown(argTypes[0]) {
+			return nil, "", noFunc(n.Name, argTypes)
+		}
+		typ = bytdb.TString
+	case "length", "char_length", "character_length":
+		if len(argTypes) != 1 || !(textOrUnknown(argTypes[0]) || (n.Name == "length" && argTypes[0] == bytdb.TBytes)) {
+			return nil, "", noFunc(n.Name, argTypes)
+		}
+		typ = bytdb.TInt
 	default:
+		if f, ok := scalarFuncs[n.Name]; ok {
+			if len(args) < f.min || (f.max >= 0 && len(args) > f.max) {
+				return nil, "", noFunc(n.Name, argTypes)
+			}
+			typ = f.ret
+			if f.typ != nil {
+				fc := &funcCall{name: n.Name, args: append([]Expr(nil), args...), types: append([]bytdb.ColType(nil), argTypes...)}
+				var err error
+				if typ, err = f.typ(fc); err != nil {
+					return nil, "", err
+				}
+				if fc.changed {
+					args, changed = fc.args, true
+				}
+			}
+			break
+		}
+		if !isKnownFunc(n.Name) {
+			// Unknown at prepare time, as in Postgres, rather than at the
+			// first row that evaluates the call (deep-look D-53).
+			return nil, "", noFunc(n.Name, argTypes)
+		}
 		typ = funcTypes[n.Name]
 	}
 	if !changed {

@@ -3999,6 +3999,17 @@ func (p *parser) exprPostfix() (Expr, error) {
 func (p *parser) postfixLoop(e Expr, d int) (Expr, error) {
 	for {
 		switch {
+		case p.cur().kind == tIdent && p.cur().text == "at" &&
+			p.tokAt(1).kind == tIdent && p.tokAt(1).text == "time" &&
+			p.tokAt(2).kind == tIdent && p.tokAt(2).text == "zone":
+			// x AT TIME ZONE z is timezone(z, x) (deep-look D-53).
+			p.i += 3
+			zone, err := p.exprPrimary()
+			if err != nil {
+				return nil, err
+			}
+			e = &ExFunc{Name: "timezone", Args: []Expr{zone, e}}
+			d = max(d, p.lastDepth) + 1
 		case p.acceptOp("::"):
 			typ, err := p.castType()
 			if err != nil {
@@ -4304,6 +4315,9 @@ func (p *parser) primary() (Expr, error) {
 		return p.windowOver(w)
 	}
 	if t.kind == tIdent && p.peekOp("(") {
+		if e, ok, err := p.sqlFuncForm(t.text); ok || err != nil {
+			return e, err
+		}
 		name := t.text
 		p.advance()
 		return p.funcCall(name)
@@ -4941,4 +4955,127 @@ func (p *parser) nullsOrder() (NullsOrder, error) {
 		return NullsLast, nil
 	}
 	return NullsDefault, p.unexpected("FIRST or LAST after NULLS")
+}
+
+// sqlFuncForm parses the SQL-standard call syntaxes that use keywords
+// between their arguments, lowering each to the library function of the
+// same meaning (deep-look D-53):
+//
+//	EXTRACT(field FROM x)                         date_part('field', x)
+//	SUBSTRING(s FROM a [FOR n]), SUBSTRING(s FOR n) substring(s, a, n)
+//	POSITION(a IN b)                              strpos(b, a)
+//	TRIM([BOTH|LEADING|TRAILING] [chars] FROM s)  btrim / ltrim / rtrim(s, chars)
+//
+// ok is false, consuming nothing, for a plain call (SUBSTRING(s, 1, 2)
+// is one), which the generic function-call path then parses.
+func (p *parser) sqlFuncForm(name string) (Expr, bool, error) {
+	switch name {
+	case "extract":
+		p.advance() // extract
+		p.advance() // (
+		var field string
+		switch t := p.cur(); t.kind {
+		case tIdent, tString, tQIdent:
+			field = t.text
+			p.advance()
+		default:
+			return nil, true, p.unexpected("a field name after EXTRACT(")
+		}
+		if err := p.expectKw("from"); err != nil {
+			return nil, true, err
+		}
+		x, err := p.expression()
+		if err != nil {
+			return nil, true, err
+		}
+		return &ExFunc{Name: "date_part", Args: []Expr{&ExLit{Val: field}, x}}, true, p.expectOp(")")
+	case "position":
+		// The first operand is parsed below the comparison level, so its
+		// IN is the keyword, not an IN-list predicate.
+		save := p.i
+		p.advance()
+		p.advance()
+		sub, err := p.exprOther()
+		if err != nil || !p.acceptKw("in") {
+			p.i = save
+			return nil, false, nil
+		}
+		s, err := p.expression()
+		if err != nil {
+			return nil, true, err
+		}
+		return &ExFunc{Name: "strpos", Args: []Expr{s, sub}}, true, p.expectOp(")")
+	case "substring":
+		save := p.i
+		p.advance()
+		p.advance()
+		s, err := p.expression()
+		if err != nil {
+			return nil, true, err
+		}
+		var from, count Expr = &ExLit{Val: int64(1)}, nil
+		switch {
+		case p.acceptKw("from"):
+			if from, err = p.expression(); err != nil {
+				return nil, true, err
+			}
+			if p.acceptKw("for") {
+				if count, err = p.expression(); err != nil {
+					return nil, true, err
+				}
+			}
+		case p.acceptKw("for"):
+			if count, err = p.expression(); err != nil {
+				return nil, true, err
+			}
+		default:
+			p.i = save // substring(s, a, n): the ordinary call
+			return nil, false, nil
+		}
+		args := []Expr{s, from}
+		if count != nil {
+			args = append(args, count)
+		}
+		return &ExFunc{Name: "substring", Args: args}, true, p.expectOp(")")
+	case "trim":
+		p.advance()
+		p.advance()
+		fn := "btrim"
+		switch {
+		case p.acceptKw("leading"):
+			fn = "ltrim"
+		case p.acceptKw("trailing"):
+			fn = "rtrim"
+		default:
+			p.acceptKw("both")
+		}
+		var s, chars Expr
+		var err error
+		if p.acceptKw("from") {
+			s, err = p.expression()
+		} else {
+			first, ferr := p.expression()
+			if ferr != nil {
+				return nil, true, ferr
+			}
+			if p.acceptKw("from") {
+				chars = first
+				s, err = p.expression()
+			} else {
+				s = first
+				if p.acceptOp(",") {
+					chars, err = p.expression()
+				}
+			}
+		}
+		if err != nil {
+			return nil, true, err
+		}
+		args := []Expr{s}
+		if chars != nil {
+			args = append(args, chars)
+		}
+		return &ExFunc{Name: fn, Args: args}, true, p.expectOp(")")
+	}
+	return nil, false, nil
 }

@@ -93,7 +93,8 @@ func sqlstate(msg string, hasPos bool) string {
 	// Subquery shapes the subquery executor does not run (LIMIT/OFFSET
 	// until deep-look D-27; UNION and GROUP BY in a scalar subquery).
 	// The typed bind pass's refusals, in Postgres's wording.
-	case strings.HasPrefix(msg, "operator does not exist"):
+	case strings.HasPrefix(msg, "operator does not exist"),
+		strings.HasPrefix(msg, "function ") && strings.Contains(msg, " does not exist"):
 		return "42883" // undefined_function
 	case strings.HasPrefix(msg, "cannot cast type "):
 		return "42846" // cannot_coerce

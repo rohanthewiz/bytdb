@@ -1119,6 +1119,11 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 // names parse fine and error only here — if a query's rows never
 // reach them (empty catalog tables), the query succeeds.
 func evalFunc(env *exEnv, name string, args []any) (any, error) {
+	// The function library (funcs.go) first; the switch below holds the
+	// functions that predate it.
+	if v, ok, err := callScalarFunc(name, args); ok {
+		return v, err
+	}
 	argN := func(i int) any {
 		if i < len(args) {
 			return args[i]
@@ -1172,6 +1177,9 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 	case "length", "char_length", "character_length":
 		if s, ok := argN(0).(string); ok {
 			return int64(len([]rune(s))), nil
+		}
+		if b, ok := argN(0).([]byte); ok && name == "length" {
+			return int64(len(b)), nil // length(bytea) counts bytes
 		}
 		return nil, nil
 	case "format_type":
@@ -1335,7 +1343,7 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 		env.d.seq.record(s, v)
 		return v, nil
 	}
-	return nil, serr.New("unknown function", "function", name)
+	return nil, serr.New("function "+name+" does not exist", "function", name)
 }
 
 // formatType is pg_catalog.format_type(typid, typmod).
@@ -1930,6 +1938,9 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 			}
 		case "exists":
 			return bytdb.TBool
+		}
+		if f, ok := scalarFuncs[n.Name]; ok {
+			return f.resultType(sc, n)
 		}
 		if t, ok := funcTypes[n.Name]; ok {
 			return t

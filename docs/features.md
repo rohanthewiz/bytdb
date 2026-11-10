@@ -702,10 +702,28 @@ text (OID 1009 in both wire formats). No array operators (`@>`, `&&`),
 DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
 ```
 
-- Scalar functions: `coalesce`, `nullif`, `lower`, `upper`, `length`,
-  `array_to_string`, `array_length`, `gen_random_uuid`, the clock functions,
-  plus the Postgres introspection functions ORMs call (`format_type`,
-  `pg_get_indexdef`, `pg_table_is_visible`, ...)
+- Scalar functions: `coalesce`, `nullif`, `greatest`, `least`, `lower`,
+  `upper`, `length` (text or bytea), `array_to_string`, `array_length`,
+  `gen_random_uuid`, the clock functions, plus the Postgres introspection
+  functions ORMs call (`format_type`, `pg_get_indexdef`,
+  `pg_table_is_visible`, ...), and the library (deep-look D-53):
+  - math: `abs round trunc ceil ceiling floor sign mod power pow sqrt cbrt
+    exp ln log pi random` (`round`/`trunc` take an optional number of
+    places and round half away from zero, numeric's rule);
+  - text: `substring`/`substr` (and `SUBSTRING(s FROM a FOR n)`), `left
+    right`, `trim`/`btrim`/`ltrim`/`rtrim` (and `TRIM([BOTH|LEADING|
+    TRAILING] [chars] FROM s)`), `replace strpos` (and `POSITION(a IN b)`),
+    `split_part repeat reverse lpad rpad initcap starts_with md5 ascii chr
+    octet_length concat concat_ws`;
+  - date/time: `EXTRACT(field FROM x)` / `date_part`, `date_trunc`,
+    `to_char` (the date/time template patterns), `to_timestamp(seconds)`,
+    `make_date`, `x AT TIME ZONE z` (the wall time in z, as bytdb's one
+    timestamp type);
+  - jsonb: `jsonb_typeof`, `jsonb_array_length`.
+
+  An unknown function, or one given arguments of types it does not take
+  (`upper(1)`), is refused when the statement is prepared — SQLSTATE 42883,
+  as in Postgres — not at the first row that evaluates it.
 - `UNION`, `INTERSECT`, `EXCEPT` (each with `ALL`), with `INTERSECT`
   binding tighter and parenthesized operands keeping their own `ORDER BY` /
   `LIMIT`; `VALUES (…), (…)` as a query and as a derived table
