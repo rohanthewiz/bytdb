@@ -79,11 +79,11 @@ func TestSubqueryLimitInterimReject(t *testing.T) {
 		}
 	}
 	for q, want := range map[string]any{
-		`select exists (select 1 from o where amt > 90 limit 1)`: true,
-		`select (select amt from o limit 1)`:                      int64(10),
-		`select (select max(amt) from o)`:                        int64(99),
-		`select array(select amt from o order by amt)`:           "{5,10,30,50,99}",
-		`select array(select amt from o order by 1)`:             "{5,10,30,50,99}",
+		`select exists (select 1 from o where amt > 90 limit 1)`:               true,
+		`select (select amt from o limit 1)`:                                   int64(10),
+		`select (select max(amt) from o)`:                                      int64(99),
+		`select array(select amt from o order by amt)`:                         "{5,10,30,50,99}",
+		`select array(select amt from o order by 1)`:                           "{5,10,30,50,99}",
 		`select count(*) from o where id in (select id from o where amt > 20)`: int64(3),
 	} {
 		res, err := d.Exec(q)
