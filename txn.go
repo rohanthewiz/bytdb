@@ -52,6 +52,14 @@ type Txn struct {
 	// int64 is enough: a Txn is single-goroutine, like the kv Tx under
 	// it.
 	writes int64
+	// done is set once the transaction has committed or rolled back
+	// (by Commit/Rollback, or when WriteTxn/ReadTxn's closure returns).
+	// Every method then returns ErrTxClosed. Without it, reads through a
+	// finished transaction looked like misses — btypedb's Get on a done
+	// transaction reports "absent" — so Get, Scan, Update and Delete
+	// said "no such row" with a nil error for rows that exist
+	// (deep-look D-19).
+	done bool
 	// saveWrites mirrors the kv layer's savepoint stack, pairing each
 	// outstanding savepoint with the write count at its mark. RollbackTo
 	// restores the count with the state, so writes a rollback discards
@@ -182,8 +190,13 @@ func (e *Engine) writeTxn(serializable bool, fn func(tx *Txn) error) error {
 		txn = &Txn{tx: tx, e: e}
 		return fn(txn)
 	})
-	if err == nil && txn != nil {
-		txn.flushSeqInvalidations()
+	if txn != nil {
+		// The kv transaction is finished whatever the outcome; a Txn
+		// the closure leaked must not keep answering.
+		txn.done = true
+		if err == nil {
+			txn.flushSeqInvalidations()
+		}
 	}
 	return err
 }
@@ -214,7 +227,9 @@ func guardPanic(fn func(tx *btypedb.Tx[string, []byte]) error) func(tx *btypedb.
 // an index in the catalog whose backfill postdates its data.
 func (e *Engine) ReadTxn(fn func(tx *Txn) error) error {
 	return e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
-		return fn(&Txn{tx: tx, e: e})
+		t := &Txn{tx: tx, e: e}
+		defer func() { t.done = true }()
+		return fn(t)
 	})
 }
 
@@ -295,6 +310,7 @@ func (t *Txn) Commit() error {
 	// issues no further engine writes once commit begins, and other
 	// goroutines were always allowed to block on the lock.
 	t.releaseWriter()
+	t.done = true
 	err := t.tx.Commit()
 	if err == nil {
 		t.flushSeqInvalidations()
@@ -306,7 +322,21 @@ func (t *Txn) Commit() error {
 // back a finished transaction is a no-op.
 func (t *Txn) Rollback() error {
 	t.releaseWriter() // before the lock is released — see Commit
+	t.done = true
 	return t.tx.Rollback()
+}
+
+// ErrTxClosed is returned by a Txn's methods once the transaction has
+// committed or rolled back. It is btypedb's sentinel, re-exported so
+// callers can match it with errors.Is without importing btypedb.
+var ErrTxClosed = btypedb.ErrTxClosed
+
+// open returns ErrTxClosed for a finished transaction, nil otherwise.
+func (t *Txn) open(op string) error {
+	if t.done {
+		return serr.Wrap(ErrTxClosed, "op", op)
+	}
+	return nil
 }
 
 // releaseWriter clears the engine's reentrancy marker once a writable
@@ -335,6 +365,9 @@ type Savepoint = btypedb.Savepoint[string, []byte]
 // later ones, and any still outstanding at Commit or Rollback are
 // cleaned up with the transaction.
 func (t *Txn) Savepoint() (*Savepoint, error) {
+	if err := t.open("savepoint"); err != nil {
+		return nil, err
+	}
 	sp, err := t.tx.Savepoint()
 	if err != nil {
 		return nil, err
@@ -347,6 +380,9 @@ func (t *Txn) Savepoint() (*Savepoint, error) {
 // discarding every change made after it. sp itself stays valid. The
 // write count rolls back with the state (see saveWrites).
 func (t *Txn) RollbackTo(sp *Savepoint) error {
+	if err := t.open("rollback to savepoint"); err != nil {
+		return err
+	}
 	if err := t.tx.RollbackTo(sp); err != nil {
 		return err
 	}
@@ -363,6 +399,9 @@ func (t *Txn) RollbackTo(sp *Savepoint) error {
 // Release discards sp — and every savepoint created after it — while
 // keeping all of the transaction's changes (and their write count).
 func (t *Txn) Release(sp *Savepoint) error {
+	if err := t.open("release savepoint"); err != nil {
+		return err
+	}
 	if err := t.tx.Release(sp); err != nil {
 		return err
 	}
@@ -387,10 +426,15 @@ func (t *Txn) saveMark(sp *Savepoint) int {
 
 // Table returns the descriptor for a table name in the transaction's
 // view, or nil if absent. A corrupt stored descriptor also reads as
-// nil here; desc, which every data path uses, surfaces it as an error.
+// nil here; desc, which every data path uses, surfaces it as an error,
+// and so does a finished transaction. The result is the caller's own
+// copy: modifying it changes nothing in the engine (deep-look D-19).
 func (t *Txn) Table(name string) *TableDesc {
+	if t.done {
+		return nil
+	}
 	d, _ := t.table(name)
-	return d
+	return d.Clone()
 }
 
 // table resolves and memoizes one descriptor from the transaction's
@@ -410,7 +454,13 @@ func (t *Txn) table(name string) (*TableDesc, error) {
 	return d, nil
 }
 
+// desc resolves a table every data path needs, failing on a finished
+// transaction first — which makes it the one place most Txn methods
+// get their ErrTxClosed from.
 func (t *Txn) desc(table string) (*TableDesc, error) {
+	if err := t.open("resolve table"); err != nil {
+		return nil, err
+	}
 	d, err := t.table(table)
 	if err != nil {
 		return nil, err
@@ -482,7 +532,7 @@ func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (R
 	if err != nil {
 		return Row{}, false, err
 	}
-	newVals, updated, err := updateRow(t.tx, desc, pkVals, set)
+	newVals, updated, err := updateRow(t.e, t.tx, desc, pkVals, set)
 	if err != nil {
 		return Row{}, false, serr.Wrap(err, "op", "update", "table", table)
 	}
@@ -497,8 +547,40 @@ func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (R
 // transaction's catalog view, that references the named table —
 // including the table's references to itself. The SQL layer's
 // DELETE/UPDATE/TRUNCATE enforcement is built on it.
+//
+// Each FKRef's Child is the caller's own copy of the referencing table's
+// descriptor (and FK points into that copy), so a caller cannot reach
+// the engine's shared descriptors through it.
 func (t *Txn) ReferencingFKs(table string) ([]FKRef, error) {
-	return t.e.referencingFKs(t.tx, table, false)
+	if err := t.open("referencing foreign keys"); err != nil {
+		return nil, err
+	}
+	refs, err := t.e.referencingFKs(t.tx, table, false)
+	if err != nil {
+		return nil, err
+	}
+	// One copy per distinct child table, so two FKs of one child still
+	// share its Child pointer, as they did before the copy.
+	copies := map[*TableDesc]*TableDesc{}
+	for i, r := range refs {
+		c, ok := copies[r.Child]
+		if !ok {
+			c = r.Child.clone()
+			copies[r.Child] = c
+		}
+		refs[i] = FKRef{Child: c, FK: &c.ForeignKeys[fkIndex(r.Child, r.FK)]}
+	}
+	return refs, nil
+}
+
+// fkIndex finds fk's position within d.ForeignKeys by identity.
+func fkIndex(d *TableDesc, fk *FKDesc) int {
+	for i := range d.ForeignKeys {
+		if &d.ForeignKeys[i] == fk {
+			return i
+		}
+	}
+	panic("bytdb: foreign key not found in its own table descriptor")
 }
 
 // Truncate removes every row of the table — and its entries in every

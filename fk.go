@@ -199,6 +199,7 @@ func validateExistingRefs(tx *btypedb.Tx[string, []byte], child, parent *TableDe
 func (e *Engine) DropForeignKey(table, name string) (bool, error) {
 	existed := false
 	err := e.alterDesc(table, func(_ *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		existed = false // the closure may re-run; see DropCheck
 		i := slices.IndexFunc(old.ForeignKeys, func(f FKDesc) bool { return f.Name == name })
 		if i < 0 {
 			return nil, nil // absent: a no-op, not an error

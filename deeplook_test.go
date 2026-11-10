@@ -6,6 +6,8 @@ package bytdb
 // ai_docs/todo/deep-look-repros/engine-audit/.
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"path/filepath"
@@ -338,5 +340,262 @@ func TestDDLCallbackWriteIsRefused(t *testing.T) {
 				t.Fatalf("a refused DDL left schema behind: %+v", d)
 			}
 		})
+	}
+}
+
+// TestClosedTxnRefusesEverything (D-19): a finished transaction used to
+// answer reads as misses — btypedb's Get on a done transaction reports
+// "absent" — so Get, Scan, Update and Delete said "no such row" with a
+// nil error for rows that exist. Every method now returns ErrTxClosed.
+func TestClosedTxnRefusesEverything(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt}, {Name: "v", Type: TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	var leaked *Txn
+	if err := e.ReadTxn(func(tx *Txn) error { leaked = tx; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := committed.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rolled, err := e.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rolled.Rollback()
+	var fromWriteTxn *Txn
+	if err := e.WriteTxn(func(tx *Txn) error { fromWriteTxn = tx; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, tx := range map[string]*Txn{"ReadTxn": leaked, "Commit": committed, "Rollback": rolled, "WriteTxn": fromWriteTxn} {
+		check := func(op string, err error) {
+			t.Helper()
+			if !errors.Is(err, ErrTxClosed) {
+				t.Errorf("%s: %s on a finished Txn: err = %v, want ErrTxClosed", name, op, err)
+			}
+		}
+		_, _, err := tx.Get("t", 1)
+		check("Get", err)
+		var scanErr error
+		for _, err := range tx.Scan("t") {
+			scanErr = err
+			break
+		}
+		check("Scan", scanErr)
+		_, err = tx.Update("t", []any{1}, map[string]any{"v": 2})
+		check("Update", err)
+		_, err = tx.Delete("t", 1)
+		check("Delete", err)
+		check("Insert", tx.Insert("t", 2, 2))
+		_, err = tx.Savepoint()
+		check("Savepoint", err)
+		_, err = tx.ReferencingFKs("t")
+		check("ReferencingFKs", err)
+		if tx.Table("t") != nil {
+			t.Errorf("%s: Table on a finished Txn returned a descriptor", name)
+		}
+	}
+}
+
+// TestDescriptorAccessorsReturnCopies (D-19): Engine.Table, Txn.Table
+// and ReferencingFKs handed out the parse cache's shared descriptor, so
+// a caller that modified "its" copy rewrote the schema every
+// transaction reads, and the next DDL persisted it. Row.Desc stays
+// shared (copying per row is too costly), so DDL now builds on the
+// stored bytes and a mutation through it cannot be persisted either.
+func TestDescriptorAccessorsReturnCopies(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	if _, err := e.CreateTable("p", []Column{{Name: "id", Type: TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt}, {Name: "v", Type: TString}, {Name: "pid", Type: TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateIndex("t", "t_v", false, "v"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddForeignKey("t", FKDesc{Name: "t_p", Cols: []int{2}, RefTable: "p"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", 1, "hello", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate every copy a caller can get, at every depth.
+	d := e.Table("t")
+	d.Columns[1].Type = TInt
+	d.Indexes[0].Cols[0] = 0
+	if err := e.ReadTxn(func(tx *Txn) error {
+		td := tx.Table("t")
+		td.Columns[1].Name = "renamed"
+		refs, err := tx.ReferencingFKs("p")
+		if err != nil {
+			return err
+		}
+		refs[0].Child.Columns[1].Type = TBool
+		refs[0].FK.Cols[0] = 0
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Row.Desc is shared, but a mutation through it must not survive a
+	// DDL: the DDL builds on the stored bytes.
+	row, _, err := e.Get("t", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := row.Desc.Columns[1].Type
+	row.Desc.Columns[1].Type = TBytes
+	if err := e.AddColumn("t", Column{Name: "w", Type: TInt}); err != nil {
+		t.Fatal(err)
+	}
+	row.Desc.Columns[1].Type = saved // put the shared descriptor back
+
+	got := e.Table("t")
+	if got.Columns[1].Type != TString || got.Columns[1].Name != "v" || got.Indexes[0].Cols[0] != 1 || got.ForeignKeys[0].Cols[0] != 2 {
+		t.Fatalf("schema changed through a returned descriptor: %+v", got)
+	}
+	if err := e.Insert("t", 2, "world", nil, nil); err != nil {
+		t.Fatalf("insert after the mutations: %v", err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIdentityUpdateBumpsCounter (D-19): setting an identity column to
+// an explicit value by UPDATE now bumps its counter past it, as an
+// explicit value on INSERT always did, so later draws cannot collide.
+func TestIdentityUpdateBumpsCounter(t *testing.T) {
+	for _, occ := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "db")
+		e := openEngine(t, path)
+		if occ {
+			e.Close()
+			e = openOCCEngine(t, path)
+		}
+		if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt, Identity: true}, {Name: "v", Type: TInt}}, "id"); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Insert("t", nil, 0); err != nil { // id 1
+			t.Fatal(err)
+		}
+		if _, err := e.Update("t", []any{1}, map[string]any{"id": 3}); err != nil {
+			t.Fatal(err)
+		}
+		for i := range 3 {
+			r, err := e.InsertReturning("t", nil, 0)
+			if err != nil {
+				t.Fatalf("occ=%v: draw %d after UPDATE id=3: %v", occ, i, err)
+			}
+			if id := r.Vals[0].(int64); id <= 3 {
+				t.Fatalf("occ=%v: drew %d, want > 3", occ, id)
+			}
+		}
+		e.Close()
+	}
+}
+
+// TestReadOnlyInsertBurnsNothing (D-19): under concurrent writes an
+// identity draw is a durable write of its own, so an insert through a
+// read-only transaction used to burn a value (and write the log) before
+// failing.
+func TestReadOnlyInsertBurnsNothing(t *testing.T) {
+	e := openOCCEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt, Identity: true}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	before, _, _ := e.PeekIdentity("t", "id")
+	err := e.ReadTxn(func(tx *Txn) error { return tx.Insert("t", nil) })
+	if err == nil {
+		t.Fatal("insert through a read-only transaction succeeded")
+	}
+	after, _, _ := e.PeekIdentity("t", "id")
+	if after != before {
+		t.Fatalf("identity next moved %d -> %d on a refused read-only insert", before, after)
+	}
+}
+
+// TestConstraintNamesShareANamespace (D-19): AddCheck accepted a name an
+// existing foreign key on the table already used.
+func TestConstraintNamesShareANamespace(t *testing.T) {
+	e := openEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	if _, err := e.CreateTable("p", []Column{{Name: "id", Type: TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateTable("c", []Column{{Name: "id", Type: TInt}, {Name: "pid", Type: TInt}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddForeignKey("c", FKDesc{Name: "k", Cols: []int{1}, RefTable: "p"}, true); err != nil {
+		t.Fatal(err)
+	}
+	err := e.AddCheck("c", CheckDesc{Name: "k", Expr: "pid > 0"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("AddCheck reusing an FK's name: err = %v, want already exists", err)
+	}
+}
+
+// TestZeroRowCol (D-19 / D-56): Row.Col on the zero Row a lookup miss
+// returns used to dereference a nil descriptor.
+func TestZeroRowCol(t *testing.T) {
+	var r Row
+	if v := r.Col("id"); v != nil {
+		t.Fatalf("zero Row Col = %v, want nil", v)
+	}
+}
+
+// TestOCCAllocatorLeaks (D-20): nextval on a missing sequence left one
+// allocator in the engine's map per distinct name, and an identity
+// insert that lost to DROP TABLE re-created the dropped table's counter
+// key — an orphan nothing deletes.
+func TestOCCAllocatorLeaks(t *testing.T) {
+	e := openOCCEngine(t, filepath.Join(t.TempDir(), "db"))
+	defer e.Close()
+	for i := range 100 {
+		if _, err := e.allocSeqObj(fmt.Sprintf("missing_%d", i)); err == nil {
+			t.Fatal("nextval on a missing sequence succeeded")
+		}
+	}
+	e.seqMu.Lock()
+	n := len(e.seqObjAllocs)
+	e.seqMu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d sequence allocators left behind by failed nextvals", n)
+	}
+
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt, Identity: true}}, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", nil); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.Table("t") == nil { // resolve and memoize in this snapshot
+		t.Fatal("no table")
+	}
+	if err := e.DropTable("t"); err != nil {
+		t.Fatal(err)
+	}
+	keysAfterDrop := e.Stats().Keys
+	_ = tx.Insert("t", nil)
+	_ = tx.Commit()
+	if k := e.Stats().Keys; k != keysAfterDrop {
+		t.Fatalf("a key outlived DROP TABLE (orphan identity counter): %d -> %d", keysAfterDrop, k)
 	}
 }

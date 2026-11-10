@@ -234,11 +234,23 @@ func (a *counterAlloc) loadLocked(e *Engine, key string, start uint64, what stri
 // value from user data as floor — a semantic requirement that must win
 // over any stored value, backward-set or not — so it keeps the plain
 // max.
-func (a *counterAlloc) reserveLocked(e *Engine, key string, floor uint64, what string, extending bool) error {
+//
+// owner, when non-nil, vouches that the counter's owner still exists; it
+// runs inside the reservation transaction only when the key is absent,
+// i.e. when this write would create it. Identity counters pass one: an
+// insert that resolved its table before a concurrent DROP TABLE would
+// otherwise lazily re-create the dropped table's counter key, an orphan
+// nothing ever deletes (deep-look D-20). Named sequences pass nil —
+// lazily creating them is their contract.
+func (a *counterAlloc) reserveLocked(e *Engine, key string, floor uint64, what string, extending bool, owner func(kvView) error) error {
 	var base, wm uint64
 	err := e.seqPut(func(tx *btypedb.Tx[string, []byte]) error {
 		base = floor
-		if raw, ok := tx.Get(key); ok {
+		if raw, ok := tx.Get(key); !ok && owner != nil {
+			if err := owner(tx); err != nil {
+				return err
+			}
+		} else if ok {
 			if len(raw) != 8 {
 				return serr.New("sequence value is corrupt",
 					"sequence", what, "len", fmt.Sprint(len(raw)))
@@ -272,7 +284,7 @@ func (a *counterAlloc) reserveLocked(e *Engine, key string, floor uint64, what s
 // allocCounter draws the next value from the counter at key,
 // non-transactionally: the draw is durable-before-visible via the
 // watermark and is never rolled back. start seeds an absent counter.
-func (e *Engine) allocCounter(key string, start uint64, what string) (uint64, error) {
+func (e *Engine) allocCounter(key string, start uint64, what string, owner func(kvView) error) (uint64, error) {
 	for range seqAllocRetries {
 		a := e.counterAllocFor(key)
 		a.mu.Lock()
@@ -280,7 +292,9 @@ func (e *Engine) allocCounter(key string, start uint64, what string) (uint64, er
 			a.mu.Unlock()
 			continue // invalidated between map lookup and lock; re-fetch
 		}
-		v, err := a.takeLocked(e, key, start, what)
+		v, err := a.takeLocked(e, key, start, what, owner)
+		// Read under the lock: whether the allocator caches anything.
+		empty := !a.loaded || a.next >= a.watermark
 		a.mu.Unlock()
 		if errors.Is(err, errSeqReset) {
 			// The counter vanished under this allocator (concurrent
@@ -291,6 +305,13 @@ func (e *Engine) allocCounter(key string, start uint64, what string) (uint64, er
 			e.dropCounterAlloc(key, a)
 			continue
 		}
+		if err != nil && empty {
+			// A failed draw that leaves nothing cached loses nothing by
+			// dropping the allocator, and keeping it would leave one
+			// behind per failed key — for a table a concurrent DROP
+			// removed, forever (deep-look D-20).
+			e.dropCounterAlloc(key, a)
+		}
 		return v, err
 	}
 	return 0, serr.New("sequence allocation kept losing to concurrent resets", "sequence", what)
@@ -298,12 +319,12 @@ func (e *Engine) allocCounter(key string, start uint64, what string) (uint64, er
 
 // takeLocked hands out one value, extending the watermark first when
 // the cache is exhausted. Caller holds a.mu.
-func (a *counterAlloc) takeLocked(e *Engine, key string, start uint64, what string) (uint64, error) {
+func (a *counterAlloc) takeLocked(e *Engine, key string, start uint64, what string, owner func(kvView) error) (uint64, error) {
 	if err := a.loadLocked(e, key, start, what); err != nil {
 		return 0, err
 	}
 	if a.next >= a.watermark {
-		if err := a.reserveLocked(e, key, a.next, what, true); err != nil {
+		if err := a.reserveLocked(e, key, a.next, what, true, owner); err != nil {
 			return 0, err
 		}
 	}
@@ -316,7 +337,7 @@ func (a *counterAlloc) takeLocked(e *Engine, key string, start uint64, what stri
 // least next — the OCC twin of bumpCounterTo, for explicit values
 // inserted into identity columns. Like all allocation it is
 // non-transactional: the bump survives the caller's rollback.
-func (e *Engine) bumpCounterAllocTo(key string, next uint64, what string) error {
+func (e *Engine) bumpCounterAllocTo(key string, next uint64, what string, owner func(kvView) error) error {
 	for range seqAllocRetries {
 		a := e.counterAllocFor(key)
 		a.mu.Lock()
@@ -337,7 +358,7 @@ func (e *Engine) bumpCounterAllocTo(key string, next uint64, what string) error 
 				a.next = next
 				return nil
 			}
-			return a.reserveLocked(e, key, next, what, false)
+			return a.reserveLocked(e, key, next, what, false, owner)
 		}()
 		a.mu.Unlock()
 		if errors.Is(err, errSeqReset) {
@@ -445,6 +466,18 @@ func (e *Engine) invalidateSeqObj(key string) {
 	}
 }
 
+// dropSeqObjAlloc removes a specific sequence-object allocator, if it
+// is still the one installed (the pointer comparison keeps it from
+// discarding a fresh replacement). Caller holds a.mu.
+func (e *Engine) dropSeqObjAlloc(key string, a *seqObjAlloc) {
+	e.seqMu.Lock()
+	if e.seqObjAllocs[key] == a {
+		delete(e.seqObjAllocs, key)
+	}
+	e.seqMu.Unlock()
+	a.dead = true
+}
+
 // reserveLocked anchors on the stored descriptor and durably advances
 // it by up to CACHE draws, leaving the allocator positioned to hand
 // those draws out from memory. Reading the descriptor inside the write
@@ -496,6 +529,12 @@ func (e *Engine) allocSeqObj(name string) (int64, error) {
 		defer a.mu.Unlock()
 		if a.reserved == 0 {
 			if err := a.reserveLocked(e, name); err != nil {
+				// A failed reservation leaves nothing cached (reserved is
+				// still 0), so dropping the allocator loses nothing — and
+				// keeping it leaked one map entry per distinct name a
+				// caller tried, nextval('no_such_seq') included, which
+				// SQL can reach at will (deep-look D-20).
+				e.dropSeqObjAlloc(key, a)
 				return 0, err
 			}
 		}

@@ -67,7 +67,7 @@ func fillIdentity(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, va
 			var v uint64
 			var err error
 			if e.occ {
-				v, err = e.allocCounter(key, 1, what)
+				v, err = e.allocCounter(key, 1, what, identityOwner(e, desc))
 			} else {
 				v, err = nextFromCounter(tx, key, 1, what)
 			}
@@ -89,7 +89,7 @@ func fillIdentity(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, va
 		}
 		if n := cv.(int64); n >= 0 {
 			if e.occ {
-				err = e.bumpCounterAllocTo(key, uint64(n)+1, what)
+				err = e.bumpCounterAllocTo(key, uint64(n)+1, what, identityOwner(e, desc))
 			} else {
 				err = bumpCounterTo(tx, key, uint64(n)+1, what)
 			}
@@ -99,6 +99,62 @@ func fillIdentity(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, va
 		}
 	}
 	return out, drawn, nil
+}
+
+// identityOwner returns the reservation guard for desc's identity
+// counters (see counterAlloc.reserveLocked): creating one is allowed
+// only while the table — this table, by ID, not a same-named successor
+// — still exists in the reservation's snapshot. Losing that race is
+// reported as the retryable conflict it is: the inserting transaction
+// cannot commit across the DROP anyway, and its retry sees the table
+// gone.
+func identityOwner(e *Engine, desc *TableDesc) func(kvView) error {
+	return func(v kvView) error {
+		d, err := e.tableFromView(v, desc.Name)
+		if err != nil {
+			return err
+		}
+		if d == nil || d.ID != desc.ID {
+			return serr.Wrap(btypedb.ErrTxConflict,
+				"reason", "table was dropped concurrently", "table", desc.Name)
+		}
+		return nil
+	}
+}
+
+// bumpIdentityOnUpdate raises the counter of every identity column an
+// update sets, so later draws land past the new value. Bumps follow the
+// same mode split as fillIdentity: transactional in serialized mode
+// (rolled back with the update), through the non-transactional
+// allocator under concurrent writes (they stand, at worst a gap).
+// Negative values never collide with draws, which start at 1.
+func bumpIdentityOnUpdate(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, set map[string]any, newVals []any) error {
+	if !desc.hasIdentity() {
+		return nil
+	}
+	for col := range set {
+		ord := desc.ColIndex(col)
+		if ord < 0 || !desc.Columns[ord].Identity {
+			continue
+		}
+		n, ok := newVals[ord].(int64)
+		if !ok || n < 0 {
+			continue
+		}
+		c := &desc.Columns[ord]
+		key := identitySeqKey(desc.ID, c.ID)
+		what := desc.Name + "." + c.Name
+		var err error
+		if e.occ {
+			err = e.bumpCounterAllocTo(key, uint64(n)+1, what, identityOwner(e, desc))
+		} else {
+			err = bumpCounterTo(tx, key, uint64(n)+1, what)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // drawnRaced reports whether a uniqueness collision on the key columns

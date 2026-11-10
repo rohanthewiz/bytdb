@@ -706,11 +706,12 @@ func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) 
 		return serr.New("check constraint name is required", "table", table)
 	}
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
-		for _, c := range old.Checks {
-			if c.Name == ck.Name {
-				return nil, serr.New(`constraint "` + ck.Name + `" for relation "` + table +
-					`" already exists`)
-			}
+		// Checks and foreign keys share one constraint namespace per
+		// table, as in Postgres — AddForeignKey already checks both
+		// lists, and this side used to check only its own (D-19).
+		if old.hasConstraint(ck.Name) {
+			return nil, serr.New(`constraint "` + ck.Name + `" for relation "` + table +
+				`" already exists`)
 		}
 		desc := old.clone()
 		desc.Checks = append(desc.Checks, ck)
@@ -737,6 +738,10 @@ func (e *Engine) AddCheck(table string, ck CheckDesc, validate func(Row) error) 
 func (e *Engine) DropCheck(table, name string) (bool, error) {
 	existed := false
 	err := e.alterDesc(table, func(_ *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		// updateDDL may run this closure more than once (an optimistic
+		// attempt that lost, then the escalation); the outcome must be
+		// the last run's, not a stale true from a lost attempt.
+		existed = false
 		i := slices.IndexFunc(old.Checks, func(c CheckDesc) bool { return c.Name == name })
 		if i < 0 {
 			return nil, nil // absent: a no-op, not an error
@@ -763,7 +768,7 @@ func (e *Engine) RenameTable(oldName, newName string) error {
 		return serr.New("new table name is required", "table", oldName)
 	}
 	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
-		desc, err := e.descFromView(tx, oldName)
+		desc, err := e.descForDDL(tx, oldName) // persisted below: build on the stored bytes
 		if err != nil {
 			return err
 		}
@@ -861,7 +866,7 @@ func (e *Engine) RenameColumn(table, oldName, newName string) error {
 // transaction commits without a descriptor write.
 func (e *Engine) alterDesc(table string, mutate func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error)) error {
 	return e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
-		old, err := e.descFromView(tx, table)
+		old, err := e.descForDDL(tx, table)
 		if err != nil {
 			return err
 		}
@@ -907,7 +912,8 @@ func (e *Engine) Tables() []string {
 
 // Table returns the descriptor for a table name, or nil if absent —
 // resolved from the committed state at the call. Transactions should
-// use Txn.Table, which resolves from their own snapshot.
+// use Txn.Table, which resolves from their own snapshot. The result is
+// the caller's own copy: modifying it changes nothing in the engine.
 func (e *Engine) Table(name string) *TableDesc {
 	var desc *TableDesc
 	e.kv.View(func(tx *btypedb.Tx[string, []byte]) error {
@@ -915,5 +921,5 @@ func (e *Engine) Table(name string) *TableDesc {
 		desc, err = e.tableFromView(tx, name)
 		return err
 	})
-	return desc
+	return desc.Clone()
 }

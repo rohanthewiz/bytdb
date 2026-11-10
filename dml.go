@@ -18,8 +18,17 @@ type Row struct {
 	Vals []any
 }
 
-// Col returns the value of the named column, or nil if no such column.
+// Col returns the value of the named column, or nil if no such column
+// — including on the zero Row a lookup miss returns.
+//
+// Row.Desc is the engine's shared descriptor, for reading only: use
+// Desc.Clone (or Engine.Table / Txn.Table, which return copies) for one
+// to modify. Copying per row would put an allocation-heavy deep copy on
+// every Get and scanned row.
 func (r Row) Col(name string) any {
+	if r.Desc == nil {
+		return nil
+	}
 	if i := r.Desc.ColIndex(name); i >= 0 {
 		return r.Vals[i]
 	}
@@ -101,6 +110,14 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 	// heap crosses the ceiling mid-statement, not only at its start.
 	if err := e.CheckMemory(); err != nil {
 		return nil, err
+	}
+	// Refuse a read-only transaction before fillIdentity: under
+	// concurrent writes an identity draw is a durable, non-transactional
+	// watermark write of its own, so an insert that was always going to
+	// fail at tx.Set would first burn a value and write to the log
+	// (deep-look D-19).
+	if !tx.Writable() {
+		return nil, btypedb.ErrTxNotWritable
 	}
 	vals, drawn, err := fillIdentity(e, tx, desc, vals)
 	if err != nil {
@@ -196,7 +213,7 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 		if err != nil {
 			return err
 		}
-		_, updated, err = updateRow(tx, desc, pkVals, set)
+		_, updated, err = updateRow(e, tx, desc, pkVals, set)
 		return err
 	})
 	if err != nil {
@@ -211,7 +228,7 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 // truth. Phase 1 computes and validates everything; phase 2 writes —
 // so any error leaves the transaction unmutated. A missing row is
 // (nil, false, nil), not an error.
-func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, set map[string]any) ([]any, bool, error) {
+func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, set map[string]any) ([]any, bool, error) {
 	oldKey, err := fullPKKey(desc, pkVals)
 	if err != nil {
 		return nil, false, err
@@ -297,6 +314,17 @@ func updateRow(tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, se
 			return nil, false, serr.New("unique index violation", "table", desc.Name, "index", idx.Name)
 		}
 		moves = append(moves, move{ok, nk, nv})
+	}
+
+	// Every check has passed. An identity column set to an explicit
+	// value bumps its counter past it, exactly as an explicit value on
+	// insert does (fillIdentity) — the documented rule that later draws
+	// cannot collide with a value already in the table. Without it,
+	// UPDATE t SET id = 3 left the counter at 2 and the next two draws
+	// collided (deep-look D-19). Postgres does not bump here; bytdb's
+	// identity contract is the stricter one and update now honors it.
+	if err := bumpIdentityOnUpdate(e, tx, desc, set, newVals); err != nil {
+		return nil, false, err
 	}
 
 	for _, m := range moves {

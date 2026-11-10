@@ -213,6 +213,13 @@ func (x *IndexDesc) DescAt(i int) bool {
 	return i < len(x.Desc) && x.Desc[i]
 }
 
+// hasConstraint reports whether a CHECK or foreign key on the table
+// already uses name; the two share one namespace per table.
+func (d *TableDesc) hasConstraint(name string) bool {
+	return slices.ContainsFunc(d.Checks, func(c CheckDesc) bool { return c.Name == name }) ||
+		slices.ContainsFunc(d.ForeignKeys, func(f FKDesc) bool { return f.Name == name })
+}
+
 // Index returns the named index's descriptor, or nil.
 func (d *TableDesc) Index(name string) *IndexDesc {
 	for i := range d.Indexes {
@@ -223,18 +230,45 @@ func (d *TableDesc) Index(name string) *IndexDesc {
 	return nil
 }
 
+// clone returns a deep copy: no slice, at any depth, is shared with d.
+// Two kinds of caller rely on that. DDL clones the descriptor it is
+// changing, and a nested slice shared with the original (an index's
+// Cols, a foreign key's RefCols) would let an in-place edit reach the
+// parse cache every transaction reads from. The exported accessors
+// (Engine.Table, Txn.Table, ReferencingFKs) hand callers a copy for
+// the same reason in the other direction: a caller "normalizing its
+// copy" must not rewrite the schema (deep-look D-19).
 func (d *TableDesc) clone() *TableDesc {
 	c := *d
 	c.Columns = slices.Clone(d.Columns)
 	c.PKCols = slices.Clone(d.PKCols)
 	c.Indexes = slices.Clone(d.Indexes)
+	for i := range c.Indexes {
+		c.Indexes[i].Cols = slices.Clone(c.Indexes[i].Cols)
+		c.Indexes[i].Desc = slices.Clone(c.Indexes[i].Desc)
+	}
 	c.Checks = slices.Clone(d.Checks)
 	c.ForeignKeys = slices.Clone(d.ForeignKeys)
+	for i := range c.ForeignKeys {
+		c.ForeignKeys[i].Cols = slices.Clone(c.ForeignKeys[i].Cols)
+		c.ForeignKeys[i].RefCols = slices.Clone(c.ForeignKeys[i].RefCols)
+	}
 	// The clone exists to be mutated, which would desynchronize a
 	// carried-over lookup table; drop it and let colOrdinalByID fall
 	// back to the linear scan until the descriptor is re-parsed.
 	c.ordByID = nil
 	return &c
+}
+
+// Clone returns a deep copy of the descriptor that the caller may
+// modify freely. The descriptors the engine hands out are already
+// copies (see clone), except Row.Desc, which is shared and read-only;
+// Clone is how to get a private one from a row.
+func (d *TableDesc) Clone() *TableDesc {
+	if d == nil {
+		return nil
+	}
+	return d.clone()
 }
 
 // ColIndex returns the ordinal of the named column, or -1.
@@ -866,6 +900,25 @@ func (e *Engine) tableFromView(v kvView, name string) (*TableDesc, error) {
 		return nil, serr.Wrap(err, "op", "decode table descriptor", "table", name)
 	}
 	e.cacheStore(name, bs, desc)
+	return desc, nil
+}
+
+// descForDDL resolves the descriptor a DDL transaction builds on by
+// parsing the stored bytes afresh, bypassing the parse cache. The
+// cache's descriptors are shared, and one reaches callers as Row.Desc;
+// a caller that mutated it would otherwise have that mutation cloned
+// into the next DDL's descriptor and persisted. Parsing from the
+// bytes makes the stored schema the only input to a schema change.
+// DDL is rare, so the parse costs nothing that matters.
+func (e *Engine) descForDDL(v kvView, table string) (*TableDesc, error) {
+	blob, ok := v.Get(descKey(table))
+	if !ok {
+		return nil, serr.New("no such table", "table", table)
+	}
+	desc, err := parseDesc(blob)
+	if err != nil {
+		return nil, serr.Wrap(err, "op", "decode table descriptor", "table", table)
+	}
 	return desc, nil
 }
 

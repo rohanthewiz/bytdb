@@ -86,7 +86,7 @@ func (e *Engine) NextSeq(name string) (uint64, error) {
 		if err := checkSeqName(name); err != nil {
 			return 0, err
 		}
-		v, err := e.allocCounter(seqNameKey(name), 1, name)
+		v, err := e.allocCounter(seqNameKey(name), 1, name, nil)
 		if err != nil {
 			return 0, serr.Wrap(err, "op", "next sequence value", "sequence", name)
 		}
