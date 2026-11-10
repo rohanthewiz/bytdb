@@ -85,14 +85,14 @@ func (d *DB) prepareUpsert(tx *bytdb.Txn, table string, desc *bytdb.TableDesc, o
 	for col := range oc.Set {
 		ord := desc.ColIndex(col)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", col)
+			return nil, noSuchColumn(table, col)
 		}
 		u.setOrds[col] = ord
 	}
 	for col := range oc.SetEx {
 		ord := desc.ColIndex(col)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", col)
+			return nil, noSuchColumn(table, col)
 		}
 		u.setOrds[col] = ord
 	}
@@ -131,7 +131,7 @@ func (u *upsert) resolveArbiters() error {
 	for i, name := range u.oc.TargetCols {
 		ord := u.desc.ColIndex(name)
 		if ord < 0 {
-			return serr.New("no such column", "table", u.table, "column", name)
+			return noSuchColumn(u.table, name)
 		}
 		want[i] = ord
 	}

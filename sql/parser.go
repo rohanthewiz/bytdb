@@ -223,10 +223,15 @@ func (p *parser) expectOp(op string) error {
 func (p *parser) unexpected(want string) error {
 	t := p.cur()
 	got := "'" + t.text + "'"
+	// The message names the offending token, as Postgres's does —
+	// `syntax error at or near "insrt"` — so err.Error() alone says
+	// where parsing stopped (it was the bare "syntax error"); the
+	// expectation and the 0-based offset stay fields (deep-look D-56).
+	msg := `syntax error at or near "` + strings.ReplaceAll(t.text, `"`, `""`) + `"`
 	if t.kind == tEOF {
-		got = "end of input"
+		got, msg = "end of input", "syntax error at end of input"
 	}
-	return serr.New("syntax error", "want", want, "got", got, "pos", fmt.Sprint(t.pos))
+	return serr.New(msg, "want", want, "got", got, "pos", fmt.Sprint(t.pos))
 }
 
 // ident consumes an identifier, quoted or not.

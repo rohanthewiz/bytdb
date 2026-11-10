@@ -117,7 +117,7 @@ func TestSystemCatalog(t *testing.T) {
 	if res := exec(t, d, `select count(*) from public.users`); res.Rows[0][0] != int64(5) {
 		t.Fatalf("public.users: %v", res.Rows)
 	}
-	if _, err := d.Exec(`select * from tables`); err == nil || !strings.Contains(err.Error(), "no such table") {
+	if _, err := d.Exec(`select * from tables`); err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("bare information_schema name: %v", err)
 	}
 	if _, err := d.Exec(`select * from myschema.t`); err == nil || !strings.Contains(err.Error(), "no such schema") {

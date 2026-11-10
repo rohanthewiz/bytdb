@@ -299,7 +299,7 @@ func TestSetPrimaryKey(t *testing.T) {
 		t.Fatalf("index scan saw %d rows; want 3", n)
 	}
 	// The new key enforces uniqueness; the old one no longer does.
-	wantErr(t, e.Insert("items", 99, "a", 1.0), "duplicate primary key")
+	wantErr(t, e.Insert("items", 99, "a", 1.0), "duplicate key value violates unique constraint")
 	if err := e.Insert("items", 10, "d", 1.0); err != nil {
 		t.Fatalf("old key value reused: %v", err)
 	}

@@ -111,7 +111,7 @@ func TestRestartIdentity(t *testing.T) {
 				{"t", "id", -5, "RESTART value (-5) cannot be less than MINVALUE (1)"},
 				{"t", "name", 10, `column "name" of relation "t" is not an identity column`},
 				{"t", "nope", 10, `column "nope" of relation "t" does not exist`},
-				{"missing", "id", 10, "no such table"},
+				{"missing", "id", 10, "does not exist"},
 			} {
 				err := e.RestartIdentity(c.table, c.col, c.next)
 				if err == nil || !strings.Contains(err.Error(), c.want) {

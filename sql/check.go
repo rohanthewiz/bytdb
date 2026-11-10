@@ -160,8 +160,8 @@ func checkRow(env *exEnv, table string, checks []namedCheck, vals []any) error {
 			return serr.Wrap(err, "constraint", ck.name)
 		}
 		if t == triFalse {
-			return serr.New(`new row for relation "` + table +
-				`" violates check constraint "` + ck.name + `"`)
+			return bytdb.KindErr(0, `new row for relation "`+table+
+				`" violates check constraint "`+ck.name+`"`, []error{bytdb.ErrCheck})
 		}
 	}
 	return nil
@@ -175,7 +175,7 @@ func checkRow(env *exEnv, table string, checks []namedCheck, vals []any) error {
 func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
 	desc := d.e.TableShared(s.Table)
 	if desc == nil {
-		return nil, serr.New("no such table", "table", s.Table)
+		return nil, noSuchTable(s.Table)
 	}
 	sc := &scope{tables: []scopeTable{{name: s.Table, desc: desc}}, width: len(desc.Columns)}
 	if err := validateCheckExpr(sc, s.Check.Ex); err != nil {
@@ -227,7 +227,7 @@ func (d *DB) execAddConstraint(s *AddConstraint) (*Result, error) {
 func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	desc := d.e.TableShared(s.Table)
 	if desc == nil {
-		return nil, serr.New("no such table", "table", s.Table)
+		return nil, noSuchTable(s.Table)
 	}
 	existed, err := d.e.DropCheck(s.Table, s.Name)
 	if err != nil {

@@ -1039,7 +1039,7 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			if oid, ok := env.d.relOID(x); ok {
 				return oid, nil
 			}
-			return nil, serr.New(`relation "` + x + `" does not exist`)
+			return nil, noSuchTable(x)
 		}
 	case "regtype", "regnamespace", "regproc", "regprocedure", "regoper", "regrole":
 		switch x := v.(type) {

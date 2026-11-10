@@ -71,7 +71,7 @@ func TestUpdatePKMove(t *testing.T) {
 
 	// Moving onto an existing pk must fail cleanly.
 	if _, err := e.Update("people", []any{10}, map[string]any{"id": 2}); err == nil ||
-		!strings.Contains(err.Error(), "duplicate primary key") {
+		!strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
 		t.Fatalf("pk collision: %v", err)
 	}
 	if row, ok, _ := e.Get("people", 10); !ok || row.Col("name") != "ada" {
@@ -102,7 +102,7 @@ func TestUpdateUniqueIndex(t *testing.T) {
 
 	// Updating into a taken unique value fails; nothing may change.
 	if _, err := e.Update("people", []any{1}, map[string]any{"email": "g@x"}); err == nil ||
-		!strings.Contains(err.Error(), "unique index violation") {
+		!strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
 		t.Fatalf("unique collision: %v", err)
 	}
 	row, _, _ := e.Get("people", 1)

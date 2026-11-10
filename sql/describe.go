@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
-	"github.com/rohanthewiz/serr"
 )
 
 // StmtInfo describes a prepared statement without executing it — what
@@ -72,7 +71,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 	case *Insert:
 		desc, _ := lk(st.Table)
 		if desc == nil {
-			return serr.New("no such table", "table", st.Table)
+			return noSuchTable(st.Table)
 		}
 		var colTypes []bytdb.ColType
 		if st.Cols == nil {
@@ -83,7 +82,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 			for _, name := range st.Cols {
 				i := desc.ColIndex(name)
 				if i < 0 {
-					return serr.New("no such column", "table", st.Table, "column", name)
+					return noSuchColumn(st.Table, name)
 				}
 				colTypes = append(colTypes, desc.Columns[i].Type)
 			}
@@ -108,7 +107,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 			for name, v := range oc.Set {
 				i := desc.ColIndex(name)
 				if i < 0 {
-					return serr.New("no such column", "table", st.Table, "column", name)
+					return noSuchColumn(st.Table, name)
 				}
 				note(v, desc.Columns[i].Type)
 			}
@@ -117,7 +116,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 			for name, ex := range oc.SetEx {
 				i := desc.ColIndex(name)
 				if i < 0 {
-					return serr.New("no such column", "table", st.Table, "column", name)
+					return noSuchColumn(st.Table, name)
 				}
 				t := desc.Columns[i].Type
 				noteExprVals(ex, func(v any) { note(v, t) })
@@ -146,7 +145,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		for name, v := range st.Set {
 			i := desc.ColIndex(name)
 			if i < 0 {
-				return serr.New("no such column", "table", st.Table, "column", name)
+				return noSuchColumn(st.Table, name)
 			}
 			note(v, desc.Columns[i].Type)
 		}
@@ -157,7 +156,7 @@ func (d *DB) describeInto(st Statement, note func(any, bytdb.ColType), info *Stm
 		for name, ex := range st.SetEx {
 			i := desc.ColIndex(name)
 			if i < 0 {
-				return serr.New("no such column", "table", st.Table, "column", name)
+				return noSuchColumn(st.Table, name)
 			}
 			t := desc.Columns[i].Type
 			noteExprVals(ex, func(v any) { note(v, t) })

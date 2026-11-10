@@ -166,7 +166,7 @@ func TestAlterColumnRestart(t *testing.T) {
 		{`alter table users alter column nope restart`, `column "nope" of relation "users" does not exist`},
 		{`alter table users alter column id restart with 0`, "RESTART value (0) cannot be less than MINVALUE (1)"},
 		{`alter table users alter column id restart with -3`, "RESTART value (-3) cannot be less than MINVALUE (1)"},
-		{`alter table nope alter column id restart`, "no such table"},
+		{`alter table nope alter column id restart`, "does not exist"},
 		{`alter table users alter column id restart with x`, "syntax error"},
 		{`alter table users alter column id restart with 99999999999999999999`, "RESTART requires an integer"},
 		{`alter table pg_class alter column oid restart`, "system catalog is read-only"},

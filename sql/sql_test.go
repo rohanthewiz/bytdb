@@ -219,7 +219,7 @@ func TestSQLCheckValidation(t *testing.T) {
 		{`create table t (a int primary key check ((select 1) = 1))`,
 			"cannot use subquery in check constraint"},
 		{`create table t (a int primary key check (b > 0))`,
-			"no such column"},
+			"does not exist"},
 		{`create table t (a int primary key check ($1 > 0))`,
 			"placeholders are not allowed in check constraints"},
 		{`create table t (a int primary key default now())`,
@@ -301,7 +301,7 @@ func TestSQLAddDropConstraint(t *testing.T) {
 		t.Fatalf("drop pkey: %v", err)
 	}
 	if _, err := d.Exec(`alter table items add constraint c check (nope > 0)`); err == nil ||
-		!strings.Contains(err.Error(), "no such column") {
+		!strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("bad column: %v", err)
 	}
 	if _, err := d.Exec(`alter table items add check (count(price) > 0)`); err == nil ||
@@ -316,9 +316,9 @@ func TestSQLAddDropConstraint(t *testing.T) {
 	for q, want := range map[string]string{
 		`alter table items add primary key (id)`:                    `multiple primary keys for table "items" are not allowed`,
 		`alter table items add constraint u unique (price)`:         "ADD UNIQUE is not supported",
-		`alter table items add foreign key (id) references o (id)`:  "no such table",
-		`alter table nosuch add check (a > 0)`:                      "no such table",
-		`alter table nosuch drop constraint c`:                      "no such table",
+		`alter table items add foreign key (id) references o (id)`:  "does not exist",
+		`alter table nosuch add check (a > 0)`:                      "does not exist",
+		`alter table nosuch drop constraint c`:                      "does not exist",
 		`alter table items add constraint x check ((select 1) = 1)`: "cannot use subquery in check constraint",
 	} {
 		if _, err := d.Exec(q); err == nil || !strings.Contains(err.Error(), want) {
@@ -350,7 +350,7 @@ func TestDropConstraintUnique(t *testing.T) {
 
 	// Column-level, table-level and CREATE UNIQUE INDEX all drop by name,
 	// and uniqueness is lifted with them.
-	wantErr(t, d, `insert into acct values (2, 'x@y', 2, 2, 'u')`, "unique index violation")
+	wantErr(t, d, `insert into acct values (2, 'x@y', 2, 2, 'u')`, "duplicate key value violates unique constraint")
 	exec(t, d, `alter table acct drop constraint acct_email_key`)
 	exec(t, d, `alter table acct drop constraint acct_a_b_key`)
 	exec(t, d, `alter table acct drop constraint acct_tag_u`)

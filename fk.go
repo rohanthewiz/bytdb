@@ -59,7 +59,7 @@ func (e *Engine) AddForeignKey(table string, fk FKDesc, validateRows bool) error
 				return nil, err
 			}
 			if p == nil {
-				return nil, serr.New("no such table", "table", fk.RefTable)
+				return nil, errNoSuchTable(fk.RefTable)
 			}
 			parent = p
 		}
@@ -75,7 +75,7 @@ func (e *Engine) AddForeignKey(table string, fk FKDesc, validateRows bool) error
 		for i, name := range fk.RefCols {
 			pOrd := parent.ColIndex(name)
 			if pOrd < 0 {
-				return nil, serr.New("no such column", "table", fk.RefTable, "column", name)
+				return nil, errNoSuchColumn(fk.RefTable, name)
 			}
 			ct, pt := old.Columns[fk.Cols[i]].Type, parent.Columns[pOrd].Type
 			if ct != pt {
@@ -186,8 +186,8 @@ func validateExistingRefs(tx *btypedb.Tx[string, []byte], child, parent *TableDe
 			return err
 		}
 		if !keys[string(kb)] {
-			return serr.New(`insert or update on table "`+child.Name+
-				`" violates foreign key constraint "`+fk.Name+`"`,
+			return KindErr(0, `insert or update on table "`+child.Name+
+				`" violates foreign key constraint "`+fk.Name+`"`, []error{ErrForeignKey},
 				"detail", fmt.Sprintf("some row's key is not present in table %q", fk.RefTable))
 		}
 	}

@@ -114,10 +114,10 @@ func TestTxnScanUnknownTargets(t *testing.T) {
 	peopleTable(t, e)
 
 	err := e.ReadTxn(func(tx *Txn) error {
-		expectScanErr(t, tx.ScanRange("ghosts", nil, nil), "no such table")
-		expectScanErr(t, tx.ScanRangeRev("ghosts", nil, nil, false), "no such table")
-		expectScanErr(t, tx.ScanIndex("ghosts", "i", nil, nil), "no such table")
-		expectScanErr(t, tx.ScanIndexRev("ghosts", "i", nil, nil, false), "no such table")
+		expectScanErr(t, tx.ScanRange("ghosts", nil, nil), "does not exist")
+		expectScanErr(t, tx.ScanRangeRev("ghosts", nil, nil, false), "does not exist")
+		expectScanErr(t, tx.ScanIndex("ghosts", "i", nil, nil), "does not exist")
+		expectScanErr(t, tx.ScanIndexRev("ghosts", "i", nil, nil, false), "does not exist")
 		expectScanErr(t, tx.ScanIndex("people", "nope", nil, nil), "no such index")
 		expectScanErr(t, tx.ScanIndexRev("people", "nope", nil, nil, false), "no such index")
 		return nil
@@ -129,7 +129,7 @@ func TestTxnScanUnknownTargets(t *testing.T) {
 
 // TestTxnCorruptDescriptor: a stored descriptor that no longer parses
 // surfaces as an error from transactional reads (the desc/table error
-// path, distinct from the "no such table" miss).
+// path, distinct from the "does not exist" miss).
 func TestTxnCorruptDescriptor(t *testing.T) {
 	e := openEngine(t, filepath.Join(t.TempDir(), "test.db"))
 	defer e.Close()

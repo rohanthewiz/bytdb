@@ -115,7 +115,7 @@ func TestFKCompositeAndUniqueTarget(t *testing.T) {
 	exec(t, d, `insert into subs values (1, 'a@b')`)
 	wantErr(t, d, `insert into subs values (2, 'z@z')`, "violates foreign key constraint")
 	wantErr(t, d, `create table bad (id int primary key, n text references users (name))`,
-		"no such table") // users doesn't exist in this db
+		"does not exist") // users doesn't exist in this db
 	exec(t, d, `create table plain (id int primary key, v text)`)
 	wantErr(t, d, `create table bad (id int primary key, v text references plain (v))`,
 		"there is no unique constraint matching given keys")

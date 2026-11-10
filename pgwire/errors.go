@@ -18,14 +18,39 @@ import (
 	"github.com/rohanthewiz/serr"
 )
 
-// sqlstate picks a five-character SQLSTATE code for an error. bytdb
-// errors carry no code, so this keys off the stable message texts;
-// anything unrecognized is XX000 (internal_error).
+// sqlstateOf picks the SQLSTATE for err: by its bytdb sentinel when it
+// has one (deep-look D-56: the engine and SQL layer classify the
+// errors callers branch on), else by message text (sqlstate).
+func sqlstateOf(err error, msg string, hasPos bool) string {
+	switch {
+	case hasPos:
+		return "42601" // syntax_error
+	case errors.Is(err, bytdb.ErrNoSuchTable):
+		return "42P01" // undefined_table
+	case errors.Is(err, bytdb.ErrNoSuchColumn):
+		return "42703" // undefined_column
+	case errors.Is(err, bytdb.ErrUniqueViolation):
+		return "23505" // unique_violation
+	case errors.Is(err, bytdb.ErrNotNull):
+		return "23502" // not_null_violation
+	case errors.Is(err, bytdb.ErrForeignKey):
+		return "23503" // foreign_key_violation
+	case errors.Is(err, bytdb.ErrCheck):
+		return "23514" // check_violation
+	}
+	return sqlstate(msg, hasPos)
+}
+
+// sqlstate picks a five-character SQLSTATE code from an error's
+// message: the fallback for errors no sentinel classifies, keyed off
+// the stable message texts; anything unrecognized is XX000
+// (internal_error).
 func sqlstate(msg string, hasPos bool) string {
 	switch {
 	case hasPos:
 		return "42601" // syntax_error
-	case strings.Contains(msg, "no such table"):
+	case strings.Contains(msg, "no such table"),
+		strings.HasPrefix(msg, `relation "`) && strings.HasSuffix(msg, `" does not exist`):
 		return "42P01" // undefined_table
 	// Also Postgres's wording for ALTER COLUMN / ADD PRIMARY KEY naming
 	// a missing column, and CREATE TABLE's key naming an undeclared one.
@@ -47,6 +72,7 @@ func sqlstate(msg string, hasPos bool) string {
 		return "42701" // duplicate_column
 	case strings.Contains(msg, "duplicate primary key"),
 		strings.Contains(msg, "unique index violation"),
+		strings.HasPrefix(msg, "duplicate key value violates unique constraint"),
 		strings.Contains(msg, "could not create unique index"):
 		return "23505" // unique_violation
 	case strings.Contains(msg, "cannot be cast automatically"):
@@ -353,7 +379,7 @@ func errorBody(err error, query string, base int) wbuf {
 	b.byte('V')
 	b.cstr("ERROR")
 	b.byte('C')
-	b.cstr(sqlstate(msg, pos >= 0))
+	b.cstr(sqlstateOf(err, msg, pos >= 0))
 	b.byte('M')
 	b.cstr(msg)
 	if len(detail) > 0 {

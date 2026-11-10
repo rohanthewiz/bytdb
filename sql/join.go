@@ -49,7 +49,7 @@ func buildScope(lookup tableLookup, items []FromItem) (*scope, error) {
 		}
 		desc, rows := lookup(it.Table)
 		if desc == nil {
-			return nil, serr.New("no such table", "table", it.Table)
+			return nil, noSuchTable(it.Table)
 		}
 		name := it.Alias
 		if name == "" {
@@ -104,7 +104,7 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 			if st.name == c.Table {
 				ord, unique := st.desc.ColIndexUnique(c.Name)
 				if ord < 0 {
-					return -1, serr.New("no such column", "table", c.Table, "column", c.Name)
+					return -1, noSuchColumn(c.Table, c.Name)
 				}
 				if !unique {
 					return -1, ambiguousColumn(c.Name)
@@ -127,7 +127,7 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 		}
 	}
 	if found < 0 {
-		return -1, serr.New("no such column", "column", c.Name)
+		return -1, noSuchColumn("", c.Name)
 	}
 	return found, nil
 }

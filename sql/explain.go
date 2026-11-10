@@ -99,7 +99,7 @@ type explainer struct {
 
 func (x *explainer) insertNode(s *Insert) (*planNode, error) {
 	if x.tx.TableShared(s.Table) == nil {
-		return nil, serr.New("no such table", "table", s.Table)
+		return nil, noSuchTable(s.Table)
 	}
 	return &planNode{
 		title:    "Insert on " + s.Table,
@@ -112,7 +112,7 @@ func (x *explainer) insertNode(s *Insert) (*planNode, error) {
 func (x *explainer) writeNode(verb, table string, where BoolExpr) (*planNode, error) {
 	desc := x.tx.TableShared(table)
 	if desc == nil {
-		return nil, serr.New("no such table", "table", table)
+		return nil, noSuchTable(table)
 	}
 	scan, err := x.scanNode(desc, table, table, where, nil, nil)
 	if err != nil {

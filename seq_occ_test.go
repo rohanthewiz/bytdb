@@ -730,7 +730,7 @@ func TestOCCBackwardSetDuringExtensionReanchors(t *testing.T) {
 // whose identity column carries a uniqueness constraint of its own
 // depends on — there a restarted counter re-issuing a cached draw
 // collides on the index, not on the key, and a caller who saw a raw
-// "unique index violation" would read a lost race as data corruption.
+// "duplicate key value violates unique constraint" would read a lost race as data corruption.
 //
 // The reclassification cannot be provoked deterministically: an
 // explicit value bumps the shared allocator (bumpCounterAllocTo), so
@@ -766,7 +766,7 @@ func TestOCCTruncateInsertRaceUniqueIndex(t *testing.T) {
 					return tx.Insert("events", w*100000+i, nil)
 				})
 				if err != nil && !errors.Is(err, btypedb.ErrTxConflict) {
-					// A bare "unique index violation" here is the bug
+					// A bare "duplicate key value violates unique constraint" here is the bug
 					// this test exists to catch.
 					errs <- err
 					return

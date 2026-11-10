@@ -49,7 +49,7 @@ func TestExplainInsertAndExprText(t *testing.T) {
 		t.Fatalf("insert plan: %v", res.Rows)
 	}
 	if _, err := d.Exec(`explain insert into missing values (1)`); err == nil ||
-		!strings.Contains(err.Error(), "no such table") {
+		!strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("insert missing: %v", err)
 	}
 
@@ -109,7 +109,7 @@ func TestAggRewriteContainers(t *testing.T) {
 		t.Fatalf("ungrouped: %v", err)
 	}
 	if _, err := d.Exec(`select nope from users group by city`); err == nil ||
-		!strings.Contains(err.Error(), "no such column") {
+		!strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("unknown col: %v", err)
 	}
 }
@@ -147,8 +147,8 @@ func TestAggRewriteErrors(t *testing.T) {
 	}
 
 	for _, c := range []struct{ q, want string }{
-		{`select sum(nope + 1) from users`, "no such column"},
-		{`select count(*) from missing`, "no such table"},
+		{`select sum(nope + 1) from users`, "does not exist"},
+		{`select count(*) from missing`, "does not exist"},
 		{`select sum(age/0) from users`, "division by zero"},
 		{`select count(*) from users group by age/0`, "division by zero"},
 		{`select count(*) from users order by 1.5`, "non-integer constant in ORDER BY"},

@@ -18,10 +18,10 @@ func TestScanUnknownTable(t *testing.T) {
 	defer e.Close()
 	peopleTable(t, e)
 
-	expectScanErr(t, e.ScanRange("ghosts", nil, nil), "no such table")
-	expectScanErr(t, e.ScanRangeRev("ghosts", nil, nil, false), "no such table")
-	expectScanErr(t, e.ScanIndex("ghosts", "i", nil, nil), "no such table")
-	expectScanErr(t, e.ScanIndexRev("ghosts", "i", nil, nil, false), "no such table")
+	expectScanErr(t, e.ScanRange("ghosts", nil, nil), "does not exist")
+	expectScanErr(t, e.ScanRangeRev("ghosts", nil, nil, false), "does not exist")
+	expectScanErr(t, e.ScanIndex("ghosts", "i", nil, nil), "does not exist")
+	expectScanErr(t, e.ScanIndexRev("ghosts", "i", nil, nil, false), "does not exist")
 	expectScanErr(t, e.ScanIndexRev("people", "nope", nil, nil, false), "no such index")
 }
 

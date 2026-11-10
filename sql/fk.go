@@ -23,7 +23,6 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
-	"github.com/rohanthewiz/serr"
 )
 
 // fkVerifyRow checks a stored child row's foreign keys: each fully
@@ -49,8 +48,8 @@ func (d *DB) fkVerifyRow(tx *bytdb.Txn, desc *bytdb.TableDesc, vals []any) error
 			return err
 		}
 		if !found {
-			return serr.New(`insert or update on table "`+desc.Name+
-				`" violates foreign key constraint "`+fk.Name+`"`,
+			return bytdb.KindErr(0, `insert or update on table "`+desc.Name+
+				`" violates foreign key constraint "`+fk.Name+`"`, []error{bytdb.ErrForeignKey},
 				"detail", fkKeyDetail(fk.RefCols, refVals)+` is not present in table "`+fk.RefTable+`"`)
 		}
 	}
@@ -132,8 +131,8 @@ func (d *DB) fkVerifyReferenced(tx *bytdb.Txn, desc *bytdb.TableDesc, refs []byt
 			return err
 		}
 		if found {
-			return serr.New(`update or delete on table "`+desc.Name+
-				`" violates foreign key constraint "`+r.FK.Name+`" on table "`+r.Child.Name+`"`,
+			return bytdb.KindErr(0, `update or delete on table "`+desc.Name+
+				`" violates foreign key constraint "`+r.FK.Name+`" on table "`+r.Child.Name+`"`, []error{bytdb.ErrForeignKey},
 				"detail", fkKeyDetail(r.FK.RefCols, refVals)+` is still referenced from table "`+r.Child.Name+`"`)
 		}
 	}
@@ -287,7 +286,7 @@ func (d *DB) fkDeleteMatching(tx *bytdb.Txn, desc *bytdb.TableDesc, cols []strin
 func (d *DB) fkRowExists(tx *bytdb.Txn, table string, cols []string, vals []any) (bool, error) {
 	desc := tx.TableShared(table)
 	if desc == nil {
-		return false, serr.New("no such table", "table", table)
+		return false, noSuchTable(table)
 	}
 	preds := make([]BoolExpr, len(cols))
 	for i, name := range cols {
@@ -396,7 +395,7 @@ func resolveFK(desc *bytdb.TableDesc, def FKDef) (bytdb.FKDesc, error) {
 	for _, name := range def.Cols {
 		ord := desc.ColIndex(name)
 		if ord < 0 {
-			return bytdb.FKDesc{}, serr.New("no such column", "table", desc.Name, "column", name)
+			return bytdb.FKDesc{}, noSuchColumn(desc.Name, name)
 		}
 		fkd.Cols = append(fkd.Cols, ord)
 	}
@@ -423,7 +422,7 @@ func resolveFK(desc *bytdb.TableDesc, def FKDef) (bytdb.FKDesc, error) {
 func (d *DB) execAddFK(s *AddFK) (*Result, error) {
 	desc := d.e.TableShared(s.Table)
 	if desc == nil {
-		return nil, serr.New("no such table", "table", s.Table)
+		return nil, noSuchTable(s.Table)
 	}
 	fkd, err := resolveFK(desc, s.FK)
 	if err != nil {

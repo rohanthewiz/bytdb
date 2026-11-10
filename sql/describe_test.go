@@ -130,11 +130,11 @@ func TestDescribeErrors(t *testing.T) {
 	d := openDB(t)
 	seedUsers(t, d)
 	for _, c := range []struct{ q, want string }{
-		{`select * from missing`, "no such table"},
-		{`select nope from users`, "no such column"},
-		{`insert into users (id, nope) values ($1, $2)`, "no such column"},
-		{`update users set nope = $1`, "no such column"},
-		{`update users set nope = age + $1`, "no such column"},
+		{`select * from missing`, "does not exist"},
+		{`select nope from users`, "does not exist"},
+		{`insert into users (id, nope) values ($1, $2)`, "does not exist"},
+		{`update users set nope = $1`, "does not exist"},
+		{`update users set nope = age + $1`, "does not exist"},
 		{`select city from users group by city having sum(name) > $1`, "numeric"},
 	} {
 		st, err := d.Prepare(c.q)

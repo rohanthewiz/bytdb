@@ -663,7 +663,30 @@ Errors are [serr](https://github.com/rohanthewiz/serr) structured
 errors: `%v` prints just the message, `bytdb.ErrText(err)` renders it
 with the structured attributes for user-facing surfaces — `wrong
 number of parameters (want: 1, got: 0)` — and a serr-aware logger
-gets the full context including code locations.
+gets the full context including code locations. Messages use Postgres's
+wording and name what went wrong (`relation "users" does not exist`,
+`duplicate key value violates unique constraint "users_pkey"`,
+`syntax error at or near "insrt"`). Branch on the condition with
+`errors.Is` against the sentinels rather than on the text:
+
+| Sentinel | Raised by | SQLSTATE |
+|---|---|---|
+| `bytdb.ErrNoSuchTable` | an unknown table, view or relation | 42P01 |
+| `bytdb.ErrNoSuchColumn` | an unknown column | 42703 |
+| `bytdb.ErrUniqueViolation` | a duplicate primary key or unique-index value | 23505 |
+| `bytdb.ErrDuplicateKey` | the primary-key case of the above (matches both) | 23505 |
+| `bytdb.ErrNotNull` | NULL into a NOT NULL or key column | 23502 |
+| `bytdb.ErrForeignKey` | a foreign-key violation, either direction | 23503 |
+| `bytdb.ErrCheck` | a CHECK violation | 23514 |
+
+```go
+if _, err := db.Exec(`insert into users values (1, 'ada')`); errors.Is(err, bytdb.ErrUniqueViolation) {
+    // already there
+}
+```
+
+`bytdb.Kind(msg, sentinels...)` builds an error of your own that the same
+`errors.Is` checks recognize.
 
 ## The `database/sql` driver, in detail
 

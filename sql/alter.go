@@ -24,7 +24,7 @@ import (
 func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 	desc := d.e.TableShared(s.Table)
 	if desc == nil {
-		return nil, serr.New("no such table", "table", s.Table)
+		return nil, noSuchTable(s.Table)
 	}
 	if desc.ColIndex(s.Col) < 0 {
 		return nil, serr.New(`column "`+s.Col+`" of relation "`+s.Table+`" does not exist`,
@@ -101,7 +101,7 @@ func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 // dropped constraint.
 func (d *DB) execReplacePrimaryKey(s *ReplacePrimaryKey) (*Result, error) {
 	if d.e.TableShared(s.Table) == nil {
-		return nil, serr.New("no such table", "table", s.Table)
+		return nil, noSuchTable(s.Table)
 	}
 	if want := bytdb.PKConstraintName(s.Table); s.Dropped != want {
 		return nil, serr.New(`multiple primary keys for table "`+s.Table+`" are not allowed`,

@@ -962,7 +962,7 @@ func resolveDefaultMarkers(vals, defaults []any) []any {
 // resolveExprValues evaluates each expression value in an INSERT row
 // (nextval('s'), 1+2, a scalar subquery) down to a plain value the
 // engine can store. VALUES has no input row, so env carries an empty
-// scope: a column reference fails with "no such column", as it should.
+// scope: a column reference fails as an undefined column, as it should.
 // Like resolveDefaultMarkers, the slice may alias the parsed AST, so
 // it is cloned before the first in-place write — prepared statements
 // re-execute (and re-evaluate volatile calls like nextval) against
@@ -992,7 +992,7 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.TableShared(s.Table)
 		if desc == nil {
-			return serr.New("no such table", "table", s.Table)
+			return noSuchTable(s.Table)
 		}
 		ret, err := d.prepareReturning(tx, s.Table, desc, &s.Returning, res)
 		if err != nil {
@@ -1007,7 +1007,7 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 			for _, name := range s.Cols {
 				ord := desc.ColIndex(name)
 				if ord < 0 {
-					return serr.New("no such column", "table", s.Table, "column", name)
+					return noSuchColumn(s.Table, name)
 				}
 				ords = append(ords, ord)
 			}
@@ -1232,7 +1232,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.TableShared(s.Table)
 		if desc == nil {
-			return serr.New("no such table", "table", s.Table)
+			return noSuchTable(s.Table)
 		}
 		name := targetName(s.Table, s.Alias)
 		ret, err := d.prepareReturning(tx, name, desc, &s.Returning, res)
@@ -1257,14 +1257,14 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		for col := range set {
 			ord := desc.ColIndex(col)
 			if ord < 0 {
-				return serr.New("no such column", "table", s.Table, "column", col)
+				return noSuchColumn(s.Table, col)
 			}
 			setOrds[col] = ord
 		}
 		for col := range setEx {
 			ord := desc.ColIndex(col)
 			if ord < 0 {
-				return serr.New("no such column", "table", s.Table, "column", col)
+				return noSuchColumn(s.Table, col)
 			}
 			setOrds[col] = ord
 		}
@@ -1468,7 +1468,7 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 	err := d.write(func(tx *bytdb.Txn) error {
 		desc := tx.TableShared(s.Table)
 		if desc == nil {
-			return serr.New("no such table", "table", s.Table)
+			return noSuchTable(s.Table)
 		}
 		name := targetName(s.Table, s.Alias)
 		ret, err := d.prepareReturning(tx, name, desc, &s.Returning, res)
@@ -1982,7 +1982,7 @@ func (d *DB) VerifyChecks(tables ...string) ([]CheckViolation, error) {
 		for _, name := range tables {
 			desc := tx.TableShared(name)
 			if desc == nil {
-				return serr.New("no such table", "table", name)
+				return noSuchTable(name)
 			}
 			checks, err := tableChecks(desc)
 			if err != nil || len(checks) == 0 {
@@ -2058,7 +2058,7 @@ func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
 		case d.e.View(t) != nil, d.e.Sequence(t) != nil:
 			notices = append(notices, `skipping "`+t+`" --- cannot vacuum non-tables or special system tables`)
 		default:
-			return nil, serr.New("no such table", "table", t)
+			return nil, noSuchTable(t)
 		}
 	}
 	if !vacuumable {
@@ -2177,7 +2177,7 @@ func resolveSetDefaults(desc *bytdb.TableDesc, set map[string]any, setEx map[str
 		}
 		ord := desc.ColIndex(col)
 		if ord < 0 {
-			return nil, nil, serr.New("no such column", "table", desc.Name, "column", col)
+			return nil, nil, noSuchColumn(desc.Name, col)
 		}
 		if ex, isEx := defaults[ord].(Expr); isEx {
 			outEx[col] = ex

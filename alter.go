@@ -91,7 +91,7 @@ func (e *Engine) AlterColumnType(table, column string, ch ColumnTypeChange) erro
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(column)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", column)
+			return nil, errNoSuchColumn(table, column)
 		}
 		oldCol := old.Columns[ord]
 		newCol := oldCol

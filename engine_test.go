@@ -97,7 +97,7 @@ func TestInsertValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := e.Insert("users", 1, "dup", 2.0, false, nil); err == nil ||
-		!strings.Contains(err.Error(), "duplicate primary key") {
+		!strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
 		t.Fatalf("duplicate insert: %v", err)
 	}
 	if err := e.Insert("users", 2, "short"); err == nil {

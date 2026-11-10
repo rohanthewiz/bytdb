@@ -980,7 +980,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		}
 		desc := d.e.TableShared(s.Table)
 		if desc == nil {
-			return nil, serr.New("no such table", "table", s.Table)
+			return nil, noSuchTable(s.Table)
 		}
 		ord := desc.ColIndex(s.Col)
 		if ord < 0 {
@@ -1033,7 +1033,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// reported rather than silently accepted — Postgres checks it too.
 		desc := d.e.TableShared(s.Table)
 		if desc == nil {
-			return nil, serr.New("no such table", "table", s.Table)
+			return nil, noSuchTable(s.Table)
 		}
 		if desc.ColIndex(s.Col) < 0 {
 			return nil, serr.New(`column "`+s.Col+`" of relation "`+s.Table+`" does not exist`,

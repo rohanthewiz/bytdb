@@ -153,7 +153,7 @@ func TestUpdateSetExpressionChecksAndErrors(t *testing.T) {
 
 	// Unknown columns fail whether the assignment is a literal or an
 	// expression referencing one.
-	if msg := execErr(t, d, `update c set nope = n + 1`); !strings.Contains(msg, "no such column") {
+	if msg := execErr(t, d, `update c set nope = n + 1`); !strings.Contains(msg, "does not exist") {
 		t.Fatalf("unknown target column: %q", msg)
 	}
 	if msg := execErr(t, d, `update c set n = nope + 1`); msg == "" {

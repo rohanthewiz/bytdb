@@ -101,7 +101,7 @@ func TestDescIndexUniqueAndMixed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := e.Insert("people", 3, "dupe", 20, "g@x"); err == nil ||
-		!strings.Contains(err.Error(), "unique index violation") {
+		!strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
 		t.Fatalf("descending unique index not enforced: %v", err)
 	}
 
@@ -212,7 +212,7 @@ func TestUniqueIndex(t *testing.T) {
 
 	// Violation on insert; the row must not be half-inserted.
 	err := e.Insert("people", 2, "impostor", 99, "ada@x")
-	if err == nil || !strings.Contains(err.Error(), "unique index violation") {
+	if err == nil || !strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
 		t.Fatalf("duplicate email insert: %v", err)
 	}
 	if _, ok, _ := e.Get("people", 2); ok {

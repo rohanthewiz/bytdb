@@ -1093,7 +1093,7 @@ func (e *Engine) tableFromView(v kvView, name string) (*TableDesc, error) {
 func (e *Engine) descForDDL(v kvView, table string) (*TableDesc, error) {
 	blob, ok := v.Get(descKey(table))
 	if !ok {
-		return nil, serr.New("no such table", "table", table)
+		return nil, errNoSuchTable(table)
 	}
 	desc, err := parseDesc(blob)
 	if err != nil {
@@ -1110,7 +1110,7 @@ func (e *Engine) descFromView(v kvView, table string) (*TableDesc, error) {
 		return nil, err
 	}
 	if desc == nil {
-		return nil, serr.New("no such table", "table", table)
+		return nil, errNoSuchTable(table)
 	}
 	return desc, nil
 }

@@ -109,10 +109,10 @@ func TestWindowErrors(t *testing.T) {
 		// Errors around the window phase surface: FROM resolution, the
 		// row-materializing scan, projection, sort keys, and the final
 		// per-row expression evaluation.
-		{`select row_number() over () from missing`, "no such table"},
+		{`select row_number() over () from missing`, "does not exist"},
 		{`select row_number() over () from users where age/0 = 1`, "division by zero"},
-		{`select row_number() over (), nope from users`, "no such column"},
-		{`select row_number() over () from users order by nope`, "no such column"},
+		{`select row_number() over (), nope from users`, "does not exist"},
+		{`select row_number() over () from users order by nope`, "does not exist"},
 		{`select row_number() over (), age/0 from users`, "division by zero"},
 		// A window inside an array subscript rewrites (ExIndex container),
 		// then the evaluator rejects the subscript itself.

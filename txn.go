@@ -545,7 +545,7 @@ func (t *Txn) desc(table string) (*TableDesc, error) {
 		return nil, err
 	}
 	if d == nil {
-		return nil, serr.New("no such table", "table", table)
+		return nil, errNoSuchTable(table)
 	}
 	return d, nil
 }

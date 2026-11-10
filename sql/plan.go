@@ -91,7 +91,7 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 		}
 		ord := desc.ColIndex(c.Name)
 		if ord < 0 {
-			return -1, serr.New("no such column", "table", alias, "column", c.Name)
+			return -1, noSuchColumn(alias, c.Name)
 		}
 		return ord, nil
 	}

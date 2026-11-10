@@ -427,7 +427,7 @@ func (e *Engine) DropColumn(table, name string) error {
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(name)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", name)
+			return nil, errNoSuchColumn(table, name)
 		}
 		if old.Columns[ord].Identity {
 			// The counter goes with the column; the column ID is never
@@ -531,7 +531,7 @@ func (e *Engine) SetColumnDefault(table, column, literal string) error {
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(column)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", column)
+			return nil, errNoSuchColumn(table, column)
 		}
 		if old.Columns[ord].Identity {
 			// The identity counter is the column's value source; a
@@ -562,7 +562,7 @@ func (e *Engine) DropColumnDefault(table, column string) error {
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(column)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", column)
+			return nil, errNoSuchColumn(table, column)
 		}
 		if old.Columns[ord].Default == "" {
 			return nil, nil // nothing to publish; alterDesc skips the write
@@ -591,7 +591,7 @@ func (e *Engine) SetColumnNotNull(table, column string) error {
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(column)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", column)
+			return nil, errNoSuchColumn(table, column)
 		}
 		if old.Columns[ord].NotNull {
 			return nil, nil // already set; nothing to publish
@@ -625,7 +625,7 @@ func (e *Engine) DropColumnNotNull(table, column string) error {
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(column)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", column)
+			return nil, errNoSuchColumn(table, column)
 		}
 		if old.isPK(ord) {
 			return nil, serr.New(`column "`+column+`" is in a primary key`,
@@ -670,8 +670,8 @@ func backfillTooLargeErr(table, column string, limit int64) error {
 // error, worded as Postgres words it (SQLSTATE 23502, the same
 // wording AddColumn uses for the equivalent case).
 func notNullValueErr(table, column string) error {
-	return serr.New(`column "` + column + `" of relation "` + table +
-		`" contains null values`)
+	return KindErr(1, `column "`+column+`" of relation "`+table+
+		`" contains null values`, []error{ErrNotNull})
 }
 
 // columnHasNoNulls reports whether every row in the table holds a
@@ -829,7 +829,7 @@ func (e *Engine) RenameColumn(table, oldName, newName string) error {
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		ord := old.ColIndex(oldName)
 		if ord < 0 {
-			return nil, serr.New("no such column", "table", table, "column", oldName)
+			return nil, errNoSuchColumn(table, oldName)
 		}
 		if old.ColIndex(newName) >= 0 {
 			return nil, serr.New(`column "` + newName + `" of relation "` + table + `" already exists`)

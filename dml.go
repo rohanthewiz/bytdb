@@ -157,7 +157,7 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 				"reason", "identity draw raced a concurrent counter reset", "table", desc.Name)
 		}
 		tx.MarkRead(key) // failed probe: see above
-		return nil, serr.New("duplicate primary key", "table", desc.Name)
+		return nil, errUniqueViolation(desc.Name, PKConstraintName(desc.Name), true)
 	}
 	type entry struct {
 		key string
@@ -179,7 +179,7 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 					"table", desc.Name, "index", desc.Indexes[i].Name)
 			}
 			tx.MarkRead(ek) // failed probe: see the primary-key probe above
-			return nil, serr.New("unique index violation", "table", desc.Name, "index", desc.Indexes[i].Name)
+			return nil, errUniqueViolation(desc.Name, desc.Indexes[i].Name, false)
 		}
 		entries[i] = entry{ek, ev}
 	}
@@ -263,7 +263,7 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 	for col, v := range set {
 		ord := desc.ColIndex(col)
 		if ord < 0 {
-			return nil, false, serr.New("no such column", "table", desc.Name, "column", col)
+			return nil, false, errNoSuchColumn(desc.Name, col)
 		}
 		if touched != nil {
 			touched[ord] = true
@@ -277,7 +277,7 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 		}
 		if cv == nil {
 			if desc.isPK(ord) {
-				return nil, false, serr.New("primary key column may not be NULL", "table", desc.Name, "column", col)
+				return nil, false, notNullErr(desc, col)
 			}
 			// Identity implies NOT NULL.
 			if desc.Columns[ord].NotNull || desc.Columns[ord].Identity {
@@ -296,7 +296,7 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 	}
 	if newKey != oldKey && tx.Contains(newKey) {
 		tx.MarkRead(newKey) // failed probe: see above
-		return nil, false, serr.New("duplicate primary key", "table", desc.Name)
+		return nil, false, errUniqueViolation(desc.Name, PKConstraintName(desc.Name), true)
 	}
 	// Index entries that change: compute and uniqueness-check them all
 	// before writing anything. An occupant of a changed unique key must
@@ -331,7 +331,7 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 		}
 		if enforced && nk != ok && tx.Contains(nk) {
 			tx.MarkRead(nk) // failed probe: see above
-			return nil, false, serr.New("unique index violation", "table", desc.Name, "index", idx.Name)
+			return nil, false, errUniqueViolation(desc.Name, idx.Name, false)
 		}
 		moves = append(moves, move{ok, nk, nv})
 	}
@@ -605,8 +605,7 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 		}
 		if cv == nil {
 			if desc.isPK(i) {
-				return nil, serr.New("primary key column may not be NULL",
-					"table", desc.Name, "column", c.Name)
+				return nil, notNullErr(desc, c.Name)
 			}
 			// Identity implies NOT NULL (insert never gets here with one:
 			// fillIdentity already drew the value).
@@ -651,10 +650,12 @@ func enforceMaxLen(v any, c *Column) (any, error) {
 	return string(runes[:c.MaxLen]), nil
 }
 
-// notNullErr is the NOT NULL violation, worded as Postgres words it.
+// notNullErr is the NOT NULL violation, worded as Postgres words it
+// and matching ErrNotNull. A primary-key column reports the same way:
+// Postgres's key columns are NOT NULL columns.
 func notNullErr(desc *TableDesc, col string) error {
-	return serr.New(`null value in column "` + col + `" of relation "` +
-		desc.Name + `" violates not-null constraint`)
+	return KindErr(1, `null value in column "`+col+`" of relation "`+
+		desc.Name+`" violates not-null constraint`, []error{ErrNotNull}, "table", desc.Name, "column", col)
 }
 
 // coerce maps v onto the canonical Go type for a column type.

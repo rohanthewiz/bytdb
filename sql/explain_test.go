@@ -122,8 +122,8 @@ func TestExplainErrorsAndOptions(t *testing.T) {
 		`explain (analyze) select * from users`:        "EXPLAIN ANALYZE is not supported",
 		`explain (format json) select * from users`:    "only EXPLAIN (FORMAT TEXT) is supported",
 		`explain create table t (a int primary key)`:   "EXPLAIN supports SELECT, INSERT, UPDATE, and DELETE",
-		`explain select * from nosuch`:                 "no such table",
-		`explain select nocol from users`:              "no such column",
+		`explain select * from nosuch`:                 "does not exist",
+		`explain select nocol from users`:              "does not exist",
 		`explain select name from users group by city`: "must appear in the GROUP BY clause",
 	} {
 		if _, err := d.Exec(q); err == nil || !strings.Contains(err.Error(), want) {

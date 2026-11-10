@@ -181,7 +181,7 @@ func TestVacuumTargets(t *testing.T) {
 	}
 
 	e0 = epoch()
-	if _, err := d.Exec(`vacuum t, nosuch`); err == nil || !strings.Contains(err.Error(), "no such table") {
+	if _, err := d.Exec(`vacuum t, nosuch`); err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("VACUUM of unknown table err = %v", err)
 	}
 	if epoch() != e0 {

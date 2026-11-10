@@ -111,7 +111,7 @@ func TestInsertExprErrors(t *testing.T) {
 
 	// VALUES has no input row: column references fail, as in Postgres.
 	if _, err := d.Exec(`insert into t values (id + 1, 2)`); err == nil ||
-		!strings.Contains(err.Error(), "no such column") {
+		!strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("column ref in VALUES: %v", err)
 	}
 	// Aggregates and windows have no row set to compute over.

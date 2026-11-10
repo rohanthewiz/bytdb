@@ -36,12 +36,12 @@ func TestSQLStateMapping(t *testing.T) {
 		{"column ref is ambiguous", false, "42702"},
 
 		// Both uniqueness wordings share one code.
-		{"duplicate primary key", false, "23505"},
+		{"duplicate key value violates unique constraint", false, "23505"},
 		{"unique index violation on idx_users_email", false, "23505"},
 
 		// The three not-null wordings share one code.
 		{"value violates not-null constraint", false, "23502"},
-		{"primary key column may not be NULL", false, "23502"},
+		{"violates not-null constraint", false, "23502"},
 		{"column age contains null values", false, "23502"},
 
 		// Both check wordings share one code.

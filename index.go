@@ -114,7 +114,7 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 		}
 		for _, en := range entries {
 			if idx.Unique && tx.Contains(en.key) {
-				return nil, serr.New("existing rows violate unique index", "table", table, "index", name)
+				return nil, KindErr(0, "existing rows violate unique index", []error{ErrUniqueViolation}, "table", table, "index", name)
 			}
 			if err := tx.Set(en.key, en.val); err != nil {
 				return nil, err
