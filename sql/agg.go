@@ -88,6 +88,15 @@ func (a *accum) add(env *exEnv, vals []any) error {
 			return nil
 		}
 		a.seen[string(kb)] = true
+		// The DISTINCT set is an in-memory row set like any other, so it
+		// is charged against the row cap and polls the memory ceiling;
+		// count(DISTINCT x) over a huge column grew it unbounded before
+		// (deep-look D-21).
+		if env != nil {
+			if err := env.d.budget().check(len(a.seen)); err != nil {
+				return err
+			}
+		}
 	}
 	a.count++
 	switch a.fn {

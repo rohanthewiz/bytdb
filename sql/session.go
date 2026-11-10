@@ -18,6 +18,7 @@ package sql
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -432,6 +433,14 @@ func parseTimeout(sv *SetVar) (time.Duration, error) {
 	if n < 0 {
 		return 0, serr.New(`invalid value for parameter "statement_timeout"`,
 			"value", sv.Value, "hint", "the timeout must be zero (disabled) or positive")
+	}
+	// Postgres keeps the parameter as an int of milliseconds, so the
+	// range tops out at 2147483647 ms (~24.8 days). Converting a larger
+	// float to time.Duration overflowed into a negative or garbage
+	// timeout (deep-look D-21).
+	if ms := n * float64(scale) / float64(time.Millisecond); ms > math.MaxInt32 {
+		return 0, serr.New(`invalid value for parameter "statement_timeout"`,
+			"value", sv.Value, "hint", "the timeout must be at most 2147483647 ms")
 	}
 	return time.Duration(n * float64(scale)), nil
 }

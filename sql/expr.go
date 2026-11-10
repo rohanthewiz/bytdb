@@ -171,6 +171,20 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 	case *ExCase:
 		return evalCase(env, n)
 	case *ExFunc:
+		// COALESCE evaluates arguments only until one is non-NULL, as
+		// CASE does: coalesce(1, 1/0) is 1 and coalesce(1, nextval('s'))
+		// draws nothing. Evaluating every argument first (the generic
+		// path below) raised errors and side effects from arguments the
+		// result never uses (deep-look D-21).
+		if n.Name == "coalesce" {
+			for _, a := range n.Args {
+				v, err := evalEx(env, a)
+				if err != nil || v != nil {
+					return v, err
+				}
+			}
+			return nil, nil
+		}
 		// ARRAY(SELECT ...) materializes the subquery's column as a
 		// Postgres array literal text ("{a,b}") — enough for psql's
 		// role listings; bytdb has no first-class arrays.
@@ -1551,6 +1565,17 @@ func runArraySub(env *exEnv, sel *Select) (any, error) {
 	return textArrayValue(vals), nil
 }
 
+// selectHasAgg reports whether any select item is or contains an
+// aggregate call.
+func selectHasAgg(sel *Select) bool {
+	for _, it := range sel.Items {
+		if it.Agg != AggNone || (it.Ex != nil && findAgg(it.Ex) != AggNone) {
+			return true
+		}
+	}
+	return false
+}
+
 // textArrayValue renders evaluated elements as the canonical array
 // literal — the runtime form of every array-typed value. Non-string
 // elements (ints from ARRAY[1,2], say) render through valText first:
@@ -1575,6 +1600,12 @@ func textArrayValue(vals []any) string {
 func runExistsSub(env *exEnv, sel *Select) (any, error) {
 	if len(sel.Union) > 0 || sel.GroupBy != nil || sel.Having != nil {
 		return nil, serr.New("this EXISTS (SELECT ...) shape is not supported")
+	}
+	// An ungrouped aggregate yields exactly one row whatever its input,
+	// so EXISTS (SELECT count(*) ... WHERE false) is true (it was false:
+	// deep-look D-21). LIMIT 0 is refused before this runner is reached.
+	if selectHasAgg(sel) {
+		return true, nil
 	}
 	fp, empty, err := prepareSubFrom(env, sel)
 	if err != nil {

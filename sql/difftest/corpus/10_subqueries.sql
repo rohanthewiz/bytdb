@@ -21,7 +21,7 @@ select (select coalesce(sum(amt), 0) from o where cust = 9);
 select (select count(distinct cust) from o);
 -- @todo D-27: expression over an aggregate inside a scalar subquery
 select (select count(*) + 1 from o);
--- @todo D-21: an ungrouped aggregate always yields a row, so EXISTS is true
+-- @todo D-25: exists() described as text (its value is right since D-21)
 select exists (select count(*) from o where false);
 -- latest row per customer, correlated
 -- @todo D-27: correlated subquery ORDER BY/LIMIT; result typed text

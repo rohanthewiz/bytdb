@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"reflect"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -72,6 +73,9 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 				if ord < 0 {
 					return -1, serr.New("no such column", "table", c.Table, "column", c.Name)
 				}
+				if dupColumn(st.desc, ord) {
+					return -1, ambiguousColumn(c.Name)
+				}
 				return st.off + ord, nil
 			}
 		}
@@ -80,8 +84,8 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 	found := -1
 	for _, st := range sc.tables {
 		if ord := st.desc.ColIndex(c.Name); ord >= 0 {
-			if found >= 0 {
-				return -1, serr.New("column reference is ambiguous; qualify it", "column", c.Name)
+			if found >= 0 || dupColumn(st.desc, ord) {
+				return -1, ambiguousColumn(c.Name)
 			}
 			found = st.off + ord
 		}
@@ -90,6 +94,25 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 		return -1, serr.New("no such column", "column", c.Name)
 	}
 	return found, nil
+}
+
+// dupColumn reports whether a column after ord shares its name. Stored
+// tables cannot have duplicate column names, but a derived table or CTE
+// can (SELECT a.id, b.id FROM a, b), and Postgres then calls any
+// reference to the name ambiguous; resolving to the first silently
+// picked a column the query never named (deep-look D-21).
+func dupColumn(d *bytdb.TableDesc, ord int) bool {
+	name := d.Columns[ord].Name
+	for i := ord + 1; i < len(d.Columns); i++ {
+		if d.Columns[i].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func ambiguousColumn(name string) error {
+	return serr.New(`column reference "`+name+`" is ambiguous; qualify it`, "column", name)
 }
 
 // table finds a scope table by alias or name (for t.* expansion).
@@ -198,8 +221,18 @@ type joinStep struct {
 	// choice. So the template Pred nodes are allocated once and their
 	// Vals mutated per outer row, and the plan built on the first row is
 	// reused with only its pushed bounds refreshed (plan.rebind).
+	//
+	// "Fixed per source column" holds for stored columns but not for a
+	// virtual-table source (a CTE or derived table whose column is an
+	// untyped expression), whose values can change Go type from row to
+	// row. tmplTypes records the type each bound value had when the plan
+	// was built; a row bringing a different one drops the cached plan
+	// and plans afresh, as corrsub's bind does — rebinding a bound the
+	// plan encoded for another type failed with "value does not fit
+	// column type" (deep-look D-21).
 	tmplPreds []*Pred
 	tmplPlan  *plan
+	tmplTypes []reflect.Type
 
 	// hashEq, when non-empty, switches this step from the nested loop
 	// to a hash join: the inner table (filtered by the static
@@ -477,13 +510,23 @@ func (j *joinRun) rec(k int, partial []any) {
 // and binds reference the same Pred nodes, so they see the new values
 // with no rebuild.
 func (step *joinStep) rowPlan(partial []any) (*plan, error) {
+	if step.tmplPlan != nil {
+		for i, tp := range step.tmpls {
+			if reflect.TypeOf(partial[tp.srcOrd]) != step.tmplTypes[i] {
+				step.tmplPlan, step.tmplPreds = nil, nil
+				break
+			}
+		}
+	}
 	if step.tmplPlan == nil {
 		exprs := make([]BoolExpr, 0, len(step.static)+len(step.tmpls))
 		exprs = append(exprs, step.static...)
 		step.tmplPreds = make([]*Pred, len(step.tmpls))
+		step.tmplTypes = make([]reflect.Type, len(step.tmpls))
 		for i, tp := range step.tmpls {
 			pr := &Pred{Item: tp.item, Op: tp.op, Val: partial[tp.srcOrd]}
 			step.tmplPreds[i] = pr
+			step.tmplTypes[i] = reflect.TypeOf(pr.Val)
 			exprs = append(exprs, pr)
 		}
 		var expr BoolExpr

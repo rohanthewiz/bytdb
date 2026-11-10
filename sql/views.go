@@ -10,6 +10,7 @@ package sql
 // catalog is served), so downstream nothing changes.
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -375,6 +376,13 @@ func (d *DB) execCreateView(s *CreateView) (*Result, error) {
 	st, err := Parse(s.Query)
 	if err != nil {
 		return nil, err
+	}
+	// The body is stored as text and re-parsed at every use, where no
+	// arguments exist to bind: CREATE VIEW v AS SELECT $1 used to be
+	// accepted and then yield the raw placeholder (deep-look D-21).
+	if n := numParams(st); n > 0 {
+		return nil, serr.New("there is no parameter $"+strconv.Itoa(n),
+			"hint", "a view body cannot use placeholders")
 	}
 	dv, err := d.withViews(st)
 	if err != nil {

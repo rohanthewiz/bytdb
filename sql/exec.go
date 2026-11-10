@@ -1030,7 +1030,20 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					continue
 				}
 			}
-			if env != nil && len(vals) == len(desc.Columns) {
+			// A NULL identity value is drawn by the engine, so a CHECK
+			// over that column can only judge the row as stored: checked
+			// before the insert it saw NULL, which a CHECK passes, and
+			// id serial CHECK (id > 5) stored 1 (deep-look D-21). Such
+			// rows are checked after the insert instead — the statement's
+			// transaction discards the row if the check fails. Every other
+			// row is checked first, so a failing row writes nothing.
+			drawsIdentity := false
+			for i := range desc.Columns {
+				if desc.Columns[i].Identity && i < len(vals) && vals[i] == nil {
+					drawsIdentity = true
+				}
+			}
+			if env != nil && len(vals) == len(desc.Columns) && !drawsIdentity {
 				if err := checkRow(env, s.Table, checks, vals); err != nil {
 					return err
 				}
@@ -1042,6 +1055,11 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 			stored, err := tx.InsertReturning(s.Table, vals...)
 			if err != nil {
 				return err
+			}
+			if env != nil && drawsIdentity {
+				if err := checkRow(env, s.Table, checks, stored.Vals); err != nil {
+					return err
+				}
 			}
 			// Foreign keys check the row as stored, after the write: the
 			// transaction discards it on error, and checking post-insert is

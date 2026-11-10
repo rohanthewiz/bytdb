@@ -6,12 +6,10 @@ create table d (id int primary key, x int);
 insert into d values (1, 1), (2, 2);
 
 -- @queries
--- @todo D-21: coalesce evaluates every argument
+-- @todo D-25: coalesce described as text (it now short-circuits: D-21)
 select coalesce(1, 1/0);
 -- @error
--- @todo D-21: CHECK never sees the drawn identity value
 insert into s (v) values (1);
 -- @error
--- @todo D-21: duplicate derived-table column resolves silently
 select x.id from (select d.id, d2.id from d, d d2) x;
 select count(distinct x) from d;

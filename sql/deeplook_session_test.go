@@ -149,3 +149,70 @@ func TestSequenceFunctionsInRowExpressions(t *testing.T) {
 		t.Fatalf("nextval after the refusals = %v; want 1", res.Rows[0][0])
 	}
 }
+
+// TestSmallSQLCorrectness (D-21): the plan's grab-bag of smaller items.
+func TestSmallSQLCorrectness(t *testing.T) {
+	d := openDB(t)
+
+	// COALESCE short-circuits: unused arguments are not evaluated.
+	exec(t, d, `create sequence s`)
+	if res := exec(t, d, `select coalesce(1, 1/0), coalesce(2, nextval('s'))`); res.Rows[0][0] != int64(1) || res.Rows[0][1] != int64(2) {
+		t.Fatalf("coalesce = %v", res.Rows[0])
+	}
+	if res := exec(t, d, `select nextval('s')`); res.Rows[0][0] != int64(1) {
+		t.Fatalf("an unused coalesce argument drew from the sequence: nextval = %v", res.Rows[0][0])
+	}
+
+	// A CHECK over an identity column judges the drawn value.
+	exec(t, d, `create table idc (id serial primary key check (id > 5), v int)`)
+	if msg := execErr(t, d, `insert into idc (v) values (1)`); !strings.Contains(msg, "violates check constraint") {
+		t.Fatalf("drawn identity 1 vs CHECK (id > 5): %s", msg)
+	}
+	if res := exec(t, d, `select count(*) from idc`); res.Rows[0][0] != int64(0) {
+		t.Fatal("the failing row was stored")
+	}
+	exec(t, d, `insert into idc values (10, 1)`) // explicit values are checked before the insert, as ever
+
+	// count(DISTINCT x) is charged against the row cap.
+	exec(t, d, `create table dv (id int primary key)`)
+	exec(t, d, `insert into dv values (1), (2), (3), (4), (5)`)
+	d.e.SetMaxResultRows(3)
+	if msg := execErr(t, d, `select count(distinct id) from dv`); !strings.Contains(msg, "result row limit") {
+		t.Fatalf("count(DISTINCT) over the row cap: %s", msg)
+	}
+	d.e.SetMaxResultRows(0)
+
+	// A view body cannot use placeholders.
+	if _, err := d.Exec(`create view pv as select $1 as x`); err == nil || !strings.Contains(err.Error(), "there is no parameter") {
+		t.Fatalf("view with a placeholder: %v", err)
+	}
+
+	// statement_timeout is range-checked.
+	s := d.NewSession()
+	defer s.Close()
+	if _, err := s.Exec(`set statement_timeout = 99999999999999999999`); err == nil {
+		t.Fatal("an overflowing statement_timeout was accepted")
+	}
+	sessExec(t, s, `set statement_timeout = 2147483647`)
+
+	// Duplicate output names in a derived table are ambiguous.
+	exec(t, d, `create table dd (id int primary key)`)
+	exec(t, d, `insert into dd values (1), (2)`)
+	if msg := execErr(t, d, `select x.id from (select a.id, b.id from dd a, dd b) x`); !strings.Contains(msg, "ambiguous") {
+		t.Fatalf("duplicate derived column: %s", msg)
+	}
+	if res := exec(t, d, `select count(*) from (select a.id, b.id from dd a, dd b) x`); res.Rows[0][0] != int64(4) {
+		t.Fatal("an unreferenced duplicate name must stay legal")
+	}
+
+	// An ungrouped aggregate yields one row, so EXISTS over it is true.
+	if res := exec(t, d, `select exists (select count(*) from dd where false)`); res.Rows[0][0] != true {
+		t.Fatalf("EXISTS (SELECT count(*) ... WHERE false) = %v", res.Rows[0][0])
+	}
+
+	// A join probe whose outer value changes Go type mid-stream re-plans.
+	res := exec(t, d, `with x as (select 1 as v union all select 2.0) select dd.id from x join dd on dd.id = x.v`)
+	if len(res.Rows) != 2 {
+		t.Fatalf("join probe across a type change: %v", res.Rows)
+	}
+}
