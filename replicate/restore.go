@@ -161,14 +161,40 @@ func loadManifest(ctx context.Context, store Storage, prefix, gen string) (*gene
 type chunkRef struct {
 	key        string
 	start, end int64
+	// skip is how many leading bytes of this chunk the previous chunk in
+	// the chain already covers; assemble writes data[skip:]. Non-zero
+	// only when two shipped chunks overlap (see contiguousChain).
+	skip int64
 }
 
 // contiguousChain parses the chunk keys of one generation and returns
-// them ordered by offset, verifying the chain starts at zero and each
-// chunk begins exactly where the previous ended. A missing first chunk
-// means the generation never became restorable (ok=false); a gap later
-// in the chain truncates it there — everything before the gap is still
-// a valid database prefix, exactly like a torn tail.
+// the chain that covers the log from offset zero as far as possible. A
+// missing first chunk means the generation never became restorable
+// (ok=false); a gap later in the chain truncates it there — everything
+// before the gap is still a valid database prefix, exactly like a torn
+// tail.
+//
+// Chunks of one generation can overlap. A chunk's key embeds its end
+// offset, and the end depends on how much log existed when it was read.
+// If a PUT is stored but the replicator sees an error (an ambiguous
+// failure: timeout after the store committed), the watermark stays put;
+// if the log grows before the retry, the retry ships [w, S2) beside the
+// stored [w, S1). Both start at w. The chain used to break on the
+// second chunk with the same start, so the generation restored short of
+// its manifest and Restore silently fell back to an older generation
+// (deep-look D-05). At each point the chain now takes, among the chunks
+// starting at or before it, the one reaching furthest, and records how
+// much of it is already covered:
+//
+//	stored:   [0 ──────── S1)            ambiguous PUT, really stored
+//	          [0 ─────────────── S2)     retry after the log grew
+//	                             [S2 ── S3)
+//	chain:    [0 ─────────────── S2)[S2 ── S3)     ([0,S1) is redundant)
+//
+// Overlapping chunks of one generation are byte-identical over the
+// overlap by construction — a generation is one log epoch, and the log
+// is append-only within an epoch — so trimming is safe; assemble checks
+// lengths, not content.
 func contiguousChain(keys []string) (chain []chunkRef, ok bool) {
 	refs := make([]chunkRef, 0, len(keys))
 	for _, k := range keys {
@@ -191,10 +217,22 @@ func contiguousChain(keys []string) (chain []chunkRef, ok bool) {
 	sort.Slice(refs, func(i, j int) bool { return refs[i].start < refs[j].start })
 
 	var next int64
-	for _, ref := range refs {
-		if ref.start != next {
-			break // gap (or duplicate); the chain ends at the last good chunk
+	i := 0
+	for {
+		// Every chunk starting at or before next is a candidate; the one
+		// reaching furthest extends the chain. Chunks it covers entirely
+		// are redundant and dropped.
+		best := -1
+		for ; i < len(refs) && refs[i].start <= next; i++ {
+			if refs[i].end > next && (best < 0 || refs[i].end > refs[best].end) {
+				best = i
+			}
 		}
+		if best < 0 {
+			break // gap (or end of chunks); the chain ends here
+		}
+		ref := refs[best]
+		ref.skip = next - ref.start
 		chain = append(chain, ref)
 		next = ref.end
 	}
@@ -232,11 +270,20 @@ func assemble(ctx context.Context, store Storage, gen string, chain []chunkRef, 
 			return nil, serr.New("chunk size mismatch",
 				"key", ref.key, "declared", fmt.Sprint(want), "actual", fmt.Sprint(got))
 		}
-		if _, err := tmp.Write(data); err != nil {
+		// Overlap with the previous chunk is trimmed by position: the
+		// bytes are the same log bytes (see contiguousChain), so the
+		// length check above is the integrity check that matters, and
+		// the running total must land exactly on this chunk's end.
+		if ref.skip < 0 || ref.skip >= int64(len(data)) || total != ref.start+ref.skip {
+			discard()
+			return nil, serr.New("chunk does not continue the chain",
+				"key", ref.key, "skip", fmt.Sprint(ref.skip), "assembled", fmt.Sprint(total))
+		}
+		if _, err := tmp.Write(data[ref.skip:]); err != nil {
 			discard()
 			return nil, serr.Wrap(err, "op", "write chunk", "key", ref.key)
 		}
-		total += int64(len(data))
+		total += int64(len(data)) - ref.skip
 	}
 
 	if err := tmp.Sync(); err != nil {

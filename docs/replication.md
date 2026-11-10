@@ -122,7 +122,7 @@ sequenceDiagram
         E-->>R: chunk bytes (holds off compaction only)
         R->>S: PUT gen/⟨id⟩/⟨watermark⟩-⟨end⟩.wlog
         alt PUT fails
-            Note over R: watermark NOT advanced —<br/>same immutable range re-ships next tick
+            Note over R: watermark NOT advanced —<br/>range from the same offset re-ships next tick
         else
             Note over R: watermark += n
         end
@@ -135,8 +135,16 @@ sequenceDiagram
 
 Design points worth knowing:
 
-- **Chunks are immutable.** A failed `PUT` simply re-reads and re-uploads the
-  identical range next tick; atomic PUT means there is never a half-object.
+- **Chunks are immutable.** A failed `PUT` re-reads and re-uploads from the
+  same offset next tick; atomic PUT means there is never a half-object. The
+  retry is not always the identical range: a chunk's key names its end
+  offset, and if the log grew in between, the retry reaches further. When the
+  failed `PUT` had in fact been stored (a lost response), the generation then
+  holds two chunks from the same offset, `[w,S1)` and `[w,S2)`. Restore
+  tolerates that: at each offset it takes the chunk reaching furthest and
+  trims any overlap with the previous one. Overlapping chunks of a generation
+  are byte-identical over the overlap, because a generation is one log epoch
+  and the log is append-only within an epoch.
 - **`ErrEpochChanged` mid-read is not an error** — compaction won the race;
   the ship returns quietly and the next one rolls a fresh generation from
   offset zero.
@@ -232,7 +240,7 @@ There is no multipart upload, and chunks are staged in memory — keep
 |---|---|
 | Compaction between ships | Epoch differs → new generation from offset 0; old ones pruned |
 | Compaction during a chunk read | `ErrEpochChanged` → quiet return; next ship rolls the generation |
-| `PUT` fails | Watermark not advanced; identical immutable range re-ships next tick |
+| `PUT` fails | Watermark not advanced; the range from the same offset re-ships next tick (longer if the log grew; restore takes the longest chunk and trims overlap) |
 | Manifest write fails | Logged; chunks are already durable, manifest retried on next catch-up |
 | Prune fails | Logged only; never blocks shipping |
 | Source DB closed | `Run` returns `ErrClosed` (terminal) |
