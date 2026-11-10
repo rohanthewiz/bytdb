@@ -184,7 +184,7 @@ The timeout lineup:
 
 | Timeout | Default | Effect |
 |---|---|---|
-| `SET statement_timeout` | 0 (off) | Bounds every statement; 57014 on expiry — a runaway query no longer wedges the global writer lock |
+| `SET statement_timeout` | 0 (off) | Bounds every statement, including its wait for the writer lock behind another session's open block; 57014 on expiry, and a write that gave up waiting never runs — a runaway query no longer wedges the global writer lock |
 | Idle-in-transaction | **5 min, on by default** | FATAL 25P03; deliberately non-Postgres default, because a writable block holds bytdb's single writer lock |
 | Idle session | off | FATAL 57P05 when enabled |
 | Startup (incl. TLS + SCRAM) | 30 s | Connection dropped |

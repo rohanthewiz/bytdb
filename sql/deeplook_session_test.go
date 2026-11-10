@@ -3,9 +3,12 @@ package sql
 // Session regression tests from the deep-look remediation plan.
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSessionParseErrorFailsBlock (D-07): a statement that failed to
@@ -407,4 +410,75 @@ func TestOneSnapshotPerStatement(t *testing.T) {
 	if res := exec(t, d, `update marks set v = 1 where id in (select id from low)`); res.RowsAffected != 2 {
 		t.Fatalf("UPDATE through a view: %d rows", res.RowsAffected)
 	}
+}
+
+// TestWriterLockWaitHonorsContext (D-33): in the default single-writer
+// mode a write queued behind another session's open block waited for the
+// writer lock whatever its context said — a 200 ms deadline was still
+// blocked seconds later — and then committed once the lock freed, for a
+// client that had given up. The wait now ends with the context, and the
+// statement does not run.
+func TestWriterLockWaitHonorsContext(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key)`)
+	// The holder's block opens on its own goroutine, as a wire session's
+	// would: from this goroutine, a write behind it is a reentrant write
+	// the engine refuses outright.
+	holder := d.NewSession()
+	defer holder.Close()
+	opened := make(chan error, 1)
+	go func() {
+		if _, err := holder.Exec(`begin`); err != nil {
+			opened <- err
+			return
+		}
+		_, err := holder.Exec(`insert into t values (1)`)
+		opened <- err
+	}()
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+
+	waitBounded := func(what string, run func(ctx context.Context) error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		err := run(ctx)
+		if took := time.Since(start); took > 2*time.Second {
+			t.Fatalf("%s: waited %v for the writer lock despite a 200ms context", what, took)
+		}
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("%s: err = %v; want the context's deadline", what, err)
+		}
+	}
+	waitBounded("autocommit INSERT", func(ctx context.Context) error {
+		_, err := d.ExecCtx(ctx, `insert into t values (2)`)
+		return err
+	})
+	other := d.NewSession()
+	defer other.Close()
+	waitBounded("BEGIN", func(ctx context.Context) error {
+		_, err := other.ExecCtx(ctx, `begin`)
+		return err
+	})
+	if other.Status() != TxIdle {
+		t.Fatal("a BEGIN that gave up left the session in a block")
+	}
+	// statement_timeout bounds the wait the same way.
+	sessExec(t, other, `set statement_timeout = 200`)
+	start := time.Now()
+	if _, err := other.Exec(`insert into t values (3)`); err == nil {
+		t.Fatal("insert behind the open block succeeded")
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("statement_timeout did not bound the lock wait: %v", took)
+	}
+
+	sessExec(t, holder, `commit`)
+	// The abandoned writes never land, and the lock is free again.
+	if got := ids(t, d, `select id from t order by id`); !reflect.DeepEqual(got, []int64{1}) {
+		t.Fatalf("rows after the holder committed: %v; want [1]", got)
+	}
+	exec(t, d, `insert into t values (4)`)
 }

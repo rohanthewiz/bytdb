@@ -1,6 +1,7 @@
 package bytdb
 
 import (
+	"context"
 	"bytes"
 	"fmt"
 	"iter"
@@ -53,7 +54,7 @@ func (e *Engine) Insert(table string, vals ...any) error {
 	if err := e.checkReentrantWrite("insert"); err != nil {
 		return err
 	}
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kvUpdate(context.Background(), func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.descFromView(tx, table)
 		if err != nil {
 			return err
@@ -76,7 +77,7 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 		return Row{}, err
 	}
 	var row Row
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kvUpdate(context.Background(), func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.descFromView(tx, table)
 		if err != nil {
 			return err
@@ -208,7 +209,7 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 		return false, serr.Wrap(err, "op", "update", "table", table)
 	}
 	updated := false
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kvUpdate(context.Background(), func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.descFromView(tx, table)
 		if err != nil {
 			return err
@@ -379,7 +380,7 @@ func (e *Engine) Delete(table string, pkVals ...any) (bool, error) {
 		return false, err
 	}
 	existed := false
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kvUpdate(context.Background(), func(tx *btypedb.Tx[string, []byte]) error {
 		desc, err := e.descFromView(tx, table)
 		if err != nil {
 			return err

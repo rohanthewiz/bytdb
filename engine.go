@@ -14,6 +14,7 @@
 package bytdb
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -422,6 +423,22 @@ type Engine struct {
 	// schema and never look again.
 	catalogVer atomic.Uint64
 
+	// writeSlot is the engine's write admission in the default
+	// single-writer mode: a one-slot semaphore every writer takes before
+	// btypedb's writer lock and gives back after it (nil under
+	// WithConcurrentWrites, whose writers hold no lock across a
+	// transaction). btypedb's writer lock is a mutex, and a mutex wait
+	// cannot be interrupted, so a write queued behind an open
+	// transaction block waited out every context and statement_timeout
+	// (up to the 5-minute idle-in-transaction limit) and then committed
+	// for a client long gone (deep-look D-33). Waiting on a channel
+	// instead, every writer can give up when its context ends; and since
+	// all of this engine's writers pass through the slot first, the
+	// mutex behind it is never contended. The plan proposed making
+	// btypedb's own lock context-aware; doing it here needs no btypedb
+	// release and changes nothing for other btypedb users.
+	writeSlot chan struct{}
+
 	// viewCount is how many views exist (see HasViews). Counted at Open
 	// and kept by CreateView/DropView after their commits; it only
 	// gates a lookup, so a moment's lag after a concurrent CREATE VIEW
@@ -482,6 +499,47 @@ func (e *Engine) updateDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error 
 	return err
 }
 
+// acquireWrite takes the write slot, waiting until it is free or ctx is
+// done. A statement whose context ended while it waited does not run:
+// ctx is checked again once the slot is held. A nil slot (concurrent
+// writes) admits at once.
+func (e *Engine) acquireWrite(ctx context.Context) error {
+	if e.writeSlot == nil {
+		return nil
+	}
+	select {
+	case e.writeSlot <- struct{}{}: // free: the common, uncontended case
+	default:
+		select {
+		case e.writeSlot <- struct{}{}:
+		case <-ctx.Done():
+			return serr.Wrap(ctx.Err(), "op", "wait for the writer lock")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		<-e.writeSlot
+		return serr.Wrap(err, "op", "wait for the writer lock")
+	}
+	return nil
+}
+
+// releaseWrite gives the write slot back.
+func (e *Engine) releaseWrite() {
+	if e.writeSlot != nil {
+		<-e.writeSlot
+	}
+}
+
+// kvUpdate is btypedb's Update behind the write slot: the one-shot
+// write and DDL paths all take the writer lock this way.
+func (e *Engine) kvUpdate(ctx context.Context, fn func(tx *btypedb.Tx[string, []byte]) error) error {
+	if err := e.acquireWrite(ctx); err != nil {
+		return err
+	}
+	defer e.releaseWrite()
+	return e.kv.Update(fn)
+}
+
 // CatalogVersion reports how many DDL transactions have committed since
 // Open. It changes after every schema change (tables, indexes,
 // constraints, views, sequences) and at no other time, so a caller
@@ -524,6 +582,10 @@ func (e *Engine) runDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error {
 		// Simulate the failed commit: run the closure, then roll the
 		// transaction back, leaving both disk and the catalog exactly
 		// as a failed WAL append would — unchanged.
+		if err := e.acquireWrite(context.Background()); err != nil {
+			return err
+		}
+		defer e.releaseWrite()
 		tx, err := e.kv.Begin(true)
 		if err != nil {
 			return err
@@ -535,7 +597,7 @@ func (e *Engine) runDDL(fn func(tx *btypedb.Tx[string, []byte]) error) error {
 		return e.testCommitErr
 	}
 	if !e.occ {
-		return e.kv.Update(fn)
+		return e.kvUpdate(context.Background(), fn)
 	}
 	var err error
 	for range ddlOptimisticTries {
@@ -721,6 +783,9 @@ func Open(path string, opts ...btypedb.Option) (*Engine, error) {
 		descCache:    map[string]descCacheEntry{},
 		seqAllocs:    map[string]*counterAlloc{},
 		seqObjAllocs: map[string]*seqObjAlloc{},
+	}
+	if !e.occ {
+		e.writeSlot = make(chan struct{}, 1)
 	}
 	e.backfillLimit.Store(DefaultBackfillLimit)
 	e.maxResultRows.Store(DefaultMaxResultRows)

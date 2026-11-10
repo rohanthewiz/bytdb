@@ -563,10 +563,21 @@ func (d *DB) write(fn func(*bytdb.Txn) error) error {
 	if d.tx != nil {
 		return fn(d.tx)
 	}
+	// The statement's context bounds the wait for the writer lock too:
+	// statement_timeout and a CancelRequest used to stop at the lock,
+	// and the write then committed once it freed (deep-look D-33).
 	if d.serial {
-		return d.e.WriteTxnSerializable(fn)
+		return d.e.WriteTxnSerializableCtx(d.stmtCtx(), fn)
 	}
-	return d.e.WriteTxn(fn)
+	return d.e.WriteTxnCtx(d.stmtCtx(), fn)
+}
+
+// stmtCtx is the statement's context, or Background when it has none.
+func (d *DB) stmtCtx() context.Context {
+	if d.ctx != nil {
+		return d.ctx
+	}
+	return context.Background()
 }
 
 // Result is the outcome of one statement. SELECT fills Cols, Types,
@@ -1067,9 +1078,11 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 			var res *Result
 			txnRun := d.e.ReadTxn
 			if selectWritesSequences(s) {
-				txnRun = d.e.WriteTxn
+				txnRun = func(fn func(*bytdb.Txn) error) error { return d.e.WriteTxnCtx(d.stmtCtx(), fn) }
 				if d.serial {
-					txnRun = d.e.WriteTxnSerializable
+					txnRun = func(fn func(*bytdb.Txn) error) error {
+						return d.e.WriteTxnSerializableCtx(d.stmtCtx(), fn)
+					}
 				}
 			}
 			err := txnRun(func(tx *bytdb.Txn) error {

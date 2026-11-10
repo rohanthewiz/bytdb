@@ -1,6 +1,7 @@
 package bytdb
 
 import (
+	"context"
 	"iter"
 
 	"github.com/rohanthewiz/btypedb"
@@ -34,6 +35,11 @@ type Txn struct {
 	// releaseW marks a writable transaction from Begin, so Commit and
 	// Rollback clear the engine's reentrancy marker (writerGID).
 	releaseW bool
+	// holdsSlot marks a writable transaction from Begin that holds the
+	// engine's write slot (single-writer mode); Commit and Rollback give
+	// it back once the kv transaction has released its lock. One-shot,
+	// like releaseW.
+	holdsSlot bool
 	// descs memoizes descriptor resolutions for the transaction's
 	// lifetime (including nil for absent tables — the snapshot cannot
 	// change underneath, so a miss is a miss for good).
@@ -121,7 +127,15 @@ func (t *Txn) flushSeqInvalidations() {
 // the process restarts (replay then drops them). Treat a commit error
 // as "durability unknown," not "definitely not applied."
 func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
-	return e.writeTxn(false, fn)
+	return e.writeTxn(context.Background(), false, fn)
+}
+
+// WriteTxnCtx is WriteTxn whose wait for the writer lock ends when ctx
+// does: in the default single-writer mode a write queued behind an open
+// transaction can be canceled or time out, and then never runs. Once
+// fn has started, ctx is fn's to honor.
+func (e *Engine) WriteTxnCtx(ctx context.Context, fn func(tx *Txn) error) error {
+	return e.writeTxn(ctx, false, fn)
 }
 
 // WriteTxnSerializable is WriteTxn at SERIALIZABLE isolation. Only
@@ -146,13 +160,23 @@ func (e *Engine) WriteTxn(fn func(tx *Txn) error) error {
 // Without WithConcurrentWrites this is exactly WriteTxn — writers
 // fully serialize anyway.
 func (e *Engine) WriteTxnSerializable(fn func(tx *Txn) error) error {
-	return e.writeTxn(true, fn)
+	return e.writeTxn(context.Background(), true, fn)
 }
 
-func (e *Engine) writeTxn(serializable bool, fn func(tx *Txn) error) error {
+// WriteTxnSerializableCtx is WriteTxnSerializable with WriteTxnCtx's
+// interruptible wait.
+func (e *Engine) WriteTxnSerializableCtx(ctx context.Context, fn func(tx *Txn) error) error {
+	return e.writeTxn(ctx, true, fn)
+}
+
+func (e *Engine) writeTxn(ctx context.Context, serializable bool, fn func(tx *Txn) error) error {
 	if err := e.checkReentrantWrite("write transaction"); err != nil {
 		return err
 	}
+	if err := e.acquireWrite(ctx); err != nil {
+		return err
+	}
+	defer e.releaseWrite()
 	// txn escapes the closure so the commit outcome can flush its
 	// pending sequence invalidations (see Txn.dirtySeqPrefixes).
 	var txn *Txn
@@ -243,16 +267,28 @@ func (e *Engine) ReadTxn(fn func(tx *Txn) error) error {
 // cannot leak the lock; Begin exists for callers whose transaction
 // boundaries arrive from outside, like a SQL session's BEGIN/COMMIT.
 func (e *Engine) Begin(writable bool) (*Txn, error) {
+	return e.BeginCtx(context.Background(), writable)
+}
+
+// BeginCtx is Begin whose wait for the writer lock (default mode, a
+// writable transaction) ends when ctx does: a session's BEGIN queued
+// behind another open block can be canceled or time out. ctx bounds
+// only that wait, not the transaction's life.
+func (e *Engine) BeginCtx(ctx context.Context, writable bool) (*Txn, error) {
 	if writable {
 		if err := e.checkReentrantWrite("begin"); err != nil {
 			return nil, err
 		}
+		if err := e.acquireWrite(ctx); err != nil {
+			return nil, err
+		}
 		tx, err := e.kv.Begin(true)
 		if err != nil {
+			e.releaseWrite()
 			return nil, err
 		}
 		e.writerGID.Store(curGID())
-		return &Txn{tx: tx, e: e, releaseW: true}, nil
+		return &Txn{tx: tx, e: e, releaseW: true, holdsSlot: e.writeSlot != nil}, nil
 	}
 	return e.readSnapshot()
 }
@@ -265,7 +301,13 @@ func (e *Engine) Begin(writable bool) (*Txn, error) {
 // embedded callers should prefer WriteTxnSerializable, which cannot
 // leak the transaction.
 func (e *Engine) BeginSerializable() (*Txn, error) {
-	t, err := e.Begin(true)
+	return e.BeginSerializableCtx(context.Background())
+}
+
+// BeginSerializableCtx is BeginSerializable with BeginCtx's
+// interruptible wait.
+func (e *Engine) BeginSerializableCtx(ctx context.Context) (*Txn, error) {
+	t, err := e.BeginCtx(ctx, true)
 	if err != nil {
 		return nil, err
 	}
@@ -312,10 +354,21 @@ func (t *Txn) Commit() error {
 	t.releaseWriter()
 	t.done = true
 	err := t.tx.Commit()
+	t.releaseSlot() // after the kv commit has released its lock
 	if err == nil {
 		t.flushSeqInvalidations()
 	}
 	return err
+}
+
+// releaseSlot gives the engine's write slot back once a writable Begin
+// transaction ends. One-shot, like releaseWriter: a deferred Rollback
+// after Commit must not release a slot the next writer now holds.
+func (t *Txn) releaseSlot() {
+	if t.holdsSlot {
+		t.holdsSlot = false
+		t.e.releaseWrite()
+	}
 }
 
 // Rollback discards the transaction's writes and releases it. Rolling
@@ -323,7 +376,9 @@ func (t *Txn) Commit() error {
 func (t *Txn) Rollback() error {
 	t.releaseWriter() // before the lock is released — see Commit
 	t.done = true
-	return t.tx.Rollback()
+	err := t.tx.Rollback()
+	t.releaseSlot()
+	return err
 }
 
 // ErrTxClosed is returned by a Txn's methods once the transaction has

@@ -136,8 +136,8 @@ func (s *Session) EndImplicit() error {
 }
 
 // beginImplicit opens the unit's implicit block, as BEGIN would.
-func (s *Session) beginImplicit() error {
-	if _, err := s.txnControl(&TxnControl{Kind: TxnBegin, Tag: "BEGIN"}); err != nil {
+func (s *Session) beginImplicit(ctx context.Context) error {
+	if _, err := s.txnControl(ctx, &TxnControl{Kind: TxnBegin, Tag: "BEGIN"}); err != nil {
 		return err
 	}
 	s.implicit = true
@@ -254,7 +254,7 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 				return &Result{}, nil
 			}
 		}
-		return s.txnControl(tc)
+		return s.txnControl(ctx, tc)
 	}
 	if s.implicit && s.tx != nil && !s.aborted && (isDDL(st) || isVacuum(st)) {
 		// DDL cannot join a block: commit the unit's writes so far and run
@@ -265,7 +265,7 @@ func (s *Session) runCtx(ctx context.Context, st Statement, args []any) (*Result
 		s.armed = true
 	}
 	if s.armed && s.tx == nil && isWrite(st) && !isDDL(st) {
-		if err := s.beginImplicit(); err != nil {
+		if err := s.beginImplicit(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -528,7 +528,11 @@ func parseTimeout(sv *SetVar) (time.Duration, error) {
 // nothing, as in Postgres; COMMIT of a failed block rolls back and
 // says so in its tag. Savepoint statements outside a block are
 // errors, not warnings, again as in Postgres.
-func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
+//
+// ctx bounds BEGIN's wait for the writer lock (single-writer mode):
+// statement_timeout and a CancelRequest now stop a BEGIN queued behind
+// another session's block (deep-look D-33).
+func (s *Session) txnControl(ctx context.Context, tc *TxnControl) (*Result, error) {
 	switch tc.Kind {
 	case TxnBegin:
 		if s.tx != nil {
@@ -552,9 +556,9 @@ func (s *Session) txnControl(tc *TxnControl) (*Result, error) {
 		var tx *bytdb.Txn
 		var err error
 		if iso == "serializable" && !tc.ReadOnly && s.db.e.ConcurrentWrites() {
-			tx, err = s.db.e.BeginSerializable()
+			tx, err = s.db.e.BeginSerializableCtx(ctx)
 		} else {
-			tx, err = s.db.e.Begin(!tc.ReadOnly)
+			tx, err = s.db.e.BeginCtx(ctx, !tc.ReadOnly)
 		}
 		if err != nil {
 			return nil, err

@@ -1,6 +1,7 @@
 package bytdb
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -96,7 +97,7 @@ func (e *Engine) NextSeq(name string) (uint64, error) {
 		return 0, err
 	}
 	var v uint64
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kvUpdate(context.Background(), func(tx *btypedb.Tx[string, []byte]) error {
 		var err error
 		v, err = nextSeqIn(tx, name)
 		return err
@@ -150,7 +151,7 @@ func (e *Engine) SetSeq(name string, next uint64) error {
 	if err := e.checkReentrantWrite("set sequence"); err != nil {
 		return err
 	}
-	err := e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err := e.kvUpdate(context.Background(), func(tx *btypedb.Tx[string, []byte]) error {
 		return setSeqIn(tx, name, next)
 	})
 	if err != nil {
@@ -254,7 +255,7 @@ func (e *Engine) DeleteSeq(name string) (existed bool, err error) {
 	if err := e.checkReentrantWrite("delete sequence"); err != nil {
 		return false, err
 	}
-	err = e.kv.Update(func(tx *btypedb.Tx[string, []byte]) error {
+	err = e.kvUpdate(context.Background(), func(tx *btypedb.Tx[string, []byte]) error {
 		existed, err = deleteSeqIn(tx, name)
 		return err
 	})

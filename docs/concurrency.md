@@ -27,6 +27,21 @@ flowchart LR
 e, _ := bytdb.Open("app.db", bytdb.WithConcurrentWrites())
 ```
 
+In the default mode a writer may have to wait for the lock, behind another
+open transaction. That wait honors a context: `Engine.WriteTxnCtx`,
+`WriteTxnSerializableCtx`, `BeginCtx` and `BeginSerializableCtx` give up when
+their context ends, and a write that gave up never runs. The SQL layer passes
+each statement's context, so `statement_timeout`, a wire `CancelRequest` and a
+`database/sql` context all bound the wait. (Engine DDL and the one-shot write
+methods still wait without a context.)
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+defer cancel()
+err := e.WriteTxnCtx(ctx, func(tx *bytdb.Txn) error { return tx.Insert("t", 2) })
+// errors.Is(err, context.DeadlineExceeded) when another block held the lock
+```
+
 ## What conflicts, and who retries
 
 A conflict means: between your `Begin` and your `Commit`, another transaction
