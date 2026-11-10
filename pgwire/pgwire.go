@@ -125,7 +125,8 @@ type Server struct {
 	// TLSConfig, when non-nil, makes the server accept the protocol's
 	// SSLRequest and upgrade the connection to TLS (it needs at least
 	// one certificate). Nil declines SSLRequest with 'N', as before.
-	// Set before Serve.
+	// Set before Serve; SetTLSConfig replaces it while serving (a
+	// certificate renewal).
 	TLSConfig *tls.Config
 
 	// RequireTLS refuses startup on connections that have not upgraded
@@ -138,7 +139,8 @@ type Server struct {
 
 	// Auth, when non-nil, requires clients to prove a password via
 	// SCRAM-SHA-256 before the session starts; nil keeps trust
-	// authentication. The registry may be updated while serving. Set
+	// authentication. The registry may be updated while serving
+	// (Credentials.ReplaceFrom swaps it whole, for a reloaded file). Set
 	// before Serve.
 	Auth *Credentials
 
@@ -190,14 +192,11 @@ type Server struct {
 	// the statement's ReadyForQuery waits on the call. Set before Serve.
 	QueryLog func(query string, d time.Duration, err error)
 
-	// bindOnce/bindData cache the RFC 5929 tls-server-end-point
-	// channel-binding value (a hash of the server certificate) that
-	// SCRAM-SHA-256-PLUS signs into the authentication exchange. Derived
-	// lazily from TLSConfig on the first TLS+SCRAM login; nil means the
-	// PLUS mechanism is not advertised (no TLS, ambiguous certificate
-	// selection, or a signature algorithm RFC 5929 leaves undefined).
-	bindOnce sync.Once
-	bindData []byte
+	// tlsLive is the TLS configuration new handshakes use, with its
+	// channel-binding value (see tlsState): TLSConfig on first use, or
+	// what SetTLSConfig installed since. Atomic, because a reload swaps
+	// it while connections are being accepted.
+	tlsLive atomic.Pointer[tlsState]
 
 	nextPID atomic.Int32
 
@@ -220,6 +219,40 @@ type Server struct {
 // statement it is running. A miss is silent — the protocol sends no
 // response either way, precisely so cancellation cannot be used to
 // probe for live PIDs.
+// tlsState is one TLS configuration as handshakes see it, with the
+// RFC 5929 tls-server-end-point channel-binding value (a hash of the
+// server certificate) that SCRAM-SHA-256-PLUS signs into the
+// authentication exchange, derived lazily on the first TLS+SCRAM login
+// under it. A connection keeps the state it handshook with, so the
+// binding it offers always matches the certificate it was served even
+// if a reload lands mid-login.
+type tlsState struct {
+	cfg  *tls.Config
+	once sync.Once
+	bind []byte
+}
+
+// currentTLS is the state new handshakes use; nil when TLS is off.
+func (s *Server) currentTLS() *tlsState {
+	if st := s.tlsLive.Load(); st != nil {
+		return st
+	}
+	if s.TLSConfig == nil {
+		return nil
+	}
+	// First use: adopt the field. A racing SetTLSConfig wins.
+	s.tlsLive.CompareAndSwap(nil, &tlsState{cfg: s.TLSConfig})
+	return s.tlsLive.Load()
+}
+
+// SetTLSConfig replaces the TLS configuration while serving — a renewed
+// certificate, say (bytdbd reloads on SIGHUP). New handshakes use cfg;
+// established connections keep theirs. Nil stops offering TLS to new
+// connections. Safe for concurrent use.
+func (s *Server) SetTLSConfig(cfg *tls.Config) {
+	s.tlsLive.Store(&tlsState{cfg: cfg})
+}
+
 func (s *Server) cancelBackend(pid int32, secret uint32) {
 	s.mu.Lock()
 	c := s.backends[pid]

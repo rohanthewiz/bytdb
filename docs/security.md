@@ -227,3 +227,11 @@ returns XX000 instead of killing the process.
 
 Configuration is validated before the database opens, so a bad flag can never
 strand a half-open engine.
+
+**SIGHUP** re-reads `-auth-file` and the `-tls-cert` / `-tls-key` pair in
+place: a password rotation or a certificate renewal takes effect for new
+logins and handshakes without dropping a connection (established sessions
+keep the credentials and certificate they started with, and SCRAM-PLUS binds
+to the certificate each connection was actually served). A file that fails
+to load is logged and the running settings stay. Only what was configured at
+startup reloads; SIGHUP never turns authentication or TLS on or off.

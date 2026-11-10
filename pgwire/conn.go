@@ -49,6 +49,9 @@ type conn struct {
 	// tlsOn: the stream has been upgraded to TLS. Gates RequireTLS and
 	// refuses a second SSLRequest.
 	tlsOn bool
+	// tlsSt is the TLS state the handshake used (its certificate's
+	// channel binding is what SCRAM-PLUS signs).
+	tlsSt *tlsState
 
 	// overLimit: the server was at MaxConns when this connection
 	// arrived. The startup handshake still runs far enough to deliver a
@@ -590,7 +593,8 @@ func (c *conn) startup() error {
 // server has a TLS config, a polite 'N' when it does not (or when the
 // stream is already TLS — a client bug Postgres also refuses).
 func (c *conn) maybeStartTLS() error {
-	if c.srv.TLSConfig == nil || c.tlsOn {
+	st := c.srv.currentTLS()
+	if st == nil || st.cfg == nil || c.tlsOn {
 		if err := c.w.WriteByte('N'); err != nil {
 			return err
 		}
@@ -609,7 +613,7 @@ func (c *conn) maybeStartTLS() error {
 	if err := c.w.Flush(); err != nil {
 		return err
 	}
-	tc := tls.Server(c.nc, c.srv.TLSConfig)
+	tc := tls.Server(c.nc, st.cfg)
 	// Handshake reads and writes inherit the startup deadlines already
 	// armed on the underlying socket.
 	if err := tc.Handshake(); err != nil {
@@ -621,7 +625,7 @@ func (c *conn) maybeStartTLS() error {
 	c.nc = tc
 	c.r = bufio.NewReader(tc)
 	c.w = bufio.NewWriterSize(stallWriter{c}, writeBufSize)
-	c.tlsOn = true
+	c.tlsOn, c.tlsSt = true, st
 	return nil
 }
 

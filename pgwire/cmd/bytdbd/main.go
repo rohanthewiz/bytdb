@@ -299,6 +299,19 @@ func main() {
 	// and reply, and only then is anything still running canceled.
 	// Shutdown waits for every connection, so the deferred e.Close never
 	// runs under an executing statement. A second signal skips the wait.
+	// SIGHUP reloads the credentials file and the TLS key pair in place
+	// (reload.go); it never stops the server.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	rc := reloadConfig{authFile: *authFile, tlsCert: *tlsCert, tlsKey: *tlsKey, creds: creds, srv: srv}
+	go func() {
+		for range hup {
+			for _, line := range rc.reload() {
+				log.Printf("bytdbd: SIGHUP: %s", line)
+			}
+		}
+	}()
+
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {

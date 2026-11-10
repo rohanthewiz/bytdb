@@ -85,6 +85,24 @@ func NewCredentials() *Credentials {
 	return &Credentials{users: map[string]scramVerifier{}, mockKey: key}
 }
 
+// ReplaceFrom makes the registry hold exactly src's users, atomically:
+// a login sees the old set or the new one, never a mix. It is how a
+// reloaded credentials file takes effect while serving (bytdbd's
+// SIGHUP) — users missing from src lose access on their next login;
+// established sessions are not affected. The mock-verifier key is kept,
+// so unknown users' fake salts stay stable across reloads.
+func (cr *Credentials) ReplaceFrom(src *Credentials) {
+	src.mu.RLock()
+	users := make(map[string]scramVerifier, len(src.users))
+	for u, v := range src.users {
+		users[u] = v
+	}
+	src.mu.RUnlock()
+	cr.mu.Lock()
+	cr.users = users
+	cr.mu.Unlock()
+}
+
 // SetPassword registers (or re-keys) a user from a plaintext
 // password. Only the derived verifier is retained.
 func (cr *Credentials) SetPassword(user, password string) {
@@ -228,17 +246,20 @@ func hmacSHA256(key []byte, msg string) []byte {
 
 // --- channel binding (SCRAM-SHA-256-PLUS, RFC 5929) ---
 
-// channelBinding returns the tls-server-end-point binding data — a
-// hash of the server's DER certificate — or nil when the PLUS
-// mechanism cannot be offered. Binding data must equal what the client
+// binding returns the tls-server-end-point binding data for one TLS
+// state — a hash of the server's DER certificate — or nil when the PLUS
+// mechanism cannot be offered (including no TLS at all). Binding data must equal what the client
 // computes from the certificate it received, so it is only derivable
 // when the served certificate is unambiguous: exactly one static
 // certificate and no dynamic selection callbacks (with those, which
 // certificate a handshake served depends on SNI and is not observable
 // after the fact from the server side).
-func (s *Server) channelBinding() []byte {
-	s.bindOnce.Do(func() {
-		cfg := s.TLSConfig
+func (st *tlsState) binding() []byte {
+	if st == nil {
+		return nil
+	}
+	st.once.Do(func() {
+		cfg := st.cfg
 		if cfg == nil || cfg.GetCertificate != nil || cfg.GetConfigForClient != nil ||
 			len(cfg.Certificates) != 1 || len(cfg.Certificates[0].Certificate) == 0 {
 			return
@@ -252,9 +273,9 @@ func (s *Server) channelBinding() []byte {
 			return
 		}
 		h.Write(leaf.Raw)
-		s.bindData = h.Sum(nil)
+		st.bind = h.Sum(nil)
 	})
-	return s.bindData
+	return st.bind
 }
 
 // bindingHash picks the certificate hash per RFC 5929 §4.1: the hash
@@ -466,7 +487,7 @@ func (c *conn) authSCRAM(user string) error {
 	// Postgres advertises the same pair in the same order.
 	var binding []byte
 	if c.tlsOn {
-		binding = c.srv.channelBinding()
+		binding = c.tlsSt.binding() // the certificate this connection was served
 	}
 	var adv wbuf
 	adv.int32(authSASL)
