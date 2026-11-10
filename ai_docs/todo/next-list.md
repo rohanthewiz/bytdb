@@ -58,7 +58,14 @@ plan's recommendations.
   `relhasindex`, varchar typmod, `regclass` rendering) and part 3
   (`NegotiateProtocolVersion`, verbatim ORM statements in
   `pgwire/orm_test.go`); D-56, D-57, D-58 rest; Phase 9 doc corrections;
-  delete `ai_docs/todo/deep-look-repros/` once ported.
+  delete `ai_docs/todo/deep-look-repros/` once ported. *Updated
+  `2026-1110-0737-deep-look-phase8-d51-d56`:* D-51 (all three parts) and
+  D-56 are done. Left: D-57 (stdlib converters, DSN options, symlinks,
+  `encryption_key_file`), D-58 rest (bytdbd replication flags, health
+  endpoint, replication metrics, SIGHUP), Phase 9, the repro cleanup.
+  The verbatim-statement tests cover goose, lib/pq and pgx only: GORM v2,
+  golang-migrate and atlas were not in the module cache, so their
+  statements still need capturing from source.
 
 - **N-044** · raised `2026-1109-2243-deep-look-phase0-phase1` · value medium
   **Cut "release A" of the deep-look plan (Phase 0 + Phase 1).** Every
@@ -84,6 +91,15 @@ plan's recommendations.
   btypedb main now also carries D-48's faster replay (389 -> 104 ms for
   500k rows, commit `ad77fd8`), which bytdb gets only through a btypedb
   tag (v0.10.0) and a `go.mod` bump — a second release decision.
+  *Updated `2026-1110-0737-deep-look-phase8-d51-d56`:* the release notes
+  must also say that error messages changed to Postgres's wording (`no
+  such table` -> `relation "t" does not exist`, `duplicate primary key` ->
+  `duplicate key value violates unique constraint "t_pkey"`, `syntax
+  error` -> `syntax error at or near "x"`, ...): embedders matching text
+  should switch to the new `errors.Is` sentinels. Also: a top-level
+  `x::regclass` now renders the relation name (typed text), and bare
+  `user` / `current_user` read as the session user even where a table has
+  such a column.
 
 - **N-045** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
   **Cache the typed tree on prepared statements (D-40 step 3).** Typing
