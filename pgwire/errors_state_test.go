@@ -113,6 +113,9 @@ func TestSQLStateMapping(t *testing.T) {
 		{"RESTART value (0) cannot be less than MINVALUE (1)", false, "22023"},
 		{"RESTART value (11) cannot be greater than MAXVALUE (10)", false, "22023"},
 
+		// The parser's expression-depth bound (deep-look D-06).
+		{"statement too complex: expression is nested more than 10000 levels deep", false, "54001"},
+
 		// Anything unrecognized is internal_error.
 		{"disk exploded", false, "XX000"},
 	}

@@ -66,6 +66,12 @@ func FuzzParse(f *testing.F) {
 		// (selectStmt -> fromClause -> tableRef -> selectStmt) that the
 		// expression-only depth guard did not cover.
 		"SELECT * FROM " + strings.Repeat("(SELECT * FROM ", 2000) + "t" + strings.Repeat(") x", 2000),
+		// Iterative operator chains (deep-look D-06): the loops never
+		// nest the parser, so maxParseDepth never trips, but the tree they
+		// build is as deep as the chain. A million terms overflowed the
+		// stack in every later walk; the depth bound must refuse it.
+		"SELECT 1" + strings.Repeat("+1", 1_000_000),
+		"SELECT 1" + strings.Repeat("::int", 200_000),
 	}
 	for _, s := range seeds {
 		f.Add(s)

@@ -82,6 +82,25 @@ func parseCheckExpr(src string) (Expr, error) {
 // levels) while costing only a few thousand Go frames.
 const maxParseDepth = 1000
 
+// maxExprDepth bounds the depth of the expression tree a statement
+// builds, which maxParseDepth alone does not. The binary-operator and
+// postfix levels (+ - || * / %, ::, [], comparisons, IS NULL, IN, LIKE,
+// BETWEEN) parse iteratively, so a chain like 1+1+1+... never nests the
+// parser — but it builds a left-deep tree as deep as the chain, and
+// every later walk (binding, typing, evaluation) recurses once per
+// level. A million-term chain fits in pgwire's 64 MiB frame and
+// overflowed the Go stack: a fatal error recover() cannot catch, so one
+// statement killed the server (deep-look D-06).
+//
+// The bound is on depth, not on a statement-wide count of operators,
+// because depth is what costs stack: a 50,000-row INSERT with a $n::int
+// cast in every cell builds 50,000 shallow trees and must keep working.
+// Depth is tracked during parsing (see parser.lastDepth) rather than by
+// a walk afterwards, so the check needs no walker that knows every node
+// type. 10,000 levels is far beyond any real query and costs a few MB
+// of stack per walk at most.
+const maxExprDepth = 10_000
+
 // maxParamNumber bounds $n placeholders. 65535 is the wire protocol's
 // own ceiling (Bind carries the parameter count as an int16), so no
 // conforming client can bind more; see the tParam case in literal for
@@ -95,6 +114,18 @@ type parser struct {
 
 	// depth is the current expression-nesting depth; see enter.
 	depth int
+
+	// lastDepth is the tree depth of the expression the most recent
+	// expression-level parse step returned (a leaf is 1), and frameMax
+	// the deepest such tree completed since the innermost enclosing
+	// measure began. Each step that wraps operands in a new node computes
+	// the node's depth as 1 + the deepest operand and refuses it past
+	// maxExprDepth (see done). Constructs that parse operands through
+	// helpers whose results they cannot see directly — a function call's
+	// arguments, an IN list, a subquery — use measure, which reports the
+	// deepest subtree completed inside them.
+	lastDepth int
+	frameMax  int
 
 	// ctes accumulates the statement's WITH entries — written ones and
 	// the synthetic ones derived tables lower to — in completion order,
@@ -117,6 +148,31 @@ func (p *parser) enter() error {
 }
 
 func (p *parser) leave() { p.depth-- }
+
+// done records that the parse step just finishing built a tree of depth
+// d, refusing it past maxExprDepth with Postgres's SQLSTATE 54001 class
+// (pgwire keys it off "statement too complex").
+func (p *parser) done(d int) error {
+	if d > maxExprDepth {
+		return serr.New("statement too complex: expression is nested more than "+
+			fmt.Sprint(maxExprDepth)+" levels deep",
+			"hint", "split the expression, or use a list (IN, ARRAY) instead of a chain of operators")
+	}
+	p.lastDepth = d
+	p.frameMax = max(p.frameMax, d)
+	return nil
+}
+
+// measure runs parse and returns the depth of the deepest expression
+// tree completed during it (0 if none), leaving frameMax covering it.
+func (p *parser) measure(parse func() error) (int, error) {
+	saved := p.frameMax
+	p.frameMax = 0
+	err := parse()
+	nested := p.frameMax
+	p.frameMax = max(saved, nested)
+	return nested, err
+}
 
 func (p *parser) cur() token { return p.toks[p.i] }
 
@@ -2907,18 +2963,23 @@ func (p *parser) exprOr() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	d := p.lastDepth
 	for p.acceptKw("or") {
 		r, err := p.exprAnd()
 		if err != nil {
 			return nil, err
 		}
+		// OR is n-ary, so a long OR chain stays shallow: appending
+		// deepens the node only if the new term is deeper than the rest.
 		if or, ok := e.(*ExOr); ok {
 			or.Exprs = append(or.Exprs, r)
+			d = max(d, p.lastDepth+1)
 		} else {
 			e = &ExOr{Exprs: []Expr{e, r}}
+			d = max(d, p.lastDepth) + 1
 		}
 	}
-	return e, nil
+	return e, p.done(d)
 }
 
 func (p *parser) exprAnd() (Expr, error) {
@@ -2926,18 +2987,21 @@ func (p *parser) exprAnd() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	d := p.lastDepth
 	for p.acceptKw("and") {
 		r, err := p.exprNot()
 		if err != nil {
 			return nil, err
 		}
-		if and, ok := e.(*ExAnd); ok {
+		if and, ok := e.(*ExAnd); ok { // n-ary: see exprOr
 			and.Exprs = append(and.Exprs, r)
+			d = max(d, p.lastDepth+1)
 		} else {
 			e = &ExAnd{Exprs: []Expr{e, r}}
+			d = max(d, p.lastDepth) + 1
 		}
 	}
-	return e, nil
+	return e, p.done(d)
 }
 
 func (p *parser) exprNot() (Expr, error) {
@@ -2952,7 +3016,7 @@ func (p *parser) exprNot() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ExNot{E: e}, nil
+		return &ExNot{E: e}, p.done(p.lastDepth + 1)
 	}
 	return p.exprCmp()
 }
@@ -2966,6 +3030,9 @@ func (p *parser) exprCmp() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	// d is e's tree depth; every postfix below wraps e, so it grows by
+	// one (or by the depth of the operands the postfix parsed, if more).
+	d := p.lastDepth
 	for {
 		switch {
 		case p.acceptKw("collate"):
@@ -2983,86 +3050,101 @@ func (p *parser) exprCmp() (Expr, error) {
 				return nil, err
 			}
 			e = &ExIsNull{E: e, Not: not}
+			d++
 		case p.cur().kind == tIdent && p.cur().text == "in":
 			p.advance()
-			r, err := p.inTail(e, false)
+			var r Expr
+			nested, err := p.measure(func() (err error) { r, err = p.inTail(e, false); return err })
 			if err != nil {
 				return nil, err
 			}
-			e = r
+			e, d = r, max(d, nested)+1
 		case p.cur().kind == tIdent && p.cur().text == "not" &&
 			p.tokAt(1).kind == tIdent && p.tokAt(1).text == "in":
 			p.advance()
 			p.advance()
-			r, err := p.inTail(e, true)
+			var r Expr
+			nested, err := p.measure(func() (err error) { r, err = p.inTail(e, true); return err })
 			if err != nil {
 				return nil, err
 			}
-			e = r
+			e, d = r, max(d, nested)+2 // NOT IN wraps in a negation too
 		case p.cur().kind == tIdent && (p.cur().text == "like" || p.cur().text == "ilike"):
 			ilike := p.cur().text == "ilike"
 			p.advance()
-			r, err := p.likeTail(e, ilike, false)
+			var r Expr
+			nested, err := p.measure(func() (err error) { r, err = p.likeTail(e, ilike, false); return err })
 			if err != nil {
 				return nil, err
 			}
-			e = r
+			e, d = r, max(d, nested)+2
 		case p.cur().kind == tIdent && p.cur().text == "not" &&
 			p.tokAt(1).kind == tIdent && (p.tokAt(1).text == "like" || p.tokAt(1).text == "ilike"):
 			ilike := p.tokAt(1).text == "ilike"
 			p.advance()
 			p.advance()
-			r, err := p.likeTail(e, ilike, true)
+			var r Expr
+			nested, err := p.measure(func() (err error) { r, err = p.likeTail(e, ilike, true); return err })
 			if err != nil {
 				return nil, err
 			}
-			e = r
+			e, d = r, max(d, nested)+2
 		case p.cur().kind == tIdent && p.cur().text == "between":
 			p.advance()
-			r, err := p.betweenTail(e, false)
+			var r Expr
+			nested, err := p.measure(func() (err error) { r, err = p.betweenTail(e, false); return err })
 			if err != nil {
 				return nil, err
 			}
-			e = r
+			e, d = r, max(d, nested)+2 // lowered to an AND of two comparisons
 		case p.cur().kind == tIdent && p.cur().text == "not" &&
 			p.tokAt(1).kind == tIdent && p.tokAt(1).text == "between":
 			p.advance()
 			p.advance()
-			r, err := p.betweenTail(e, true)
+			var r Expr
+			nested, err := p.measure(func() (err error) { r, err = p.betweenTail(e, true); return err })
 			if err != nil {
 				return nil, err
 			}
-			e = r
+			e, d = r, max(d, nested)+3
 		default:
 			op, ok, err := p.cmpOp()
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
-				return e, nil
+				return e, p.done(d)
 			}
 			if t := p.cur(); t.kind == tIdent && (t.text == "any" || t.text == "all") && p.peekOp("(") {
 				all := t.text == "all"
 				p.advance() // any / all
 				p.advance() // (
 				var r Expr
-				if c := p.cur(); c.kind == tIdent && c.text == "select" {
-					p.advance()
-					st, err := p.selectStmt()
-					if err != nil {
-						return nil, err
+				nested, err := p.measure(func() error {
+					if c := p.cur(); c.kind == tIdent && c.text == "select" {
+						p.advance()
+						st, err := p.selectStmt()
+						if err != nil {
+							return err
+						}
+						r = &ExSub{Sel: st.(*Select)}
+						return nil
 					}
-					r = &ExSub{Sel: st.(*Select)}
-				} else {
 					var err error
-					if r, err = p.expression(); err != nil {
-						return nil, err
-					}
+					r, err = p.expression()
+					return err
+				})
+				if err != nil {
+					return nil, err
 				}
 				if err := p.expectOp(")"); err != nil {
 					return nil, err
 				}
 				e = &ExAny{Op: op, L: e, R: r, All: all}
+				d = max(d, nested+1) + 1 // the subquery node sits above its body
+				if err := p.done(d); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			r, err := p.exprAdd()
@@ -3070,6 +3152,13 @@ func (p *parser) exprCmp() (Expr, error) {
 				return nil, err
 			}
 			e = &ExCmp{Op: op, L: e, R: r}
+			d = max(d, p.lastDepth) + 1
+		}
+		// Refuse as soon as a chain passes the bound, not at its end: a
+		// million-term chain should cost one check per term, and the tree
+		// it would build is exactly what must never exist.
+		if err := p.done(d); err != nil {
+			return nil, err
 		}
 	}
 }
@@ -3222,15 +3311,16 @@ func (p *parser) exprAdd() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	d := p.lastDepth
 	for {
 		t := p.cur()
 		if t.kind != tOp {
-			return e, nil
+			return e, p.done(d)
 		}
 		switch t.text {
 		case "+", "-", "||", "->", "->>", "#>", "#>>":
 		default:
-			return e, nil
+			return e, p.done(d)
 		}
 		p.advance()
 		r, err := p.exprMul()
@@ -3238,6 +3328,10 @@ func (p *parser) exprAdd() (Expr, error) {
 			return nil, err
 		}
 		e = &ExArith{Op: t.text, L: e, R: r}
+		d = max(d, p.lastDepth) + 1
+		if err := p.done(d); err != nil { // per term: see exprCmp
+			return nil, err
+		}
 	}
 }
 
@@ -3246,10 +3340,11 @@ func (p *parser) exprMul() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	d := p.lastDepth
 	for {
 		t := p.cur()
 		if t.kind != tOp || (t.text != "*" && t.text != "/" && t.text != "%") {
-			return e, nil
+			return e, p.done(d)
 		}
 		p.advance()
 		r, err := p.exprUnary()
@@ -3257,6 +3352,10 @@ func (p *parser) exprMul() (Expr, error) {
 			return nil, err
 		}
 		e = &ExArith{Op: t.text, L: e, R: r}
+		d = max(d, p.lastDepth) + 1
+		if err := p.done(d); err != nil { // per term: see exprCmp
+			return nil, err
+		}
 	}
 }
 
@@ -3267,7 +3366,10 @@ func (p *parser) exprUnary() (Expr, error) {
 		// becomes 0 - E (or passes through for unary +).
 		if p.tokAt(1).kind == tNumber {
 			v, err := p.literal()
-			return &ExLit{Val: v}, err
+			if err != nil {
+				return nil, err
+			}
+			return &ExLit{Val: v}, p.done(1)
 		}
 		p.advance()
 		e, err := p.exprPostfix()
@@ -3275,7 +3377,7 @@ func (p *parser) exprUnary() (Expr, error) {
 			return nil, err
 		}
 		if t.text == "-" {
-			return &ExArith{Op: "-", L: &ExLit{Val: int64(0)}, R: e}, nil
+			return &ExArith{Op: "-", L: &ExLit{Val: int64(0)}, R: e}, p.done(p.lastDepth + 1)
 		}
 		return e, nil
 	}
@@ -3287,6 +3389,7 @@ func (p *parser) exprPostfix() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	d := p.lastDepth
 	for {
 		switch {
 		case p.acceptOp("::"):
@@ -3295,6 +3398,7 @@ func (p *parser) exprPostfix() (Expr, error) {
 				return nil, err
 			}
 			e = &ExCast{E: e, Type: typ}
+			d++
 		case p.acceptOp("["):
 			idx, err := p.expression()
 			if err != nil {
@@ -3304,8 +3408,12 @@ func (p *parser) exprPostfix() (Expr, error) {
 				return nil, err
 			}
 			e = &ExIndex{E: e, Idx: idx}
+			d = max(d, p.lastDepth) + 1
 		default:
-			return e, nil
+			return e, p.done(d)
+		}
+		if err := p.done(d); err != nil { // per postfix: see exprCmp
+			return nil, err
 		}
 	}
 }
@@ -3335,7 +3443,19 @@ func (p *parser) castType() (string, error) {
 	return name, nil
 }
 
+// exprPrimary parses one primary and records its tree depth: one more
+// than the deepest expression parsed inside it (its arguments, list
+// elements, CASE arms, subquery body), or 1 for a leaf.
 func (p *parser) exprPrimary() (Expr, error) {
+	var e Expr
+	nested, err := p.measure(func() (err error) { e, err = p.primary(); return err })
+	if err != nil {
+		return nil, err
+	}
+	return e, p.done(nested + 1)
+}
+
+func (p *parser) primary() (Expr, error) {
 	// Folded zero-argument system functions: version(), ...
 	if v, name, ok, err := p.sysFuncCall(); err != nil {
 		return nil, err

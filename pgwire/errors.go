@@ -128,6 +128,11 @@ func sqlstate(msg string, hasPos bool) string {
 		strings.Contains(msg, "result row limit"),                 // Engine.SetMaxResultRows
 		strings.Contains(msg, "transaction write limit exceeded"): // bytdb.ErrTxnTooLarge
 		return "54000" // program_limit_exceeded
+	// The parser's expression-depth bound (sql maxExprDepth). Postgres
+	// reports a statement that would recurse too deeply as 54001
+	// (statement_too_complex) — its "stack depth limit exceeded".
+	case strings.Contains(msg, "statement too complex"):
+		return "54001" // statement_too_complex
 	// The engine's memory ceiling (bytdb.ErrOutOfMemory). Postgres
 	// raises 53200 when an allocation fails; clients and pools treat
 	// the 53 class as "server resources", retryable later, rather than
