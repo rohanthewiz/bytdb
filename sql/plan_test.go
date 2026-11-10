@@ -173,17 +173,30 @@ func TestPlanUnknownColumn(t *testing.T) {
 }
 
 func TestPlanORIsResidualOnly(t *testing.T) {
-	// A top-level OR pushes nothing, even when every branch touches
-	// the primary key.
+	// A top-level OR pushes nothing when its branches are not all
+	// equalities on one column — here the branches name two columns.
 	p, err := planScan(planDesc(), "users", or(
 		cpred("id", OpEQ, int64(1)),
-		cpred("id", OpEQ, int64(2)),
+		cpred("age", OpEQ, int64(2)),
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.get != nil || p.from != nil || p.stops != nil || p.index != "" {
+	if p.get != nil || p.from != nil || p.stops != nil || p.index != "" || p.in != nil {
 		t.Fatalf("want unbounded primary scan, got %#v", p)
+	}
+
+	// Equalities on one key column are an IN list in disguise and run
+	// as key probes (deep-look D-38); the OR stays the residual filter.
+	p, err = planScan(planDesc(), "users", or(
+		cpred("id", OpEQ, int64(2)),
+		cpred("id", OpEQ, int64(1)),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.in == nil || !reflect.DeepEqual(p.in.keys, []any{int64(1), int64(2)}) || p.get == nil {
+		t.Fatalf("want point-get probes over [1 2], got %#v", p)
 	}
 
 	// NOT blocks pushdown of its subtree too.

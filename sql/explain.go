@@ -114,7 +114,7 @@ func (x *explainer) writeNode(verb, table string, where BoolExpr) (*planNode, er
 	if desc == nil {
 		return nil, serr.New("no such table", "table", table)
 	}
-	scan, err := x.scanNode(desc, table, table, where)
+	scan, err := x.scanNode(desc, table, table, where, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -374,23 +374,40 @@ func (x *explainer) stepScan(fp *fromPlan, step *joinStep, claimed map[BoolExpr]
 	case len(exprs) > 1:
 		where = &And{Exprs: exprs}
 	}
-	return x.scanNode(step.st.desc, step.st.name, display, where)
+	return x.scanNode(step.st.desc, step.st.name, display, where, step.probes, claimed)
 }
 
 // scanNode explains one table read: planScan picks the path exactly
 // as execution will; its pushed conjuncts render as the Index Cond
 // (or point-get Key) and the rest as the scan's Filter.
-func (x *explainer) scanNode(desc *bytdb.TableDesc, alias, display string, where BoolExpr) (*planNode, error) {
+//
+// probes are the step's IN-list conjuncts (see joinStep.probes); the one
+// that drives key probes, if any, is the Index Cond and is added to
+// claimed (when non-nil) so the WHERE's Filter line does not repeat it.
+func (x *explainer) scanNode(desc *bytdb.TableDesc, alias, display string, where BoolExpr, probes []BoolExpr, claimed map[BoolExpr]bool) (*planNode, error) {
 	pl := x.step0Plan // the order-aware plan, when this is the sorted single-table scan
 	if pl == nil {
 		var err error
-		if pl, err = planScan(desc, alias, where); err != nil {
+		if pl, err = planScan(desc, alias, where, probes...); err != nil {
 			return nil, err
 		}
+	}
+	if pl.in != nil && claimed != nil {
+		claimed[pl.in.cond] = true
 	}
 	pushed := map[BoolExpr]bool{}
 	for _, pr := range pl.pushed {
 		pushed[pr] = true
+	}
+	if pl.in != nil {
+		// The IN-list conjunct drives the probes: it is the Index Cond
+		// (shown as Postgres prints it, = ANY of the probed keys), so it
+		// is not also a Filter.
+		pushed[pl.in.cond] = true
+		if x.tmpl == nil {
+			x.tmpl = map[*Pred]string{}
+		}
+		x.tmpl[pl.in.pred] = inProbeText(pl.in, desc)
 	}
 	walkPreds(where, func(pr *Pred) error {
 		if pr.Item.Col.Table != "" && pr.Item.Col.Table != alias {
@@ -412,9 +429,11 @@ func (x *explainer) scanNode(desc *bytdb.TableDesc, alias, display string, where
 	}
 	ordered := pl == x.step0Plan // this scan is read in ORDER BY order
 	switch {
-	case pl.get != nil:
+	case pl.get != nil && pl.in == nil:
 		n.title = "Point Get on " + display
 		cond = "Key: "
+	case pl.get != nil: // one point get per IN key: an index scan in Postgres's terms
+		n.title = "Index Scan using " + desc.Name + "_pkey on " + display
 	case pl.index != "":
 		n.title = "Index Scan" + backward + " using " + pl.index + " on " + display
 	case len(pl.from) > 0 || len(pl.stops) > 0 || ordered:
@@ -460,6 +479,21 @@ func unclaimed(parts []BoolExpr, claimed map[BoolExpr]bool) []BoolExpr {
 		}
 	}
 	return out
+}
+
+// inProbeText renders an IN-list probe as Postgres's Index Cond does:
+// col = ANY (keys), with the keys de-duplicated and in scan order.
+func inProbeText(in *inProbe, desc *bytdb.TableDesc) string {
+	t := desc.Columns[in.ord].Type
+	parts := make([]string, len(in.keys))
+	for i, k := range in.keys {
+		if txt, ok := typedLitText(k, t); ok {
+			parts[i] = txt
+		} else {
+			parts[i] = litText(k)
+		}
+	}
+	return "(" + in.pred.Item.Col.Name + " = ANY (ARRAY[" + strings.Join(parts, ", ") + "]))"
 }
 
 // typedLitText renders a value held in a column's runtime form as the

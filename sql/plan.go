@@ -24,6 +24,10 @@ type plan struct {
 	filter  BoolExpr // residual filter: the full condition (nil: all rows)
 	binds   binds    // the filter's operand ordinals within this table's rows
 	pushed  []*Pred  // the conjuncts behind get/from/stops (EXPLAIN's Index Cond)
+	// in, when set, runs the plan once per key of an IN-list conjunct
+	// (inlist.go, deep-look D-38): its synthetic equality is in pushed,
+	// and scanPlan rebinds it to each key in turn.
+	in *inProbe
 }
 
 type stopKind int
@@ -56,8 +60,15 @@ type stop struct {
 // secondary index with the longest equality prefix (plus at most one
 // range column), else a full scan. Only predicates that are top-level
 // AND conjuncts push down; anything under OR or NOT is residual-only.
-func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error) {
-	return planScanOrdered(desc, alias, where, nil)
+//
+// probes are extra IN-list conjuncts (col IN (constants), col =
+// ANY(constant array)) that may drive key probes without being part of
+// the residual filter: a join step's filter holds plain Preds only (its
+// scan runs without an evaluation environment), and the WHERE that
+// contains the IN is checked after the join anyway. Conjuncts of that
+// shape inside where itself are considered too.
+func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr, probes ...BoolExpr) (*plan, error) {
+	return planScanOrdered(desc, alias, where, nil, probes)
 }
 
 // planScanOrdered is planScan with an ORDER BY tie-break: when paths
@@ -66,7 +77,7 @@ func planScan(desc *bytdb.TableDesc, alias string, where BoolExpr) (*plan, error
 // the sort keys, so the sort can be skipped for free. Order never
 // outranks selectivity: a strictly better-scoring path still wins
 // even when it forces a sort.
-func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys []sortKey) (*plan, error) {
+func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys []sortKey, probes []BoolExpr) (*plan, error) {
 	p := &plan{desc: desc, filter: where, binds: binds{}}
 
 	// Every column referenced anywhere in the tree must exist in this
@@ -125,6 +136,16 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 		}
 	}
 
+	// One IN-list (or = ANY constant array) conjunct may act as an
+	// equality whose value varies per probe (inlist.go). probeOrd keeps
+	// its column out of the "pinned to a constant" set the order checks
+	// use: across probes the column takes several values, in order.
+	probe := chooseInProbe(desc, alias, where, probes, eq, lo, hi)
+	probeOrd := -1
+	if probe != nil {
+		probeOrd = probe.ord
+	}
+
 	// A full-PK equality is a point lookup.
 	if k := eqPrefix(desc.PKCols, eq); k == len(desc.PKCols) {
 		p.get = make([]any, k)
@@ -132,6 +153,7 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 			p.get[i] = eq[ord].Val
 			p.pushed = append(p.pushed, eq[ord])
 		}
+		p.attachProbe(probe)
 		return p, nil
 	}
 
@@ -149,7 +171,9 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 		}
 		pinned := map[int]bool{}
 		for i, k := 0, eqPrefix(cols, eq); i < k; i++ {
-			pinned[cols[i]] = true
+			if cols[i] != probeOrd {
+				pinned[cols[i]] = true
+			}
 		}
 		ok, _ := pathOrder(desc, idx, pinned, keys)
 		return ok
@@ -166,7 +190,7 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 		}
 	}
 	if bestScore == 0 {
-		return p, nil // full scan of the primary index
+		return p, nil // full scan of the primary index (a probe cannot score 0)
 	}
 	if bestIdx != nil {
 		p.index = bestIdx.Name
@@ -213,6 +237,7 @@ func planScanOrdered(desc *bytdb.TableDesc, alias string, where BoolExpr, keys [
 			}
 		}
 	}
+	p.attachProbe(probe)
 	return p, nil
 }
 
@@ -371,8 +396,8 @@ func pushKindOf(v any) pushKind {
 // order serves the sort, trading a full scan plus sort for a bounded
 // ordered index walk. The second result reports whether the sort can
 // be skipped.
-func chooseOrderedPlan(desc *bytdb.TableDesc, alias string, where BoolExpr, keys []sortKey, limited bool) (*plan, bool, error) {
-	p, err := planScanOrdered(desc, alias, where, keys)
+func chooseOrderedPlan(desc *bytdb.TableDesc, alias string, where BoolExpr, keys []sortKey, limited bool, probes []BoolExpr) (*plan, bool, error) {
+	p, err := planScanOrdered(desc, alias, where, keys, probes)
 	if err != nil {
 		return nil, false, err
 	}
@@ -429,7 +454,7 @@ func (p *plan) orderSatisfied(desc *bytdb.TableDesc, keys []sortKey) (ok, revers
 	}
 	pinned := map[int]bool{}
 	for _, st := range p.stops {
-		if st.kind == stopNE {
+		if st.kind == stopNE && (p.in == nil || st.ord != p.in.ord) {
 			pinned[st.ord] = true
 		}
 	}

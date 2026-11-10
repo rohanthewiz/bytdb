@@ -319,6 +319,21 @@ folded to the constant by the bind pass and pushes like a bare one. A cast
 on the *column* side (`day < '…'::timestamptz`, where Postgres compares the
 date as a timestamp) is an expression, not a key range, and filters instead.
 
+**IN lists run as key probes** (deep-look D-38). One conjunct of the form
+`col IN (constants)`, `col = ANY(ARRAY[…])` / `= ANY('{…}')` (including an
+array bound as one parameter), or `col = k1 OR col = k2 …` counts as an
+equality on its column when choosing the path. Its constants are converted
+to the column's key form, NULLs dropped (they match nothing), then sorted in
+the path column's direction and de-duplicated; execution runs the plan once
+per key, rebinding the bound each time, so `id IN (…)` on a primary key is a
+handful of point gets. Because the keys run in scan order, the probes visit
+rows in the order a single scan of the path would, and a path that serves
+`ORDER BY` still does — with the probed column treated as ordered, not
+pinned. `EXPLAIN` shows the probe as `Index Cond: (col = ANY (ARRAY[…]))`.
+Only one such conjunct drives probes; others, and `NOT IN`, stay filters,
+and a constant list in a filter is checked through a hash set built once per
+statement rather than walked per row.
+
 Join steps choose between index nested loop and hash join per step (decision
 diagram on the [Features](features.md#joins) page); `EXPLAIN` prints the
 Postgres-shaped plan tree (`Point Get`, `Index Scan [Backward]`, `Seq Scan`,

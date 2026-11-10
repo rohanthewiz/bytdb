@@ -70,7 +70,22 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 		conj := func() string {
 			age := func() int { return 16 + rng.Intn(17) }
 			pick := func(vals []string) string { return vals[rng.Intn(len(vals))] }
-			switch rng.Intn(15) {
+			// some renders 1-4 values drawn from vals (repeats allowed),
+			// quoted when q, for the IN-list shapes (D-38).
+			some := func(vals []string, q bool) string {
+				n := 1 + rng.Intn(4)
+				parts := make([]string, n)
+				for i := range parts {
+					parts[i] = pick(vals)
+					if q {
+						parts[i] = "'" + parts[i] + "'"
+					}
+				}
+				return strings.Join(parts, ", ")
+			}
+			ids := []string{"1", "5", "17", "40", "79", "80", "200"}
+			ages := []string{"18", "21", "25", "30", "null"}
+			switch rng.Intn(21) {
 			case 0:
 				return fmt.Sprintf("age = %d", age())
 			case 1:
@@ -99,6 +114,18 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 				return fmt.Sprintf("day = '%s'", pick(days))
 			case 13:
 				return fmt.Sprintf("day = '%s' and at <= '%s'", pick(days), pick(ats))
+			case 14:
+				return fmt.Sprintf("id in (%s)", some(ids, false))
+			case 15:
+				return fmt.Sprintf("age in (%s)", some(ages, false))
+			case 16:
+				return fmt.Sprintf("city in (%s)", some(cities, true))
+			case 17:
+				return fmt.Sprintf("uid = any(array[%s]::uuid[])", some(uids, true))
+			case 18:
+				return fmt.Sprintf("(day = '%s' or day = '%s')", pick(days), pick(days))
+			case 19:
+				return fmt.Sprintf("age = any('{%s}')", strings.ReplaceAll(some(ages, false), " ", ""))
 			default:
 				return fmt.Sprintf("id = %d", 1+rng.Intn(90))
 			}

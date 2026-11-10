@@ -323,6 +323,22 @@ func evalIn(env *exEnv, n *ExIn) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
+	// A constant list probes a per-statement hash set instead of being
+	// walked per row (deep-look D-38: N probes of an IN-list plan each
+	// re-check the conjunct, which a walk makes O(N²)).
+	if r, handled := inListSet(env, n, v); handled {
+		out := triFalse
+		switch r {
+		case true:
+			out = triTrue
+		case nil:
+			out = triUnknown
+		}
+		if n.Not {
+			out = out.not()
+		}
+		return triVal(out), nil
+	}
 	out := triFalse
 	for _, le := range n.List {
 		lv, err := evalEx(env, le)

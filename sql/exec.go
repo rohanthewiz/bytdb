@@ -32,6 +32,46 @@ const cancelEvery = 256
 // correlated-subquery and inner-join-loop storms, since those re-enter
 // here per outer row — and every cancelEvery rows within one scan.
 func scanPlan(ctx context.Context, tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb.Row) bool) error {
+	if p.in != nil {
+		return scanProbes(ctx, tx, table, p, env, yield)
+	}
+	return scanPlanOne(ctx, tx, table, p, env, yield)
+}
+
+// scanProbes runs an IN-list plan once per key (inlist.go): each probe
+// rebinds the synthetic equality and scans its region. Keys are in the
+// probed column's scan direction, so walking them forward — or backward
+// for a reverse plan — visits rows in the order one scan of the path
+// would.
+func scanProbes(ctx context.Context, tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb.Row) bool) error {
+	keys := p.in.keys
+	stopped := false
+	each := func(r bytdb.Row) bool {
+		if !yield(r) {
+			stopped = true
+			return false
+		}
+		return true
+	}
+	for i := range keys {
+		k := keys[i]
+		if p.reverse {
+			k = keys[len(keys)-1-i]
+		}
+		p.in.pred.Val = k
+		p.rebind()
+		if err := scanPlanOne(ctx, tx, table, p, env, each); err != nil {
+			return err
+		}
+		if stopped {
+			return nil
+		}
+	}
+	return nil
+}
+
+// scanPlanOne runs a plan's single access path.
+func scanPlanOne(ctx context.Context, tx *bytdb.Txn, table string, p *plan, env *exEnv, yield func(bytdb.Row) bool) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return serr.Wrap(err, "state", "statement canceled")
@@ -625,7 +665,7 @@ func orderedScan(fp *fromPlan, s *Select, keys []sortKey) (*plan, bool, error) {
 			return nil, false, nil
 		}
 	}
-	return chooseOrderedPlan(step.st.desc, step.st.name, combineStatic(step.static), keys, s.Limit >= 0)
+	return chooseOrderedPlan(step.st.desc, step.st.name, combineStatic(step.static), keys, s.Limit >= 0, step.probes)
 }
 
 // combineStatic folds a step's static conjuncts into one condition, as

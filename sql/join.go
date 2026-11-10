@@ -217,6 +217,13 @@ type joinStep struct {
 	st     scopeTable
 	static []BoolExpr
 	tmpls  []predTmpl
+	// probes are IN-list conjuncts on this table's columns (col IN
+	// (constants), col = ANY(array)). They are Conds, so they cannot join
+	// static — the step's scan filter runs without an evaluation
+	// environment — but the planner may turn one into key probes
+	// (inlist.go, deep-look D-38); the WHERE or ON that holds them still
+	// checks every row.
+	probes []BoolExpr
 	plan   *plan // precomputed access path (order-aware single-table scan); nil: plan per outer row
 
 	// tmplPreds/tmplPlan cache the nested-loop inner scan across outer
@@ -300,6 +307,21 @@ func prepareFrom(lk tableLookup, items []FromItem, where BoolExpr) (*fromPlan, e
 			avail = append(avail, whereConj...)
 		}
 		end := st.off + len(st.desc.Columns)
+		// IN-list conjuncts whose column is this table's. The column is
+		// resolved against the scope as far as this step, so an
+		// unqualified name that belongs to another table never probes
+		// this one.
+		addProbe := func(part BoolExpr) {
+			if col, ok := isInShape(part); ok {
+				if ord, err := sc.prefix(k + 1).resolve(col); err == nil && ord >= st.off && ord < end {
+					step.probes = append(step.probes, part)
+				}
+			}
+		}
+		eachPart(it.On, addProbe)
+		if it.Join != JoinLeft {
+			eachPart(where, addProbe)
+		}
 		for _, pr := range avail {
 			bd := fp.b[pr]
 			lIn := bd.l >= st.off && bd.l < end
@@ -549,7 +571,7 @@ func (step *joinStep) rowPlan(partial []any) (*plan, error) {
 		case len(exprs) > 1:
 			expr = &And{Exprs: exprs}
 		}
-		pl, err := planScan(step.st.desc, step.st.name, expr)
+		pl, err := planScan(step.st.desc, step.st.name, expr, step.probes...)
 		if err != nil {
 			return nil, err
 		}
@@ -609,7 +631,7 @@ func (j *joinRun) hashStep(k int, partial []any) {
 				add(rv)
 			}
 		} else {
-			pl, err := planScan(step.st.desc, step.st.name, combineStatic(step.static))
+			pl, err := planScan(step.st.desc, step.st.name, combineStatic(step.static), step.probes...)
 			if err != nil {
 				j.err = err
 				return

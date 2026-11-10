@@ -48,6 +48,9 @@ type subMemo struct {
 	// sets holds uncorrelated IN-subqueries' values as hash sets
 	// (subselect.go, D-28).
 	sets map[*Select]*subSet
+	// lists holds constant IN lists as hash sets (inlist.go, D-38); a
+	// nil entry records a list that is not constant.
+	lists map[*ExIn]*subSet
 }
 
 func newSubMemo() *subMemo {
