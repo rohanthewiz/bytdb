@@ -42,6 +42,25 @@ err := e.WriteTxnCtx(ctx, func(tx *bytdb.Txn) error { return tx.Insert("t", 2) }
 // errors.Is(err, context.DeadlineExceeded) when another block held the lock
 ```
 
+**Reads in a hot loop: use one `ReadTxn`.** Reads never block, but each
+one-shot `Engine.Get` opens and releases its own snapshot, and both steps take
+the store's internal mutex for a moment, so many goroutines doing one-shot
+reads contend there: about 1.1 µs per call serially and no faster per call
+across 8 goroutines. Inside a `ReadTxn`, `Txn.Get` costs about 0.6 µs and
+scales with cores (about 0.2 µs per call across 8 goroutines), because the
+snapshot is opened once. The trade is staleness: the whole loop reads one
+snapshot.
+
+```go
+err := e.ReadTxn(func(tx *bytdb.Txn) error {
+    for _, id := range ids {
+        row, ok, err := tx.Get("users", id)
+        // ...
+    }
+    return nil
+})
+```
+
 ## What conflicts, and who retries
 
 A conflict means: between your `Begin` and your `Commit`, another transaction
