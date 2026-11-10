@@ -956,6 +956,10 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 			return err
 		}
 		recheck := newParentKeyRecheck(s.Table, desc) // used by DO UPDATE only
+		// Child-side foreign keys are checked at end of statement (D-31):
+		// INSERT INTO node VALUES (1, 2), (2, NULL) must not depend on
+		// which row comes first.
+		childFKs := d.newChildFKQueue(desc)
 		var env *exEnv
 		if len(checks) > 0 {
 			env = d.tableEnv(tx, s.Table, desc)
@@ -1014,10 +1018,8 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					if !updated { // DO UPDATE ... WHERE filtered the pair out
 						continue
 					}
-					if len(desc.ForeignKeys) > 0 {
-						if err := d.fkVerifyRow(tx, desc, stored.Vals); err != nil {
-							return err
-						}
+					if err := childFKs.add(stored.Vals); err != nil {
+						return err
 					}
 					// Parent side: DO UPDATE may change a key other rows
 					// reference, exactly like UPDATE (deep-look D-10).
@@ -1069,14 +1071,12 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					return err
 				}
 			}
-			// Foreign keys check the row as stored, after the write: the
-			// transaction discards it on error, and checking post-insert is
-			// what lets a self-referencing row (a node that is its own
-			// parent) go in.
-			if len(desc.ForeignKeys) > 0 {
-				if err := d.fkVerifyRow(tx, desc, stored.Vals); err != nil {
-					return err
-				}
+			// Foreign keys check the row as stored, after the statement's
+			// last write (childFKs.verify): the transaction discards the
+			// rows on error, and checking late is what lets a
+			// self-referencing row (a node that is its own parent) go in.
+			if err := childFKs.add(stored.Vals); err != nil {
+				return err
 			}
 			affected++
 			// A NULL in an identity column meant a draw: record it for
@@ -1103,6 +1103,9 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 					return err
 				}
 			}
+		}
+		if err := childFKs.verify(d, tx); err != nil {
+			return err
 		}
 		return recheck.verify(d, tx)
 	})
@@ -1181,9 +1184,15 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		env := d.tableEnv(tx, s.Table, desc)
 		var rows [][]any
 		var capErr error
+		// The materialized rows are an in-memory row set like any other,
+		// so besides the write cap they are held to the row cap and the
+		// memory-ceiling poll (next-list N-029).
+		budget := d.budget()
 		err = scanPlan(d.ctx, tx, s.Table, pl, env, func(r bytdb.Row) bool {
 			rows = append(rows, r.Vals)
-			capErr = tx.CheckWrites(int64(len(rows)))
+			if capErr = tx.CheckWrites(int64(len(rows))); capErr == nil {
+				capErr = budget.check(len(rows))
+			}
 			return capErr == nil
 		})
 		if err != nil {
@@ -1197,7 +1206,22 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		// re-checked once the statement's writes are in (NO ACTION is an
 		// end-of-statement check, so intra-statement key shuffles work).
 		recheck := newParentKeyRecheck(s.Table, desc)
-		for _, rv := range rows {
+		// Child side, also at end of statement (D-31) — and only when SET
+		// touches a foreign-key column: the row's references cannot have
+		// changed otherwise (D-45's rider: no per-row parent probe for an
+		// UPDATE of unrelated columns).
+		var childFKs *childFKQueue
+		if setTouchesFK(desc, setOrds) {
+			childFKs = d.newChildFKQueue(desc)
+		}
+		// Pass 1 evaluates every row's SET expressions and CHECKs before
+		// anything is written, so every row sees the statement's starting
+		// state (deep-look D-29). Interleaved, a subquery in SET read the
+		// rows this statement had already updated: SET x = (SELECT
+		// max(x) ...) + 1 produced 31, 32, 33 where Postgres gives 31,
+		// 31, 31.
+		sets := make([]map[string]any, len(rows))
+		for i, rv := range rows {
 			// SET expressions evaluate against the pre-update row (SET age
 			// = age + 1 reads the old age; Postgres semantics), then coerce
 			// string results to the column type exactly like a quoted
@@ -1238,24 +1262,25 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 					return err
 				}
 			}
+			sets[i] = set
+		}
+		// Pass 2 writes.
+		for i, rv := range rows {
 			pk := make([]any, len(desc.PKCols))
-			for i, ord := range desc.PKCols {
-				pk[i] = rv[ord]
+			for j, ord := range desc.PKCols {
+				pk[j] = rv[ord]
 			}
 			// RETURNING reports the engine's post-update row rather than a
 			// SQL-layer reconstruction: the engine applies its own coercion
 			// (e.g. an int assigned to a float column stores as float), and
 			// only its output is guaranteed to match what a later read sees.
-			stored, ok, err := tx.UpdateReturning(s.Table, pk, set)
+			stored, ok, err := tx.UpdateReturning(s.Table, pk, sets[i])
 			if err != nil {
 				return err
 			}
 			if ok {
-				if len(desc.ForeignKeys) > 0 {
-					// Child side: the row's own references must still exist.
-					if err := d.fkVerifyRow(tx, desc, stored.Vals); err != nil {
-						return err
-					}
+				if err := childFKs.add(stored.Vals); err != nil {
+					return err
 				}
 				if err := recheck.note(tx, rv, stored.Vals); err != nil {
 					return err
@@ -1273,6 +1298,9 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 				}
 			}
 		}
+		if err := childFKs.verify(d, tx); err != nil {
+			return err
+		}
 		return recheck.verify(d, tx)
 	})
 	if err != nil {
@@ -1280,6 +1308,21 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 	}
 	res.RowsAffected = affected
 	return res, nil
+}
+
+// setTouchesFK reports whether an UPDATE's SET names a column of any
+// of the table's own foreign keys.
+func setTouchesFK(desc *bytdb.TableDesc, setOrds map[string]int) bool {
+	for _, fk := range desc.ForeignKeys {
+		for _, ord := range fk.Cols {
+			for _, so := range setOrds {
+				if so == ord {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (d *DB) execDelete(s *Delete) (*Result, error) {
@@ -1322,6 +1365,19 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		// RETURNING is computed for every row before the first delete, so
+		// a subquery in it sees the statement's starting state: DELETE ...
+		// RETURNING (SELECT count(*) FROM t) reported the count after
+		// earlier rows were already gone (deep-look D-29).
+		var outs [][]any
+		if ret != nil {
+			outs = make([][]any, len(pks))
+			for i := range pks {
+				if outs[i], err = ret.row(rows[i]); err != nil {
+					return err
+				}
+			}
+		}
 		for i, pk := range pks {
 			ok, err := tx.Delete(s.Table, pk...)
 			if err != nil {
@@ -1330,11 +1386,7 @@ func (d *DB) execDelete(s *Delete) (*Result, error) {
 			if ok {
 				affected++
 				if ret != nil {
-					out, err := ret.row(rows[i])
-					if err != nil {
-						return err
-					}
-					res.Rows = append(res.Rows, out)
+					res.Rows = append(res.Rows, outs[i])
 					if err := retBudget.check(len(res.Rows)); err != nil {
 						return err
 					}

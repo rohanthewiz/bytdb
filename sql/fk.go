@@ -57,15 +57,74 @@ func (d *DB) fkVerifyRow(tx *bytdb.Txn, desc *bytdb.TableDesc, vals []any) error
 	return nil
 }
 
+// childFKQueue defers a statement's child-side foreign-key checks to
+// the end of the statement (deep-look D-31). NO ACTION constraints are
+// checked at end of statement in Postgres, and sql/fk.go's contract
+// always said so, but each written row used to be checked as it was
+// written, so the outcome depended on row order:
+//
+//	INSERT INTO node VALUES (1, 2), (2, NULL)   -- row 1's parent arrives second
+//	UPDATE node SET id = id + 10, parent = parent + 10
+//
+// both failed, where Postgres accepts them. The queue holds each row
+// as stored and is checked after the last write; it is an in-memory row
+// set, so it is charged against the row cap like any other.
+type childFKQueue struct {
+	desc   *bytdb.TableDesc
+	rows   [][]any
+	budget rowBudget
+}
+
+func (d *DB) newChildFKQueue(desc *bytdb.TableDesc) *childFKQueue {
+	if len(desc.ForeignKeys) == 0 {
+		return nil
+	}
+	return &childFKQueue{desc: desc, budget: d.budget()}
+}
+
+// add queues one stored row; a nil queue (no foreign keys) ignores it.
+func (q *childFKQueue) add(vals []any) error {
+	if q == nil {
+		return nil
+	}
+	q.rows = append(q.rows, vals)
+	return q.budget.check(len(q.rows))
+}
+
+// verify runs the queued checks; call it after the statement's last
+// write.
+func (q *childFKQueue) verify(d *DB, tx *bytdb.Txn) error {
+	if q == nil {
+		return nil
+	}
+	for _, vals := range q.rows {
+		if err := d.fkVerifyRow(tx, q.desc, vals); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // fkVerifyReferenced checks, for one former parent-row image, that no
 // child row still references it — the DELETE/UPDATE-side of every
 // inbound constraint. refs comes from Txn.ReferencingFKs; oldVals is
 // the parent row as it was before the statement's write.
+//
+// Run at end of statement, it first asks whether the old key still
+// exists in the parent: a statement that moves keys around (UPDATE p
+// SET id = CASE WHEN id = 1 THEN 2 ELSE 1 END) leaves every key it
+// started with, so nothing can have been orphaned, though each row's
+// own key changed (deep-look D-31).
 func (d *DB) fkVerifyReferenced(tx *bytdb.Txn, desc *bytdb.TableDesc, refs []bytdb.FKRef, oldVals []any) error {
 	for _, r := range refs {
 		refVals, ok := fkRefTuple(desc, r.FK.RefCols, oldVals)
 		if !ok {
 			continue // a NULL key tuple can never be referenced
+		}
+		if still, err := d.fkRowExists(tx, desc.Name, r.FK.RefCols, refVals); err != nil {
+			return err
+		} else if still {
+			continue
 		}
 		childCols := fkChildCols(&r)
 		found, err := d.fkRowExists(tx, r.Child.Name, childCols, refVals)

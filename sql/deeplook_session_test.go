@@ -309,3 +309,58 @@ func TestInSubquerySet(t *testing.T) {
 		t.Errorf("text IN (integers): %s", msg)
 	}
 }
+
+// TestStatementSeesItsStartingState (D-29): UPDATE evaluates every SET
+// and CHECK before writing, and DELETE computes RETURNING before
+// deleting, so a subquery reads the statement's starting state.
+func TestStatementSeesItsStartingState(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table g (id int primary key, grp int, x int)`)
+	exec(t, d, `insert into g values (1, 1, 10), (2, 1, 20), (3, 1, 30)`)
+	res := exec(t, d, `update g set x = (select max(g2.x) from g g2 where g2.grp = g.grp) + 1 returning x`)
+	for _, r := range res.Rows {
+		if r[0] != int64(31) {
+			t.Fatalf("UPDATE saw its own writes: %v", res.Rows)
+		}
+	}
+	res = exec(t, d, `delete from g returning (select count(*) from g)`)
+	for _, r := range res.Rows {
+		if r[0] != int64(3) {
+			t.Fatalf("DELETE RETURNING saw its own deletes: %v", res.Rows)
+		}
+	}
+	// UPDATE's materialized rows are charged to the row cap (N-029).
+	exec(t, d, `insert into g values (1, 1, 1), (2, 1, 2), (3, 1, 3)`)
+	d.e.SetMaxResultRows(2)
+	if msg := execErr(t, d, `update g set x = 0`); !strings.Contains(msg, "result row limit") {
+		t.Fatalf("UPDATE over the row cap: %s", msg)
+	}
+	d.e.SetMaxResultRows(0)
+}
+
+// TestForeignKeysAtEndOfStatement (D-31): NO ACTION is checked after
+// the statement's last write, so row order and key shuffles within one
+// statement do not matter; a real violation still fails it.
+func TestForeignKeysAtEndOfStatement(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table node (id int primary key, parent int references node(id))`)
+	exec(t, d, `insert into node values (1, 2), (2, null)`)
+	exec(t, d, `update node set id = id + 10, parent = parent + 10`)
+	if res := exec(t, d, `select id, parent from node order by id`); !reflect.DeepEqual(res.Rows, [][]any{{int64(11), int64(12)}, {int64(12), nil}}) {
+		t.Fatalf("after the shuffle: %v", res.Rows)
+	}
+	if msg := execErr(t, d, `insert into node values (20, 99)`); !strings.Contains(msg, "violates foreign key constraint") {
+		t.Fatalf("a dangling reference: %s", msg)
+	}
+	exec(t, d, `create table p (id int primary key)`)
+	exec(t, d, `create table c (id int primary key, pid int references p(id))`)
+	exec(t, d, `insert into p values (1), (3)`)
+	exec(t, d, `insert into c values (1, 1)`)
+	// 1 moves to 2, then 3 moves to 1: key 1 exists again by the end of
+	// the statement, so nothing was orphaned. (A direct swap 1 <-> 2
+	// fails on the primary key mid-statement, in Postgres too.)
+	exec(t, d, `update p set id = case id when 1 then 2 when 3 then 1 end`)
+	if msg := execErr(t, d, `update p set id = id + 10`); !strings.Contains(msg, "violates foreign key constraint") {
+		t.Fatalf("orphaning update: %s", msg)
+	}
+}

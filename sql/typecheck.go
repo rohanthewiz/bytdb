@@ -439,13 +439,13 @@ func (t *typer) items(in []SelectItem, ts *tscope) ([]SelectItem, []bytdb.ColTyp
 				out[i].Ex = ex
 			}
 			types = append(types, outputType(typ))
+		case it.Agg != AggNone: // before Star: count(*) is an aggregate with Star set
+			types = append(types, t.aggType(it.Agg, it.Star, ts.colType(it.Col), it.Col))
 		case it.Star:
 			// t.* expands at projection; its columns are not one type.
 			types = append(types, "")
 		case it.IsLit:
 			types = append(types, outputType(litStaticType(it.Lit, "")))
-		case it.Agg != AggNone:
-			types = append(types, t.aggType(it.Agg, it.Star, ts.colType(it.Col), it.Col))
 		default:
 			types = append(types, ts.colType(it.Col))
 		}
