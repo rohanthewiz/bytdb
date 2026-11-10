@@ -51,3 +51,32 @@ func TestParseErrorFailsBlock(t *testing.T) {
 		t.Fatalf("%d rows committed from failed blocks", n)
 	}
 }
+
+// TestCommentOnlyQueries (D-08): pgx's liveness check sends "-- ping",
+// which bytdb parsed as a syntax error, so every database/sql Ping
+// failed with "driver: bad connection" and pools threw away healthy
+// connections. A query of only comments is an empty statement in both
+// protocols, and a trailing comment after the last statement is
+// ignored rather than failing the batch after it ran.
+func TestCommentOnlyQueries(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	if err := c.Ping(ctx); err != nil {
+		t.Fatalf("pgx Ping: %v", err)
+	}
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeExec, pgx.QueryExecModeDescribeExec} {
+		for _, q := range []string{"-- ping", "/* nothing /* nested */ here */", "  ;  -- x"} {
+			if _, err := c.Exec(ctx, q, mode); err != nil {
+				t.Fatalf("mode %v: Exec(%q): %v", mode, q, err)
+			}
+		}
+	}
+	mustExec(t, c, `create table t (id int primary key)`)
+	if _, err := c.Exec(ctx, "insert into t values (1); -- trailing", pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatalf("statement with a trailing comment: %v", err)
+	}
+	var n int64
+	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("count = %d, err = %v", n, err)
+	}
+}

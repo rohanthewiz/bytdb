@@ -13,6 +13,15 @@ func TestSplitStatements(t *testing.T) {
 		{"select 1", []stmtPart{{"select 1", 0}}},
 		{"select 1;", []stmtPart{{"select 1", 0}}},
 		{"  ; ;\n;", nil},
+		// Comments alone are an empty statement (deep-look D-08): pgx's
+		// ping, a trailing comment after the last ';', and a nested block
+		// comment. A "--" inside a string is not a comment.
+		{"-- ping", nil},
+		{"/* a /* nested ; */ b */  -- c\n ;", nil},
+		{"select 1; -- trailing", []stmtPart{{"select 1", 0}}},
+		{"select 1; /* trailing */ ;", []stmtPart{{"select 1", 0}}},
+		{"select '--x'", []stmtPart{{"select '--x'", 0}}},
+		{"-- lead\nselect 2", []stmtPart{{"-- lead\nselect 2", 0}}},
 		{"create table t (a int); insert into t values (1)", []stmtPart{
 			{"create table t (a int)", 0},
 			{"insert into t values (1)", 24},

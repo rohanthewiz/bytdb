@@ -578,7 +578,9 @@ func (c *conn) parse(r *rbuf) {
 		}
 	}
 	p := &prepared{query: query, paramOIDs: oids}
-	if q := strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"); q != "" {
+	// A query of only comments is an empty statement (Execute answers
+	// EmptyQueryResponse), not a syntax error — see splitStatements.
+	if q := strings.TrimRight(strings.TrimSpace(query), "; \t\r\n"); q != "" && !isEmptyQuery(q) {
 		st, err := c.srv.db.Prepare(q)
 		if err != nil {
 			c.sendError(err, query, 0)

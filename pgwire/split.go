@@ -33,15 +33,26 @@ type stmtPart struct {
 // statements. The regions listed in the file header are opaque, so a
 // ';' inside one never splits. An unterminated region runs to the end
 // of the buffer; the parser then reports it properly.
+//
+// A statement made only of comments and whitespace is empty, as in
+// Postgres. pgx's liveness check sends exactly that ("-- ping"), and
+// handing it to the parser made every database/sql Ping fail with
+// "driver: bad connection", so pools discarded healthy connections; a
+// trailing comment after the last ';' failed the same way after the
+// statements before it had run (deep-look D-08). The test lives here,
+// in the lexer-aware scan, because only the scan knows where comments
+// are: nested block comments and "--" inside strings defeat a regexp.
 func splitStatements(q string) []stmtPart {
 	var parts []stmtPart
 	start := 0
+	content := false // the current statement has a byte outside comments and whitespace
 	emit := func(end int) {
 		text := q[start:end]
-		if lead := len(text) - len(strings.TrimLeft(text, " \t\r\n")); strings.TrimSpace(text) != "" {
+		if lead := len(text) - len(strings.TrimLeft(text, " \t\r\n")); content {
 			parts = append(parts, stmtPart{text: strings.TrimSpace(text), off: start + lead})
 		}
 		start = end + 1
+		content = false
 	}
 	depth := 0 // block comment nesting
 	for i := 0; i < len(q); i++ {
@@ -64,14 +75,22 @@ func splitStatements(q string) []stmtPart {
 				i++
 			}
 		case c == '\'' || c == '"':
+			content = true
 			i = skipQuoted(q, i)
 		case c == ';':
 			emit(i)
+		case c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '\f' && c != '\v':
+			content = true
 		}
 	}
 	emit(len(q))
 	return parts
 }
+
+// isEmptyQuery reports whether q holds no statement at all: nothing but
+// whitespace, comments and semicolons. Postgres answers such a query
+// with EmptyQueryResponse in either protocol.
+func isEmptyQuery(q string) bool { return len(splitStatements(q)) == 0 }
 
 // skipQuoted returns the index of the quote that closes the region
 // opened at q[open], or len(q) when the region is unterminated, so the
