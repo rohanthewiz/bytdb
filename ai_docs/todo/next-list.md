@@ -42,19 +42,20 @@ to be implemented as written, so its six decisions (Q1–Q6) are taken at the
 plan's recommendations.
 
 - **N-042** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
-  **Performance (plan Phase 7, D-37 to D-50).** UUID, timestamp and date
-  keys never push down (`sql/plan.go:302-320`; do after N-037); `IN`-lists
-  on a key are full scans; `decodeRow` decodes every column of every row and
-  is 77% of an aggregate scan (`dml.go:809-838`); a prepared point read
-  re-derives everything and opens four snapshots; wire rows cost 11–16
-  allocations each; startup replay is 0.9 s per million rows. Correct
-  `docs/benchmarks.md`, which blames interpreted execution for the scan gap.
-  Memory per row (D-49) and streamed results (D-50) are recorded in the plan
-  but not scheduled. Done already: D-40 steps 1 and 2 (`Engine.HasViews`,
-  `Engine.CatalogVersion`), D-28 (hash set for `IN (subquery)`, 957 ms ->
-  72 ms) and the baseline benchmarks (`BenchmarkDL*` in root, `sql/` and
-  `pgwire/`, D-04). The typed bind pass costs ~4%% on a prepared point read
-  until D-40 step 3 caches typed statements per catalog version.
+  **Performance (plan Phase 7, D-37 to D-50).** *Updated `2026-1110-0512-deep-look-phase7-part1`:* done
+  D-37 (uuid/timestamp/date keys push down; cast literals fold), D-38
+  (IN-lists, `= ANY`, OR-of-equalities run as key probes), D-39 (rows
+  decode in place, SELECTs decode only named columns; `docs/benchmarks.md`
+  corrected), D-40 steps 1, 2 and 4 (descriptor memo per catalog version,
+  parse cache), D-41 (wire rows in one reused buffer, 64 KiB writer), D-42
+  (`bytdbd -socket`). D-40 step 3 (cache the typed tree on `Stmt`) is not
+  done: typing runs after binding because it converts parameter values, so
+  a cached typed tree needs that conversion re-derived per value — worth it
+  only with a design for it. Left: D-43 (top-N heap), D-44 (per-row
+  overheads), D-45 (write-path allocations), D-46 (shared read snapshot),
+  D-47 (catalog vtables), D-48 (btypedb replay), the D-49 sizing note, and
+  D-50's mitigation (Q6: `bytdbd` default result cap 1M).
+
 - **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
   **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
   tables that clients and migration tools send (advisory locks, `DISCARD
