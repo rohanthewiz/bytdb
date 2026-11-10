@@ -93,6 +93,9 @@ const maxViewDepth = 32
 // references materialized into vtabs. The common statement touches no
 // views and pays one map probe per referenced name.
 func (d *DB) withViews(st Statement) (*DB, error) {
+	if !d.e.HasViews() {
+		return d, nil // no view exists: nothing to materialize (D-40 step 1)
+	}
 	names := map[string]bool{}
 	collectStmtTables(st, names)
 	var dw *DB
@@ -267,6 +270,9 @@ func collectExprTables(e Expr, out map[string]bool) {
 // cheap pre-check that decides whether execution needs the wrapping
 // snapshot and materialization pass.
 func (d *DB) usesViews(st Statement) bool {
+	if !d.e.HasViews() {
+		return false
+	}
 	names := map[string]bool{}
 	collectStmtTables(st, names)
 	for name := range names {
@@ -311,6 +317,9 @@ func (d *DB) staticWith(s *Select) (*DB, error) {
 // shape comes from describing its stored query, and it registers with
 // no rows. Depth-limited like the real expansion.
 func (d *DB) staticViews(st Statement) (*DB, error) {
+	if !d.e.HasViews() {
+		return d, nil
+	}
 	names := map[string]bool{}
 	collectStmtTables(st, names)
 	dw := d

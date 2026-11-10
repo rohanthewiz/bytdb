@@ -364,3 +364,47 @@ func TestForeignKeysAtEndOfStatement(t *testing.T) {
 		t.Fatalf("orphaning update: %s", msg)
 	}
 }
+
+// TestOneSnapshotPerStatement (D-30): a UNION's arms ran in separate
+// read transactions, so under a concurrent writer two counts of the same
+// table could disagree. The statement now reads one snapshot.
+func TestOneSnapshotPerStatement(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table t (id int primary key)`)
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			default:
+			}
+			if _, err := d.Exec(`insert into t values ($1)`, int64(i)); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	for range 500 {
+		res := exec(t, d, `select count(*) from t union all select count(*) from t`)
+		if len(res.Rows) != 2 || res.Rows[0][0] != res.Rows[1][0] {
+			t.Fatalf("one statement saw two snapshots: %v", res.Rows)
+		}
+	}
+	// A view read by an UPDATE is materialized in the UPDATE's own
+	// transaction (and still works).
+	exec(t, d, `create view low as select id from t where id < 3`)
+	exec(t, d, `create table marks (id int primary key, v int)`)
+	exec(t, d, `insert into marks values (1, 0), (2, 0), (5, 0)`)
+	if res := exec(t, d, `update marks set v = 1 where id in (select id from low)`); res.RowsAffected != 2 {
+		t.Fatalf("UPDATE through a view: %d rows", res.RowsAffected)
+	}
+}

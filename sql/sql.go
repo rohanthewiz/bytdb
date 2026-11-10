@@ -760,6 +760,34 @@ func (d *DB) run(st Statement, args []any) (*Result, error) {
 	return res, err
 }
 
+// withViewsInTxn runs a data-modifying statement with the views it
+// references materialized inside the statement's own write transaction.
+// They used to be materialized first, on a snapshot of their own, so an
+// UPDATE could read a view as of one moment and write as of another
+// (deep-look D-30). With no view involved (the common case), or inside
+// a session block (already one transaction), it is a plain call.
+func (d *DB) withViewsInTxn(st Statement, run func(*DB) (*Result, error)) (*Result, error) {
+	if d.tx != nil || !d.usesViews(st) {
+		dv, err := d.withViews(st)
+		if err != nil {
+			return nil, err
+		}
+		return run(dv)
+	}
+	var res *Result
+	err := d.write(func(tx *bytdb.Txn) error {
+		dw := *d
+		dw.tx = tx
+		dv, err := dw.withViews(st)
+		if err != nil {
+			return err
+		}
+		res, err = run(dv)
+		return err
+	})
+	return res, err
+}
+
 // dispatch is one execution attempt of run: bind, coerce, execute.
 func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 	st, err := bindParams(st, args)
@@ -1013,11 +1041,7 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 	case *AlterSequence:
 		return d.execAlterSequence(s)
 	case *Insert:
-		dv, err := d.withViews(s)
-		if err != nil {
-			return nil, err
-		}
-		return dv.execInsert(s)
+		return d.withViewsInTxn(s, func(dv *DB) (*Result, error) { return dv.execInsert(s) })
 	case *Select:
 		// runIt materializes referenced views, then the statement's
 		// CTEs, then runs the body.
@@ -1035,7 +1059,11 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// the write, as they should). CTEs and views get a wrapping
 		// read transaction for the same reason — their materializations
 		// and the body must share one snapshot.
-		if d.tx == nil && (selectWritesSequences(s) || len(s.With) > 0 || d.usesViews(s)) {
+		// A UNION joins them for the same reason: each arm runs its own
+		// read otherwise, so SELECT count(*) FROM t UNION ALL SELECT
+		// count(*) FROM t could report two different counts under a
+		// concurrent writer (deep-look D-30).
+		if d.tx == nil && (selectWritesSequences(s) || len(s.With) > 0 || len(s.Union) > 0 || d.usesViews(s)) {
 			var res *Result
 			txnRun := d.e.ReadTxn
 			if selectWritesSequences(s) {
@@ -1058,19 +1086,11 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		}
 		return runIt(d)
 	case *Update:
-		dv, err := d.withViews(s)
-		if err != nil {
-			return nil, err
-		}
-		return dv.execUpdate(s)
+		return d.withViewsInTxn(s, func(dv *DB) (*Result, error) { return dv.execUpdate(s) })
 	case *Delete:
 		df := *d
 		df.freeing = true
-		dv, err := df.withViews(s)
-		if err != nil {
-			return nil, err
-		}
-		return dv.execDelete(s)
+		return df.withViewsInTxn(s, func(dv *DB) (*Result, error) { return dv.execDelete(s) })
 	case *Explain:
 		// EXPLAIN must not execute, so CTEs and views register as
 		// empty-row virtual tables with statically derived shapes.
