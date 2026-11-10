@@ -31,41 +31,16 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-049
+**Next ID:** N-050
 
 ## Open
 
-N-043 to N-047 come from one audit and share one plan,
-`ai_docs/todo/2026-1109-deep-look-remediation-plan.md`. Each is a phase of
-it; the `D-xx` numbers are that plan's item IDs. The user asked for the plan
-to be implemented as written, so its six decisions (Q1–Q6) are taken at the
-plan's recommendations.
-
-- **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
-  **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
-  tables that clients and migration tools send (advisory locks, `DISCARD
-  ALL`, `current_user`, `pg_tables`); everyday SQL that fails to parse
-  (`CAST`, `INSERT ... SELECT`, `FOR UPDATE`, `NULLS FIRST/LAST`); scalar
-  functions and aggregates; migration DDL; sentinel errors and readable
-  messages in the Go API; multi-statement `Exec` in the stdlib driver;
-  replication flags and a Unix socket for `bytdbd`. Which tool needs which
-  statement is from memory: capture each tool's real statements before
-  prioritizing by it. *Updated `2026-1110-0700-deep-look-phase8-d52-d53-d51`:*
-  D-52, D-53, D-54, D-55 and D-51 part 1 (session surface) are done. Left:
-  D-51 part 2 (catalog tables and rows: `pg_tables`, `pg_indexes`,
-  `pg_views`, `pg_settings`, `information_schema.schemata`/`views`/
-  `referential_constraints`/`constraint_column_usage`, `relnatts`,
-  `relhasindex`, varchar typmod, `regclass` rendering) and part 3
-  (`NegotiateProtocolVersion`, verbatim ORM statements in
-  `pgwire/orm_test.go`); D-56, D-57, D-58 rest; Phase 9 doc corrections;
-  delete `ai_docs/todo/deep-look-repros/` once ported. *Updated
-  `2026-1110-0737-deep-look-phase8-d51-d56`:* D-51 (all three parts) and
-  D-56 are done. Left: D-57 (stdlib converters, DSN options, symlinks,
-  `encryption_key_file`), D-58 rest (bytdbd replication flags, health
-  endpoint, replication metrics, SIGHUP), Phase 9, the repro cleanup.
-  The verbatim-statement tests cover goose, lib/pq and pgx only: GORM v2,
-  golang-migrate and atlas were not in the module cache, so their
-  statements still need capturing from source.
+N-044 to N-047 and N-049 come from one audit and share one plan,
+`ai_docs/todo/2026-1109-deep-look-remediation-plan.md`; the `D-xx` numbers
+are that plan's item IDs. The user asked for the plan to be implemented as
+written, so its six decisions (Q1–Q6) are taken at the plan's
+recommendations. Every phase of it (0–9) is now on main; what remains is the
+release (N-044) and the pieces deliberately deferred (N-045 to N-047, N-049).
 
 - **N-044** · raised `2026-1109-2243-deep-look-phase0-phase1` · value medium
   **Cut "release A" of the deep-look plan (Phase 0 + Phase 1).** Every
@@ -133,6 +108,16 @@ plan's recommendations.
   Needs the user's call: lossy alias, refuse with a hint (today, minus the
   hint), or a decimal type. `interval`, `money`, `bit` and `citext` are
   refused the same way and are lower value.
+
+- **N-049** · raised `2026-1110-0757-deep-look-phase8-close` · value low
+  **Capture GORM v2, golang-migrate and atlas statements verbatim.**
+  `pgwire/orm_verbatim_test.go` holds goose, lib/pq and pgx statements copied
+  from their sources; the other three tools were not in the module cache, and
+  the plan asked for captured statements, not remembered ones. With network
+  access, read each tool's Postgres driver/dialect source (golang-migrate's
+  `database/postgres`, GORM's `gorm.io/driver/postgres` migrator, atlas's
+  inspect queries), copy the connect- and migration-time SQL into the same
+  test file, and fix whatever fails.
 
 ## Validate
 
@@ -235,6 +220,40 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   imports it.
 
 ## Closed
+
+- **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-10, `2026-1110-0757-deep-look-phase8-close`.   **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
+  tables that clients and migration tools send (advisory locks, `DISCARD
+  ALL`, `current_user`, `pg_tables`); everyday SQL that fails to parse
+  (`CAST`, `INSERT ... SELECT`, `FOR UPDATE`, `NULLS FIRST/LAST`); scalar
+  functions and aggregates; migration DDL; sentinel errors and readable
+  messages in the Go API; multi-statement `Exec` in the stdlib driver;
+  replication flags and a Unix socket for `bytdbd`. Which tool needs which
+  statement is from memory: capture each tool's real statements before
+  prioritizing by it. *Updated `2026-1110-0700-deep-look-phase8-d52-d53-d51`:*
+  D-52, D-53, D-54, D-55 and D-51 part 1 (session surface) are done. Left:
+  D-51 part 2 (catalog tables and rows: `pg_tables`, `pg_indexes`,
+  `pg_views`, `pg_settings`, `information_schema.schemata`/`views`/
+  `referential_constraints`/`constraint_column_usage`, `relnatts`,
+  `relhasindex`, varchar typmod, `regclass` rendering) and part 3
+  (`NegotiateProtocolVersion`, verbatim ORM statements in
+  `pgwire/orm_test.go`); D-56, D-57, D-58 rest; Phase 9 doc corrections;
+  delete `ai_docs/todo/deep-look-repros/` once ported. *Updated
+  `2026-1110-0737-deep-look-phase8-d51-d56`:* D-51 (all three parts) and
+  D-56 are done. Left: D-57 (stdlib converters, DSN options, symlinks,
+  `encryption_key_file`), D-58 rest (bytdbd replication flags, health
+  endpoint, replication metrics, SIGHUP), Phase 9, the repro cleanup.
+  The verbatim-statement tests cover goose, lib/pq and pgx only: GORM v2,
+  golang-migrate and atlas were not in the module cache, so their
+  statements still need capturing from source. *Closed:* all of
+  D-51 (session surface, catalog tables and rows, NegotiateProtocolVersion,
+  verbatim goose/lib/pq/pgx statements), D-52, D-53, D-54, D-55, D-56
+  (sentinels, Postgres-worded messages, value shapes, Row getters, Lookup*,
+  one-shots, ExecScript), D-57 (driver shapes, DSN settings, `:memory:`, key
+  file, symlinks) and D-58 (daemon replication/restore, `/healthz`,
+  replication metrics, SIGHUP reload) are on main, as is Phase 9's doc table.
+  The repro directory was deleted after a run against main (recoverable from
+  `2388d34`). The uncaptured tools moved to N-049.
 
 - **N-042** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
   2026-11-10, `2026-1110-0555-deep-look-phase7-part2-phase8-start`. **Performance (plan Phase 7, D-37 to D-50).** Done:

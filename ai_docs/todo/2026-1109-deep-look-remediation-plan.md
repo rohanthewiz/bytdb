@@ -42,9 +42,11 @@ every later phase lands against a safety net.
 - "Postgres gives" is stated from knowledge. Nobody ran Postgres during the
   audit; D-02 is what makes those claims checkable.
 - Every item carries its minimal repro inline. The audit's full runnable
-  repro modules are in `ai_docs/todo/deep-look-repros/` (see its README for
-  how to run them and which directory covers which items); delete that
-  directory once D-01 has ported them.
+  repro modules were in `ai_docs/todo/deep-look-repros/` (its README said
+  how to run them and which directory covers which items). They were
+  deleted on 2026-11-10 after a run against main showed every repro passing,
+  refused by its fix, or measurement-only; recover them with
+  `git checkout 2388d34 -- ai_docs/todo/deep-look-repros`.
 
 ## Decisions needed before starting
 
