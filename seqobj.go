@@ -91,8 +91,84 @@ func checkSeqDesc(d *SeqDesc) error {
 	if d.Cache < 1 {
 		return serr.New("CACHE (" + fmtInt(d.Cache) + ") must be greater than zero")
 	}
+	if d.Cache > MaxSeqCache {
+		return serr.New("CACHE (" + fmtInt(d.Cache) + ") must be at most " + fmtInt(MaxSeqCache))
+	}
 	return nil
 }
+
+// MaxSeqCache caps a sequence's CACHE. Postgres has no such cap, but
+// nothing gains from a larger one: a cached batch is burned on every
+// restart, and under concurrent writes the batch end is computed per
+// reservation (advanceSeq). A cycling sequence with a tiny range still
+// walks its batch one cycle at a time, so the cap is also what bounds
+// that walk. A million draws per durable write already makes the
+// watermark write vanish from any profile.
+const MaxSeqCache = 1_000_000
+
+// advanceSeq moves d forward by up to n draws, exactly as n calls to
+// stepSeq would, and reports how many draws it made. It stops early
+// only at a non-cycling bound, returning stepSeq's "reached maximum"
+// error alongside the count of draws that did exist.
+//
+// Runs between bounds are taken in one arithmetic jump, so the cost is
+// O(1) per run rather than O(n) per batch: stepping one draw at a time
+// made a CACHE of 2^50 spin for days while holding the sequence's
+// allocator mutex (deep-look D-13). A cycling sequence makes one jump
+// per cycle plus one wrapping stepSeq call.
+//
+//	Increment > 0:  Last ──jump── Max | wrap→Min (CYCLE) or stop
+//	                 avail = (Max - Last) / Increment draws fit before Max
+func advanceSeq(d *SeqDesc, name string, n int64) (int64, error) {
+	var k int64
+	for k < n {
+		if !d.Called {
+			// The first draw returns Last itself (START), no step.
+			d.Called = true
+			k++
+			continue
+		}
+		if avail := seqStepsToBound(d); avail > 0 {
+			take := min(uint64(n-k), avail)
+			// take*|Increment| <= the distance to the bound, so the true
+			// result is in int64 range; uint64 arithmetic computes it
+			// without tripping on intermediate sign changes.
+			if d.Increment > 0 {
+				d.Last = int64(uint64(d.Last) + take*uint64(d.Increment))
+			} else {
+				d.Last = int64(uint64(d.Last) - take*absInc(d.Increment))
+			}
+			k += int64(take)
+			continue
+		}
+		// At the bound: one real step either wraps (CYCLE) or errors.
+		if _, err := stepSeq(d, name); err != nil {
+			return k, err
+		}
+		k++
+	}
+	return k, nil
+}
+
+// seqStepsToBound is how many further stepSeq calls stay strictly
+// inside the bound in the increment's direction (0 at or past it).
+// The distance is taken in uint64: Max - Last can exceed MaxInt64 when
+// Last is negative.
+func seqStepsToBound(d *SeqDesc) uint64 {
+	if d.Increment > 0 {
+		if d.Last >= d.Max {
+			return 0
+		}
+		return (uint64(d.Max) - uint64(d.Last)) / uint64(d.Increment)
+	}
+	if d.Last <= d.Min {
+		return 0
+	}
+	return (uint64(d.Last) - uint64(d.Min)) / absInc(d.Increment)
+}
+
+// absInc is |inc| for a negative increment, safe for math.MinInt64.
+func absInc(inc int64) uint64 { return uint64(-(inc + 1)) + 1 }
 
 // CreateSequence registers a sequence object. The descriptor's option
 // fields must be fully resolved (defaults applied by the caller); ID,

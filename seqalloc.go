@@ -451,20 +451,17 @@ func (a *seqObjAlloc) reserveLocked(e *Engine, name string) error {
 			return err
 		}
 		pos = *stored
-		batch := max(stored.Cache, 1)
-		// Step a scratch copy forward to find where the batch ends. A
-		// non-cycling sequence may hit its bound early: reserve the
-		// draws that do exist, and only error when not even one does.
+		// Clamped at run time as well as at CREATE/ALTER: a descriptor
+		// stored before the cap existed may still carry a huge CACHE.
+		batch := min(max(stored.Cache, 1), MaxSeqCache)
+		// Advance a scratch copy to where the batch ends. A non-cycling
+		// sequence may hit its bound early: reserve the draws that do
+		// exist, and only error when not even one does.
 		work := *stored
-		k = 0
-		for k < batch {
-			if _, err := stepSeq(&work, name); err != nil {
-				if k == 0 {
-					return err
-				}
-				break
-			}
-			k++
+		var aerr error
+		k, aerr = advanceSeq(&work, name, batch)
+		if k == 0 {
+			return aerr
 		}
 		return writeSeqDescIn(tx, &work)
 	})

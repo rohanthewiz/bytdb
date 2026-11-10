@@ -286,8 +286,10 @@ DROP SEQUENCE IF EXISTS order_ids;
 - Options: `AS smallint|integer|bigint` (bounds the declarable range),
   `INCREMENT [BY]` (negative descends), `MINVALUE`/`MAXVALUE`/`NO
   MINVALUE`/`NO MAXVALUE`, `START [WITH]`, `CYCLE`/`NO CYCLE`, `CACHE n`
-  (stored and reported; allocation behaves as `CACHE 1` — under the default
-  single writer, batching would only manufacture gaps), `IF [NOT]
+  (at most 1,000,000; under the default single writer it is stored and
+  reported but allocation behaves as `CACHE 1`, since batching would only
+  manufacture gaps; under `WithConcurrentWrites` it is the batch each
+  durable reservation covers), `IF [NOT]
   EXISTS` with Postgres' skip notices. Exhaustion, bounds, and option
   validation carry Postgres' wording (`nextval: reached maximum value of
   sequence "s" (20)`).
