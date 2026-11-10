@@ -3,7 +3,6 @@ package sql
 import (
 	"context"
 	"math"
-	"reflect"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -232,14 +231,15 @@ type joinStep struct {
 	// "Fixed per source column" holds for stored columns but not for a
 	// virtual-table source (a CTE or derived table whose column is an
 	// untyped expression), whose values can change Go type from row to
-	// row. tmplTypes records the type each bound value had when the plan
-	// was built; a row bringing a different one drops the cached plan
-	// and plans afresh, as corrsub's bind does — rebinding a bound the
-	// plan encoded for another type failed with "value does not fit
-	// column type" (deep-look D-21).
+	// row. tmplTypes records the kind each bound value had when the plan
+	// was built (pushKind: Go type, and uuid-sized or not); a row
+	// bringing a different one drops the cached plan and plans afresh,
+	// as corrsub's bind does — rebinding a bound the plan encoded for
+	// another type failed with "value does not fit column type"
+	// (deep-look D-21).
 	tmplPreds []*Pred
 	tmplPlan  *plan
-	tmplTypes []reflect.Type
+	tmplTypes []pushKind
 
 	// hashEq, when non-empty, switches this step from the nested loop
 	// to a hash join: the inner table (filtered by the static
@@ -525,7 +525,7 @@ func (j *joinRun) rec(k int, partial []any) {
 func (step *joinStep) rowPlan(partial []any) (*plan, error) {
 	if step.tmplPlan != nil {
 		for i, tp := range step.tmpls {
-			if reflect.TypeOf(partial[tp.srcOrd]) != step.tmplTypes[i] {
+			if pushKindOf(partial[tp.srcOrd]) != step.tmplTypes[i] {
 				step.tmplPlan, step.tmplPreds = nil, nil
 				break
 			}
@@ -535,11 +535,11 @@ func (step *joinStep) rowPlan(partial []any) (*plan, error) {
 		exprs := make([]BoolExpr, 0, len(step.static)+len(step.tmpls))
 		exprs = append(exprs, step.static...)
 		step.tmplPreds = make([]*Pred, len(step.tmpls))
-		step.tmplTypes = make([]reflect.Type, len(step.tmpls))
+		step.tmplTypes = make([]pushKind, len(step.tmpls))
 		for i, tp := range step.tmpls {
 			pr := &Pred{Item: tp.item, Op: tp.op, Val: partial[tp.srcOrd]}
 			step.tmplPreds[i] = pr
-			step.tmplTypes[i] = reflect.TypeOf(pr.Val)
+			step.tmplTypes[i] = pushKindOf(pr.Val)
 			exprs = append(exprs, pr)
 		}
 		var expr BoolExpr

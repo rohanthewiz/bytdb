@@ -311,6 +311,14 @@ Ties between equally-selective paths break toward the one whose order also
 serves `ORDER BY`. The whole WHERE is re-checked row by row regardless, so
 pushdown is purely an optimization — correctness never depends on it.
 
+A conjunct pushes when it compares a key column with a constant of the
+column's own type: integer, float, text, boolean, timestamp, date and uuid
+keys all qualify (the last three since deep-look D-37; they used to be full
+scans). A typed literal — `id = '…'::uuid`, `day >= '2024-01-01'::date` — is
+folded to the constant by the bind pass and pushes like a bare one. A cast
+on the *column* side (`day < '…'::timestamptz`, where Postgres compares the
+date as a timestamp) is an expression, not a key range, and filters instead.
+
 Join steps choose between index nested loop and hash join per step (decision
 diagram on the [Features](features.md#joins) page); `EXPLAIN` prints the
 Postgres-shaped plan tree (`Point Get`, `Index Scan [Backward]`, `Seq Scan`,

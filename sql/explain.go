@@ -83,6 +83,11 @@ type explainer struct {
 	d    *DB
 	tx   *bytdb.Txn
 	tmpl map[*Pred]string
+	// predType is the column type of each scan predicate's left column,
+	// filled by scanNode, so a literal stored in its runtime form (a
+	// timestamp's microsecond count, a uuid's 16 bytes) renders as the
+	// typed literal Postgres prints instead.
+	predType map[*Pred]bytdb.ColType
 	// Set for a single-table SELECT whose scan yields ORDER BY order:
 	// scanNode renders step0Plan instead of re-planning, and selectNode
 	// drops the Sort node. Reset per SELECT core.
@@ -387,6 +392,18 @@ func (x *explainer) scanNode(desc *bytdb.TableDesc, alias, display string, where
 	for _, pr := range pl.pushed {
 		pushed[pr] = true
 	}
+	walkPreds(where, func(pr *Pred) error {
+		if pr.Item.Col.Table != "" && pr.Item.Col.Table != alias {
+			return nil
+		}
+		if ord := desc.ColIndex(pr.Item.Col.Name); ord >= 0 {
+			if x.predType == nil {
+				x.predType = map[*Pred]bytdb.ColType{}
+			}
+			x.predType[pr] = desc.Columns[ord].Type
+		}
+		return nil
+	})
 	n := &planNode{}
 	cond := "Index Cond: "
 	backward := ""
@@ -445,12 +462,44 @@ func unclaimed(parts []BoolExpr, claimed map[BoolExpr]bool) []BoolExpr {
 	return out
 }
 
+// typedLitText renders a value held in a column's runtime form as the
+// typed literal Postgres prints in a plan — '2024-01-02'::date rather
+// than the day count 19724. ok is false for every other type or value,
+// which render as they are.
+func typedLitText(v any, t bytdb.ColType) (string, bool) {
+	var txt string
+	switch t {
+	case bytdb.TTimestamp:
+		n, ok := v.(int64)
+		if !ok {
+			return "", false
+		}
+		txt = bytdb.FormatTimestamp(n)
+	case bytdb.TDate:
+		n, ok := v.(int64)
+		if !ok {
+			return "", false
+		}
+		txt = bytdb.FormatDate(n)
+	case bytdb.TUUID:
+		b, ok := v.([]byte)
+		if !ok || len(b) != 16 {
+			return "", false
+		}
+		txt = bytdb.FormatUUID(b)
+	default:
+		return "", false
+	}
+	return "'" + txt + "'::" + pgTypeName(t), true
+}
+
 // placeholderVal is a stand-in of a source column's value kind, so a
 // synthesized template predicate pushes down exactly when the real
-// per-row value would.
+// per-row value would. Timestamps and dates hold int64 counts and
+// uuids 16 bytes at runtime (litFits pushes exactly those).
 func placeholderVal(t bytdb.ColType) any {
 	switch t {
-	case bytdb.TInt:
+	case bytdb.TInt, bytdb.TTimestamp, bytdb.TDate:
 		return int64(0)
 	case bytdb.TFloat:
 		return 0.0
@@ -458,6 +507,8 @@ func placeholderVal(t bytdb.ColType) any {
 		return false
 	case bytdb.TBytes:
 		return []byte{}
+	case bytdb.TUUID:
+		return make([]byte, 16)
 	}
 	return ""
 }
@@ -484,6 +535,11 @@ func (x *explainer) boolText(e BoolExpr) string {
 	case *Pred:
 		if t, ok := x.tmpl[n]; ok {
 			return t
+		}
+		if n.RItem == nil {
+			if lit, ok := typedLitText(n.Val, x.predType[n]); ok {
+				return "(" + exprText(itemToAggExpr(n.Item)) + " " + opText(n.Op) + " " + lit + ")"
+			}
 		}
 		return exprText(predToExpr(n))
 	case *Cond:

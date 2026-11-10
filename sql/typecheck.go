@@ -764,6 +764,11 @@ func (t *typer) boolx(e BoolExpr, ts *tscope, having bool) (BoolExpr, error) {
 		if err != nil {
 			return nil, err
 		}
+		if !having {
+			if pr := t.foldCastPred(ex, ts); pr != nil {
+				return pr, nil
+			}
+		}
 		if ex == n.Ex {
 			return n, nil
 		}
@@ -887,6 +892,60 @@ func (t *typer) pred(n *Pred, ts *tscope, having bool) (BoolExpr, error) {
 		return nil, err
 	}
 	return n, nil
+}
+
+// foldCastPred turns col <op> 'literal'::type (either way round) into
+// a Pred leaf carrying the cast's value, when the cast's type is the
+// column's own timestamp, date or uuid type. The parser lowers only a
+// bare literal to a Pred; a cast stays a Cond the planner cannot push,
+// so WHERE id = '…'::uuid — the usual way to write a typed literal in
+// Postgres, and what ORMs emit as $1::uuid — was a full scan while
+// WHERE id = '…' was a point get (deep-look D-37). The cast is
+// evaluated once here; its value is the column's runtime form, which
+// both the planner (litFits) and the residual comparison take as is.
+// Anything else, including a cast that fails (its error stays with the
+// executor, as before), returns nil.
+func (t *typer) foldCastPred(ex Expr, ts *tscope) *Pred {
+	cmp, ok := ex.(*ExCmp)
+	if !ok || !orderingOp(cmp.Op) {
+		return nil
+	}
+	col, lit, op := cmp.L, cmp.R, cmp.Op
+	if _, isCol := col.(*ExCol); !isCol {
+		if !flippable(op) {
+			return nil
+		}
+		col, lit, op = cmp.R, cmp.L, flip(op)
+	}
+	c, ok := col.(*ExCol)
+	if !ok {
+		return nil
+	}
+	cast, ok := lit.(*ExCast)
+	if !ok {
+		return nil
+	}
+	l, ok := cast.E.(*ExLit)
+	if !ok || l.Val == nil {
+		return nil
+	}
+	if _, isParam := l.Val.(Param); isParam {
+		return nil
+	}
+	to := castColType(cast.Type)
+	switch to {
+	case bytdb.TTimestamp, bytdb.TDate, bytdb.TUUID:
+	default:
+		return nil
+	}
+	if _, ct, err := t.expr(c, ts); err != nil || ct != to {
+		return nil
+	}
+	v, err := castValFrom(&exEnv{d: t.d}, l.Val, cast.From, cast.Type)
+	if err != nil || v == nil || !litFits(v, to) {
+		return nil
+	}
+	return &Pred{Item: SelectItem{Col: c.Col}, Op: op, Val: v}
 }
 
 // orderingOp reports whether op is one of the six comparisons.

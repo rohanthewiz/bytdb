@@ -53,8 +53,6 @@ package sql
 // to push into. Correlated ON conjuncts keep today's Cond-only path.
 
 import (
-	"reflect"
-
 	"github.com/rohanthewiz/serr"
 )
 
@@ -70,10 +68,10 @@ type corrSpec struct {
 // corrTmpl is a live template: the Pred sitting in a step's static
 // list (allocated once; Val mutated by bind) plus what bind needs.
 type corrTmpl struct {
-	step int          // fp.steps index of the inner table the Pred pushes into
-	pred *Pred        // shared with fp.steps[step].static
-	ref  ColRef       // outer side, re-resolved against the live env each bind
-	typ  reflect.Type // Go type last bound; a change invalidates the step's plan
+	step int      // fp.steps index of the inner table the Pred pushes into
+	pred *Pred    // shared with fp.steps[step].static
+	ref  ColRef   // outer side, re-resolved against the live env each bind
+	typ  pushKind // kind (pushKindOf) last bound; a change invalidates the step's plan
 }
 
 // subPrep is a subquery's prepared FROM, reusable across invocations
@@ -266,7 +264,7 @@ func (sp *subPrep) bind(env *exEnv) (empty, ok bool) {
 			// keeps a nil from ever reaching plan construction.
 			return true, true
 		}
-		if t := reflect.TypeOf(v); t != tm.typ {
+		if t := pushKindOf(v); t != tm.typ {
 			// The value's Go type decides litFits and the pushed key
 			// encoding, and plan.rebind assumes both are fixed. Column
 			// values have fixed types, so this fires once on the first

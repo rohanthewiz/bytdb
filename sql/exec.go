@@ -409,8 +409,9 @@ func compareVals(a, b any) (int, bool) {
 // greater than every non-NaN value and equal to itself, so it sorts
 // last ascending and groups deterministically. Go's cmp.Compare does
 // the opposite (NaN smallest), which would silently diverge in ORDER
-// BY, MIN/MAX, and range comparisons. The store rejects NaN in keys,
-// but expressions and parameters can still produce one.
+// BY, MIN/MAX, and range comparisons. Stored NaNs (keys included,
+// since deep-look D-36) encode to sort in the same place, so a scan's
+// order and this comparison agree.
 func cmpFloat(a, b float64) int {
 	an, bn := math.IsNaN(a), math.IsNaN(b)
 	switch {

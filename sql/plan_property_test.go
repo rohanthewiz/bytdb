@@ -22,19 +22,36 @@ import (
 // in the planner all surface here as a row-set or row-order mismatch.
 func TestPlannerEquivalenceProperty(t *testing.T) {
 	d := openDB(t)
-	exec(t, d, `create table ti (id int primary key, age int, city text, score float)`)
-	exec(t, d, `create table ts (id int primary key, age int, city text, score float)`)
+	// uid, at and day cover the key types D-37 made pushable: uuid,
+	// timestamp and date conjuncts reach point gets and bounded scans,
+	// and must agree with the bare table's filter.
+	exec(t, d, `create table ti (id int primary key, age int, city text, score float, uid uuid, at timestamp, day date)`)
+	exec(t, d, `create table ts (id int primary key, age int, city text, score float, uid uuid, at timestamp, day date)`)
 
 	rng := rand.New(rand.NewSource(1234))
 	cities := []string{"london", "nyc", "austin", "sf"}
 	scores := []string{"-2.5", "0.0", "1.5", "3.25", "7.0"}
+	uids := []string{
+		"00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-0000000000a0",
+		"7f000000-0000-4000-8000-000000000000", "80000000-0000-4000-8000-000000000000",
+		"ffffffff-ffff-4fff-bfff-ffffffffffff",
+	}
+	ats := []string{"1969-12-31 23:59:59", "2024-01-01 00:00:00", "2024-01-01 00:00:01", "2024-06-15 12:30:00", "2031-03-04 05:06:07"}
+	days := []string{"1960-01-01", "2024-01-01", "2024-01-02", "2024-06-15", "2031-03-04"}
+	orNull := func(vals []string) string {
+		if rng.Intn(7) == 0 {
+			return "null"
+		}
+		return "'" + vals[rng.Intn(len(vals))] + "'"
+	}
 	for id := 1; id <= 80; id++ {
 		age := "null"
 		if rng.Intn(8) > 0 {
 			age = fmt.Sprint(18 + rng.Intn(13))
 		}
-		row := fmt.Sprintf("(%d, %s, '%s', %s)",
-			id, age, cities[rng.Intn(len(cities))], scores[rng.Intn(len(scores))])
+		row := fmt.Sprintf("(%d, %s, '%s', %s, %s, %s, %s)",
+			id, age, cities[rng.Intn(len(cities))], scores[rng.Intn(len(scores))],
+			orNull(uids), orNull(ats), orNull(days))
 		exec(t, d, "insert into ti values "+row)
 		exec(t, d, "insert into ts values "+row)
 	}
@@ -43,13 +60,17 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 	exec(t, d, `create index ti_age on ti (age)`)
 	exec(t, d, `create index ti_city_age on ti (city, age desc)`)
 	exec(t, d, `create index ti_score on ti (score desc)`)
+	exec(t, d, `create index ti_uid on ti (uid)`)
+	exec(t, d, `create index ti_day_at on ti (day, at desc)`)
+	exec(t, d, `create index ti_at on ti (at)`)
 
 	// Random WHERE: 0-2 type-correct conjuncts over indexed columns,
 	// biased toward shapes the planner can serve from an index.
 	randWhere := func() string {
 		conj := func() string {
 			age := func() int { return 16 + rng.Intn(17) }
-			switch rng.Intn(9) {
+			pick := func(vals []string) string { return vals[rng.Intn(len(vals))] }
+			switch rng.Intn(15) {
 			case 0:
 				return fmt.Sprintf("age = %d", age())
 			case 1:
@@ -66,6 +87,18 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 				return fmt.Sprintf("score <= %s", scores[rng.Intn(len(scores))])
 			case 7:
 				return "age is null"
+			case 8:
+				return fmt.Sprintf("uid = '%s'", pick(uids))
+			case 9:
+				return fmt.Sprintf("uid > '%s'::uuid", pick(uids))
+			case 10:
+				return fmt.Sprintf("at >= '%s'", pick(ats))
+			case 11:
+				return fmt.Sprintf("at < '%s'::timestamp", pick(ats))
+			case 12:
+				return fmt.Sprintf("day = '%s'", pick(days))
+			case 13:
+				return fmt.Sprintf("day = '%s' and at <= '%s'", pick(days), pick(ats))
 			default:
 				return fmt.Sprintf("id = %d", 1+rng.Intn(90))
 			}
@@ -86,7 +119,7 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 		col  int // ordinal in the fixed projection below
 		desc bool
 	}
-	orderCols := []string{"id", "age", "city", "score"}
+	orderCols := []string{"id", "age", "city", "score", "uid", "at", "day"}
 	randOrder := func() (string, []orderKey) {
 		n := rng.Intn(3)
 		if n == 0 {
@@ -111,7 +144,7 @@ func TestPlannerEquivalenceProperty(t *testing.T) {
 	for iter := range 400 {
 		where := randWhere()
 		orderBy, keys := randOrder()
-		body := "select id, age, city, score from %s" + where + orderBy
+		body := "select id, age, city, score, uid, at, day from %s" + where + orderBy
 
 		ri := exec(t, d, fmt.Sprintf(body, "ti"))
 		rs := exec(t, d, fmt.Sprintf(body, "ts"))

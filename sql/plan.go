@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"reflect"
 	"slices"
 
 	"github.com/rohanthewiz/bytdb"
@@ -299,6 +300,19 @@ func pathScore(cols []int, eq, lo, hi map[int]*Pred) int {
 // bound for a column of type t — i.e. the engine's coercion accepts
 // it. Literals that don't fit are still evaluated by the residual
 // filter, just without pushdown.
+//
+// The value must also be in the column's canonical runtime form, not
+// just one the engine would coerce: the pushed value doubles as a scan
+// stop (stopped compares it with each row's stored value through
+// compareVals), and a stop that cannot compare ends the scan. The typed
+// bind pass already converts literals that meet these columns —
+// '2024-01-01' against a timestamp becomes its microsecond count, a
+// uuid string its 16 bytes — so this only has to recognize the result.
+//
+// Timestamp, date and uuid keys used to fall through to false, so a
+// uuid primary-key lookup was a full scan and a join on one a scan per
+// outer row (3000 × 3000 rows: 1.75 s against 8 ms for an int key;
+// deep-look D-37).
 func litFits(v any, t bytdb.ColType) bool {
 	switch t {
 	case bytdb.TInt:
@@ -315,8 +329,37 @@ func litFits(v any, t bytdb.ColType) bool {
 	case bytdb.TBool:
 		_, ok := v.(bool)
 		return ok
+	case bytdb.TTimestamp, bytdb.TDate:
+		// Microseconds or days since the epoch. A time.Time (a bound Go
+		// parameter the pass has not converted) stays residual: it
+		// would not compare as a stop.
+		_, ok := v.(int64)
+		return ok
+	case bytdb.TUUID:
+		// Exactly 16 bytes: anything else the engine refuses to encode,
+		// and the residual comparison rejects every row anyway.
+		b, ok := v.([]byte)
+		return ok && len(b) == 16
 	}
-	return false // TBytes: no bytes literals exist in the dialect
+	return false // TBytes, arrays, jsonb: no ordered key pushdown
+}
+
+// pushKind classifies a value by what litFits decides on: its Go type
+// and, for a byte string, whether it is uuid-sized. A plan built with a
+// value pushed (or not) stays right for a later value of the same kind,
+// so the plan caches that rebind values in place (join templates,
+// correlated-subquery templates) keep a plan only while every value's
+// kind is unchanged. The Go type alone is not enough: a bytea column
+// joined to a uuid key can bring 16 bytes on one row (pushed) and 5 on
+// the next, which the engine refuses to encode as a uuid bound.
+type pushKind struct {
+	t      reflect.Type
+	uuidSz bool
+}
+
+func pushKindOf(v any) pushKind {
+	b, ok := v.([]byte)
+	return pushKind{t: reflect.TypeOf(v), uuidSz: ok && len(b) == 16}
 }
 
 // chooseOrderedPlan picks the scan path for a single-table SELECT,
