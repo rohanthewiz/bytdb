@@ -188,8 +188,9 @@ The timeout lineup:
 | Idle-in-transaction | **5 min, on by default** | FATAL 25P03; deliberately non-Postgres default, because a writable block holds bytdb's single writer lock |
 | Idle session | off | FATAL 57P05 when enabled |
 | Startup (incl. TLS + SCRAM) | 30 s | Connection dropped |
-| I/O read/write | 60 s | Connection dropped |
-| Max connections | 100 | FATAL 53300 "sorry, too many clients already"; cancel connections are exempt |
+| I/O read | 60 s | Bounds reading one message body once it has started arriving; connection dropped |
+| I/O write | 60 s | Bounds a *stall*: re-armed before every socket write, so a client reading a large result slowly but steadily is never cut off, and time spent executing (waiting for the writer lock, say) never counts against it; connection dropped |
+| Max connections | 100 | FATAL 53300 "sorry, too many clients already"; cancel connections are exempt. Past twice the cap, new connections are closed at once, before any handshake, so a connect flood cannot exhaust file descriptors |
 
 Each connection also has resource ceilings (16 K prepared statements/portals,
 bounded message-body preallocation) and a per-connection panic fence that

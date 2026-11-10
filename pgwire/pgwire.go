@@ -62,6 +62,7 @@ package pgwire
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"net"
 	"sort"
 	"sync"
@@ -321,8 +322,14 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 // Serve accepts connections on ln until Close, one goroutine per
-// connection. After Close it returns nil; any other accept error is
-// returned.
+// connection. After Close it returns nil. A temporary accept error (the
+// process out of file descriptors, a connection reset before accept) is
+// retried with a capped exponential backoff, as net/http does; any
+// other accept error is returned.
+//
+// Returning on the first error of any kind used to stop bytdbd on a
+// transient EMFILE: the listener stayed open, but nothing accepted from
+// it again (deep-look D-14).
 func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	if s.closed {
@@ -332,6 +339,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 	s.ln = ln
 	s.mu.Unlock()
+	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
@@ -341,7 +349,28 @@ func (s *Server) Serve(ln net.Listener) error {
 			if closed {
 				return nil
 			}
+			if temporaryAcceptErr(err) {
+				backoff = min(max(2*backoff, acceptBackoffMin), acceptBackoffMax)
+				time.Sleep(backoff)
+				continue
+			}
 			return err
+		}
+		backoff = 0
+		s.mu.Lock()
+		// The over-limit decision is made under the same lock that
+		// registers the connection, so racing accepts cannot both squeak
+		// under the cap. maxConns() folds in the default/unlimited policy.
+		eff := s.maxConns()
+		if eff > 0 && len(s.conns) >= hardConnCeiling(eff) {
+			// Past the hard ceiling, close at once: no TLS handshake, no
+			// 53300. Over-limit connections are otherwise accepted so they
+			// can be refused properly, which means MaxConns alone does
+			// not bound file descriptors — a flood of connects could
+			// exhaust them while each waits out its handshake.
+			s.mu.Unlock()
+			nc.Close()
+			continue
 		}
 		c := &conn{
 			srv:      s,
@@ -351,18 +380,13 @@ func (s *Server) Serve(ln net.Listener) error {
 			writeTx:  s.writeTimeout(),
 			readTx:   s.readTimeout(),
 			r:        bufio.NewReader(nc),
-			w:        bufio.NewWriter(nc),
 			sess:     s.db.NewSession(),
 			stmts:    map[string]*prepared{},
 			portals:  map[string]*portal{},
 			pid:      s.nextPID.Add(1),
 			secret:   newCancelSecret(),
 		}
-		s.mu.Lock()
-		// The over-limit decision is made under the same lock that
-		// registers the connection, so racing accepts cannot both squeak
-		// under the cap. maxConns() folds in the default/unlimited policy.
-		eff := s.maxConns()
+		c.w = bufio.NewWriter(stallWriter{c})
 		c.overLimit = eff > 0 && len(s.conns) >= eff
 		s.conns[nc] = struct{}{}
 		s.backends[c.pid] = c
@@ -379,6 +403,28 @@ func (s *Server) Serve(ln net.Listener) error {
 			c.run()
 		}()
 	}
+}
+
+// Accept-retry backoff bounds: the net/http values.
+const (
+	acceptBackoffMin = 5 * time.Millisecond
+	acceptBackoffMax = time.Second
+)
+
+// hardConnCeiling is the connection count past which new connections
+// are closed outright instead of being refused with 53300: twice the
+// effective MaxConns, leaving room for refusals and CancelRequests in
+// flight.
+func hardConnCeiling(maxConns int) int { return 2 * maxConns }
+
+// temporaryAcceptErr reports whether an accept error is worth retrying.
+// net.Error's Temporary is deprecated because "temporary" is ill-defined
+// for most errors, but accept is the case it was made for: syscall.Errno
+// reports EMFILE, ENFILE, ECONNABORTED and friends as temporary, and
+// net/http's own accept loop still relies on it.
+func temporaryAcceptErr(err error) bool {
+	var ne interface{ Temporary() bool }
+	return errors.As(err, &ne) && ne.Temporary()
 }
 
 // Close stops accepting and closes every open connection. The

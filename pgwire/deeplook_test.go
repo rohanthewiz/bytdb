@@ -3,11 +3,24 @@ package pgwire_test
 // Wire-level regression tests from the deep-look remediation plan.
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"path/filepath"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/pgwire"
+	bsql "github.com/rohanthewiz/bytdb/sql"
 )
 
 // TestParseErrorFailsBlock (D-07): a Parse (or Bind/Describe) error never
@@ -78,5 +91,159 @@ func TestCommentOnlyQueries(t *testing.T) {
 	var n int64
 	if err := c.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("count = %d, err = %v", n, err)
+	}
+}
+
+// TestWriteDeadlineExcludesExecution (D-15a): the write deadline was
+// armed when a message arrived, before the statement ran. A write that
+// waited 900 ms for the writer lock under a 300 ms WriteTimeout then
+// committed, and its reply hit the long-expired deadline: the client
+// saw a dropped connection for a write that had committed.
+func TestWriteDeadlineExcludesExecution(t *testing.T) {
+	ctx := context.Background()
+	addr := startConfiguredServer(t, func(s *pgwire.Server) { s.WriteTimeout = 300 * time.Millisecond })
+	url := fmt.Sprintf("postgres://test@%s/test?sslmode=disable", addr)
+	a, b := connect(t, url), connect(t, url)
+	mustExec(t, a, `create table t (id int primary key)`)
+	mustExec(t, a, `begin`)
+	mustExec(t, a, `insert into t values (1)`)
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Exec(ctx, `insert into t values (2)`)
+		done <- err
+	}()
+	time.Sleep(900 * time.Millisecond) // b waits on the writer lock for 3x WriteTimeout
+	mustExec(t, a, `commit`)
+	if err := <-done; err != nil {
+		t.Fatalf("a write that waited for the lock and committed reported: %v", err)
+	}
+	var n int64
+	if err := b.QueryRow(ctx, `select count(*) from t`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("count = %d, err = %v", n, err)
+	}
+}
+
+// TestWriteDeadlineBoundsStallNotTransfer (D-15b): one deadline covered
+// a whole reply, so a client reading a large result steadily was cut
+// off once the transfer outran WriteTimeout. The deadline now bounds a
+// stall: here ~4 MB arrives at ~3 MB/s against a 300 ms WriteTimeout.
+// (TestWriteDeadlineFreesWriterLock covers a reader that stops.)
+func TestWriteDeadlineBoundsStallNotTransfer(t *testing.T) {
+	addr := startWriteTimeoutServer(t, 300*time.Millisecond)
+	nc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	var body []byte
+	body = binary.BigEndian.AppendUint32(body, 196608)
+	body = append(body, "user\x00test\x00\x00"...)
+	if _, err := nc.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(body)+4)), body...)); err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReaderSize(nc, 64<<10)
+	pgReadUntilReady(t, r)
+	if _, err := nc.Write(pgSimpleQuery(`select s from big`)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	total := 0
+	buf := make([]byte, 64<<10)
+	var tail []byte
+	for {
+		n, err := r.Read(buf)
+		total += n
+		tail = append(tail, buf[:n]...)
+		if len(tail) > 6 {
+			tail = tail[len(tail)-6:]
+		}
+		if string(tail) == "Z\x00\x00\x00\x05I" {
+			break // ReadyForQuery: the whole result arrived
+		}
+		if err != nil {
+			t.Fatalf("stream cut after %v and %d bytes: %v", time.Since(start), total, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if took := time.Since(start); took < 300*time.Millisecond {
+		t.Fatalf("transfer took %v; the test needs it to outlast WriteTimeout", took)
+	}
+}
+
+// flakyListener returns a temporary error from its first n Accepts.
+type flakyListener struct {
+	net.Listener
+	failures atomic.Int32
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	if l.failures.Add(-1) >= 0 {
+		return nil, &net.OpError{Op: "accept", Net: "tcp", Err: syscall.EMFILE}
+	}
+	return l.Listener.Accept()
+}
+
+// TestServeRetriesTemporaryAcceptErrors (D-14): Serve returned on the
+// first accept error of any kind, so a transient EMFILE stopped bytdbd
+// from accepting ever again while the process kept running.
+func TestServeRetriesTemporaryAcceptErrors(t *testing.T) {
+	e, err := bytdb.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fl := &flakyListener{Listener: ln}
+	fl.failures.Store(3)
+	srv := pgwire.NewServer(bsql.New(e))
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(fl) }()
+	t.Cleanup(func() {
+		srv.Close()
+		e.Close()
+	})
+	c := connect(t, fmt.Sprintf("postgres://test@%s/test", ln.Addr()))
+	if err := c.Ping(context.Background()); err != nil {
+		t.Fatalf("server stopped accepting after temporary errors: %v", err)
+	}
+	select {
+	case err := <-served:
+		t.Fatalf("Serve returned early: %v", err)
+	default:
+	}
+}
+
+// TestHardConnectionCeiling (D-14): connections over MaxConns are
+// accepted so they can be refused with 53300, which left file
+// descriptors unbounded under a connect flood. Past twice MaxConns they
+// are now closed at once, before any handshake.
+func TestHardConnectionCeiling(t *testing.T) {
+	addr := startConfiguredServer(t, func(s *pgwire.Server) { s.MaxConns = 2 })
+	// Four silent connections fill MaxConns (2) and the refusal band (2
+	// more, held open in their startup handshake).
+	var held []net.Conn
+	for range 4 {
+		nc, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, nc)
+	}
+	defer func() {
+		for _, nc := range held {
+			nc.Close()
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // let the server register them
+	nc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := nc.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("connection past the hard ceiling: read err = %v, want EOF (closed at once)", err)
 	}
 }

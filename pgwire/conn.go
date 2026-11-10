@@ -34,8 +34,13 @@ type conn struct {
 	writeTx  time.Duration // per-statement output write deadline; 0 = disabled
 	readTx   time.Duration // in-flight message-body read deadline; 0 = disabled
 	r        *bufio.Reader
-	w        *bufio.Writer
+	w        *bufio.Writer // always wraps a stallWriter over nc
 	sess     *sql.Session
+
+	// inSession is set once the startup handshake completes. From then
+	// on the write deadline is the per-write stall bound (stallWriter);
+	// before it, the handshake's own startupTimeout governs.
+	inSession bool
 
 	// tlsOn: the stream has been upgraded to TLS. Gates RequireTLS and
 	// refuses a second SSLRequest.
@@ -223,10 +228,10 @@ func (c *conn) run() (err error) {
 		if c.inErr && typ != msgSync && typ != msgTerminate {
 			continue
 		}
-		// The reply to this message is about to be written; bound how long
-		// the server will block on a client that has stopped reading —
-		// critically, one holding the writer lock inside a transaction.
-		c.armWriteDeadline()
+		// No write deadline is armed here: stallWriter arms one before
+		// each write that reaches the socket (see its comment), so time
+		// spent executing — waiting for the writer lock, say — never
+		// counts against it.
 		r := &rbuf{b: body}
 		switch typ {
 		case msgQuery:
@@ -298,15 +303,33 @@ func (c *conn) armBodyDeadline() {
 	c.nc.SetReadDeadline(time.Now().Add(c.readTx))
 }
 
-// armWriteDeadline bounds how long the server will block writing one
-// statement's reply. A write-deadline expiry latches into the buffered
-// writer's sticky error, surfaces at c.wErr(), and ends the connection —
-// which rolls back any open block and frees the writer lock.
-func (c *conn) armWriteDeadline() {
-	if c.nc == nil || c.writeTx <= 0 {
-		return
+// stallWriter is the io.Writer beneath the connection's bufio.Writer.
+// It arms the write deadline afresh before every write that reaches the
+// socket, so WriteTimeout bounds a stall — one write making no progress
+// — which is what it exists for: a client that stops draining while its
+// transaction holds the writer lock. A deadline expiry latches into the
+// buffered writer's sticky error, surfaces at c.wErr(), and ends the
+// connection, which rolls back any open block and frees the lock.
+//
+// The deadline used to be armed once per incoming message, before the
+// statement ran (deep-look D-15). Two things went wrong. Time spent
+// executing counted against it, so a write that waited 900 ms for the
+// writer lock under a 300 ms WriteTimeout committed and then found its
+// reply's deadline long expired: the client saw a dropped connection
+// for a committed write. And one deadline covered the whole reply, so a
+// client reading a large result steadily was cut off once the total
+// transfer outran WriteTimeout.
+//
+// It reads c.nc on every call rather than capturing it, so the TLS
+// upgrade (which replaces c.nc) needs no rewiring.
+type stallWriter struct{ c *conn }
+
+func (w stallWriter) Write(p []byte) (int, error) {
+	c := w.c
+	if c.inSession && c.writeTx > 0 {
+		c.nc.SetWriteDeadline(time.Now().Add(c.writeTx))
 	}
-	c.nc.SetWriteDeadline(time.Now().Add(c.writeTx))
+	return c.nc.Write(p)
 }
 
 // idleTxExpired reports whether a read error is the armed
@@ -430,10 +453,16 @@ func (c *conn) startup() error {
 			c.ready()
 			// The session is established; from here the deadlines belong
 			// to the per-message helpers (armIdleDeadline / armBodyDeadline
-			// for reads, armWriteDeadline for writes), so the startup ones
-			// must go.
+			// for reads, stallWriter for writes), so the startup ones must
+			// go. Flush first, so the handshake's last bytes still go out
+			// under the startup deadline.
+			err := c.w.Flush()
 			c.nc.SetReadDeadline(time.Time{})
 			c.nc.SetWriteDeadline(time.Time{})
+			c.inSession = true
+			if err != nil {
+				return err
+			}
 			return c.wErr()
 		default:
 			return serr.New("unsupported protocol version", "version", fmt.Sprint(code))
@@ -475,7 +504,7 @@ func (c *conn) maybeStartTLS() error {
 	// reader and writer must be rebuilt around it.
 	c.nc = tc
 	c.r = bufio.NewReader(tc)
-	c.w = bufio.NewWriter(tc)
+	c.w = bufio.NewWriter(stallWriter{c})
 	c.tlsOn = true
 	return nil
 }
