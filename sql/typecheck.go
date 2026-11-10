@@ -215,7 +215,7 @@ func (d *DB) typeStatement(st Statement, note func(any, bytdb.ColType)) (Stateme
 		if err != nil {
 			return nil, err
 		}
-		return out, nil
+		return regclassOutputs(out), nil
 	case *Insert:
 		return t.insert(s)
 	case *Update:

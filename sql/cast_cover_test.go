@@ -22,8 +22,10 @@ func TestCastValPairs(t *testing.T) {
 		'true'::bool, 'f'::boolean, null::bool,
 		'2.5'::numeric, 1::float8, 2.25::real, null::decimal`)
 	// 3.9::bigint rounds (Postgres float→int semantics), not truncates.
+	// A top-level regclass renders as the relation's name, and an oid
+	// that names nothing as its number (Postgres's regclass output).
 	want := [][]any{{int64(42), int64(4), nil, int64(7),
-		int64(123), int64(5), nil,
+		"123", "5", nil,
 		int64(99), int64(42), nil,
 		"1.5", "true", nil,
 		true, false, nil,
@@ -55,7 +57,7 @@ func TestCastValErrors(t *testing.T) {
 		// typed bind pass knows the operand's type (deep-look D-24); a
 		// date has no cast to a number at all.
 		{`select current_date::int`, "cannot cast type date to bigint"},
-		{`select 'missing'::regclass`, "relation does not exist"},
+		{`select 'missing'::regclass`, `relation "missing" does not exist`},
 		// reg* types other than regclass do not resolve names.
 		{`select 'pg_type'::regtype`, "unsupported cast"},
 		{`select 'maybe'::bool`, "invalid input syntax for type bool"},
@@ -121,7 +123,7 @@ func TestExprStaticTypesAndNames(t *testing.T) {
 	wantTypes := []bytdb.ColType{
 		bytdb.TString, bytdb.TFloat, bytdb.TInt,
 		bytdb.TInt, bytdb.TFloat,
-		bytdb.TFloat, bytdb.TBool, bytdb.TInt, bytdb.TString,
+		bytdb.TFloat, bytdb.TBool, bytdb.TString, bytdb.TString, // age::regclass renders a name
 		bytdb.TBool, bytdb.TBool, bytdb.TBool, bytdb.TBool,
 		bytdb.TString, bytdb.TString, bytdb.TInt,
 	}

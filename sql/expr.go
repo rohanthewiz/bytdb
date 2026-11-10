@@ -213,6 +213,12 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		// regclass's text form is the relation's name (conrelid::regclass
+		// ::text in ORM key queries); its value is the oid, so only the
+		// shape of the expression can tell (deep-look D-51).
+		if x, ok := v.(int64); ok && isTextType(n.Type) && isRegclassCast(n.E) {
+			return env.d.relName(x), nil
+		}
 		return castValFrom(env, v, n.From, n.Type)
 	case *ExIndex:
 		return nil, serr.New("array subscripts are not supported")
@@ -1027,16 +1033,13 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			if n, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64); err == nil {
 				return n, nil
 			}
-			name := strings.TrimPrefix(strings.TrimSpace(x), "public.")
-			if desc := env.d.e.TableShared(name); desc != nil {
-				return int64(desc.ID), nil
+			// Tables, sequences (nextval's 'name'::regclass argument),
+			// views, indexes and system tables share the relation
+			// namespace; "Quoted" names keep their case (deep-look D-51).
+			if oid, ok := env.d.relOID(x); ok {
+				return oid, nil
 			}
-			// Sequences share the relation namespace: 'name'::regclass
-			// is how drivers spell nextval's argument.
-			if sd := env.d.e.Sequence(name); sd != nil {
-				return int64(sd.ID), nil
-			}
-			return nil, serr.New("relation does not exist", "relation", x)
+			return nil, serr.New(`relation "` + x + `" does not exist`)
 		}
 	case "regtype", "regnamespace", "regproc", "regprocedure", "regoper", "regrole":
 		switch x := v.(type) {
@@ -1440,7 +1443,7 @@ func indexdef(d *DB, oid int64, colNo int64) any {
 		keys := make([]string, len(cols))
 		for i, o := range cols {
 			names[i] = desc.Columns[o].Name
-			keys[i] = names[i]
+			keys[i] = quoteIdent(names[i]) // identifiers quoted as pg_get_indexdef quotes them
 			if i < len(descs) && descs[i] {
 				keys[i] += " DESC"
 			}
@@ -1456,7 +1459,7 @@ func indexdef(d *DB, oid int64, colNo int64) any {
 			u = "UNIQUE "
 		}
 		return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING btree (%s)",
-			u, name, desc.Name, strings.Join(keys, ", "))
+			u, quoteIdent(name), quoteIdent(desc.Name), strings.Join(keys, ", "))
 	}
 	return nil
 }

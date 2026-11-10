@@ -1014,6 +1014,34 @@ as `VIEW`. The columns come from describing the stored query, so listing them
 never runs it. They are always nullable with no default, as in Postgres. A
 view whose base table was dropped still lists in `pg_class`, with no columns.
 
+The other catalog tables tools read: `pg_tables`, `pg_indexes` (with
+`indexdef`), `pg_views` (with the stored definition), `pg_sequences`,
+`pg_settings` (what `SHOW ALL` lists, from the reading session: SET values
+show `source = 'session'`), `pg_description` (always empty: `COMMENT ON` is
+accepted and ignored), and `information_schema.schemata`, `.views`,
+`.referential_constraints` (each FK with the parent key it references and
+its delete rule) and `.constraint_column_usage` (for an FK, the referenced
+columns). `pg_tables` lists user tables only. `information_schema.columns`
+carries `numeric_precision` / `_radix` / `_scale` (bits, as Postgres reports
+int8 and float8), `datetime_precision`, `is_identity` (`NO`: serial-style
+columns report their `nextval` default instead, as a Postgres serial does)
+and `is_generated`. A `VARCHAR(n)` column reads as `character varying` /
+`varchar` there and as varchar with typmod n+4 in `pg_attribute`, so
+`format_type` renders `character varying(20)`. `pg_class.relhasindex` is
+true for every table (each has its primary key's index) and `relnatts` counts
+attributes.
+
+**regclass.** `'name'::regclass` resolves tables, views, sequences, indexes
+and system tables (`'pg_class'::regclass` is Postgres's 1259), with
+`"Quoted"` names keeping their case and an optional schema. In the other
+direction, a top-level `oid::regclass` select item and any
+`x::regclass::text` render the relation's name (quoted where needed; an oid
+that names nothing renders as its number), as Postgres's regclass output
+does. bytdb has no regclass value type, so inside a subquery, a view or a
+WHERE clause a regclass stays its oid; comparisons such as
+`attrelid = 't'::regclass` work as before, but an outer query reading a
+subquery's regclass column sees the number. Use `::regclass::text` there.
+
 Errors carry Postgres SQLSTATEs (42P01 undefined_table, 23505
 unique_violation, 23503 foreign_key_violation, 22P02
 invalid_text_representation, 25P02 in_failed_sql_transaction, 2BP01

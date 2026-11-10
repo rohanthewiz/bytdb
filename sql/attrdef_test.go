@@ -19,7 +19,8 @@ func TestPgAttrdef(t *testing.T) {
 		note text)`)
 
 	res := exec(t, d, `select adrelid, adnum, adbin from pg_attrdef order by adnum`)
-	oid := exec(t, d, `select 'items'::regclass`).Rows[0][0]
+	// ::oid keeps the number (a top-level regclass renders as the name).
+	oid := exec(t, d, `select 'items'::regclass::oid`).Rows[0][0]
 	want := [][]any{
 		{oid, int64(2), "1"},
 		{oid, int64(3), "'new'"},

@@ -455,10 +455,11 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("relrowsecurity", bytdb.TBool), sysCol("relforcerowsecurity", bytdb.TBool),
 			sysCol("relispartition", bytdb.TBool), sysCol("reloftype", bytdb.TInt),
 			sysCol("reltablespace", bytdb.TInt), sysCol("relreplident", bytdb.TString),
-			sysCol("reltoastrelid", bytdb.TInt), sysCol("reloptions", bytdb.TString)),
+			sysCol("reltoastrelid", bytdb.TInt), sysCol("reloptions", bytdb.TString),
+			sysCol("relnatts", bytdb.TInt)),
 		rows: func(d *DB) [][]any {
 			var rows [][]any
-			rel := func(oid int64, name, kind string, hasIdx bool, nChecks int) {
+			rel := func(oid int64, name, kind string, hasIdx bool, nChecks, natts int) {
 				am := int64(0) // sequences have no access method
 				switch kind {
 				case "i":
@@ -469,23 +470,33 @@ var sysTables = map[string]*sysTableDef{
 				rows = append(rows, []any{
 					oid, name, oidPublic, kind, int64(10), "p", hasIdx, -1.0, int64(0),
 					am, int64(nChecks), false, false, false, false, false, int64(0),
-					int64(0), "d", int64(0), nil,
+					int64(0), "d", int64(0), nil, int64(natts),
 				})
 			}
+			// relhasindex is true for every table: each has its primary
+			// key's index (psql's \d gates its Indexes: footer on it; it
+			// read false for a table with only a primary key). relnatts
+			// counts a relation's attributes: columns, key columns for an
+			// index, Postgres's three for a sequence.
 			for _, desc := range d.userDescs() {
-				rel(int64(desc.ID), desc.Name, "r", len(desc.Indexes) > 0, len(desc.Checks))
-				rel(indexOID(desc.ID, 0), desc.Name+"_pkey", "i", false, 0)
+				rel(int64(desc.ID), desc.Name, "r", true, len(desc.Checks), len(desc.Columns))
+				rel(indexOID(desc.ID, 0), desc.Name+"_pkey", "i", false, 0, len(desc.PKCols))
 				for _, ix := range desc.Indexes {
-					rel(indexOID(desc.ID, ix.ID), ix.Name, "i", false, 0)
+					rel(indexOID(desc.ID, ix.ID), ix.Name, "i", false, 0, len(ix.Cols))
 				}
 			}
 			for _, sd := range d.e.Sequences() {
-				rel(int64(sd.ID), sd.Name, "S", false, 0)
+				rel(int64(sd.ID), sd.Name, "S", false, 0, 3)
 			}
 			// Views get synthetic oids well above the table-ID range;
 			// they have no stored ID of their own (see viewOID).
+			shapes := d.viewColumns()
 			for i, vd := range d.e.Views() {
-				rel(viewOID(i), vd.Name, "v", false, 0)
+				n := 0
+				if i < len(shapes) {
+					n = len(shapes[i].cols)
+				}
+				rel(viewOID(i), vd.Name, "v", false, 0, n)
 			}
 			return rows
 		},
@@ -510,10 +521,13 @@ var sysTables = map[string]*sysTableDef{
 				if c.Identity {
 					identity = "d"
 				}
+				// VARCHAR(n) reports as varchar with typmod n+4, so
+				// format_type renders "character varying(n)" (it read as
+				// text, -1).
 				rows = append(rows, []any{
-					relid, c.Name, typeOID(c.Type), typeLen(c.Type),
+					relid, c.Name, colTypeOID(c), typeLen(c.Type),
 					int64(num), notNull, c.Default != "", false,
-					int64(-1), int64(0), identity, "",
+					colTypmod(c), int64(0), identity, "",
 					"p", "", int64(-1),
 				})
 			}
@@ -995,10 +1009,25 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("ordinal_position", bytdb.TInt), sysCol("column_default", bytdb.TString),
 			sysCol("is_nullable", bytdb.TString), sysCol("data_type", bytdb.TString),
 			sysCol("udt_name", bytdb.TString),
-			sysCol("character_maximum_length", bytdb.TInt)),
+			sysCol("character_maximum_length", bytdb.TInt),
+			sysCol("numeric_precision", bytdb.TInt), sysCol("numeric_precision_radix", bytdb.TInt),
+			sysCol("numeric_scale", bytdb.TInt), sysCol("datetime_precision", bytdb.TInt),
+			sysCol("is_identity", bytdb.TString), sysCol("identity_generation", bytdb.TString),
+			sysCol("is_generated", bytdb.TString), sysCol("is_updatable", bytdb.TString)),
 		rows: func(d *DB) [][]any {
-			var rows [][]any
-			for _, desc := range d.userDescs() {
+			// One row per column of every table: rows come from a slab
+			// sized up front rather than one allocation each, since the
+			// table is read whole for every introspection query (a
+			// table_name filter applies after the build; see N-047).
+			descs := d.userDescs()
+			n := 0
+			for _, desc := range descs {
+				n += len(desc.Columns)
+			}
+			const width = 18
+			slab := make([]any, 0, n*width)
+			rows := make([][]any, 0, n)
+			for _, desc := range descs {
 				pk := map[int]bool{}
 				for _, o := range desc.PKCols {
 					pk[o] = true
@@ -1013,7 +1042,7 @@ var sysTables = map[string]*sysTableDef{
 					// declared defaults report their stored literal text.
 					var dflt any
 					if c.Identity {
-						dflt = fmt.Sprintf("nextval('%s_%s_seq'::regclass)", desc.Name, c.Name)
+						dflt = serialDefault(desc.Name, c.Name)
 					} else if c.Default != "" {
 						dflt = c.Default
 					}
@@ -1023,11 +1052,19 @@ var sysTables = map[string]*sysTableDef{
 					if c.MaxLen > 0 {
 						maxLen = int64(c.MaxLen)
 					}
-					rows = append(rows, []any{
+					// A serial-style column reports is_identity NO, as a
+					// Postgres serial does: its default is the nextval above.
+					// The numeric and datetime precisions describe the binary
+					// types (int8: 64 bits, float8: 53; timestamps: 6).
+					prec, radix, scale := numericPrecision(c.Type)
+					start := len(slab)
+					slab = append(slab,
 						sysDatabase, "public", desc.Name, c.Name,
-						int64(i + 1), dflt, nullable, sqlTypeName(c.Type), udtName(c.Type),
-						maxLen,
-					})
+						int64(i+1), dflt, nullable, colDataType(c), colUdtName(c),
+						maxLen, prec, radix, scale, datetimePrecision(c.Type),
+						"NO", nil, "NEVER", "YES",
+					)
+					rows = append(rows, slab[start:len(slab):len(slab)])
 				}
 			}
 			// Views list their output columns too, as in Postgres. The
@@ -1036,10 +1073,12 @@ var sysTables = map[string]*sysTableDef{
 			// only the type.
 			for _, v := range d.viewColumns() {
 				for j, c := range v.cols {
+					prec, radix, scale := numericPrecision(c.Type)
 					rows = append(rows, []any{
 						sysDatabase, "public", v.name, c.Name,
 						int64(j + 1), nil, "YES", sqlTypeName(c.Type), udtName(c.Type),
-						nil,
+						nil, prec, radix, scale, datetimePrecision(c.Type),
+						"NO", nil, "NEVER", "NO",
 					})
 				}
 			}
