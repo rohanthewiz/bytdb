@@ -64,6 +64,9 @@ func (ns *nameSet) selectNames(sel *Select) {
 	}
 	for _, f := range sel.From {
 		ns.boolNames(f.On)
+		for _, c := range f.Using {
+			ns.add(c)
+		}
 		for _, a := range f.FuncArgs {
 			ns.exprNames(a)
 		}

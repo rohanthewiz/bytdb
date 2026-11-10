@@ -456,10 +456,7 @@ func (d *DB) execSelectAggWindow(s *Select) (*Result, error) {
 			}
 			slices.SortStableFunc(order, func(a, b int) int {
 				for k, sk := range q.sorts {
-					c := orderCmp(sortVals[a][k], sortVals[b][k])
-					if sk.desc {
-						c = -c
-					}
+					c := keyCmp(sortVals[a][k], sortVals[b][k], sk.desc, sk.nulls)
 					if c != 0 {
 						return c
 					}
@@ -564,10 +561,7 @@ func sortPartition(env *exEnv, ob []OrderItem, base [][]any, idxs []int) error {
 	}
 	slices.SortStableFunc(idxs, func(a, b int) int {
 		for k, o := range ob {
-			c := orderCmp(ov[a][k], ov[b][k])
-			if o.Desc {
-				c = -c
-			}
+			c := keyCmp(ov[a][k], ov[b][k], o.Desc, o.Nulls)
 			if c != 0 {
 				return c
 			}

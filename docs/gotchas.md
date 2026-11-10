@@ -131,6 +131,7 @@ Parse-time rejections with pointed errors:
 | A lone `ALTER TABLE ... ADD PRIMARY KEY` (every table already has one) | Replace it: `DROP CONSTRAINT t_pkey, ADD PRIMARY KEY (...)` — the only multi-action `ALTER TABLE` accepted |
 | `ALTER COLUMN TYPE` on a foreign-key column (either side) | Drop the constraint, change the type on both sides, re-add it |
 | `RIGHT` / `FULL` / `NATURAL` joins | Rewrite as `LEFT`/`INNER` |
+| `SELECT *` over `JOIN … USING` listing the USING column once | Both tables' copies are listed; name the columns you want (an unqualified USING column is the merged one) |
 | `CREATE TABLE ... AS SELECT` | `CREATE TABLE` with a primary key, then `INSERT ... SELECT` |
 | `LOCK TABLE` as mutual exclusion under `WithConcurrentWrites` | It parses and does nothing; in the default mode writes serialize anyway, but under concurrent writes use a row both sessions update, or `SERIALIZABLE` |
 | Type modifiers on casts (`'abc'::varchar(2)`, `1.555::numeric(5,2)`) | They parse and are not applied: the cast converts to the base type, without truncating or rounding |

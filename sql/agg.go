@@ -176,8 +176,9 @@ type aggKey struct {
 }
 
 type aggSortKey struct {
-	ex   Expr // rewritten: evaluates per group
-	desc bool
+	ex    Expr // rewritten: evaluates per group
+	desc  bool
+	nulls NullsOrder
 }
 
 // aggQuery is a resolved aggregate SELECT: the group keys, the
@@ -311,6 +312,21 @@ func resolveAgg(sc *scope, s *Select, rowMode bool) (*aggQuery, error) {
 			ex = g.Ex
 		default:
 			ex = &ExCol{Col: g.Col}
+			// GROUP BY may name an output column by its alias, as in
+			// Postgres — where, unlike ORDER BY, an input column of the
+			// same name wins (deep-look D-52).
+			if g.Col.Table == "" {
+				if _, err := sc.resolve(g.Col); err != nil {
+					for _, it := range s.Items {
+						if it.As == g.Col.Name {
+							if ex, err = aggItemExpr(it); err != nil {
+								return nil, err
+							}
+							break
+						}
+					}
+				}
+			}
 		}
 		if findAgg(ex) != AggNone {
 			return nil, serr.New("aggregate functions are not allowed in GROUP BY")
@@ -359,7 +375,7 @@ func resolveAgg(sc *scope, s *Select, rowMode bool) (*aggQuery, error) {
 				return nil, serr.New("ORDER BY position is not in the select list",
 					"position", fmt.Sprint(n))
 			}
-			q.sorts = append(q.sorts, aggSortKey{ex: q.outs[n-1], desc: o.Desc})
+			q.sorts = append(q.sorts, aggSortKey{ex: q.outs[n-1], desc: o.Desc, nulls: o.Nulls})
 			continue
 		}
 		// A bare name matching an output alias sorts by that output.
@@ -367,7 +383,7 @@ func resolveAgg(sc *scope, s *Select, rowMode bool) (*aggQuery, error) {
 			if i := slices.IndexFunc(s.Items, func(it SelectItem) bool {
 				return it.As == o.Col.Name
 			}); i >= 0 {
-				q.sorts = append(q.sorts, aggSortKey{ex: q.outs[i], desc: o.Desc})
+				q.sorts = append(q.sorts, aggSortKey{ex: q.outs[i], desc: o.Desc, nulls: o.Nulls})
 				continue
 			}
 		}
@@ -379,7 +395,7 @@ func resolveAgg(sc *scope, s *Select, rowMode bool) (*aggQuery, error) {
 		if err != nil {
 			return nil, err
 		}
-		q.sorts = append(q.sorts, aggSortKey{ex: r, desc: o.Desc})
+		q.sorts = append(q.sorts, aggSortKey{ex: r, desc: o.Desc, nulls: o.Nulls})
 	}
 	return q, nil
 }
@@ -833,10 +849,7 @@ func (d *DB) execSelectAgg(s *Select) (*Result, error) {
 			}
 			slices.SortStableFunc(kept, func(a, b *group) int {
 				for i, sk := range q.sorts {
-					c := orderCmp(sortVals[a][i], sortVals[b][i])
-					if sk.desc {
-						c = -c
-					}
+					c := keyCmp(sortVals[a][i], sortVals[b][i], sk.desc, sk.nulls)
 					if c != 0 {
 						return c
 					}

@@ -1089,6 +1089,16 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 	case *Insert:
 		return d.withViewsInTxn(s, func(dv *DB) (*Result, error) { return dv.execInsert(s) })
 	case *Select:
+		// FOR UPDATE / FOR SHARE (plan Q3): in a transaction block under
+		// concurrent writes, the rows it reads become serializable reads
+		// of the block, so a concurrent writer of them makes one side
+		// fail with 40001 instead of both proceeding on stale data. The
+		// upgrade covers the block's later reads too, which is stricter,
+		// never looser. In the default mode, and outside a block, there
+		// is nothing to do: one writer runs at a time.
+		if s.ForUpdate && d.tx != nil && d.e.ConcurrentWrites() {
+			d.tx.TrackReads()
+		}
 		// runIt materializes referenced views, then the statement's
 		// CTEs, then runs the body.
 		runIt := func(dd *DB) (*Result, error) {

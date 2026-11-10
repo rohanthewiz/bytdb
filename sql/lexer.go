@@ -77,8 +77,29 @@ func lex(src string) ([]token, error) {
 			if err != nil {
 				return nil, serr.Wrap(err, "pos", fmt.Sprint(i))
 			}
-			toks = append(toks, token{tString, text, i})
+			start := i
 			i += n
+			// String constants separated only by whitespace that includes
+			// a newline are one constant, as the SQL standard and Postgres
+			// have it ('foo'\n'bar' is 'foobar'); on one line the second
+			// is a syntax error, as there (deep-look D-52).
+			for {
+				j, newline := i, false
+				for j < len(src) && (src[j] == ' ' || src[j] == '\t' || src[j] == '\n' || src[j] == '\r') {
+					newline = newline || src[j] == '\n'
+					j++
+				}
+				if !newline || j >= len(src) || src[j] != '\'' {
+					break
+				}
+				more, m, err := scanQuoted(src[j:], '\'')
+				if err != nil {
+					return nil, serr.Wrap(err, "pos", fmt.Sprint(j))
+				}
+				text += more
+				i = j + m
+			}
+			toks = append(toks, token{tString, text, start})
 		case isDigit(c) || (c == '.' && i+1 < len(src) && isDigit(src[i+1])):
 			start := i
 			end, err := scanNumber(src, i)
@@ -91,6 +112,16 @@ func lex(src string) ([]token, error) {
 				return nil, serr.Wrap(err, "pos", fmt.Sprint(start))
 			}
 			toks = append(toks, token{tNumber, text, start})
+		case c == '$' && i+1 < len(src) && (src[i+1] == '$' || isIdentStart(src[i+1])):
+			// Dollar quoting: $$...$$ or $tag$...$tag$, a string constant
+			// with no escapes at all — how function bodies and migration
+			// scripts quote text full of quotes (deep-look D-52).
+			text, n, err := scanDollarQuoted(src[i:])
+			if err != nil {
+				return nil, serr.Wrap(err, "pos", fmt.Sprint(i))
+			}
+			toks = append(toks, token{tString, text, i})
+			i += n
 		case c == '$' && i+1 < len(src) && isDigit(src[i+1]):
 			start := i
 			i++
@@ -415,8 +446,36 @@ func scanOp(src string, i int) string {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
+// isIdentStart accepts the bytes Postgres's scanner does: ASCII letters,
+// underscore, and every byte of a multi-byte UTF-8 character (>= 0x80),
+// so unquoted non-ASCII identifiers (ñame, 名前) lex as identifiers
+// (deep-look D-52). strings.ToLower folds them as Unicode.
 func isIdentStart(c byte) bool {
-	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
 }
 
-func isIdentPart(c byte) bool { return isIdentStart(c) || isDigit(c) }
+// isIdentPart also takes digits and '$', which Postgres allows after an
+// identifier's first character.
+func isIdentPart(c byte) bool { return isIdentStart(c) || isDigit(c) || c == '$' }
+
+// scanDollarQuoted reads a dollar-quoted constant at s[0] == '$': the
+// opening tag ($$ or $tag$), the body, and the identical closing tag.
+// It returns the body and the bytes consumed.
+func scanDollarQuoted(s string) (string, int, error) {
+	end := 1
+	for end < len(s) && s[end] != '$' {
+		if !isIdentPart(s[end]) || s[end] == '$' {
+			return "", 0, serr.New("malformed dollar-quote tag")
+		}
+		end++
+	}
+	if end >= len(s) {
+		return "", 0, serr.New("unterminated dollar-quoted string")
+	}
+	tag := s[:end+1] // $tag$ (or $$)
+	body := strings.Index(s[len(tag):], tag)
+	if body < 0 {
+		return "", 0, serr.New("unterminated dollar-quoted string")
+	}
+	return s[len(tag) : len(tag)+body], len(tag) + body + len(tag), nil
+}

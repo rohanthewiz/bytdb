@@ -989,7 +989,19 @@ type GroupItem struct {
 type OrderItem struct {
 	SelectItem
 	Desc bool
+	// Nulls is an explicit NULLS FIRST or NULLS LAST; the default puts
+	// NULLs last ascending and first descending, as Postgres does.
+	Nulls NullsOrder
 }
+
+// NullsOrder is an ORDER BY key's NULLS FIRST / NULLS LAST choice.
+type NullsOrder uint8
+
+const (
+	NullsDefault NullsOrder = iota // last for ASC, first for DESC
+	NullsFirst
+	NullsLast
+)
 
 // JoinType is how a FROM item combines with the tables before it.
 type JoinType int
@@ -1011,6 +1023,11 @@ type FromItem struct {
 	FuncArgs []Expr // non-nil: a set-returning function call in FROM —
 	// parses (psql writes them inside never-evaluated subqueries) but
 	// errors if the scan is ever built
+	// Using is JOIN ... USING (cols): equality of each named column
+	// between this table and the one earlier table that has it, ANDed
+	// into On when the FROM is prepared (prepareFrom), since only then
+	// are the tables' columns known.
+	Using []string
 }
 
 // CTE is one WITH entry: a named subquery materialized once, before
@@ -1060,13 +1077,41 @@ type Select struct {
 	LimitParam  Param
 	OffsetParam Param
 	Union       []UnionArm
+	// ForUpdate is a FOR UPDATE / FOR SHARE locking clause (any
+	// strength). See parser.lockingClause for what it means in bytdb.
+	ForUpdate bool
 }
 
-// UnionArm is one UNION [ALL] continuation, combined left to right:
-// a distinct arm dedups everything accumulated so far, per SQL.
+// UnionArm is one set-operation continuation — UNION, INTERSECT or
+// EXCEPT, [ALL] — combined left to right with everything before it:
+// a UNION arm appends (and, unless ALL, dedups the accumulation), an
+// INTERSECT arm keeps the accumulated rows that also appear in the arm,
+// an EXCEPT arm keeps those that do not. INTERSECT's higher precedence
+// and parenthesized operands are resolved at parse time, so a chain is
+// always evaluated in order (parser.queryRest).
 type UnionArm struct {
+	Op  SetOp
 	All bool
 	Sel *Select
+}
+
+// SetOp is a UnionArm's operation.
+type SetOp uint8
+
+const (
+	SetUnion SetOp = iota
+	SetIntersect
+	SetExcept
+)
+
+func (o SetOp) String() string {
+	switch o {
+	case SetIntersect:
+		return "INTERSECT"
+	case SetExcept:
+		return "EXCEPT"
+	}
+	return "UNION"
 }
 
 // Update is UPDATE t SET col = expr, ... [WHERE ...] [RETURNING ...].

@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -22,6 +23,13 @@ type scope struct {
 	// Only the aggregate rewriter consults it — it otherwise insists that
 	// every column be a group key or an aggregate argument.
 	correlated bool
+	// merged maps the columns of JOIN ... USING to the left table's
+	// ordinal: an unqualified reference to one is not ambiguous, as in
+	// Postgres, where the USING column is a single merged column. For
+	// the INNER and LEFT joins bytdb has, the merged value is the left
+	// table's (equal to the right's, or the left row's own when the
+	// right side is NULL-extended).
+	merged map[string]int
 }
 
 type scopeTable struct {
@@ -57,6 +65,19 @@ func buildScope(lookup tableLookup, items []FromItem) (*scope, error) {
 			return nil, serr.New("table name appears twice in FROM; alias one of them", "name", name)
 		}
 		seen[name] = true
+		for _, c := range it.Using {
+			for _, st := range sc.tables {
+				if ord := st.desc.ColIndex(c); ord >= 0 {
+					if sc.merged == nil {
+						sc.merged = map[string]int{}
+					}
+					if _, already := sc.merged[c]; !already {
+						sc.merged[c] = st.off + ord
+					}
+					break
+				}
+			}
+		}
 		sc.tables = append(sc.tables, scopeTable{name: name, desc: desc, off: sc.width, rows: rows})
 		sc.width += len(desc.Columns)
 	}
@@ -66,7 +87,7 @@ func buildScope(lookup tableLookup, items []FromItem) (*scope, error) {
 // prefix is the scope an ON condition sees: the first n tables.
 func (sc *scope) prefix(n int) *scope {
 	last := sc.tables[n-1]
-	return &scope{tables: sc.tables[:n], width: last.off + len(last.desc.Columns)}
+	return &scope{tables: sc.tables[:n], width: last.off + len(last.desc.Columns), merged: sc.merged}
 }
 
 // resolve maps a column reference to its combined-row ordinal. An
@@ -92,6 +113,9 @@ func (sc *scope) resolve(c ColRef) (int, error) {
 			}
 		}
 		return -1, serr.New("no such table in FROM", "table", c.Table)
+	}
+	if ord, ok := sc.merged[c.Name]; ok && ord < sc.width {
+		return ord, nil
 	}
 	found := -1
 	for _, st := range sc.tables {
@@ -290,6 +314,9 @@ type predTmpl struct {
 func prepareFrom(lk tableLookup, items []FromItem, where BoolExpr) (*fromPlan, error) {
 	sc, err := buildScope(lk, items)
 	if err != nil {
+		return nil, err
+	}
+	if items, err = foldUsing(sc, items); err != nil {
 		return nil, err
 	}
 	fp := &fromPlan{sc: sc, where: where, b: binds{}}
@@ -703,4 +730,54 @@ func (j *joinRun) hashStep(k int, partial []any) {
 		copy(vals, partial)
 		j.rec(k+1, vals)
 	}
+}
+
+// foldUsing turns each JOIN ... USING (cols) into ON conditions, now
+// that the scope knows every table's columns: for each column, the one
+// earlier table that has it equals the joined table's (deep-look D-52).
+// Items are copied before any is changed — they belong to a parsed tree
+// that may be shared.
+//
+// Unlike Postgres, a USING column is not merged into one in SELECT *:
+// both tables' copies are listed (docs/gotchas.md).
+func foldUsing(sc *scope, items []FromItem) ([]FromItem, error) {
+	copied := false
+	for k, it := range items {
+		if len(it.Using) == 0 {
+			continue
+		}
+		if !copied {
+			items, copied = slices.Clone(items), true
+		}
+		right := sc.tables[k]
+		var conds []BoolExpr
+		for _, c := range it.Using {
+			if right.desc.ColIndex(c) < 0 {
+				return nil, serr.New(`column "` + c + `" specified in USING clause does not exist in right table`)
+			}
+			left := ""
+			for _, st := range sc.tables[:k] {
+				if st.desc.ColIndex(c) >= 0 {
+					if left != "" {
+						return nil, serr.New(`common column name "` + c + `" appears more than once in left table`)
+					}
+					left = st.name
+				}
+			}
+			if left == "" {
+				return nil, serr.New(`column "` + c + `" specified in USING clause does not exist in left table`)
+			}
+			r := SelectItem{Col: ColRef{Table: right.name, Name: c}}
+			conds = append(conds, &Pred{Item: SelectItem{Col: ColRef{Table: left, Name: c}}, Op: OpEQ, RItem: &r})
+		}
+		if it.On != nil {
+			conds = append(conds, it.On)
+		}
+		items[k].On = &And{Exprs: conds}
+		if len(conds) == 1 {
+			items[k].On = conds[0]
+		}
+		items[k].Using = nil
+	}
+	return items, nil
 }

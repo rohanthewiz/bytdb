@@ -55,10 +55,7 @@ func newTopN(keys []sortKey, n int64) *topN {
 // keys in turn, then by arrival.
 func (h *topHeap) order(a, b topEntry) int {
 	for _, k := range h.keys {
-		c := orderCmp(a.row[k.ord], b.row[k.ord])
-		if k.desc {
-			c = -c
-		}
+		c := keyCmp(a.row[k.ord], b.row[k.ord], k.desc, k.nulls)
 		if c != 0 {
 			return c
 		}

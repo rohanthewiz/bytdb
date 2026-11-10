@@ -108,6 +108,8 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		return n.Val, nil
 	case *ExCol:
 		return env.lookupVal(n.Col)
+	case *exRow:
+		return nil, errRowConstructor()
 	case *ExAnd:
 		out := triTrue
 		for _, sub := range n.Exprs {

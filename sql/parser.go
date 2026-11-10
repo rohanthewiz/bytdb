@@ -345,6 +345,11 @@ func (p *parser) statement() (Statement, error) {
 		return p.withStmt()
 	case p.acceptKw("select"):
 		return p.selectStmt()
+	case p.cur().kind == tIdent && p.cur().text == "values",
+		p.cur().kind == tOp && p.cur().text == "(":
+		// VALUES as a query, and a query that opens with a parenthesized
+		// operand: (SELECT ...) UNION (SELECT ...) (deep-look D-52).
+		return p.queryExpr()
 	case p.acceptKw("update"):
 		return p.update()
 	case p.acceptKw("delete"):
@@ -2155,19 +2160,181 @@ func (p *parser) selectStmt() (Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	// UNION [ALL] chains; ORDER BY / LIMIT / OFFSET then apply to the
-	// combined result.
-	for p.acceptKw("union") {
-		all := p.acceptKw("all")
-		if err := p.expectKw("select"); err != nil {
-			return nil, err
+	return p.queryRest(s, false)
+}
+
+// queryExpr parses a whole query starting at SELECT, VALUES or '(' —
+// the entry for a statement or derived table that does not begin with
+// SELECT (deep-look D-52).
+func (p *parser) queryExpr() (*Select, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+	head, closed, err := p.setPrimary()
+	if err != nil {
+		return nil, err
+	}
+	st, err := p.queryRest(head, closed)
+	if err != nil {
+		return nil, err
+	}
+	return st.(*Select), nil
+}
+
+// setPrimary parses one operand of a set expression: a SELECT core,
+// VALUES, or a parenthesized query. closed reports a parenthesized one,
+// which may carry its own ORDER BY / LIMIT and so must be wrapped before
+// anything outside it is attached (see queryRest).
+func (p *parser) setPrimary() (s *Select, closed bool, err error) {
+	switch {
+	case p.acceptKw("select"):
+		s, err = p.selectCore()
+		return s, false, err
+	case p.acceptKw("values"):
+		s, err = p.valuesQuery()
+		return s, false, err
+	case p.cur().kind == tOp && p.cur().text == "(":
+		p.advance()
+		if s, err = p.queryExpr(); err != nil {
+			return nil, false, err
 		}
-		arm, err := p.selectCore()
+		return s, true, p.expectOp(")")
+	}
+	return nil, false, p.unexpected("SELECT, VALUES or a parenthesized query")
+}
+
+// setTerm parses an INTERSECT chain, which binds tighter than UNION and
+// EXCEPT.
+func (p *parser) setTerm() (s *Select, closed bool, err error) {
+	if s, closed, err = p.setPrimary(); err != nil {
+		return nil, false, err
+	}
+	for p.acceptKw("intersect") {
+		all := p.setAll()
+		if closed {
+			s, closed = p.wrapDerived(s), false
+		}
+		r, _, err := p.setPrimary()
+		if err != nil {
+			return nil, false, err
+		}
+		s.Union = append(s.Union, UnionArm{Op: SetIntersect, All: all, Sel: p.asArm(r)})
+	}
+	return s, closed, nil
+}
+
+// setAll parses the ALL | DISTINCT after a set operator; DISTINCT is
+// the default.
+func (p *parser) setAll() bool {
+	if p.acceptKw("all") {
+		return true
+	}
+	p.acceptKw("distinct")
+	return false
+}
+
+// asArm makes a set operand usable as one arm of a chain: a plain SELECT
+// core is one already; anything with its own set operations, ORDER BY,
+// LIMIT or OFFSET becomes a derived table, so it runs as the unit it was
+// written as.
+func (p *parser) asArm(s *Select) *Select {
+	if len(s.Union) == 0 && len(s.OrderBy) == 0 && s.Limit < 0 && s.Offset == 0 &&
+		s.LimitParam == 0 && s.OffsetParam == 0 && !s.ForUpdate {
+		return s
+	}
+	return p.wrapDerived(s)
+}
+
+// wrapDerived lowers a query to SELECT * FROM (query): a synthetic CTE,
+// exactly as a derived table in FROM lowers (tableRef).
+func (p *parser) wrapDerived(s *Select) *Select {
+	p.nDerived++
+	name := fmt.Sprintf("*derived*%d", p.nDerived)
+	p.ctes = append(p.ctes, CTE{Name: name, Sel: s})
+	return &Select{Star: true, From: []FromItem{{Table: name, Alias: "*set*" + strconv.Itoa(p.nDerived)}}, Limit: -1}
+}
+
+// valuesQuery parses VALUES (row), (row), ... after VALUES as a query:
+// one SELECT per row, chained with UNION ALL, columns named column1,
+// column2, ... as Postgres names them. The rows' types unify the way a
+// UNION's arms do.
+func (p *parser) valuesQuery() (*Select, error) {
+	var head *Select
+	width := -1
+	for {
+		row, err := p.exprList()
 		if err != nil {
 			return nil, err
 		}
-		s.Union = append(s.Union, UnionArm{All: all, Sel: arm})
+		if width >= 0 && len(row) != width {
+			return nil, serr.New("VALUES lists must all be the same length")
+		}
+		width = len(row)
+		core := &Select{Limit: -1}
+		for i, e := range row {
+			it := lowerItem(e)
+			it.As = "column" + strconv.Itoa(i+1)
+			core.Items = append(core.Items, it)
+		}
+		if head == nil {
+			head = core
+		} else {
+			head.Union = append(head.Union, UnionArm{Op: SetUnion, All: true, Sel: core})
+		}
+		if !p.acceptOp(",") {
+			return head, nil
+		}
 	}
+}
+
+// queryRest parses what follows a query's first operand: further set
+// operations, then ORDER BY / LIMIT / OFFSET / FETCH / FOR UPDATE, which
+// apply to the combined result. A parenthesized first operand (closed)
+// is wrapped first when anything follows it, so its own ORDER BY or
+// LIMIT keeps applying to it alone.
+func (p *parser) queryRest(s *Select, closed bool) (Statement, error) {
+	var err error
+	follows := func() bool {
+		t := p.cur()
+		if t.kind != tIdent {
+			return false
+		}
+		switch t.text {
+		case "union", "except", "intersect", "order", "limit", "offset", "fetch", "for":
+			return true
+		}
+		return false
+	}
+	if closed && follows() {
+		s = p.wrapDerived(s)
+	}
+	for p.cur().kind == tIdent && p.cur().text == "intersect" {
+		p.advance()
+		all := p.setAll()
+		r, _, err := p.setPrimary()
+		if err != nil {
+			return nil, err
+		}
+		s.Union = append(s.Union, UnionArm{Op: SetIntersect, All: all, Sel: p.asArm(r)})
+	}
+	for {
+		op := SetUnion
+		switch {
+		case p.acceptKw("union"):
+		case p.acceptKw("except"):
+			op = SetExcept
+		default:
+			goto tail
+		}
+		all := p.setAll()
+		r, _, err := p.setTerm()
+		if err != nil {
+			return nil, err
+		}
+		s.Union = append(s.Union, UnionArm{Op: op, All: all, Sel: p.asArm(r)})
+	}
+tail:
 	if p.acceptKw("order") {
 		if err := p.expectKw("by"); err != nil {
 			return nil, err
@@ -2183,6 +2350,9 @@ func (p *parser) selectStmt() (Statement, error) {
 			} else {
 				p.acceptKw("asc")
 			}
+			if item.Nulls, err = p.nullsOrder(); err != nil {
+				return nil, err
+			}
 			s.OrderBy = append(s.OrderBy, item)
 			if !p.acceptOp(",") {
 				break
@@ -2192,6 +2362,11 @@ func (p *parser) selectStmt() (Statement, error) {
 	for {
 		switch {
 		case p.acceptKw("limit"):
+			// LIMIT ALL and LIMIT NULL are "no limit" (deep-look D-52).
+			if p.acceptKw("all") || p.acceptKw("null") {
+				s.Limit, s.LimitParam = -1, 0
+				continue
+			}
 			if s.Limit, s.LimitParam, err = p.nonNegInt("LIMIT"); err != nil {
 				return nil, err
 			}
@@ -2199,10 +2374,86 @@ func (p *parser) selectStmt() (Statement, error) {
 			if s.Offset, s.OffsetParam, err = p.nonNegInt("OFFSET"); err != nil {
 				return nil, err
 			}
+			if !p.acceptKw("rows") {
+				p.acceptKw("row") // the SQL-standard OFFSET n ROWS
+			}
+		case p.acceptKw("fetch"):
+			// FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY, the standard
+			// spelling of LIMIT; n defaults to 1.
+			if !p.acceptKw("first") {
+				if err := p.expectKw("next"); err != nil {
+					return nil, err
+				}
+			}
+			s.Limit, s.LimitParam = 1, 0
+			if t := p.cur(); t.kind == tNumber || t.kind == tParam {
+				if s.Limit, s.LimitParam, err = p.nonNegInt("FETCH"); err != nil {
+					return nil, err
+				}
+			}
+			if !p.acceptKw("rows") {
+				if err := p.expectKw("row"); err != nil {
+					return nil, err
+				}
+			}
+			if p.acceptKw("with") {
+				return nil, serr.New("FETCH ... WITH TIES is not supported")
+			}
+			if err := p.expectKw("only"); err != nil {
+				return nil, err
+			}
+		case p.acceptKw("for"):
+			if err := p.lockingClause(s); err != nil {
+				return nil, err
+			}
 		default:
 			return s, nil
 		}
 	}
+}
+
+// lockingClause parses FOR {UPDATE | NO KEY UPDATE | SHARE | KEY SHARE}
+// [OF t, ...] [NOWAIT | SKIP LOCKED] after FOR (deep-look D-52, plan
+// Q3). bytdb has no row locks: in the default mode one writer runs at a
+// time, which already gives the clause's guarantee, and under
+// concurrent writes the executor turns it into serializable reads of
+// the rows it selects (Select.ForUpdate). NOWAIT and SKIP LOCKED then
+// change nothing, as nothing is ever locked.
+func (p *parser) lockingClause(s *Select) error {
+	switch {
+	case p.acceptKw("update"):
+	case p.acceptKw("share"):
+	case p.acceptKw("no"):
+		if err := p.expectKw("key"); err != nil {
+			return err
+		}
+		if err := p.expectKw("update"); err != nil {
+			return err
+		}
+	case p.acceptKw("key"):
+		if err := p.expectKw("share"); err != nil {
+			return err
+		}
+	default:
+		return p.unexpected("UPDATE, NO KEY UPDATE, SHARE or KEY SHARE after FOR")
+	}
+	if p.acceptKw("of") {
+		for {
+			if _, err := p.tableName(); err != nil {
+				return err
+			}
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	if !p.acceptKw("nowait") && p.acceptKw("skip") {
+		if err := p.expectKw("locked"); err != nil {
+			return err
+		}
+	}
+	s.ForUpdate = true
+	return nil
 }
 
 // selectCore parses one SELECT's items, FROM, WHERE, GROUP BY, and
@@ -2473,13 +2724,20 @@ func (p *parser) fromClause() ([]FromItem, error) {
 	}
 }
 
-// joinOn parses "t [alias] ON expr" after a JOIN keyword.
+// joinOn parses "t [alias] ON expr" (or "USING (cols)") after a JOIN
+// keyword.
 func (p *parser) joinOn(jt JoinType) (FromItem, error) {
 	it, err := p.tableRef()
 	if err != nil {
 		return FromItem{}, err
 	}
 	it.Join = jt
+	if p.acceptKw("using") {
+		if it.Using, err = p.identList("a join column"); err != nil {
+			return FromItem{}, err
+		}
+		return it, nil
+	}
 	if err := p.expectKw("on"); err != nil {
 		return FromItem{}, err
 	}
@@ -2498,6 +2756,8 @@ var noAlias = map[string]bool{
 	"cross": true, "union": true, "as": true, "and": true, "or": true,
 	"not": true, "using": true, "natural": true, "set": true,
 	"values": true, "returning": true,
+	// The clauses deep-look D-52 added after FROM.
+	"for": true, "fetch": true, "intersect": true, "except": true, "window": true,
 }
 
 // tableName parses a table name with an optional schema qualifier:
@@ -2818,10 +3078,8 @@ func (p *parser) sysFuncCall() (val, name string, ok bool, err error) {
 func (p *parser) tableRef() (FromItem, error) {
 	if t := p.cur(); t.kind == tOp && t.text == "(" {
 		p.advance()
-		if err := p.expectKw("select"); err != nil {
-			return FromItem{}, err
-		}
-		st, err := p.selectStmt()
+		// (SELECT ...), (VALUES ...), or a parenthesized set expression.
+		st, err := p.queryExpr()
 		if err != nil {
 			return FromItem{}, err
 		}
@@ -2841,9 +3099,17 @@ func (p *parser) tableRef() (FromItem, error) {
 			// to reference the derived columns.
 			return FromItem{}, serr.New("subquery in FROM must have an alias")
 		}
+		// AS v(a, b) renames the derived columns — how a VALUES list in
+		// FROM gets names other than column1, column2.
+		var cols []string
+		if p.cur().kind == tOp && p.cur().text == "(" {
+			if cols, err = p.identList("a column alias"); err != nil {
+				return FromItem{}, err
+			}
+		}
 		p.nDerived++
 		it.Table = fmt.Sprintf("*derived*%d", p.nDerived) // '*' cannot appear in identifiers
-		p.ctes = append(p.ctes, CTE{Name: it.Table, Sel: st.(*Select)})
+		p.ctes = append(p.ctes, CTE{Name: it.Table, Cols: cols, Sel: st})
 		return it, nil
 	}
 	name, err := p.tableName()
@@ -2893,6 +3159,18 @@ func (p *parser) colRef() (ColRef, error) {
 	if err != nil {
 		return ColRef{}, err
 	}
+	if p.acceptOp(".") {
+		// schema.table.column. Every user table lives in public, so that
+		// qualifier drops; any other schema names nothing (deep-look D-52).
+		col, err := p.ident("a column name")
+		if err != nil {
+			return ColRef{}, err
+		}
+		if first != "public" {
+			return ColRef{}, serr.New(`schema "`+first+`" does not exist`, "column", first+"."+name+"."+col)
+		}
+		return ColRef{Table: name, Name: col}, nil
+	}
 	return ColRef{Table: first, Name: name}, nil
 }
 
@@ -2901,7 +3179,7 @@ func (p *parser) colRef() (ColRef, error) {
 var itemEnd = map[string]bool{
 	"from": true, "where": true, "group": true, "having": true,
 	"order": true, "limit": true, "offset": true, "union": true,
-	"as": true,
+	"as": true, "for": true, "fetch": true, "intersect": true, "except": true,
 }
 
 // selectListItem parses one select-list entry: t.*, or an expression
@@ -3222,11 +3500,43 @@ func (p *parser) exprCmp() (Expr, error) {
 			}
 		case p.acceptKw("is"):
 			not := p.acceptKw("not")
-			if err := p.expectKw("null"); err != nil {
+			switch {
+			case p.acceptKw("null"), p.acceptKw("unknown"):
+				// IS UNKNOWN is IS NULL for a boolean.
+				e = &ExIsNull{E: e, Not: not}
+				d++
+			case p.acceptKw("true"), p.acceptKw("false"):
+				e = isTruth(e, p.toks[p.i-1].text == "true", not)
+				d += 3
+			case p.acceptKw("distinct"):
+				if err := p.expectKw("from"); err != nil {
+					return nil, err
+				}
+				r, err := p.exprOther()
+				if err != nil {
+					return nil, err
+				}
+				e = isDistinct(e, r, not)
+				d = max(d, p.lastDepth) + 3
+			default:
+				return nil, p.unexpected("NULL, TRUE, FALSE, UNKNOWN or DISTINCT FROM after IS")
+			}
+		case p.cur().kind == tIdent && p.cur().text == "in" && isRow(e):
+			p.advance()
+			r, err := p.rowInTail(e.(*exRow), false)
+			if err != nil {
 				return nil, err
 			}
-			e = &ExIsNull{E: e, Not: not}
-			d++
+			e, d = r, d+4
+		case p.cur().kind == tIdent && p.cur().text == "not" &&
+			p.tokAt(1).kind == tIdent && p.tokAt(1).text == "in" && isRow(e):
+			p.advance()
+			p.advance()
+			r, err := p.rowInTail(e.(*exRow), true)
+			if err != nil {
+				return nil, err
+			}
+			e, d = r, d+5
 		case p.cur().kind == tIdent && p.cur().text == "in":
 			p.advance()
 			var r Expr
@@ -3326,6 +3636,13 @@ func (p *parser) exprCmp() (Expr, error) {
 			r, err := p.exprOther()
 			if err != nil {
 				return nil, err
+			}
+			if isRow(e) || isRow(r) {
+				if e, err = rowCompare(op, e, r); err != nil {
+					return nil, err
+				}
+				d = max(d, p.lastDepth) + 3
+				break
 			}
 			e = &ExCmp{Op: op, L: e, R: r}
 			d = max(d, p.lastDepth) + 1
@@ -3746,7 +4063,43 @@ func (p *parser) primary() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		if p.acceptOp(",") {
+			// A row constructor, (a, b): only comparisons and IN take
+			// one, and exprCmp lowers it away there (deep-look D-52).
+			row := &exRow{Elems: []Expr{e}}
+			for {
+				el, err := p.expression()
+				if err != nil {
+					return nil, err
+				}
+				row.Elems = append(row.Elems, el)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+			return row, p.expectOp(")")
+		}
 		return e, p.expectOp(")")
+	}
+	if t.kind == tIdent && t.text == "cast" && p.peekOp("(") {
+		// CAST(x AS t), the standard spelling of x::t.
+		p.advance()
+		p.advance()
+		e, err := p.expression()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("as"); err != nil {
+			return nil, err
+		}
+		typ, err := p.castType()
+		if err != nil {
+			return nil, err
+		}
+		return &ExCast{E: e, Type: typ}, p.expectOp(")")
+	}
+	if e, ok, err := p.typedLiteral(); ok || err != nil {
+		return e, err
 	}
 	if t.kind == tIdent && t.text == "case" {
 		p.advance()
@@ -3977,6 +4330,9 @@ func (p *parser) windowOver(w *ExWindow) (Expr, error) {
 				o.Desc = true
 			} else {
 				p.acceptKw("asc")
+			}
+			if o.Nulls, err = p.nullsOrder(); err != nil {
+				return nil, err
 			}
 			w.OrderBy = append(w.OrderBy, o)
 			if !p.acceptOp(",") {
@@ -4341,4 +4697,183 @@ func (p *parser) literal() (any, error) {
 		return Param(n), nil
 	}
 	return nil, p.unexpected("a literal value")
+}
+
+// --- deep-look D-52: syntax lowered at parse time ---
+
+// exRow is a row constructor, (a, b, ...). exprCmp lowers a row
+// comparison or row IN into plain comparisons; a row anywhere else
+// survives the parse and is refused by the typing pass and the
+// evaluator (errRowConstructor).
+type exRow struct{ Elems []Expr }
+
+func (*exRow) expr() {}
+
+// errRowConstructor refuses a row constructor outside = , <> and IN.
+func errRowConstructor() error {
+	return serr.New("a row constructor ( a, b ) is supported only in = , <> and IN comparisons")
+}
+
+func isRow(e Expr) bool {
+	_, ok := e.(*exRow)
+	return ok
+}
+
+// rowCompare lowers (a, b) = (c, d) to a = c AND b = d, and <> to its
+// negation — the row comparisons with Postgres's three-valued meaning
+// (a NULL pair leaves an equality unknown, exactly as the AND/OR of the
+// element comparisons does). Ordering comparisons of rows are not
+// supported.
+func rowCompare(op PredOp, l, r Expr) (Expr, error) {
+	lr, lok := l.(*exRow)
+	rr, rok := r.(*exRow)
+	if !lok || !rok {
+		return nil, serr.New("a row can be compared only with another row")
+	}
+	if len(lr.Elems) != len(rr.Elems) {
+		return nil, serr.New("unequal number of entries in row expressions")
+	}
+	if op != OpEQ && op != OpNE {
+		return nil, serr.New("row comparisons support only = and <>")
+	}
+	eq := &ExAnd{}
+	for i := range lr.Elems {
+		eq.Exprs = append(eq.Exprs, &ExCmp{Op: OpEQ, L: lr.Elems[i], R: rr.Elems[i]})
+	}
+	if op == OpNE {
+		return &ExNot{E: eq}, nil
+	}
+	return eq, nil
+}
+
+// rowInTail parses the list after (a, b) [NOT] IN and lowers it to an
+// OR of row equalities (each an AND), negated for NOT IN: the meaning
+// Postgres gives a row IN, NULLs included. A subquery on the right is
+// not supported.
+func (p *parser) rowInTail(row *exRow, not bool) (Expr, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	if t := p.cur(); t.kind == tIdent && t.text == "select" {
+		return nil, serr.New("(a, b) IN (SELECT ...) is not supported; join, or compare columns one by one")
+	}
+	any := &ExOr{}
+	for {
+		el, err := p.expression()
+		if err != nil {
+			return nil, err
+		}
+		eq, err := rowCompare(OpEQ, row, el)
+		if err != nil {
+			return nil, err
+		}
+		any.Exprs = append(any.Exprs, eq)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if not {
+		return &ExNot{E: any}, nil
+	}
+	return any, nil
+}
+
+// isTruth lowers x IS [NOT] TRUE / FALSE. Unlike x = true, the result
+// is never NULL: a NULL x is neither true nor false.
+//
+//	x IS TRUE      CASE WHEN x     THEN true  ELSE false END
+//	x IS NOT TRUE  CASE WHEN x     THEN false ELSE true  END
+//	x IS FALSE     CASE WHEN NOT x THEN true  ELSE false END
+//	x IS NOT FALSE CASE WHEN NOT x THEN false ELSE true  END
+func isTruth(x Expr, want, not bool) Expr {
+	cond := x
+	if !want {
+		cond = &ExNot{E: x}
+	}
+	return &ExCase{
+		Whens: []ExWhen{{When: cond, Then: &ExLit{Val: !not}}},
+		Else:  &ExLit{Val: not},
+	}
+}
+
+// isDistinct lowers a IS [NOT] DISTINCT FROM b: equality that treats two
+// NULLs as equal and a NULL against a value as different, never NULL.
+//
+//	a IS DISTINCT FROM b      CASE WHEN a IS NULL THEN b IS NOT NULL
+//	                               WHEN b IS NULL THEN true
+//	                               ELSE a <> b END
+//
+// (and the mirror for NOT DISTINCT). Both operands are evaluated twice;
+// a volatile one (nextval) would draw twice.
+func isDistinct(a, b Expr, not bool) Expr {
+	if not {
+		return &ExCase{
+			Whens: []ExWhen{
+				{When: &ExIsNull{E: a}, Then: &ExIsNull{E: b}},
+				{When: &ExIsNull{E: b}, Then: &ExLit{Val: false}},
+			},
+			Else: &ExCmp{Op: OpEQ, L: a, R: b},
+		}
+	}
+	return &ExCase{
+		Whens: []ExWhen{
+			{When: &ExIsNull{E: a}, Then: &ExIsNull{E: b, Not: true}},
+			{When: &ExIsNull{E: b}, Then: &ExLit{Val: true}},
+		},
+		Else: &ExCmp{Op: OpNE, L: a, R: b},
+	}
+}
+
+// typedLitTypes are the type names that may prefix a string constant as
+// a typed literal, date '2024-01-02' — the same as '2024-01-02'::date.
+var typedLitTypes = map[string]bool{
+	"date": true, "timestamp": true, "timestamptz": true, "uuid": true,
+	"text": true, "varchar": true, "bool": true, "boolean": true,
+	"int": true, "integer": true, "bigint": true, "smallint": true,
+	"numeric": true, "decimal": true, "real": true, "float8": true, "float4": true,
+	"json": true, "jsonb": true, "bytea": true,
+}
+
+// typedLiteral parses type 'string' (including timestamp WITH[OUT] TIME
+// ZONE 'string') as a cast of the string. ok is false, consuming
+// nothing, when the tokens are not that shape.
+func (p *parser) typedLiteral() (Expr, bool, error) {
+	t := p.cur()
+	if t.kind != tIdent || !typedLitTypes[t.text] {
+		return nil, false, nil
+	}
+	n := 1
+	if t.text == "timestamp" {
+		if w := p.tokAt(1); w.kind == tIdent && (w.text == "with" || w.text == "without") &&
+			p.tokAt(2).kind == tIdent && p.tokAt(2).text == "time" &&
+			p.tokAt(3).kind == tIdent && p.tokAt(3).text == "zone" {
+			n = 4
+		}
+	}
+	if p.tokAt(n).kind != tString {
+		return nil, false, nil
+	}
+	typ := t.text
+	p.i += n
+	s := p.cur().text
+	p.advance()
+	return &ExCast{E: &ExLit{Val: s}, Type: typ}, true, nil
+}
+
+// nullsOrder parses an ORDER BY key's optional NULLS FIRST | NULLS LAST
+// (deep-look D-52).
+func (p *parser) nullsOrder() (NullsOrder, error) {
+	if !p.acceptKw("nulls") {
+		return NullsDefault, nil
+	}
+	switch {
+	case p.acceptKw("first"):
+		return NullsFirst, nil
+	case p.acceptKw("last"):
+		return NullsLast, nil
+	}
+	return NullsDefault, p.unexpected("FIRST or LAST after NULLS")
 }

@@ -137,16 +137,28 @@ func (x *explainer) selectNode(s *Select) (*planNode, error) {
 		}
 		app.children = append(app.children, arm)
 		distinct := false
+		setOp := ""
 		for _, u := range s.Union {
 			if arm, err = x.armNode(u.Sel); err != nil {
 				return nil, err
 			}
 			app.children = append(app.children, arm)
-			distinct = distinct || !u.All
+			switch u.Op {
+			case SetIntersect:
+				setOp = "Intersect"
+			case SetExcept:
+				setOp = "Except"
+			default:
+				distinct = distinct || !u.All
+			}
 		}
 		n = app
 		if distinct {
 			n = &planNode{title: "Unique", children: []*planNode{app}}
+		}
+		if setOp != "" {
+			// Postgres's name for the hashed INTERSECT/EXCEPT over its inputs.
+			n = &planNode{title: "HashSetOp " + setOp, children: []*planNode{n}}
 		}
 	} else if n, err = x.armNode(s); err != nil {
 		return nil, err

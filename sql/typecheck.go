@@ -1138,6 +1138,8 @@ func (t *typer) expr(e Expr, ts *tscope) (Expr, bytdb.ColType, error) {
 		return nil, "", nil
 	case *ExLit:
 		return n, litStaticType(n.Val, n.Typ), nil
+	case *exRow:
+		return nil, "", errRowConstructor()
 	case *ExCol:
 		return n, ts.colType(n.Col), nil
 	case *ExCmp:

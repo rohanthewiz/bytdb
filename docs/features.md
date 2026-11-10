@@ -400,7 +400,9 @@ DROP INDEX orders_by_age ON orders;
 ### Joins
 
 `INNER`, `LEFT [OUTER]`, and `CROSS` (including comma syntax), in left-deep
-chains. Two physical strategies, chosen per join step:
+chains, with `ON` or `USING (cols)`; an unqualified USING column names the
+merged column, as in Postgres. Two physical strategies, chosen per join
+step:
 
 ```sql
 -- anti-join: users with no orders (sql/join_test.go)
@@ -679,13 +681,21 @@ text (OID 1009 in both wire formats). No array operators (`@>`, `&&`),
 
 ### Expressions
 
-- Comparisons `= != <> < <= > >=`, `IS [NOT] NULL`, regex `~ !~ ~* !~*`
+- Comparisons `= != <> < <= > >=`, `IS [NOT] NULL`, `IS [NOT] TRUE |
+  FALSE | UNKNOWN`, `IS [NOT] DISTINCT FROM`, regex `~ !~ ~* !~*`; row
+  comparisons `(a, b) = (1, 2)`, `<>`, and `(a, b) [NOT] IN ((1, 2), ...)`
 - Three-valued `AND` / `OR` / `NOT`; arithmetic `+ - * / %`; string `||`
 - `CASE WHEN`, `IN` / `NOT IN` (including `IN (SELECT ...)`), `BETWEEN`,
   `op ANY(...)` / `op ALL(...)` with `ARRAY[...]`, subqueries, or `'{...}'`
   literals
-- `::` casts (int family, text family, bool, float/numeric, timestamp/date,
-  uuid, jsonb, reg* types)
+- `::` casts and `CAST(x AS t)` (int family, text family, bool,
+  float/numeric, timestamp/date, uuid, jsonb, reg* types; `character
+  varying`, `timestamp with time zone` and modifiers such as `varchar(10)`
+  parse, the modifiers unapplied), and typed literals `date '…'`,
+  `timestamp '…'`, `uuid '…'`, …
+- String constants: `'…'`, `E'…'`, dollar quotes `$$…$$` / `$tag$…$tag$`,
+  and constants continued across a newline (`'foo'` newline `'bar'`);
+  unquoted identifiers may be non-ASCII; `public.t.col` names a column
 - Correlated scalar subqueries, `EXISTS`, `ARRAY(SELECT ...)`:
 
 ```sql
@@ -696,7 +706,18 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
   `array_to_string`, `array_length`, `gen_random_uuid`, the clock functions,
   plus the Postgres introspection functions ORMs call (`format_type`,
   `pg_get_indexdef`, `pg_table_is_visible`, ...)
-- `UNION [ALL]`, `SELECT` without `FROM` (`SELECT 1`)
+- `UNION`, `INTERSECT`, `EXCEPT` (each with `ALL`), with `INTERSECT`
+  binding tighter and parenthesized operands keeping their own `ORDER BY` /
+  `LIMIT`; `VALUES (…), (…)` as a query and as a derived table
+  (`FROM (VALUES …) AS v(a, b)`); `SELECT` without `FROM` (`SELECT 1`)
+- `ORDER BY … NULLS FIRST | LAST`; `GROUP BY` an output alias; `LIMIT ALL`,
+  `OFFSET n ROWS`, `FETCH FIRST | NEXT n ROWS ONLY`
+- `SELECT … FOR UPDATE | SHARE [OF t] [NOWAIT | SKIP LOCKED]`: in the default
+  mode writes already serialize, so it changes nothing; under concurrent
+  writes, inside a transaction block, it makes the block SERIALIZABLE from
+  that point, so a concurrent writer of the rows it read fails one side with
+  40001 rather than letting both proceed on stale data. NOWAIT and SKIP
+  LOCKED change nothing: no row is ever locked
 - Expression values in `INSERT ... VALUES` — evaluated per row, so
   `VALUES (nextval('s'), 'by'||'tdb', (SELECT max(id) FROM t))` all work;
   aggregates, window calls, and column references are rejected, as in

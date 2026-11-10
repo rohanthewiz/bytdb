@@ -555,10 +555,7 @@ func sortOffsetProject(res *Result, rows [][]any, keys []sortKey, proj []projEnt
 	if len(keys) > 0 {
 		slices.SortStableFunc(rows, func(a, b []any) int {
 			for _, k := range keys {
-				c := orderCmp(a[k.ord], b[k.ord])
-				if k.desc {
-					c = -c
-				}
+				c := keyCmp(a[k.ord], b[k.ord], k.desc, k.nulls)
 				if c != 0 {
 					return c
 				}
@@ -602,8 +599,27 @@ func satAdd(a, b int64) int64 {
 }
 
 type sortKey struct {
-	ord  int
-	desc bool
+	ord   int
+	desc  bool
+	nulls NullsOrder
+}
+
+// keyCmp orders two values of one ORDER BY key: orderCmp (NULLs last),
+// reversed for DESC, with an explicit NULLS FIRST/LAST placing a NULL
+// against a value whatever the direction. Every sort — plain, DISTINCT,
+// top-N, aggregate, window — compares through it.
+func keyCmp(a, b any, desc bool, nulls NullsOrder) int {
+	if nulls != NullsDefault && (a == nil) != (b == nil) {
+		if (a == nil) == (nulls == NullsFirst) {
+			return -1
+		}
+		return 1
+	}
+	c := orderCmp(a, b)
+	if desc {
+		c = -c
+	}
+	return c
 }
 
 // buildSortKeys resolves a SELECT's ORDER BY into combined-row sort
@@ -619,12 +635,12 @@ func buildSortKeys(sc *scope, s *Select, proj []projEntry, exprs []Expr) ([]sort
 				return nil, nil, err
 			}
 			if pe.ord >= 0 {
-				keys = append(keys, sortKey{pe.ord, o.Desc})
+				keys = append(keys, sortKey{pe.ord, o.Desc, o.Nulls})
 			}
 			continue // a literal output is a constant key: no effect
 		}
 		if o.Ex != nil { // a hidden sort expression, appended like an item
-			keys = append(keys, sortKey{sc.width + len(exprs), o.Desc})
+			keys = append(keys, sortKey{sc.width + len(exprs), o.Desc, o.Nulls})
 			exprs = append(exprs, o.Ex)
 			continue
 		}
@@ -632,7 +648,7 @@ func buildSortKeys(sc *scope, s *Select, proj []projEntry, exprs []Expr) ([]sort
 		if o.Col.Table == "" {
 			if pe, ok := aliasEntry(sc, s, proj, o.Col.Name); ok {
 				if pe.ord >= 0 {
-					keys = append(keys, sortKey{pe.ord, o.Desc})
+					keys = append(keys, sortKey{pe.ord, o.Desc, o.Nulls})
 				}
 				continue
 			}
@@ -641,7 +657,7 @@ func buildSortKeys(sc *scope, s *Select, proj []projEntry, exprs []Expr) ([]sort
 		if err != nil {
 			return nil, nil, err
 		}
-		keys = append(keys, sortKey{ord, o.Desc})
+		keys = append(keys, sortKey{ord, o.Desc, o.Nulls})
 	}
 	return keys, exprs, nil
 }
@@ -1523,7 +1539,16 @@ func (d *DB) execUnion(s *Select) (*Result, error) {
 			return nil, err
 		}
 		if len(armRes.Cols) != len(res.Cols) {
-			return nil, serr.New("each UNION query must have the same number of columns")
+			return nil, serr.New("each " + arm.Op.String() + " query must have the same number of columns")
+		}
+		switch arm.Op {
+		case SetIntersect, SetExcept:
+			// Set operations on whole rows, NULLs equal to NULLs as a
+			// set operation treats them (deep-look D-52).
+			if rows, err = intersectExcept(rows, armRes.Rows, arm.Op == SetIntersect, arm.All); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		rows = append(rows, armRes.Rows...)
 		// Each arm was charged as it ran; the concatenation is a new,
@@ -1669,7 +1694,7 @@ func outputSortKeys(order []OrderItem, cols []string, errName, errShape string) 
 				return nil, serr.New("ORDER BY position is not in the select list",
 					"position", fmt.Sprint(n))
 			}
-			keys = append(keys, sortKey{int(n - 1), o.Desc})
+			keys = append(keys, sortKey{int(n - 1), o.Desc, o.Nulls})
 		case o.Ex == nil && o.Agg == AggNone && o.Col.Table == "":
 			found := -1
 			for i, c := range cols {
@@ -1681,7 +1706,7 @@ func outputSortKeys(order []OrderItem, cols []string, errName, errShape string) 
 			if found < 0 {
 				return nil, serr.New(errName, "column", o.Col.Name)
 			}
-			keys = append(keys, sortKey{found, o.Desc})
+			keys = append(keys, sortKey{found, o.Desc, o.Nulls})
 		default:
 			return nil, serr.New(errShape)
 		}
@@ -1695,10 +1720,7 @@ func sortLimitRows(rows [][]any, keys []sortKey, offset, limit int64) [][]any {
 	if len(keys) > 0 {
 		slices.SortStableFunc(rows, func(a, b []any) int {
 			for _, k := range keys {
-				c := orderCmp(a[k.ord], b[k.ord])
-				if k.desc {
-					c = -c
-				}
+				c := keyCmp(a[k.ord], b[k.ord], k.desc, k.nulls)
 				if c != 0 {
 					return c
 				}
@@ -1722,6 +1744,53 @@ func sortLimitRows(rows [][]any, keys []sortKey, offset, limit int64) [][]any {
 // dedupRows keeps each distinct row's first occurrence, compared by
 // the order-preserving tuple encoding (NULLs equal NULLs, as UNION
 // and SELECT DISTINCT both require).
+// intersectExcept combines the accumulated rows with an INTERSECT or
+// EXCEPT arm, keeping the accumulated order:
+//
+//	INTERSECT      distinct left rows that also occur on the right
+//	INTERSECT ALL  each left row while the right still has a copy (min of the counts)
+//	EXCEPT         distinct left rows that do not occur on the right
+//	EXCEPT ALL     each left row once the right's copies are used up (count difference)
+func intersectExcept(left, right [][]any, intersect, all bool) ([][]any, error) {
+	counts := make(map[string]int, len(right))
+	for _, r := range right {
+		k, err := hashKey(r...)
+		if err != nil {
+			return nil, serr.Wrap(err, "op", "encode row for set operation")
+		}
+		counts[string(k)]++
+	}
+	var out [][]any
+	emitted := map[string]bool{}
+	for _, r := range left {
+		kb, err := hashKey(r...)
+		if err != nil {
+			return nil, serr.Wrap(err, "op", "encode row for set operation")
+		}
+		k := string(kb)
+		if !all {
+			if emitted[k] {
+				continue
+			}
+			if (counts[k] > 0) == intersect {
+				emitted[k] = true
+				out = append(out, r)
+			}
+			continue
+		}
+		switch {
+		case counts[k] > 0 && intersect:
+			counts[k]--
+			out = append(out, r)
+		case counts[k] > 0:
+			counts[k]-- // EXCEPT ALL: this copy cancels one on the right
+		case !intersect:
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 func dedupRows(rows [][]any) ([][]any, error) {
 	seen := make(map[string]bool, len(rows))
 	out := rows[:0]
