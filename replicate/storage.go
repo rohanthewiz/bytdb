@@ -17,12 +17,18 @@
 //	gen/<generation-id>/<start>-<end>.wlog   one shipped byte range
 //	gen/<generation-id>/manifest.json        completeness marker (once caught up)
 //
-// where start/end are 16-hex-digit byte offsets. Generation IDs embed a
-// UTC timestamp so plain lexicographic ordering is chronological, and
-// chunk names embed both ends of their range so a restore can verify
-// contiguity from the listing alone, before downloading anything. The
-// manifest records the generation's certified-complete size, so restore
-// can tell a valid torn tail from a generation that has lost chunks.
+// where start/end are 16-hex-digit byte offsets. Generation IDs lead
+// with a sequence number one past the largest in the store when the
+// generation rolled ("g0000000000000042-<UTC timestamp>-<random>"), and
+// that number, not the timestamp, orders generations — so a clock that
+// steps backwards, or a replacement host whose clock lags, cannot make
+// a stale generation look newest. Chunk names embed both ends of their
+// range so a restore can verify contiguity from the listing alone,
+// before downloading anything; chunks may overlap (a retried upload, or
+// a merge of small chunks beside its not-yet-deleted parts), and
+// restore takes the furthest-reaching one at each offset. The manifest
+// records the generation's certified-complete size, so restore can tell
+// a valid torn tail from a generation that has lost chunks.
 package replicate
 
 import "context"

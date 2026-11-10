@@ -86,8 +86,8 @@ func TestRestorePrefersCompleteOverPartialNewer(t *testing.T) {
 	completeGen := r.Status().Generation
 
 	// A newer generation that never caught up: one chunk from offset zero,
-	// no manifest. "zzzz-..." sorts after any timestamp-based generation.
-	partialGen := "zzzz-partial"
+	// no manifest. It carries the next sequence number.
+	partialGen := newerGen(completeGen, "partial")
 	partialKey := fmt.Sprintf("gen/%s/%016x-%016x.wlog", partialGen, 0, 64)
 	if err := store.Put(ctx, partialKey, make([]byte, 64)); err != nil {
 		t.Fatal(err)
@@ -134,7 +134,7 @@ func TestRestoreSkipsDamagedManifestedGeneration(t *testing.T) {
 	completeGen := r.Status().Generation
 
 	// A newer generation certified to size 200 whose chain reaches only 64.
-	damagedGen := "zzzz-damaged"
+	damagedGen := newerGen(completeGen, "damaged")
 	if err := store.Put(ctx, fmt.Sprintf("gen/%s/%016x-%016x.wlog", damagedGen, 0, 64), make([]byte, 64)); err != nil {
 		t.Fatal(err)
 	}

@@ -83,7 +83,27 @@ func Restore(ctx context.Context, store Storage, prefix, destPath string) (*Rest
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	byGen, err := listGenerations(ctx, store, prefix)
+	// A restore can run while the source still replicates (restoring a
+	// copy elsewhere, say). The replicator deletes objects — whole
+	// generations when it prunes, merged-away chunks after a grace
+	// period — so a chunk chosen from the listing can be gone by the
+	// time it is fetched. The selection is then stale, not the store
+	// broken: list again and choose afresh, once.
+	for attempt := 1; ; attempt++ {
+		info, err := restoreOnce(ctx, store, prefix, destPath)
+		var gone *chunkGetError
+		if err != nil && errors.As(err, &gone) && attempt < 2 && ctx.Err() == nil {
+			continue
+		}
+		return info, err
+	}
+}
+
+// restoreOnce is one list-select-assemble pass of Restore.
+func restoreOnce(ctx context.Context, store Storage, prefix, destPath string) (*RestoreInfo, error) {
+	lctx, cancel := opContext(ctx, defaultOpTimeout, defaultMinTransferRate, 0)
+	byGen, err := listGenerations(lctx, store, prefix)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +111,11 @@ func Restore(ctx context.Context, store Storage, prefix, destPath string) (*Rest
 	for g := range byGen {
 		gens = append(gens, g)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(gens)))
+	// Newest first, by sequence number (see newGenerationID): ordering by
+	// name compared wall-clock timestamps, and a clock stepped backwards
+	// made a stale generation look newest (deep-look D-34).
+	sortGenerations(gens)
+	slices.Reverse(gens)
 
 	// Pass 1: the newest complete (manifested) generation.
 	sawManifest := false
@@ -142,10 +166,22 @@ func Restore(ctx context.Context, store Storage, prefix, destPath string) (*Rest
 	return nil, serr.Wrap(ErrIncompleteReplica, "prefix", prefix, "generationsSeen", strconv.Itoa(len(gens)))
 }
 
+// chunkGetError marks a failed chunk download, the one failure Restore
+// retries with a fresh listing.
+type chunkGetError struct {
+	key string
+	err error
+}
+
+func (e *chunkGetError) Error() string { return "get chunk " + e.key + ": " + e.err.Error() }
+func (e *chunkGetError) Unwrap() error { return e.err }
+
 // loadManifest downloads and parses a generation's completeness marker.
 // Only called for generations whose listing already showed the manifest
 // key, so a Get error here is a genuine store failure.
 func loadManifest(ctx context.Context, store Storage, prefix, gen string) (*generationManifest, error) {
+	ctx, cancel := opContext(ctx, defaultOpTimeout, defaultMinTransferRate, 0)
+	defer cancel()
 	data, err := store.Get(ctx, manifestKey(prefix, gen))
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "get manifest")
@@ -239,10 +275,26 @@ func contiguousChain(keys []string) (chain []chunkRef, ok bool) {
 	return chain, len(chain) > 0
 }
 
+// restoreWorkers is how many chunk downloads run at once. Downloads
+// overlap; writes stay in chain order. Memory is bounded by the window:
+// at most restoreWorkers chunks are fetched but not yet written.
+const restoreWorkers = 6
+
 // assemble downloads a validated chain into destPath via a temp file,
 // fsyncing before the rename so a crash mid-restore never leaves a
 // plausible-looking partial database — the same dance btypedb's own
 // Backup and Compact do.
+//
+// Chunks download in parallel (deep-look D-34: a generation of
+// thousands of small chunks restored one round trip at a time) and are
+// written strictly in order:
+//
+//	dispatcher ──► slot (≤ restoreWorkers) ──► fetch goroutine ──► results[i]
+//	writer:  results[0], results[1], ...  in order, releasing a slot per chunk
+//
+// A slot is released when the writer consumes chunk i, not when chunk i
+// arrives, so a slow early chunk stalls new downloads instead of letting
+// later chunks pile up in memory.
 func assemble(ctx context.Context, store Storage, gen string, chain []chunkRef, destPath string) (*RestoreInfo, error) {
 	tmpPath := destPath + ".restore-tmp"
 	tmp, err := os.Create(tmpPath)
@@ -254,12 +306,45 @@ func assemble(ctx context.Context, store Storage, gen string, chain []chunkRef, 
 		os.Remove(tmpPath)
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // stops the dispatcher and in-flight downloads on any early return
+	type fetched struct {
+		data []byte
+		err  error
+	}
+	results := make([]chan fetched, len(chain))
+	for i := range results {
+		results[i] = make(chan fetched, 1) // buffered: a fetch never blocks on an abandoned writer
+	}
+	slots := make(chan struct{}, restoreWorkers)
+	go func() {
+		for i, ref := range chain {
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				// The writer is at chunk i at the latest; every earlier
+				// result is filled by its fetch, so this one is all it
+				// can still be waiting on.
+				results[i] <- fetched{err: ctx.Err()}
+				return
+			}
+			go func() {
+				gctx, gcancel := opContext(ctx, defaultOpTimeout, defaultMinTransferRate, ref.end-ref.start)
+				defer gcancel()
+				data, err := store.Get(gctx, ref.key)
+				results[i] <- fetched{data, err}
+			}()
+		}
+	}()
+
 	var total int64
-	for _, ref := range chain {
-		data, err := store.Get(ctx, ref.key)
+	for i, ref := range chain {
+		f := <-results[i]
+		<-slots
+		data, err := f.data, f.err
 		if err != nil {
 			discard()
-			return nil, serr.Wrap(err, "op", "get chunk", "key", ref.key)
+			return nil, &chunkGetError{key: ref.key, err: err}
 		}
 		// The chunk's own name declares its size; a mismatch means the
 		// object was corrupted or tampered with in the store, and

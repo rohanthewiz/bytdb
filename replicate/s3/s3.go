@@ -68,6 +68,15 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 
+	// SessionToken is the third part of temporary credentials (an IAM
+	// role, an STS AssumeRole, an EC2/ECS instance profile). When set it
+	// is sent as X-Amz-Security-Token and covered by the signature, as
+	// SigV4 requires; static access keys leave it empty. Temporary
+	// credentials expire, so a long-running replicator needs a client
+	// rebuilt with fresh ones before then — this client does not
+	// refresh credentials itself.
+	SessionToken string
+
 	// VirtualHost switches addressing from path-style
 	// (endpoint/bucket/key — the default, and what most S3-compatibles
 	// prefer) to virtual-hosted style (bucket.endpoint/key — AWS's
@@ -202,8 +211,18 @@ func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 			return nil, serr.Wrap(err, "op", "decode list response", "prefix", prefix)
 		}
 		keys = append(keys, page.Keys...)
-		if !page.IsTruncated || page.NextContinuationToken == "" {
+		if !page.IsTruncated {
 			return keys, nil
+		}
+		// A truncated page without a continuation token cannot be
+		// continued. Returning what was collected would hand the caller
+		// a silently partial listing — and both of its callers act on
+		// absence: restore would pick an older generation or report
+		// missing chunks, and pruning would count too few generations.
+		// (deep-look D-34)
+		if page.NextContinuationToken == "" {
+			return nil, serr.New("s3: truncated list page without a continuation token",
+				"prefix", prefix, "keysSoFar", fmt.Sprint(len(keys)))
 		}
 		token = page.NextContinuationToken
 	}
@@ -244,10 +263,18 @@ func (c *Client) sign(req *http.Request, canonicalPath, canonicalQuery string, b
 	req.Header.Set("X-Amz-Date", amzDate)
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
+	// Canonical headers are lower-cased and sorted by name; the session
+	// token, when present, sorts last and must be signed — AWS rejects a
+	// request whose security token is sent but not covered.
 	canonicalHeaders := "host:" + req.URL.Host + "\n" +
 		"x-amz-content-sha256:" + payloadHash + "\n" +
 		"x-amz-date:" + amzDate + "\n"
-	const signedHeaders = "host;x-amz-content-sha256;x-amz-date"
+	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
+	if tok := strings.TrimSpace(c.cfg.SessionToken); tok != "" {
+		req.Header.Set("X-Amz-Security-Token", tok)
+		canonicalHeaders += "x-amz-security-token:" + tok + "\n"
+		signedHeaders += ";x-amz-security-token"
+	}
 
 	canonicalRequest := strings.Join([]string{
 		req.Method,

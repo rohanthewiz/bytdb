@@ -215,8 +215,8 @@ func TestCompactionRollsGeneration(t *testing.T) {
 	if gen1 == gen0 {
 		t.Fatal("generation did not roll after compaction")
 	}
-	if gen1 < gen0 {
-		t.Fatalf("generation IDs not chronological: %s then %s", gen0, gen1)
+	if !generationLess(gen0, gen1) || gen1 < gen0 {
+		t.Fatalf("generation IDs not ordered: %s then %s", gen0, gen1)
 	}
 
 	restorePath := filepath.Join(dir, "restored.db")
@@ -316,9 +316,9 @@ func TestRestoreSkipsEmptyGeneration(t *testing.T) {
 	goodGen := r.Status().Generation
 
 	// A later, broken generation: its chain starts at a nonzero offset,
-	// as if the first PUT never landed. "zz..." sorts after any
-	// timestamp ID, so restore sees it first.
-	brokenKey := fmt.Sprintf("gen/zzzz-broken/%016x-%016x.wlog", 64, 128)
+	// as if the first PUT never landed. Its sequence number is the next
+	// one, so restore sees it first.
+	brokenKey := fmt.Sprintf("gen/%s/%016x-%016x.wlog", newerGen(goodGen, "broken"), 64, 128)
 	if err := store.Put(ctx, brokenKey, make([]byte, 64)); err != nil {
 		t.Fatal(err)
 	}

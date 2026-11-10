@@ -31,6 +31,15 @@ type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	t       *testing.T
+
+	// token, when set, is the session token every request must carry
+	// (and sign); a request without it is refused like AWS refuses an
+	// expired or missing STS token.
+	token string
+	// noContinuation makes a truncated list page omit its continuation
+	// token — a malformed response the client must not mistake for the
+	// end of the listing.
+	noContinuation bool
 }
 
 func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -96,7 +105,7 @@ func (f *fakeS3) serveList(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprint(w, `<?xml version="1.0"?><ListBucketResult>`)
 	fmt.Fprintf(w, "<IsTruncated>%v</IsTruncated>", truncated)
-	if truncated {
+	if truncated && !f.noContinuation {
 		fmt.Fprintf(w, "<NextContinuationToken>%s</NextContinuationToken>", keys[len(keys)-1])
 	}
 	for _, k := range keys {
@@ -123,12 +132,27 @@ func (f *fakeS3) verifySignature(r *http.Request, body []byte) bool {
 		return false
 	}
 
+	headers := "host:" + r.Host + "\nx-amz-content-sha256:" + payloadHash + "\nx-amz-date:" + amzDate + "\n"
+	signed := "host;x-amz-content-sha256;x-amz-date"
+	if tok := r.Header.Get("X-Amz-Security-Token"); tok != "" || f.token != "" {
+		if tok != f.token {
+			f.t.Errorf("security token %q, want %q", tok, f.token)
+			return false
+		}
+		headers += "x-amz-security-token:" + tok + "\n"
+		signed += ";x-amz-security-token"
+	}
+	if !strings.Contains(auth, "SignedHeaders="+signed+",") {
+		f.t.Errorf("SignedHeaders in %q, want %s", auth, signed)
+		return false
+	}
+
 	canonicalRequest := strings.Join([]string{
 		r.Method,
 		r.URL.EscapedPath(),
 		canonicalQueryString(r.URL.Query()),
-		"host:" + r.Host + "\nx-amz-content-sha256:" + payloadHash + "\nx-amz-date:" + amzDate + "\n",
-		"host;x-amz-content-sha256;x-amz-date",
+		headers,
+		signed,
 		payloadHash,
 	}, "\n")
 	scope := amzDate[:8] + "/" + testRegion + "/s3/aws4_request"
@@ -149,16 +173,23 @@ func (f *fakeS3) verifySignature(r *http.Request, body []byte) bool {
 }
 
 func newTestClient(t *testing.T) (*Client, *fakeS3) {
+	return newTestClientToken(t, "")
+}
+
+// newTestClientToken is newTestClient with temporary credentials: both
+// the client and the fake endpoint get token.
+func newTestClientToken(t *testing.T, token string) (*Client, *fakeS3) {
 	t.Helper()
-	fake := &fakeS3{objects: map[string][]byte{}, t: t}
+	fake := &fakeS3{objects: map[string][]byte{}, t: t, token: token}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
 	c, err := New(Config{
-		Endpoint:  srv.URL,
-		Region:    testRegion,
-		Bucket:    testBucket,
-		AccessKey: testAccess,
-		SecretKey: testSecret,
+		Endpoint:     srv.URL,
+		Region:       testRegion,
+		Bucket:       testBucket,
+		AccessKey:    testAccess,
+		SecretKey:    testSecret,
+		SessionToken: token,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -265,5 +296,49 @@ func TestVirtualHostAddressing(t *testing.T) {
 	u, canonical = vhost.objectURL("k1")
 	if u.Host != "b.obj.example.com" || canonical != "/k1" {
 		t.Fatalf("virtual-host: host=%q canonical=%q", u.Host, canonical)
+	}
+}
+
+// TestSessionToken: temporary credentials (IAM role, STS) carry a
+// session token that must be sent as X-Amz-Security-Token and covered by
+// the signature; the fake endpoint refuses a request without it, or one
+// that sends it unsigned (deep-look D-34).
+func TestSessionToken(t *testing.T) {
+	c, _ := newTestClientToken(t, "FQoGZXIvYXdzEJr//////////wEaDOkey+token/with=chars")
+	ctx := context.Background()
+	if err := c.Put(ctx, "gen/a/x.wlog", []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Get(ctx, "gen/a/x.wlog")
+	if err != nil || string(got) != "payload" {
+		t.Fatalf("get = %q, %v", got, err)
+	}
+	if keys, err := c.List(ctx, "gen/"); err != nil || len(keys) != 1 {
+		t.Fatalf("list = %v, %v", keys, err)
+	}
+	if err := c.Delete(ctx, "gen/a/x.wlog"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestListTruncatedWithoutToken: a page marked truncated but carrying
+// no continuation token cannot be continued; List used to return the
+// keys collected so far as if they were all of them, and restore and
+// pruning both act on what is absent from a listing (deep-look D-34).
+func TestListTruncatedWithoutToken(t *testing.T) {
+	c, fake := newTestClient(t)
+	ctx := context.Background()
+	for i := range 5 {
+		if err := c.Put(ctx, fmt.Sprintf("gen/%d", i), []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake.noContinuation = true
+	keys, err := c.List(ctx, "gen/")
+	if err == nil {
+		t.Fatalf("List returned %d keys from a truncated listing with no way to continue; want an error", len(keys))
+	}
+	if !strings.Contains(err.Error(), "continuation token") {
+		t.Fatalf("err = %v", err)
 	}
 }
