@@ -1690,6 +1690,90 @@ func (d *DB) execTruncate(s *Truncate) (*Result, error) {
 //
 // VERBOSE adds one more notice line after any skip warnings, with the
 // log's size before and after (see vacuumReport).
+// CheckViolation is one stored row that fails one of its table's CHECK
+// constraints, as VerifyChecks reports it.
+type CheckViolation struct {
+	Table      string
+	Constraint string
+	Key        []any // the row's primary-key values
+}
+
+// maxVerifyNotices caps how many violations VACUUM (VERIFY) lists; the
+// final notice gives the total.
+const maxVerifyNotices = 100
+
+// VerifyChecks re-evaluates every CHECK constraint against every stored
+// row of the named tables (all tables when none are named), in one read
+// snapshot, and returns the rows that fail. Writes enforce checks, so
+// this finds only rows admitted when a check could not be enforced:
+// before the typed bind pass (deep-look D-23), a CHECK comparing a date
+// or timestamp column with a literal never failed. Nothing is changed;
+// a NULL result passes, as on insert. The SQL form is VACUUM (VERIFY).
+func (d *DB) VerifyChecks(tables ...string) ([]CheckViolation, error) {
+	if len(tables) == 0 {
+		tables = d.e.Tables()
+	}
+	var out []CheckViolation
+	err := d.read(func(tx *bytdb.Txn) error {
+		for _, name := range tables {
+			desc := tx.TableShared(name)
+			if desc == nil {
+				return serr.New("no such table", "table", name)
+			}
+			checks, err := tableChecks(desc)
+			if err != nil || len(checks) == 0 {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			env := d.tableEnv(tx, name, desc)
+			for row, err := range tx.Scan(name) {
+				if err != nil {
+					return err
+				}
+				rowEnv := *env
+				rowEnv.row = row.Vals
+				for _, ck := range checks {
+					t, err := evalTruth(&rowEnv, ck.ex)
+					if err != nil {
+						return serr.Wrap(err, "table", name, "constraint", ck.name)
+					}
+					if t == triFalse {
+						key := make([]any, len(desc.PKCols))
+						for i, ord := range desc.PKCols {
+							key[i] = row.Vals[ord]
+						}
+						out = append(out, CheckViolation{Table: name, Constraint: ck.name, Key: key})
+					}
+				}
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// execVerifyChecks is VACUUM (VERIFY): VerifyChecks with its findings as
+// notices (the statement itself succeeds, so a script can run it and
+// read the report).
+func (d *DB) execVerifyChecks(tables []string) (*Result, error) {
+	found, err := d.VerifyChecks(tables...)
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	for i, v := range found {
+		if i == maxVerifyNotices {
+			break
+		}
+		lines = append(lines, fmt.Sprintf(`row %v of relation "%s" violates check constraint "%s"`,
+			v.Key, v.Table, v.Constraint))
+	}
+	lines = append(lines, fmt.Sprintf("VERIFY found %d check constraint violation(s)", len(found)))
+	return &Result{Notice: strings.Join(lines, "\n")}, nil
+}
+
 func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
 	// Sessions refuse VACUUM inside a block before it gets here; this
 	// guards a DB bound to a transaction by any other route, since
@@ -1697,6 +1781,9 @@ func (d *DB) execVacuum(s *Vacuum) (*Result, error) {
 	// its rollback.
 	if d.tx != nil {
 		return nil, serr.New("VACUUM cannot run inside a transaction block")
+	}
+	if s.Verify {
+		return d.execVerifyChecks(s.Tables)
 	}
 	var notices []string
 	vacuumable := len(s.Tables) == 0

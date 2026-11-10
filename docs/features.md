@@ -744,6 +744,8 @@ VACUUM (FULL, ANALYZE) users;      -- options parse and are ignored; any named
                                    -- table compacts the whole file
 VACUUM VERBOSE;                    -- INFO: compacted the storage log:
                                    --   1048576 bytes before, 262144 after (786432 reclaimed)
+VACUUM (VERIFY) events;            -- bytdb: re-check every CHECK on stored rows (no
+                                   -- compaction); one notice per violating row
 
 SET search_path TO public, other;  -- SESSION/LOCAL both scope to session
 SET time zone 'UTC';
@@ -759,7 +761,16 @@ so there is no per-table vacuum — a table list is only validated (views and
 sequences draw Postgres's "skipping" warning, unknown names 42P01). VERBOSE
 (or `(VERBOSE true)`) is the one option that does something: it reports the
 log's size before and after as an INFO notice, in place of Postgres's
-per-table page counts. To judge whether a VACUUM is worth running at all,
+per-table page counts. `(VERIFY)` is bytdb's own option: it compacts
+nothing and instead re-evaluates every CHECK constraint of the named tables
+(all tables when none are named) against every stored row, listing each
+violating row's key as a notice (up to 100, then the total). Writes enforce
+checks, so it only finds rows admitted while a check could not be: before
+bytdb's typed bind pass, a CHECK comparing a `date` or `timestamp` column
+with a literal (`CHECK (day >= '2000-01-01')`) was never violated. Run it
+once after upgrading a database written by an older bytdb; embedders can
+call `DB.VerifyChecks` for the same report as data.
+To judge whether a VACUUM is worth running at all,
 compare `Stats().LogBytes` with `LogBaseBytes` (see Monitoring memory in the
 README). On a replicated database each VACUUM rolls the replication
 generation, re-shipping the compacted file. `SET`/`SHOW` overlay session

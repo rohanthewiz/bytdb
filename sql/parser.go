@@ -2571,8 +2571,11 @@ func (p *parser) vacuumStmt() (Statement, error) {
 				}
 				p.advance() // the option's value
 			}
-			if strings.ToLower(opt) == "verbose" {
+			switch strings.ToLower(opt) {
+			case "verbose":
 				v.Verbose = on
+			case "verify":
+				v.Verify = on
 			}
 			if !p.acceptOp(",") {
 				break

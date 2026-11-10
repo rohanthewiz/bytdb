@@ -668,6 +668,13 @@ type Truncate struct {
 type Vacuum struct {
 	Tables  []string // nil: the whole database (the only granularity there is)
 	Verbose bool     // VERBOSE, or (VERBOSE [true|on|1]): report what the compaction reclaimed
+	// Verify is bytdb's VACUUM (VERIFY): instead of compacting, re-check
+	// every CHECK constraint against every stored row of the named
+	// tables (all tables when none are named) and report each violation
+	// as a notice. It exists for databases written before CHECKs over
+	// dates and timestamps were enforced (deep-look D-23): such a row
+	// was admitted while its check was inert and stays until found.
+	Verify bool
 }
 
 // ShowVar is SHOW name (or SHOW ALL): report a configuration

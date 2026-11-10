@@ -172,3 +172,36 @@ func TestHashKeysBySQLEquality(t *testing.T) {
 		t.Errorf("count(DISTINCT x) = %v, want 3", res.Rows[0][0])
 	}
 }
+
+// TestVerifyChecks (release note for D-23): rows admitted while a CHECK
+// over a date was inert are found by VACUUM (VERIFY) / DB.VerifyChecks,
+// without changing anything and without failing the statement.
+func TestVerifyChecks(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table ck (id int primary key, day date check (day >= '2000-01-01'))`)
+	exec(t, d, `insert into ck values (1, '2001-01-01')`)
+	// The engine API bypasses CHECKs (they belong to the SQL layer),
+	// which stands in for a row written before the check was enforced.
+	old, err := bytdb.ParseDate("1999-01-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.e.Insert("ck", 2, old); err != nil {
+		t.Fatal(err)
+	}
+	found, err := d.VerifyChecks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || found[0].Table != "ck" || found[0].Key[0] != int64(2) {
+		t.Fatalf("VerifyChecks = %+v", found)
+	}
+	res := exec(t, d, `vacuum (verify) ck`)
+	if !strings.Contains(res.Notice, `row [2] of relation "ck" violates check constraint "ck_day_check"`) ||
+		!strings.Contains(res.Notice, "found 1 check constraint violation") {
+		t.Fatalf("VACUUM (VERIFY) notice: %q", res.Notice)
+	}
+	if res := exec(t, d, `select count(*) from ck`); res.Rows[0][0] != int64(2) {
+		t.Fatal("VERIFY changed the table")
+	}
+}
