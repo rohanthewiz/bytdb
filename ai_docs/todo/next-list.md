@@ -31,30 +31,15 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-045
+**Next ID:** N-048
 
 ## Open
 
-N-042 to N-044 come from one audit and share one plan,
+N-043 to N-047 come from one audit and share one plan,
 `ai_docs/todo/2026-1109-deep-look-remediation-plan.md`. Each is a phase of
 it; the `D-xx` numbers are that plan's item IDs. The user asked for the plan
 to be implemented as written, so its six decisions (Q1–Q6) are taken at the
 plan's recommendations.
-
-- **N-042** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
-  **Performance (plan Phase 7, D-37 to D-50).** *Updated `2026-1110-0512-deep-look-phase7-part1`:* done
-  D-37 (uuid/timestamp/date keys push down; cast literals fold), D-38
-  (IN-lists, `= ANY`, OR-of-equalities run as key probes), D-39 (rows
-  decode in place, SELECTs decode only named columns; `docs/benchmarks.md`
-  corrected), D-40 steps 1, 2 and 4 (descriptor memo per catalog version,
-  parse cache), D-41 (wire rows in one reused buffer, 64 KiB writer), D-42
-  (`bytdbd -socket`). D-40 step 3 (cache the typed tree on `Stmt`) is not
-  done: typing runs after binding because it converts parameter values, so
-  a cached typed tree needs that conversion re-derived per value — worth it
-  only with a design for it. Left: D-43 (top-N heap), D-44 (per-row
-  overheads), D-45 (write-path allocations), D-46 (shared read snapshot),
-  D-47 (catalog vtables), D-48 (btypedb replay), the D-49 sizing note, and
-  D-50's mitigation (Q6: `bytdbd` default result cap 1M).
 
 - **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · value medium
   **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
@@ -91,6 +76,27 @@ plan's recommendations.
   btypedb main now also carries D-48's faster replay (389 -> 104 ms for
   500k rows, commit `ad77fd8`), which bytdb gets only through a btypedb
   tag (v0.10.0) and a `go.mod` bump — a second release decision.
+
+- **N-045** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
+  **Cache the typed tree on prepared statements (D-40 step 3).** Typing
+  runs after parameter binding because it converts parameter values (a text
+  `$1` against a uuid column becomes 16 bytes), so a typed tree cannot be
+  reused as is. A design would type the unbound tree once per catalog
+  version and replay only the per-value conversions. After D-40's descriptor
+  memo, typing is a smaller share of a prepared point read; measure before
+  starting.
+- **N-046** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
+  **Shared read snapshot for one-shot reads (D-46).** `Engine.Get` opens and
+  releases a btypedb snapshot per call, both under btypedb's mutex, so
+  concurrent one-shot reads do not scale. Reusing one refcounted snapshot per
+  commit version needs btypedb to guarantee concurrent reads of one snapshot
+  and ships with a btypedb release. Documented workaround: `ReadTxn`.
+- **N-047** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
+  **Remaining Phase 7 pieces.** D-47 second half (memoize catalog rows per
+  catalog version, excluding live tables such as `pg_stat_activity` and
+  sequence state, or push `table_name = 'x'` into the builders); D-45's
+  identity-counter batching (keep default-mode counters in the `Txn` until
+  commit) and lazy counter names.
 
 ## Validate
 
@@ -194,6 +200,17 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-042** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
+  2026-11-10, `2026-1110-0555-deep-look-phase7-part2-phase8-start`. **Performance (plan Phase 7, D-37 to D-50).** Done:
+  D-37 (uuid/timestamp/date pushdown), D-38 (IN-list probes), D-39 (in-place
+  and column-masked decoding), D-40 steps 1, 2, 4 (descriptor memo, parse
+  cache), D-41 (wire rows), D-42 (`bytdbd -socket`), D-43 (top-N heap), D-44
+  (per-row overheads, LIKE prefix ranges, name index), D-45 (write-path
+  allocations), D-47 first half (shape-only catalog lookups), D-48 in
+  btypedb main (`ad77fd8`, replay 389 -> 104 ms; ships with a btypedb tag,
+  N-044), D-49 sizing note, D-50 mitigation (`bytdbd` result cap 1M). D-46
+  done as documentation (ReadTxn for hot loops). What was left open is
+  carried in N-045 to N-047.
 - **N-041** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
   2026-11-09, `2026-1109-2355-deep-look-phases-5-6`. **Replication and server hardening (plan Phase 6,
   D-34 to D-36).** D-34: generation names lead with a sequence number (one
