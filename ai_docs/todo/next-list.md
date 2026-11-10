@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-048
+**Next ID:** N-049
 
 ## Open
 
@@ -50,7 +50,15 @@ plan's recommendations.
   messages in the Go API; multi-statement `Exec` in the stdlib driver;
   replication flags and a Unix socket for `bytdbd`. Which tool needs which
   statement is from memory: capture each tool's real statements before
-  prioritizing by it.
+  prioritizing by it. *Updated `2026-1110-0700-deep-look-phase8-d52-d53-d51`:*
+  D-52, D-53, D-54, D-55 and D-51 part 1 (session surface) are done. Left:
+  D-51 part 2 (catalog tables and rows: `pg_tables`, `pg_indexes`,
+  `pg_views`, `pg_settings`, `information_schema.schemata`/`views`/
+  `referential_constraints`/`constraint_column_usage`, `relnatts`,
+  `relhasindex`, varchar typmod, `regclass` rendering) and part 3
+  (`NegotiateProtocolVersion`, verbatim ORM statements in
+  `pgwire/orm_test.go`); D-56, D-57, D-58 rest; Phase 9 doc corrections;
+  delete `ai_docs/todo/deep-look-repros/` once ported.
 
 - **N-044** · raised `2026-1109-2243-deep-look-phase0-phase1` · value medium
   **Cut "release A" of the deep-look plan (Phase 0 + Phase 1).** Every
@@ -97,6 +105,18 @@ plan's recommendations.
   sequence state, or push `table_name = 'x'` into the builders); D-45's
   identity-counter batching (keep default-mode counters in the `Txn` until
   commit) and lazy counter names.
+
+- **N-048** · raised `2026-1110-0700-deep-look-phase8-d52-d53-d51` · value medium
+  **`numeric` / `decimal` columns are refused in CREATE TABLE.** `create
+  table t (x numeric(10,2))` fails with "unknown column type", so a schema
+  dumped from Postgres with a money column does not load. Casts already
+  treat `numeric` as float8. Mapping the column type to float8 the same way
+  is a one-line change but silently loses exactness (0.1 + 0.2), which is
+  exactly what a `numeric(10,2)` column exists to avoid; a real decimal type
+  is a new value kind through tuple encoding, wire codecs and arithmetic.
+  Needs the user's call: lossy alias, refuse with a hint (today, minus the
+  hint), or a decimal type. `interval`, `money`, `bit` and `citext` are
+  refused the same way and are lower value.
 
 ## Validate
 
