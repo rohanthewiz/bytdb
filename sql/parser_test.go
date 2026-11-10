@@ -426,13 +426,13 @@ func TestParseAggregates(t *testing.T) {
 
 func TestParseAggregateErrors(t *testing.T) {
 	for _, src := range []string{
-		`select * from t where count(*) > 1`,          // aggregates belong in HAVING
-		`select sum() from t`,                         // missing argument
-		`select sum(*) from t`,                        // * only for count
-		`select city from t group by 1.5`,             // non-integer constant
-		`select city from t group by 'city'`,          // non-integer constant
-		`select city from t group by 0`,               // position out of range
-		`select sum(count(*)) from t`,                 // nested aggregates
+		`select * from t where count(*) > 1`, // aggregates belong in HAVING
+		`select sum() from t`,                // missing argument
+		`select sum(*) from t`,               // * only for count
+		`select city from t group by 1.5`,    // non-integer constant
+		`select city from t group by 'city'`, // non-integer constant
+		`select city from t group by 0`,      // position out of range
+		`select sum(count(*)) from t`,        // nested aggregates
 	} {
 		if _, err := Parse(src); err == nil {
 			t.Errorf("Parse(%q): expected error", src)
