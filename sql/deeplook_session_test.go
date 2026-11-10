@@ -96,3 +96,30 @@ func TestSubqueryLimitInterimReject(t *testing.T) {
 		}
 	}
 }
+
+// TestUpsertChangingReferencedKey (D-10): ON CONFLICT DO UPDATE that
+// changes a key other rows reference skipped the parent-side check, so
+// the child was left dangling. UPDATE always checked; the two now share
+// one code path.
+func TestUpsertChangingReferencedKey(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table p (id int primary key, name text)`)
+	exec(t, d, `create table ch (id int primary key, pid int references p(id))`)
+	exec(t, d, `insert into p values (1, 'a'), (2, 'b')`)
+	exec(t, d, `insert into ch values (1, 1)`)
+
+	msg := execErr(t, d, `insert into p values (1, 'x') on conflict (id) do update set id = 100`)
+	if !strings.Contains(msg, "violates foreign key constraint") {
+		t.Fatalf("upsert moving a referenced key: %s", msg)
+	}
+	if res := exec(t, d, `select id from p order by id`); len(res.Rows) != 2 || res.Rows[0][0] != int64(1) {
+		t.Fatalf("parent rows after the refused upsert: %v", res.Rows)
+	}
+	// An unreferenced key may move; a non-key update of a referenced row
+	// is fine.
+	exec(t, d, `insert into p values (2, 'x') on conflict (id) do update set id = 200`)
+	exec(t, d, `insert into p values (1, 'x') on conflict (id) do update set name = excluded.name`)
+	if res := exec(t, d, `select id, name from p order by id`); len(res.Rows) != 2 || res.Rows[1][0] != int64(200) || res.Rows[0][1] != "x" {
+		t.Fatalf("parent rows: %v", res.Rows)
+	}
+}

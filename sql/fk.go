@@ -255,6 +255,58 @@ func fkKeyDetail(cols []string, vals []any) string {
 	return "Key (" + strings.Join(cols, ", ") + ")=(" + strings.Join(vs, ", ") + ")"
 }
 
+// parentKeyRecheck is the parent side of NO ACTION for one statement
+// that may change referenced keys: it remembers the former image of
+// every parent row whose referenced columns changed, and verify then
+// checks — once the statement's writes are all in — that no child still
+// references any of them. Checking at end of statement is what lets an
+// intra-statement key shuffle (swap two keys) pass.
+//
+// UPDATE and INSERT ... ON CONFLICT DO UPDATE both change existing rows
+// and both go through this one type. The upsert path used to skip the
+// step entirely, so DO UPDATE SET id = 100 left children pointing at a
+// key that no longer existed (deep-look D-10); sharing the code keeps
+// the two from drifting apart again.
+type parentKeyRecheck struct {
+	desc   *bytdb.TableDesc
+	table  string
+	loaded bool
+	refs   []bytdb.FKRef
+	old    [][]any
+}
+
+func newParentKeyRecheck(table string, desc *bytdb.TableDesc) *parentKeyRecheck {
+	return &parentKeyRecheck{table: table, desc: desc}
+}
+
+// note records a changed row. The inbound references are resolved on
+// first use, so a statement that never changes a row (an upsert whose
+// every row inserts) never pays for the catalog walk.
+func (p *parentKeyRecheck) note(tx *bytdb.Txn, oldVals, newVals []any) error {
+	if !p.loaded {
+		refs, err := tx.ReferencingFKs(p.table)
+		if err != nil {
+			return err
+		}
+		p.refs, p.loaded = refs, true
+	}
+	if len(p.refs) > 0 && fkRefColsChanged(p.desc, p.refs, oldVals, newVals) {
+		p.old = append(p.old, oldVals)
+	}
+	return nil
+}
+
+// verify runs the deferred checks; call it after the statement's last
+// write.
+func (p *parentKeyRecheck) verify(d *DB, tx *bytdb.Txn) error {
+	for _, old := range p.old {
+		if err := d.fkVerifyReferenced(tx, p.desc, p.refs, old); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // fkRefColsChanged reports whether any column some inbound FK
 // references differs between a parent row's old and new images —
 // the trigger for re-checking references on UPDATE.

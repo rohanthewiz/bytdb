@@ -947,6 +947,7 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 		if err != nil {
 			return err
 		}
+		recheck := newParentKeyRecheck(s.Table, desc) // used by DO UPDATE only
 		var env *exEnv
 		if len(checks) > 0 {
 			env = d.tableEnv(tx, s.Table, desc)
@@ -1010,6 +1011,11 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 							return err
 						}
 					}
+					// Parent side: DO UPDATE may change a key other rows
+					// reference, exactly like UPDATE (deep-look D-10).
+					if err := recheck.note(tx, existing.Vals, stored.Vals); err != nil {
+						return err
+					}
 					affected++
 					if ret != nil {
 						out, err := ret.row(stored.Vals)
@@ -1072,7 +1078,7 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 				}
 			}
 		}
-		return nil
+		return recheck.verify(d, tx)
 	})
 	if err != nil {
 		return nil, err
@@ -1164,11 +1170,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 		// old row images whose referenced columns change must be
 		// re-checked once the statement's writes are in (NO ACTION is an
 		// end-of-statement check, so intra-statement key shuffles work).
-		refs, err := tx.ReferencingFKs(s.Table)
-		if err != nil {
-			return err
-		}
-		var refRecheck [][]any
+		recheck := newParentKeyRecheck(s.Table, desc)
 		for _, rv := range rows {
 			// SET expressions evaluate against the pre-update row (SET age
 			// = age + 1 reads the old age; Postgres semantics), then coerce
@@ -1229,8 +1231,8 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 						return err
 					}
 				}
-				if len(refs) > 0 && fkRefColsChanged(desc, refs, rv, stored.Vals) {
-					refRecheck = append(refRecheck, rv)
+				if err := recheck.note(tx, rv, stored.Vals); err != nil {
+					return err
 				}
 				affected++
 				if ret != nil {
@@ -1245,12 +1247,7 @@ func (d *DB) execUpdate(s *Update) (*Result, error) {
 				}
 			}
 		}
-		for _, old := range refRecheck {
-			if err := d.fkVerifyReferenced(tx, desc, refs, old); err != nil {
-				return err
-			}
-		}
-		return nil
+		return recheck.verify(d, tx)
 	})
 	if err != nil {
 		return nil, err
