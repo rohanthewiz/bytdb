@@ -1,8 +1,8 @@
 package bytdb
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"fmt"
 	"iter"
 	"slices"
