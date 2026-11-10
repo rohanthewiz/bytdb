@@ -1125,6 +1125,11 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Backstop for validateRowExpr: an evaluation context with no
+		// statement transaction must fail, not dereference nil.
+		if env.tx == nil {
+			return nil, serr.New("nextval is not allowed here", "sequence", s)
+		}
 		v, err := env.tx.NextVal(s)
 		if err != nil {
 			return nil, err
@@ -1147,6 +1152,9 @@ func evalFunc(env *exEnv, name string, args []any) (any, error) {
 				return nil, serr.New("setval's third argument must be a boolean")
 			}
 			called = b
+		}
+		if env.tx == nil { // see nextval
+			return nil, serr.New("setval is not allowed here", "sequence", s)
 		}
 		if err := env.tx.SetVal(s, v, called); err != nil {
 			return nil, err

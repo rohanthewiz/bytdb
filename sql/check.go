@@ -87,6 +87,20 @@ func validateRowExpr(sc *scope, ex Expr, plural, singular string) error {
 				fail = serr.New("placeholders are not allowed in " + plural)
 				return false
 			}
+		case *ExFunc:
+			// Row expressions are evaluated where no statement
+			// transaction exists — inside a DDL transaction (USING, a new
+			// CHECK's validation) or per row of other statements (CHECK)
+			// — so a sequence function has no transaction to draw in
+			// (it panicked on the nil one: deep-look D-18), and a draw
+			// from inside DDL would be an engine write the DDL itself
+			// blocks. A CHECK that consumes sequence values on every
+			// evaluation would be wrong regardless.
+			switch n.Name {
+			case "nextval", "setval", "currval", "lastval":
+				fail = serr.New("sequence functions are not allowed in "+plural, "function", n.Name)
+				return false
+			}
 		case *ExCol:
 			if _, err := sc.resolve(n.Col); err != nil {
 				fail = err

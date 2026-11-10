@@ -123,3 +123,29 @@ func TestUpsertChangingReferencedKey(t *testing.T) {
 		t.Fatalf("parent rows: %v", res.Rows)
 	}
 }
+
+// TestSequenceFunctionsInRowExpressions (D-18): nextval/setval in an
+// ALTER ... USING or a CHECK expression dereferenced a nil statement
+// transaction and panicked. They are now refused when the expression is
+// validated.
+func TestSequenceFunctionsInRowExpressions(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create sequence sq`)
+	exec(t, d, `create table t (id int primary key, i int)`)
+	exec(t, d, `insert into t values (1, 1)`)
+	for _, q := range []string{
+		`alter table t alter column i type int using nextval('sq')`,
+		`alter table t add constraint ck check (nextval('sq') > 0)`,
+		`alter table t add constraint ck check (setval('sq', 5) > 0)`,
+		`create table u (id int primary key, v int check (v < nextval('sq')))`,
+	} {
+		msg := execErr(t, d, q)
+		if !strings.Contains(msg, "sequence functions are not allowed") {
+			t.Errorf("%s: %s", q, msg)
+		}
+	}
+	// The sequence was never drawn from.
+	if res := exec(t, d, `select nextval('sq')`); res.Rows[0][0] != int64(1) {
+		t.Fatalf("nextval after the refusals = %v; want 1", res.Rows[0][0])
+	}
+}
