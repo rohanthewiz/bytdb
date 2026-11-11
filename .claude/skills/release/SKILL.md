@@ -5,15 +5,16 @@ description: Cut a bytdb release — tag the root module and pgwire in lockstep 
 
 # Releasing bytdb
 
-The repo holds three Go modules. Each one is released differently:
+The repo holds four Go modules. Each one is released differently:
 
 | module | path | released? |
 |---|---|---|
 | `github.com/rohanthewiz/bytdb` | `.` | tagged `vX.Y.Z` |
 | `github.com/rohanthewiz/bytdb/pgwire` | `pgwire/` | tagged `pgwire/vX.Y.Z`, in lockstep with root |
 | `github.com/rohanthewiz/bytdb/bench` | `bench/` | never tagged, but its pin must follow the release |
+| `github.com/rohanthewiz/bytdb/sql/difftest` | `sql/difftest/` | never tagged; same as bench |
 
-pgwire and bench both `require` bytdb at a version. Inside a workspace
+pgwire, bench and sql/difftest all `require` bytdb at a version. Inside a workspace
 (the root `go.work`, and bench's nested one), every build uses the working
 tree whatever the pins say, so a stale pin doesn't show up locally. Outside
 it (`GOWORK=off`), the pins decide:
@@ -31,6 +32,9 @@ it (`GOWORK=off`), the pins decide:
   `bench/run.sh` on the working tree. Its pin still has to follow the
   release: `bench/run.sh`'s `go run` under `set -e` fails with "updates to
   go.mod needed" when the pin lags.
+- **sql/difftest is the same as bench**: `replace` for bytdb and pgwire,
+  never tagged, pins (bytdb, and btypedb as an indirect) tidied with
+  bench in step 5.
 
 Release steps 4–7 exist for those reasons.
 
@@ -53,7 +57,12 @@ tags stay unbackfilled by decision (next-list N-012).
    more than one machine, so never tag a stale checkout.
 2. **Test both released modules.** Run `go vet ./...` and `go test ./...`
    at the root and again in `pgwire/`. Everything must be green before
-   anything is tagged.
+   anything is tagged. Also check that CI's last run on `main` is green
+   (`gh run list -L 3`): the Linux `test` job catches what macOS runs miss
+   (a Linux-only socket-timing test failure once kept it red for a day
+   unnoticed). `pgwire-released-pin` is allowed to fail until step 4.
+   If the release also takes a new btypedb, tag btypedb first, bump the
+   root's `go.mod` to it, push, and let CI pass before step 3.
 3. **Tag root and push.**
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z: <what the release adds>" HEAD
@@ -71,18 +80,19 @@ tags stay unbackfilled by decision (next-list N-012).
    bytdb needs at a higher version (btypedb, serr). When `GOPRIVATE`
    covers `github.com/rohanthewiz/*`, the fetch goes to GitHub rather than
    the proxy. GitHub has the tag since step 3.
-5. **Tidy bench.** Run `cd bench && go mod tidy`. The bench pin rises to
-   `vX.Y.Z` because bench requires pgwire, and pgwire now requires
-   `vX.Y.Z` (minimum version selection). That is why this step comes after
-   step 4 and not before it.
-6. **Build both ways.** Run these in `pgwire/` and in `bench/`:
+5. **Tidy bench and sql/difftest.** Run `go mod tidy` in `bench/` and in
+   `sql/difftest/`. Their bytdb pin rises to `vX.Y.Z` because each
+   requires pgwire, and pgwire now requires `vX.Y.Z` (minimum version
+   selection). That is why this step comes after step 4 and not before it.
+6. **Build both ways.** Run these in `pgwire/`, `bench/` and `sql/difftest/`:
    ```bash
    go build ./... && GOWORK=off go build ./...
    ```
    Also run `go test ./...` in `pgwire/`. A `GOWORK=off` failure here is
    the stale-pin symptom this routine exists to prevent.
-7. **Commit, tag pgwire, push.** Put the pgwire and bench changes in one
-   commit, `pgwire, bench: bump bytdb to vX.Y.Z`. Then:
+7. **Commit, tag pgwire, push.** Put the pgwire, bench and difftest
+   changes in one commit, `pgwire, bench, difftest: bump bytdb to vX.Y.Z`.
+   Then:
    ```bash
    git tag -a pgwire/vX.Y.Z -m "pgwire vX.Y.Z: tracks bytdb vX.Y.Z; <pgwire-side changes, if any>" HEAD
    git push origin main && git push origin pgwire/vX.Y.Z
