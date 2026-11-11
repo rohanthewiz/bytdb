@@ -35,46 +35,13 @@ through all 74 docs.
 
 ## Open
 
-N-044 to N-047 and N-049 come from one audit and share one plan,
+N-045 to N-047 and N-049 come from one audit and share one plan,
 `ai_docs/todo/2026-1109-deep-look-remediation-plan.md`; the `D-xx` numbers
 are that plan's item IDs. The user asked for the plan to be implemented as
 written, so its six decisions (Q1–Q6) are taken at the plan's
-recommendations. Every phase of it (0–9) is now on main; what remains is the
-release (N-044) and the pieces deliberately deferred (N-045 to N-047, N-049).
-
-- **N-044** · raised `2026-1109-2243-deep-look-phase0-phase1` · value medium
-  **Cut "release A" of the deep-look plan (Phase 0 + Phase 1).** Every
-  Phase 1 fix is on `main`, but nothing is tagged: the last tags are bytdb
-  and pgwire `v0.22.0`. pgwire now uses unreleased root API
-  (`Session.Fail`, `DB.CatalogVersion`, and N-032's `PeekIdentity`), so its
-  `GOWORK=off` build fails until the root is tagged; CI reports that job as
-  allowed-to-fail. The plan calls release A patch-level, but it adds API
-  and SQL behavior (hex literals, `= NULL`, refused subquery shapes), so
-  the `release` skill's rule says minor: `v0.23.0`. Tagging publishes to the
-  module proxy for good, so it waits for the user's go-ahead. *Updated
-  `2026-1109-2330-deep-look-phases-2-to-4`:* main now also carries the plan's release B (Phases 2 and 3) and
-  most of release C (Phase 4); only Phase 5 (D-33) needs a btypedb tag
-  first. *Updated `2026-1109-2355-deep-look-phases-5-6`:* D-33 landed engine-side, so no btypedb tag is
-  needed, and Phase 6 is on main too; the release notes must add the new
-  replication generation naming (old buckets still restore: legacy names
-  count as older than any new one). One release of everything on main is the simpler choice now; the
-  release notes must list the newly refused shapes (`1 < 'a'`,
-  `timestamp + 1`, `integer || integer`, `1 = true`), the CHECKs that start
-  being enforced (run `VACUUM (VERIFY)` after upgrading), and the
-  implicit-transaction change for batches (D-32). *Updated
-  `2026-1110-0512-deep-look-phase7-part1` (later the same session):*
-  btypedb main now also carries D-48's faster replay (389 -> 104 ms for
-  500k rows, commit `ad77fd8`), which bytdb gets only through a btypedb
-  tag (v0.10.0) and a `go.mod` bump — a second release decision.
-  *Updated `2026-1110-0737-deep-look-phase8-d51-d56`:* the release notes
-  must also say that error messages changed to Postgres's wording (`no
-  such table` -> `relation "t" does not exist`, `duplicate primary key` ->
-  `duplicate key value violates unique constraint "t_pkey"`, `syntax
-  error` -> `syntax error at or near "x"`, ...): embedders matching text
-  should switch to the new `errors.Is` sentinels. Also: a top-level
-  `x::regclass` now renders the relation name (typed text), and bare
-  `user` / `current_user` read as the session user even where a table has
-  such a column.
+recommendations. Every phase of it (0–9) is on main and released in
+`v0.23.0` (N-044, closed); what remains is the pieces deliberately deferred
+(N-045 to N-047, N-049).
 
 - **N-045** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
   **Cache the typed tree on prepared statements (D-40 step 3).** Typing
@@ -121,29 +88,6 @@ release (N-044) and the pieces deliberately deferred (N-045 to N-047, N-049).
 
 ## Validate
 
-- **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · value medium
-  **`go install …@version` refuses the pgwire commands.** *Fixed
-  `2026-1104-1351-n030-n031-estring-split-pgwire-replace`, awaiting a release.* `pgwire/go.mod` dropped its `replace
-  github.com/rohanthewiz/bytdb => ../`. The item offered that or moving the
-  commands into a module without one, and dropping it was the cheaper,
-  reversible choice that keeps the install paths. `go.work` still keeps
-  workspace builds on the working tree. `GOWORK=off` builds and tests of
-  pgwire now compile against the released bytdb v0.22.0 and pass. bench
-  keeps its `replace`, because nothing installs it. The release skill's
-  rationale and step 4 now say this: step 4 runs `GOWORK=off go get
-  …@vX.Y.Z && go mod tidy`, because `go.sum` changes too. A new gotcha says
-  never to add the `replace` back. README, `docs/cli.md`, `docs/index.md`,
-  `docs/features.md` and the bytdb skill now show `@latest`, noting that it
-  needs a pgwire release newer than v0.22.0. Checked with a local file
-  GOPROXY serving the working tree as fake versions (with
-  `GOPRIVATE=none.invalid`, since the dev machine's GOPRIVATE covers
-  `github.com/rohanthewiz/*`): the old `go.mod` fails with the toolchain's
-  "replace directives" error, and the new one installs `bytdb` and
-  `bytdbd` and runs `go run …/cmd/bytdb@v…`. **Check after the next pgwire
-  tag:** from outside a checkout, `go install
-  github.com/rohanthewiz/bytdb/pgwire/cmd/bytdb@latest` and `go run
-  github.com/rohanthewiz/bytdb/pgwire/cmd/bytdbd@latest -h`, once through
-  the proxy (`GOPRIVATE=none.invalid`) and once with the default env.
 - **N-033** · raised `2026-1104-1337-bytdb-cli-shell` · value low
   **Run the `bytdb` shell interactively on Linux and Windows terminals.**
   Interactive mode (liner line editing, raw/cooked terminal handoff
@@ -220,6 +164,36 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   imports it.
 
 ## Closed
+
+- **N-044** · raised `2026-1109-2243-deep-look-phase0-phase1` · closed
+  2026-11-11, `2026-1111-1625-release-v0.23.0`. **Cut the deep-look release.** One release of
+  everything on main, as the item's updates concluded. btypedb `v0.10.0`
+  (`ad77fd8`, D-48's faster replay) was tagged first and the root bumped to
+  it (`a6ce6f7`). Root `v0.23.0` on `a6ce6f7`, `pgwire/v0.23.0` on
+  `e2f0e14` (pgwire, bench and sql/difftest pins bumped); all three resolve
+  on proxy.golang.org. The release notes this item collected are in the
+  `v0.23.0` tag body ("Upgrade notes"). Before tagging, the Linux CI `test`
+  job had failed on every push since D-15:
+  `TestWriteDeadlineBoundsStallNotTransfer` was cut after ~2.6 MB because
+  Linux wakes a writer blocked on a full socket only after about a third of
+  an autotuned (up to 4 MiB) send buffer drains, longer than the test's
+  300 ms WriteTimeout at its ~2-3 MB/s pace. Reproduced in a
+  `golang:1.26.1` container (5/5), fixed in the test by clamping both ends'
+  socket buffers to 64 KiB (30/30, full race suite green on Linux), with
+  `WriteTimeout`'s doc noting the same granularity for production
+  (`38fd26d`). The release skill now covers `sql/difftest`, requires a
+  green CI run before tagging, and orders a btypedb tag first.
+- **N-031** · raised `2026-1104-1337-bytdb-cli-shell` · closed 2026-11-11,
+  `2026-1111-1625-release-v0.23.0`. **`go install …@version` refuses the pgwire commands.**
+  Validated after `pgwire/v0.23.0`, the first pgwire tag without a
+  `replace`: from outside a checkout with `GOWORK=off`, `go install
+  github.com/rohanthewiz/bytdb/pgwire/cmd/{bytdb,bytdbd}@latest` installs
+  both commands and `go run …/cmd/bytdbd@latest -h` prints usage, once
+  through the proxy (`GOPRIVATE=none.invalid`) and once with the default
+  env. `go version -m` shows pgwire v0.23.0, bytdb v0.23.0, btypedb v0.10.0.
+  The `pgwire-released-pin` CI job stays allowed-to-fail on purpose: it
+  fails whenever pgwire uses root API newer than the last tag, which is
+  the N-031 trade-off, not a defect.
 
 - **N-043** · raised `2026-1109-1706-deep-look-audit-remediation-plan` · closed
   2026-11-10, `2026-1110-0757-deep-look-phase8-close`.   **Convenience (plan Phase 8, D-51 to D-58).** Statements and catalog
