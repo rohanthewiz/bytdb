@@ -50,6 +50,15 @@ func TestIdleSessionTimeout(t *testing.T) {
 // and a short WriteTimeout, returning the listen address.
 func startWriteTimeoutServer(t *testing.T, wt time.Duration) string {
 	t.Helper()
+	return startWriteTimeoutServerOn(t, wt, nil)
+}
+
+// startWriteTimeoutServerOn is startWriteTimeoutServer with a hook to wrap
+// the listener, so a test can shape the accepted sockets (for instance
+// clamp their kernel buffers) before the server sees them. nil leaves the
+// listener as is.
+func startWriteTimeoutServerOn(t *testing.T, wt time.Duration, wrap func(net.Listener) net.Listener) string {
+	t.Helper()
 	e, err := bytdb.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -97,12 +106,16 @@ func startWriteTimeoutServer(t *testing.T, wt time.Duration) string {
 	}
 	srv := pgwire.NewServer(db)
 	srv.WriteTimeout = wt
+	addr := ln.Addr().String()
+	if wrap != nil {
+		ln = wrap(ln)
+	}
 	go srv.Serve(ln)
 	t.Cleanup(func() {
 		srv.Close()
 		e.Close()
 	})
-	return ln.Addr().String()
+	return addr
 }
 
 // pgReadUntilReady consumes backend frames until ReadyForQuery ('Z').

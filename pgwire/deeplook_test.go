@@ -129,13 +129,33 @@ func TestWriteDeadlineExcludesExecution(t *testing.T) {
 // off once the transfer outran WriteTimeout. The deadline now bounds a
 // stall: here ~4 MB arrives at ~3 MB/s against a 300 ms WriteTimeout.
 // (TestWriteDeadlineFreesWriterLock covers a reader that stops.)
+//
+// Both ends' kernel buffers are clamped to 64 KiB, and the test fails on
+// Linux without that. A Go Write blocked on a full socket wakes on
+// EPOLLOUT, and Linux raises EPOLLOUT only once the free send space is at
+// least half of what is still queued (sk_stream_is_writeable), so about
+// a third of the send buffer has to drain first. Linux autotunes that
+// buffer up to tcp_wmem's max (4 MiB by default), so at this test's
+// ~2-3 MB/s the wake-up comes after more than a second. The server's
+// write makes no visible progress for longer than WriteTimeout and is
+// cut, though the reader never paused. With 64 KiB buffers the wake-up
+// comes every few tens of ms, and the test measures what it means to: a
+// transfer that outlasts WriteTimeout without any stall. macOS wakes
+// writers sooner, which is why only the Linux CI job failed. The same
+// granularity applies in production, which is one reason WriteTimeout
+// defaults to a minute rather than milliseconds.
 func TestWriteDeadlineBoundsStallNotTransfer(t *testing.T) {
-	addr := startWriteTimeoutServer(t, 300*time.Millisecond)
+	addr := startWriteTimeoutServerOn(t, 300*time.Millisecond, func(ln net.Listener) net.Listener {
+		return sndbufListener{ln, 64 << 10}
+	})
 	nc, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer nc.Close()
+	if err := nc.(*net.TCPConn).SetReadBuffer(64 << 10); err != nil {
+		t.Fatal(err)
+	}
 	var body []byte
 	body = binary.BigEndian.AppendUint32(body, 196608)
 	body = append(body, "user\x00test\x00\x00"...)
@@ -169,6 +189,28 @@ func TestWriteDeadlineBoundsStallNotTransfer(t *testing.T) {
 	if took := time.Since(start); took < 300*time.Millisecond {
 		t.Fatalf("transfer took %v; the test needs it to outlast WriteTimeout", took)
 	}
+}
+
+// sndbufListener sets SO_SNDBUF on every accepted TCP connection, so a
+// test controls how much the kernel buffers on the server's side
+// (TestWriteDeadlineBoundsStallNotTransfer explains why that matters).
+type sndbufListener struct {
+	net.Listener
+	size int
+}
+
+func (l sndbufListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return c, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		if err := tc.SetWriteBuffer(l.size); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 // flakyListener returns a temporary error from its first n Accepts.

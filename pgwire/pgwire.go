@@ -163,6 +163,14 @@ type Server struct {
 	// the read-side idle-in-transaction deadline cannot fire because the
 	// server is stuck writing, not reading. A write deadline is the only
 	// thing that frees the lock. Set before Serve.
+	//
+	// The bound applies to each socket write, but "no progress" is as seen
+	// from the server's side. Linux wakes a writer blocked on a full socket
+	// only after about a third of the send buffer has drained, and it
+	// autotunes that buffer up to tcp_wmem's max (4 MiB by default). So a
+	// client draining slower than roughly that third per WriteTimeout
+	// (about 20 KB/s at the 60 s default) is cut even though it never
+	// stopped. Sub-second values suit tests, not real clients.
 	WriteTimeout time.Duration
 
 	// ReadTimeout bounds how long reading a single in-flight message body
