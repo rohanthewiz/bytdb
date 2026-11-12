@@ -104,14 +104,6 @@ recommendations. Every phase of it (0–9) is on main and released in
   comparison; `interval` is the largest (a new value kind with calendar
   arithmetic). No consumer has asked.
 
-- **N-054** · raised `2026-1111-1759-numeric-type-n048` · value medium
-  **A duplicate CREATE TABLE is SQLSTATE XX000.** `ddl.go:91` raises
-  "table already exists", which no `pgwire/errors.go` case maps, so a
-  client sees internal_error where Postgres sends 42P07
-  (duplicate_table) with `relation "t" already exists`. Found while
-  verifying N-048 over the wire. Check CREATE INDEX / VIEW / SEQUENCE
-  duplicates in the same pass (Postgres: 42P07 for all relations).
-
 ## Validate
 
 - **N-033** · raised `2026-1104-1337-bytdb-cli-shell` · value low
@@ -190,6 +182,28 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   imports it.
 
 ## Closed
+
+- **N-054** · raised `2026-1111-1759-numeric-type-n048` · closed
+  2026-11-11, `2026-1111-1808-duplicate-relation-42p07-n054`. **A
+  duplicate CREATE TABLE was SQLSTATE XX000.** It was all of them: no
+  `pgwire/errors.go` case mapped any duplicate-relation error, so CREATE
+  TABLE ("table already exists"), CREATE INDEX ("index already exists")
+  and the already Postgres-worded CREATE VIEW / CREATE SEQUENCE / RENAME
+  TABLE refusals all went out as XX000. Fixed with a new sentinel,
+  `bytdb.ErrRelationExists` (`err.go`, `errRelationExists`), raised at
+  all seven sites (`ddl.go` x3, `seqobj.go`, `view.go` x2, `index.go`)
+  with Postgres's single wording `relation "x" already exists`. pgwire
+  maps the sentinel and the bare text form to 42P07, the text case ahead
+  of 42710 so a relation named `constraint_*` isn't claimed as a
+  duplicate constraint. Evidence: `sql/difftest/corpus/78_duplicate_relation.sql`
+  (9 `@error 42P07` entries, all failing with XX000 before the mapping)
+  matches Postgres 16.15, as do messages; `TestDuplicateRelation` (pgx),
+  `TestSentinelErrors` and `TestSQLStateMapping` rows; race suite and
+  staticcheck v0.8.2 clean. Docs: README sentinel table, skill, and a
+  gotchas line on bytdb's per-table index-name scope (verified).
+  **Release notes:** duplicate-relation errors are now 42P07 (were
+  XX000); CREATE TABLE's and CREATE INDEX's messages change to
+  `relation "x" already exists`; new sentinel `ErrRelationExists`.
 
 - **N-048** · raised `2026-1110-0700-deep-look-phase8-d52-d53-d51` · closed
   2026-11-11, `2026-1111-1759-numeric-type-n048`. **`numeric` / `decimal`

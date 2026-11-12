@@ -20,6 +20,7 @@ func TestSentinelErrors(t *testing.T) {
 	exec(t, d, `create unique index p_email on p (email)`)
 	exec(t, d, `create table c (id int primary key, pid int references p (id))`)
 	exec(t, d, `insert into p values (1, 'a@x', 1)`)
+	exec(t, d, `create view rv as select 1 as one`)
 
 	for _, c := range []struct {
 		q     string
@@ -36,6 +37,15 @@ func TestSentinelErrors(t *testing.T) {
 		{`select * from nope`, []error{bytdb.ErrNoSuchTable}, nil, `relation "nope" does not exist`},
 		{`select nope from p`, []error{bytdb.ErrNoSuchColumn}, nil, `column "nope" does not exist`},
 		{`update p set nope = 1`, []error{bytdb.ErrNoSuchColumn}, nil, `column "nope" of relation "p" does not exist`},
+		// N-054: every relation kind collides as Postgres's duplicate_table,
+		// in one wording. Tables, views and sequences share a namespace;
+		// an index name collides within its table.
+		{`create table p (id int primary key)`, []error{bytdb.ErrRelationExists}, nil, `relation "p" already exists`},
+		{`create view p as select 1`, []error{bytdb.ErrRelationExists}, nil, `relation "p" already exists`},
+		{`create sequence p`, []error{bytdb.ErrRelationExists}, nil, `relation "p" already exists`},
+		{`create table rv (id int primary key)`, []error{bytdb.ErrRelationExists}, nil, `relation "rv" already exists`},
+		{`create unique index p_email on p (n)`, []error{bytdb.ErrRelationExists}, nil, `relation "p_email" already exists`},
+		{`alter table c rename to p`, []error{bytdb.ErrRelationExists}, nil, `relation "p" already exists`},
 		{`insrt into p values (1)`, nil, nil, `syntax error at or near "insrt"`},
 		{`select * from`, nil, nil, `syntax error at end of input`},
 	} {

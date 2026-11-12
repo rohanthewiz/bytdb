@@ -145,7 +145,8 @@ are transitive and still blocked by a NO ACTION constraint
 downstream). Errors carry Postgres wording and SQLSTATEs; branch with
 `errors.Is` on `bytdb.ErrNoSuchTable`, `ErrNoSuchColumn`,
 `ErrUniqueViolation` (`ErrDuplicateKey` for the primary key),
-`ErrNotNull`, `ErrForeignKey`, `ErrCheck` rather than on text.
+`ErrNotNull`, `ErrForeignKey`, `ErrCheck`, `ErrRelationExists` (a
+duplicate table/view/sequence/index name, 42P07) rather than on text.
 
 `DEFAULT` takes constants (pg_dump's `(0)` and `'x'::text` spellings
 too) plus `now()`/`current_date` (evaluated once per INSERT statement)

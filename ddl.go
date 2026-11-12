@@ -88,12 +88,12 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 		// writer lock serializes DDL, so racing CreateTables see each
 		// other's committed descriptor, never a stale catalog.
 		if tx.Contains(descKey(name)) {
-			return serr.New("table already exists", "table", name)
+			return errRelationExists(name)
 		}
 		// Sequences and views share the relation namespace, as in
 		// Postgres.
 		if tx.Contains(sqlSeqKey(name)) || tx.Contains(viewKey(name)) {
-			return serr.New(`relation "` + name + `" already exists`)
+			return errRelationExists(name)
 		}
 		// Allocate the next table ID from the sequence key.
 		next, err := nextFromCounter(tx, seqKey(), firstUserTableID, "table-id")
@@ -791,7 +791,7 @@ func (e *Engine) RenameTable(oldName, newName string) error {
 			return err
 		}
 		if tx.Contains(descKey(newName)) || tx.Contains(sqlSeqKey(newName)) || tx.Contains(viewKey(newName)) {
-			return serr.New(`relation "` + newName + `" already exists`)
+			return errRelationExists(newName)
 		}
 		refs, err := e.referencingFKs(tx, oldName, true)
 		if err != nil {

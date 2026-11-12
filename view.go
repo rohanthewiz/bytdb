@@ -37,11 +37,11 @@ func (e *Engine) CreateView(name, query string, orReplace bool) error {
 	replaced := false // reset on every run: updateDDL may retry the closure
 	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		if tx.Contains(descKey(name)) || tx.Contains(sqlSeqKey(name)) {
-			return serr.New(`relation "` + name + `" already exists`)
+			return errRelationExists(name)
 		}
 		replaced = tx.Contains(viewKey(name))
 		if !orReplace && replaced {
-			return serr.New(`relation "` + name + `" already exists`)
+			return errRelationExists(name)
 		}
 		blob, err := json.Marshal(ViewDesc{Name: name, Query: query})
 		if err != nil {

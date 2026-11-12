@@ -37,6 +37,8 @@ func sqlstateOf(err error, msg string, hasPos bool) string {
 		return "23503" // foreign_key_violation
 	case errors.Is(err, bytdb.ErrCheck):
 		return "23514" // check_violation
+	case errors.Is(err, bytdb.ErrRelationExists):
+		return "42P07" // duplicate_table
 	}
 	return sqlstate(msg, hasPos)
 }
@@ -52,6 +54,15 @@ func sqlstate(msg string, hasPos bool) string {
 	case strings.Contains(msg, "no such table"),
 		strings.HasPrefix(msg, `relation "`) && strings.HasSuffix(msg, `" does not exist`):
 		return "42P01" // undefined_table
+	// The text form of bytdb.ErrRelationExists, for an error that lost
+	// its sentinel on the way (re-raised from text, or an embedder's own
+	// wording). Postgres uses 42P07 for every relation kind: table,
+	// view, sequence and index alike. It sits ahead of the 42710 case
+	// below, which would otherwise claim a relation whose name contains
+	// "constraint". The "skipping" notice never reaches here (noticeBody
+	// maps it), and the anchored suffix keeps it out regardless.
+	case strings.HasPrefix(msg, `relation "`) && strings.HasSuffix(msg, `" already exists`):
+		return "42P07" // duplicate_table
 	// Also Postgres's wording for ALTER COLUMN / ADD PRIMARY KEY naming
 	// a missing column, and CREATE TABLE's key naming an undeclared one.
 	// The `column "` prefix keeps a constraint's "does not exist"

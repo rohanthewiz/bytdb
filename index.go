@@ -55,7 +55,7 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 	var created *IndexDesc
 	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
 		if old.Index(name) != nil {
-			return nil, serr.New("index already exists", "table", table, "index", name)
+			return nil, errRelationExists(name)
 		}
 		idx := IndexDesc{Name: name, Unique: unique, ID: primaryIndexID + 1}
 		for _, x := range old.Indexes {

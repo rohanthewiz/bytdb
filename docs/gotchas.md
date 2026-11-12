@@ -268,6 +268,12 @@ Four semantic notes that surprise people (all Postgres-faithful):
   a retired column ID (invisible, but occupying space) until rows are updated
   or compaction-adjacent rewrites happen. Re-adding the same name gets a fresh
   ID; old data can never resurface.
+- **Index names are scoped to their table**, not to the schema as in
+  Postgres. Two tables can each have an index `idx_id`, and an index can share
+  a name with a table, view or sequence. A collision within one table is
+  still Postgres's `relation "x" already exists` (42P07,
+  `bytdb.ErrRelationExists`), as is any collision among tables, views and
+  sequences, which share one namespace.
 
 ## Two different "index" features
 

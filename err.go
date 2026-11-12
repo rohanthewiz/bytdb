@@ -27,6 +27,13 @@ var (
 	ErrNotNull         = errors.New("not-null constraint violation")
 	ErrForeignKey      = errors.New("foreign key constraint violation")
 	ErrCheck           = errors.New("check constraint violation")
+	// ErrRelationExists is a CREATE (or RENAME) onto a name a relation
+	// already holds. Tables, views and sequences share one namespace,
+	// so any of the three collides with the others; index names are
+	// scoped to their table in bytdb (Postgres scopes them to the
+	// schema), so an index collides only with its table's other
+	// indexes. Postgres's SQLSTATE for every case is 42P07.
+	ErrRelationExists = errors.New("relation already exists")
 )
 
 // Kind returns an error whose message is msg and which errors.Is
@@ -60,6 +67,15 @@ func KindErr(skip int, msg string, kinds []error, fields ...string) error {
 // errNoSuchTable is the undefined-table error, in Postgres's wording.
 func errNoSuchTable(table string) error {
 	return KindErr(1, `relation "`+table+`" does not exist`, []error{ErrNoSuchTable}, "table", table)
+}
+
+// errRelationExists is the duplicate-relation error, in Postgres's
+// wording: `relation "x" already exists`, whatever kind of relation
+// (table, view, sequence, index) holds or wants the name. It adds no
+// fields of its own, since the message already names the relation; the
+// DDL entry points' wrappers still attach their usual op/table context.
+func errRelationExists(name string) error {
+	return KindErr(1, `relation "`+name+`" already exists`, []error{ErrRelationExists})
 }
 
 // errNoSuchColumn is the undefined-column error. With a table it names

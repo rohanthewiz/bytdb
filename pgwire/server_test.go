@@ -226,6 +226,45 @@ func TestDependencyRefusals(t *testing.T) {
 	}
 }
 
+// TestDuplicateRelation (N-054): creating or renaming onto a taken
+// relation name is 42P07 duplicate_table with Postgres's message, for
+// every relation kind. Before, CREATE TABLE's "table already exists"
+// and CREATE INDEX's "index already exists" fell through to XX000, and
+// the views' and sequences' Postgres-worded errors did too: no case
+// mapped them. A migration tool that tolerates "already there" by code
+// read every one as an internal error.
+func TestDuplicateRelation(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	mustExec(t, c, `create table t (id int primary key, a int)`)
+	mustExec(t, c, `create index t_a on t (a)`)
+	mustExec(t, c, `create view v as select id from t`)
+	mustExec(t, c, `create sequence s`)
+	mustExec(t, c, `create table u (id int primary key)`)
+
+	for _, tc := range []struct{ q, name string }{
+		{`create table t (id int primary key)`, "t"},
+		{`create table v (id int primary key)`, "v"},
+		{`create table s (id int primary key)`, "s"},
+		{`create view t as select 1`, "t"},
+		{`create view v as select 2`, "v"},
+		{`create sequence t`, "t"},
+		{`create sequence s`, "s"},
+		{`create index t_a on t (id)`, "t_a"},
+		{`alter table u rename to v`, "v"},
+	} {
+		var pgErr *pgconn.PgError
+		_, err := c.Exec(ctx, tc.q)
+		want := `relation "` + tc.name + `" already exists`
+		if !errors.As(err, &pgErr) || pgErr.Code != "42P07" || pgErr.Message != want {
+			t.Errorf("%s\n  got: %+v\n  want: 42P07 %q", tc.q, err, want)
+		}
+	}
+	// The IF NOT EXISTS forms still skip with a 42P07 NOTICE, not an error.
+	mustExec(t, c, `create table if not exists t (id int primary key)`)
+	mustExec(t, c, `create index if not exists t_a on t (id)`)
+}
+
 // TestPrimaryKeyDDLErrors: DDL that would break the one-primary-key
 // invariant is 42P16, a key naming a missing column is 42703, and a key
 // naming a column twice is 42701, never 23505, which a client would

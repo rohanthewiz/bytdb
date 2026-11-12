@@ -705,6 +705,7 @@ wording and name what went wrong (`relation "users" does not exist`,
 | `bytdb.ErrNotNull` | NULL into a NOT NULL or key column | 23502 |
 | `bytdb.ErrForeignKey` | a foreign-key violation, either direction | 23503 |
 | `bytdb.ErrCheck` | a CHECK violation | 23514 |
+| `bytdb.ErrRelationExists` | CREATE TABLE / VIEW / SEQUENCE / INDEX or a table RENAME onto a taken name (`relation "t" already exists`) | 42P07 |
 
 ```go
 if _, err := db.Exec(`insert into users values (1, 'ada')`); errors.Is(err, bytdb.ErrUniqueViolation) {

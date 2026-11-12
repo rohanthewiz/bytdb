@@ -60,6 +60,11 @@ func TestSQLStateMapping(t *testing.T) {
 		{"check constraint chk_age is violated by some row", false, "23514"},
 
 		{"constraint chk_age already exists", false, "42710"},
+		// Any relation kind's duplicate is 42P07 (N-054), including one
+		// whose name contains "constraint", which the 42710 case would
+		// otherwise claim.
+		{`relation "t" already exists`, false, "42P07"},
+		{`relation "constraint_log" already exists`, false, "42P07"},
 		{"constraint chk_age does not exist", false, "42704"},
 
 		// Literal parse failures, whatever the type.

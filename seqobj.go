@@ -184,7 +184,7 @@ func (e *Engine) CreateSequence(desc *SeqDesc) error {
 	}
 	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
 		if tx.Contains(sqlSeqKey(desc.Name)) || tx.Contains(descKey(desc.Name)) || tx.Contains(viewKey(desc.Name)) {
-			return serr.New(`relation "` + desc.Name + `" already exists`)
+			return errRelationExists(desc.Name)
 		}
 		id, err := nextFromCounter(tx, seqKey(), firstUserTableID, "table-id")
 		if err != nil {
