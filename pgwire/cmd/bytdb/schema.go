@@ -38,7 +38,6 @@ import (
 	"math"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
@@ -54,10 +53,8 @@ func columnDDL(c bytdb.Column) string {
 		// serial is the bytdb spelling of an identity column (an int
 		// with its own durable counter, implying NOT NULL).
 		b.WriteString("serial")
-	case c.Type == bytdb.TString && c.MaxLen > 0:
-		b.WriteString("varchar(" + strconv.Itoa(c.MaxLen) + ")")
 	default:
-		b.WriteString(typeName(c.Type))
+		b.WriteString(columnTypeName(c)) // varchar(n), numeric(p,s), ...
 	}
 	if c.NotNull && !c.Identity {
 		b.WriteString(" NOT NULL")
@@ -465,10 +462,7 @@ func describeTable(desc *bytdb.TableDesc) *resultSet {
 		types: []bytdb.ColType{bytdb.TString, bytdb.TString, bytdb.TString, bytdb.TString, bytdb.TString, bytdb.TString},
 	}
 	for i, c := range desc.Columns {
-		typ := typeName(c.Type)
-		if c.Type == bytdb.TString && c.MaxLen > 0 {
-			typ = "varchar(" + strconv.Itoa(c.MaxLen) + ")"
-		}
+		typ := columnTypeName(c)
 		null := "YES"
 		if c.NotNull || c.Identity || pk[i] {
 			null = "NO"

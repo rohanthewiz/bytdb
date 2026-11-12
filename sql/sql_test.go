@@ -645,10 +645,11 @@ func TestSQLAggregates(t *testing.T) {
 	if !reflect.DeepEqual(res.Cols, []string{"count(*)", "min(age)", "max(age)", "sum(age)", "avg(age)"}) {
 		t.Fatalf("cols: %v", res.Cols)
 	}
-	if !reflect.DeepEqual(res.Types, []bytdb.ColType{bytdb.TInt, bytdb.TInt, bytdb.TInt, bytdb.TInt, bytdb.TFloat}) {
+	// avg over integers is numeric, as in Postgres (N-048).
+	if !reflect.DeepEqual(res.Types, []bytdb.ColType{bytdb.TInt, bytdb.TInt, bytdb.TInt, bytdb.TInt, bytdb.TNumeric}) {
 		t.Fatalf("types: %v", res.Types)
 	}
-	want := [][]any{{int64(5), int64(28), int64(45), int64(189), 37.8}}
+	want := [][]any{{int64(5), int64(28), int64(45), int64(189), decv("37.8000000000000000")}}
 	if !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("got %v", res.Rows)
 	}
@@ -760,8 +761,8 @@ func TestSQLDistinctAggregates(t *testing.T) {
 	// Dedup state is per group, per accumulator.
 	res = exec(t, d, `select grp, count(distinct v), sum(distinct v), avg(distinct v) from m group by grp`)
 	want := [][]any{
-		{"a", int64(2), int64(30), 15.0},
-		{"b", int64(1), int64(10), 10.0},
+		{"a", int64(2), int64(30), decv("15.0000000000000000")},
+		{"b", int64(1), int64(10), decv("10.0000000000000000")},
 	}
 	if !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("got %v", res.Rows)
@@ -999,13 +1000,13 @@ func TestSQLAggregateExpressions(t *testing.T) {
 
 	// Expressions over aggregates; literals ride along.
 	res = exec(t, d, `select 'x', count(*) + 1, sum(age * 2), avg(age + 0.0) from users`)
-	if !reflect.DeepEqual(res.Rows, [][]any{{"x", int64(6), int64(378), 37.8}}) {
+	if !reflect.DeepEqual(res.Rows, [][]any{{"x", int64(6), int64(378), decv("37.8000000000000000")}}) {
 		t.Fatalf("got %v", res.Rows)
 	}
 	if !reflect.DeepEqual(res.Cols, []string{"?column?", "?column?", "sum", "avg"}) {
 		t.Fatalf("cols: %v", res.Cols)
 	}
-	if !reflect.DeepEqual(res.Types, []bytdb.ColType{bytdb.TString, bytdb.TInt, bytdb.TInt, bytdb.TFloat}) {
+	if !reflect.DeepEqual(res.Types, []bytdb.ColType{bytdb.TString, bytdb.TInt, bytdb.TInt, bytdb.TNumeric}) {
 		t.Fatalf("types: %v", res.Types)
 	}
 

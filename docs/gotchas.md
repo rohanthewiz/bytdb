@@ -142,13 +142,16 @@ Parse-time rejections with pointed errors:
 | `SELECT *` over `JOIN … USING` listing the USING column once | Both tables' copies are listed; name the columns you want (an unqualified USING column is the merged one) |
 | `CREATE TABLE ... AS SELECT` | `CREATE TABLE` with a primary key, then `INSERT ... SELECT` |
 | `LOCK TABLE` as mutual exclusion under `WithConcurrentWrites` | It parses and does nothing; in the default mode writes serialize anyway, but under concurrent writes use a row both sessions update, or `SERIALIZABLE` |
-| Type modifiers on casts (`'abc'::varchar(2)`, `1.555::numeric(5,2)`) | They parse and are not applied: the cast converts to the base type, without truncating or rounding |
+| Type modifiers on casts (`'abc'::varchar(2)`, `timestamp(3)`) | They parse and are not applied: the cast converts to the base type, without truncating. `numeric(p, s)` is the exception: it rounds and range-checks as in Postgres |
 | `WITH RECURSIVE`; `WITH` on INSERT/UPDATE/DELETE; data-modifying CTEs | CTEs are SELECT-only and non-recursive |
 | Writable or materialized views; `WITH CHECK OPTION` | Views are read-only, materialized per statement |
 | FK `MATCH FULL/PARTIAL`, `ON UPDATE CASCADE`, `ON DELETE/UPDATE SET NULL/DEFAULT` | `MATCH SIMPLE` with `NO ACTION`/`RESTRICT`/`ON DELETE CASCADE` only — rejected rather than silently weakened |
 | `TRUNCATE ... CASCADE` | Name every referencing table: `TRUNCATE parent, child` (the error's HINT lists them) |
 | `ON CONFLICT ON CONSTRAINT name`, index predicates in the conflict target | Name the columns: `ON CONFLICT (col, ...)` |
-| Decimal/`NUMERIC` storage, time-of-day, `CHAR(n)`, interval | `numeric` casts to float; store money as int cents; `TIME` → use `TIMESTAMP` |
+| Time-of-day, `CHAR(n)`, interval, `money`, `bit`, `citext` | `TIME` → use `TIMESTAMP`; `money` → `numeric(p,2)` |
+| `numeric` `NaN` / `Infinity` | Refused (0A000): store them in a `double precision` column, or use NULL |
+| Exact numeric `sqrt`, `exp`, `ln`, `log`, `power`, `cbrt` | They convert a numeric argument to float8 and return float8 (Postgres returns numeric for some): cast back, `sqrt(x)::numeric(20,10)`, when you need a numeric. `abs round trunc ceil floor sign mod` are exact |
+| `round(int)`, `ceil(int)`, `trunc(int)`, `sign(int)` result type | bigint here, double precision in Postgres (values agree); `round(int, n)` is numeric in both |
 | Array types other than `TEXT[]`; multi-dimensional arrays; array `@>`/`&&`/`unnest`/subscripts | One-dimensional text arrays with `= ANY(col)`, `array_to_string`, `array_length` |
 | `jsonb_set`, `jsonb_build_*`, `jsonb_agg`, `to_jsonb`, jsonpath (`@?` `@@`), `#-`, jsonb indexes | Read-modify-write with `\|\|` and `-`; the operator family covers reads |
 | Expression column defaults beyond the clock markers | Constants plus `DEFAULT now()` / `current_date` only; `nextval(...)` as DEFAULT → use `SERIAL` or put `nextval('s')` in VALUES |

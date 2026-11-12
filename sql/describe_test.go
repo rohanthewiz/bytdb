@@ -63,7 +63,7 @@ func TestDescribe(t *testing.T) {
 			command: "SELECT",
 			params:  []bytdb.ColType{bytdb.TInt},
 			cols:    []string{"city", "count(*)", "avg(age)", "sum(age)"},
-			types:   []bytdb.ColType{bytdb.TString, bytdb.TInt, bytdb.TFloat, bytdb.TInt},
+			types:   []bytdb.ColType{bytdb.TString, bytdb.TInt, bytdb.TNumeric, bytdb.TInt},
 		},
 		{
 			// INSERT with explicit column list, out of declared order.

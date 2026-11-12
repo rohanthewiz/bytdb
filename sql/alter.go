@@ -30,7 +30,7 @@ func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 		return nil, serr.New(`column "`+s.Col+`" of relation "`+s.Table+`" does not exist`,
 			"table", s.Table, "column", s.Col)
 	}
-	ch := bytdb.ColumnTypeChange{Type: s.Type, MaxLen: s.MaxLen}
+	ch := bytdb.ColumnTypeChange{Type: s.Type, MaxLen: s.MaxLen, Precision: s.Precision, Scale: s.Scale}
 
 	if s.Using != nil {
 		sc := tableScope(s.Table, desc)

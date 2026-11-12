@@ -1097,9 +1097,11 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 		p.advance()
 		col.Type, col.Identity, col.NotNull = bytdb.TInt, true, true
 	default:
-		if col.Type, col.MaxLen, err = p.typeName(); err != nil {
+		var mods typeMods
+		if col.Type, mods, err = p.typeName(); err != nil {
 			return fail(err)
 		}
+		col.MaxLen, col.Precision, col.Scale = mods.MaxLen, mods.Precision, mods.Scale
 	}
 	pk := false
 	var checks []CheckDef
@@ -1351,6 +1353,10 @@ func renderLit(v any) string {
 		return strconv.FormatInt(n, 10)
 	case float64:
 		return strconv.FormatFloat(n, 'g', -1, 64)
+	case bytdb.Decimal:
+		// Unquoted, so it reads back as a numeric literal, scale and all
+		// (DEFAULT 0.00 stays 0.00).
+		return n.String()
 	case bool:
 		return strconv.FormatBool(n)
 	case string:
@@ -1409,26 +1415,91 @@ var serialTypes = map[string]bool{
 // on a string representation; see bytdb.TTextArray), so the suffix is
 // legal on the text/varchar family alone and rejected elsewhere rather
 // than parsing into a type the engine would refuse later.
-func (p *parser) typeName() (typ bytdb.ColType, maxLen int, err error) {
-	if typ, maxLen, err = p.typeNameBase(); err != nil {
-		return "", 0, err
+//
+// numeric / decimal / dec are handled here rather than in typeNameBase
+// because their modifier is two numbers, carried in typeMods.
+func (p *parser) typeName() (typ bytdb.ColType, mods typeMods, err error) {
+	if t := p.cur(); t.kind == tIdent && numericTypeNames[t.text] {
+		p.advance()
+		prec, scale, err := p.numericMods()
+		if err != nil {
+			return "", typeMods{}, err
+		}
+		if p.cur().kind == tOp && p.cur().text == "[" {
+			return "", typeMods{}, serr.New("only text[] arrays are supported", "type", "numeric[]")
+		}
+		return bytdb.TNumeric, typeMods{Precision: prec, Scale: scale}, nil
+	}
+	if typ, mods.MaxLen, err = p.typeNameBase(); err != nil {
+		return "", typeMods{}, err
 	}
 	if !p.acceptOp("[") {
-		return typ, maxLen, nil
+		return typ, mods, nil
 	}
 	if err = p.expectOp("]"); err != nil {
-		return "", 0, err
+		return "", typeMods{}, err
 	}
 	if typ != bytdb.TString {
-		return "", 0, serr.New("only text[] arrays are supported",
+		return "", typeMods{}, serr.New("only text[] arrays are supported",
 			"type", string(typ)+"[]")
 	}
-	if maxLen != 0 {
+	if mods.MaxLen != 0 {
 		// A per-element length limit would need enforcement inside the
 		// stored literal; refuse rather than silently drop the limit.
-		return "", 0, serr.New("varchar(n)[] is not supported; use text[]")
+		return "", typeMods{}, serr.New("varchar(n)[] is not supported; use text[]")
 	}
-	return bytdb.TTextArray, 0, nil
+	return bytdb.TTextArray, typeMods{}, nil
+}
+
+// typeMods is a column type's modifiers: VARCHAR(n)'s length, or
+// numeric(p, s)'s precision and scale (all zero: none).
+type typeMods struct {
+	MaxLen           int
+	Precision, Scale int32
+}
+
+// numericTypeNames are the spellings of Postgres's numeric type.
+var numericTypeNames = map[string]bool{"numeric": true, "decimal": true, "dec": true}
+
+// numericMods parses numeric's optional "(p)" or "(p, s)" (the type
+// name already consumed). Absent is (0, 0): unconstrained. (p) means
+// scale 0. The scale may be negative (Postgres 15+); the ranges are
+// the engine's to check (bytdb.Column), so the error comes out the same
+// for CREATE TABLE and the Go API.
+func (p *parser) numericMods() (prec, scale int32, err error) {
+	if !p.acceptOp("(") {
+		return 0, 0, nil
+	}
+	num := func(what string) (int32, error) {
+		neg := p.acceptOp("-")
+		t := p.cur()
+		if t.kind != tNumber {
+			return 0, p.unexpected(what)
+		}
+		n, err := strconv.ParseInt(t.text, 10, 32)
+		if err != nil {
+			return 0, serr.New("invalid NUMERIC type modifier", "got", t.text)
+		}
+		p.advance()
+		if neg {
+			n = -n
+		}
+		return int32(n), nil
+	}
+	if prec, err = num("a precision"); err != nil {
+		return 0, 0, err
+	}
+	if prec < 1 {
+		// Postgres refuses numeric(0) at parse; the engine would read a
+		// zero precision as "unconstrained", so it must not get through.
+		return 0, 0, serr.New(fmt.Sprintf("NUMERIC precision %d must be between 1 and 1000", prec))
+	}
+	if p.acceptOp(",") {
+		if scale, err = num("a scale"); err != nil {
+			return 0, 0, err
+		}
+	}
+	return prec, scale, p.expectOp(")")
 }
 
 // typeNameBase parses the scalar type name itself. maxLen is a
@@ -1969,11 +2040,12 @@ func (p *parser) alterTableAction(table string) (Statement, error) {
 // the new type, then an optional USING expression computing each
 // row's new value. COLLATE is not accepted — bytdb has one collation.
 func (p *parser) alterColumnType(table, col string) (Statement, error) {
-	typ, maxLen, err := p.typeName()
+	typ, mods, err := p.typeName()
 	if err != nil {
 		return nil, err
 	}
-	st := &AlterColumnType{Table: table, Col: col, Type: typ, MaxLen: maxLen}
+	st := &AlterColumnType{Table: table, Col: col, Type: typ, MaxLen: mods.MaxLen,
+		Precision: mods.Precision, Scale: mods.Scale}
 	if p.acceptKw("using") {
 		start := p.cur().pos
 		if st.Using, err = p.expression(); err != nil {
@@ -4192,9 +4264,27 @@ func (p *parser) castType() (string, error) {
 			name = "char"
 		}
 	}
-	// Type modifiers — varchar(10), numeric(10,2), timestamp(3) — parse
-	// and are not applied: a cast converts to the base type (deep-look
-	// D-52; docs/gotchas.md lists it).
+	// numeric(p, s) is the one modifier a cast applies (N-048): the
+	// cast rounds to the scale and refuses an overflow, which is how
+	// SQL rounds money (avg(x)::numeric(10,2)). It rides in the type
+	// string as "numeric(p,s)", which castVal and castColType read back,
+	// so ExCast needs no new field. decimal and dec are numeric.
+	if numericTypeNames[name] {
+		prec, scale, err := p.numericMods()
+		if err != nil {
+			return "", err
+		}
+		if p.acceptOp("[") {
+			return "", serr.New("array casts are not supported", "type", "numeric[]")
+		}
+		if prec == 0 {
+			return "numeric", nil
+		}
+		return fmt.Sprintf("numeric(%d,%d)", prec, scale), nil
+	}
+	// The other modifiers — varchar(10), timestamp(3) — parse and are
+	// not applied: a cast converts to the base type (deep-look D-52;
+	// docs/gotchas.md lists it).
 	if p.acceptOp("(") {
 		for {
 			if p.cur().kind != tNumber {
@@ -4924,14 +5014,17 @@ func (p *parser) literal() (any, error) {
 		if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 			return n, nil
 		}
-		f, err := strconv.ParseFloat(t.text, 64)
+		// Anything else — a point, an exponent, or an integer too big
+		// for bigint — is numeric, as in Postgres (N-048): 0.1 + 0.2 is
+		// exactly 0.3, and a numeric column takes the literal digit for
+		// digit. The typing pass converts it to float8 where the
+		// context is float (a float column, float arithmetic), the
+		// implicit numeric -> float8 cast Postgres applies there.
+		d, err := bytdb.ParseDecimal(text)
 		if err != nil {
 			return nil, serr.New("bad numeric literal", "text", t.text, "pos", fmt.Sprint(t.pos))
 		}
-		if neg {
-			f = -f
-		}
-		return f, nil
+		return d, nil
 	case tString:
 		if neg {
 			return nil, p.unexpected("a number after '-'")

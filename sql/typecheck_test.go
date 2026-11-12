@@ -103,7 +103,9 @@ func TestTypedCasts(t *testing.T) {
 		t.Errorf("ts::date described as %v", res.Types[0])
 	}
 	res = exec(t, d, `select 1000000.0::text, 1e15::text, 0.00001::text, 1::bool, 0::bool, true::int, false::int`)
-	want = []any{"1000000", "1e+15", "1e-05", true, false, int64(1), int64(0)}
+	// Decimal literals are numeric (N-048), and numeric's text keeps the
+	// written scale and never uses an exponent — Postgres's answers.
+	want = []any{"1000000.0", "1000000000000000", "0.00001", true, false, int64(1), int64(0)}
 	if !reflect.DeepEqual(res.Rows[0], want) {
 		t.Errorf("casts = %#v, want %#v", res.Rows[0], want)
 	}

@@ -247,7 +247,7 @@ func TestLexerParserDivergences(t *testing.T) {
 		`select 0b101`:                int64(5),
 		`select 1_000`:                int64(1000),
 		`select 0x_ff`:                int64(255),
-		`select 1_000.000_5`:          1000.0005,
+		`select 1_000.000_5`:          decv("1000.0005"), // numeric, as in Postgres (N-048)
 		`select -0x10`:                int64(-16),
 		`select E'\x41'`:              "A",
 		`select E'\101'`:              "A",
@@ -267,7 +267,7 @@ func TestLexerParserDivergences(t *testing.T) {
 			t.Errorf("%s: %v", q, err)
 			continue
 		}
-		if got := res.Rows[0][0]; got != want {
+		if got := res.Rows[0][0]; !reflect.DeepEqual(got, want) {
 			t.Errorf("%s = %#v, want %#v", q, got, want)
 		}
 	}

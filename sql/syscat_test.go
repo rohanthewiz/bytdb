@@ -247,7 +247,7 @@ func TestSystemCatalogViews(t *testing.T) {
 	for view, want := range map[string][][]any{
 		// Postgres never marks a view column NOT NULL, even over a PK.
 		"adults":      {{"id", "int8", false}, {"name", "text", false}, {"age", "int8", false}},
-		"by_city":     {{"city", "text", false}, {"n", "int8", false}, {"mean", "float8", false}},
+		"by_city":     {{"city", "text", false}, {"n", "int8", false}, {"mean", "numeric", false}}, // avg(int) is numeric
 		"adult_names": {{"name", "text", false}},
 	} {
 		res := exec(t, d, fmt.Sprintf(attrs, view))
@@ -261,7 +261,7 @@ func TestSystemCatalogViews(t *testing.T) {
 	want := [][]any{
 		{"city", int64(1), "text", "YES", nil},
 		{"n", int64(2), "bigint", "YES", nil},
-		{"mean", int64(3), "double precision", "YES", nil},
+		{"mean", int64(3), "numeric", "YES", nil}, // avg(int) is numeric
 	}
 	if !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("info columns for view: %v", res.Rows)

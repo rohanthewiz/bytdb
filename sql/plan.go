@@ -387,6 +387,14 @@ func litFits(v any, t bytdb.ColType) bool {
 		// would not compare as a stop.
 		_, ok := v.(int64)
 		return ok
+	case bytdb.TNumeric:
+		// A Decimal, or an integer the engine promotes exactly when it
+		// encodes the key. A float stays residual: Postgres compares
+		// numeric with float8 as float8, and a key holds the exact value.
+		switch v.(type) {
+		case bytdb.Decimal, int64:
+			return true
+		}
 	case bytdb.TUUID:
 		// Exactly 16 bytes: anything else the engine refuses to encode,
 		// and the residual comparison rejects every row anyway.

@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/rohanthewiz/bytdb"
 )
 
 // execErr runs a statement that must fail and returns the error text.
@@ -210,13 +212,13 @@ func TestSumOverflow(t *testing.T) {
 		t.Fatalf("exact-boundary sum: %v", res.Rows)
 	}
 
-	// AVG reads the float accumulator, so it survives inputs whose
-	// integer sum would overflow — matching Postgres, where avg(bigint)
-	// is numeric.
+	// AVG folds an integer total that outgrows int64 into an exact
+	// numeric, so it survives inputs whose integer sum would overflow —
+	// and, like Postgres's avg(bigint), its result is numeric, exact.
 	exec(t, d, `update s set n = 9223372036854775807 where id = 1`)
 	exec(t, d, `update s set n = 9223372036854775807 where id = 2`)
 	res = exec(t, d, `select avg(n) from s`)
-	if got, ok := res.Rows[0][0].(float64); !ok || got != float64(math.MaxInt64) {
+	if got, ok := res.Rows[0][0].(bytdb.Decimal); !ok || got.String() != "9223372036854775807" {
 		t.Fatalf("avg over big ints: %v", res.Rows)
 	}
 	// Float SUM likewise accumulates in float64.

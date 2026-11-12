@@ -29,7 +29,7 @@ func TestCastValPairs(t *testing.T) {
 		int64(99), int64(42), nil,
 		"1.5", "true", nil,
 		true, false, nil,
-		2.5, 1.0, 2.25, nil}}
+		decv("2.5"), 1.0, 2.25, nil}} // '2.5'::numeric is numeric (N-048)
 	if !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("got %v", res.Rows)
 	}
@@ -78,12 +78,15 @@ func TestCastValErrors(t *testing.T) {
 }
 
 // Float→int casts round half to even (Postgres rint semantics), and
-// ::float is an accepted alias for double precision.
+// ::float is an accepted alias for double precision. A bare 2.5 is a
+// numeric literal (N-048), whose cast to int rounds half away from zero
+// instead, as in Postgres: 2.5::int is 3 but 2.5::float8::int is 2.
 func TestFloatIntCastRounding(t *testing.T) {
 	d := openDB(t)
 
-	res := exec(t, d, `select 1.7::int, 2.5::int, 3.5::int, (-1.7)::int, 1.5::float`)
-	want := [][]any{{int64(2), int64(2), int64(4), int64(-2), 1.5}}
+	res := exec(t, d, `select 1.7::float8::int, 2.5::float8::int, 3.5::float8::int, (-1.7)::float8::int, 1.5::float,
+		2.5::int, (-2.5)::int`)
+	want := [][]any{{int64(2), int64(2), int64(4), int64(-2), 1.5, int64(3), int64(-3)}}
 	if !reflect.DeepEqual(res.Rows, want) {
 		t.Fatalf("got %v, want %v", res.Rows, want)
 	}
@@ -120,9 +123,11 @@ func TestExprStaticTypesAndNames(t *testing.T) {
 		age in (1, 2), age = any(array[1]), not (age = 1), name is null,
 		age::text, case when age > 1 then 'a' end, 1 + 1
 		from users`)
+	// age + 1.5 and the CASE over decimal literals are numeric, as in
+	// Postgres (N-048).
 	wantTypes := []bytdb.ColType{
-		bytdb.TString, bytdb.TFloat, bytdb.TInt,
-		bytdb.TInt, bytdb.TFloat,
+		bytdb.TString, bytdb.TNumeric, bytdb.TInt,
+		bytdb.TInt, bytdb.TNumeric,
 		bytdb.TFloat, bytdb.TBool, bytdb.TString, bytdb.TString, // age::regclass renders a name
 		bytdb.TBool, bytdb.TBool, bytdb.TBool, bytdb.TBool,
 		bytdb.TString, bytdb.TString, bytdb.TInt,

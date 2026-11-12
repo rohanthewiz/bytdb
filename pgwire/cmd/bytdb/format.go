@@ -51,8 +51,23 @@ func typeName(t bytdb.ColType) string {
 		return "text[]"
 	case bytdb.TJSONB:
 		return "jsonb"
+	case bytdb.TNumeric:
+		return "numeric"
 	}
 	return string(t)
+}
+
+// columnTypeName is a declared column's type with its modifier, as
+// .schema and .describe show it: varchar(n), numeric(p,s), or the bare
+// type name.
+func columnTypeName(c bytdb.Column) string {
+	switch {
+	case c.Type == bytdb.TString && c.MaxLen > 0:
+		return "varchar(" + strconv.Itoa(c.MaxLen) + ")"
+	case c.Type == bytdb.TNumeric:
+		return bytdb.NumericTypeName(c)
+	}
+	return typeName(c.Type)
 }
 
 // shortTypeName is typeName compacted for the duckbox header row, where
@@ -65,7 +80,9 @@ func shortTypeName(t bytdb.ColType) string {
 }
 
 // isNumeric reports whether a column type right-aligns in box output.
-func isNumeric(t bytdb.ColType) bool { return t == bytdb.TInt || t == bytdb.TFloat }
+func isNumeric(t bytdb.ColType) bool {
+	return t == bytdb.TInt || t == bytdb.TFloat || t == bytdb.TNumeric
+}
 
 // displayValue renders v for a human. ok is false for SQL NULL, so each
 // renderer can substitute its own null text (.nullvalue).
@@ -99,6 +116,8 @@ func displayValue(v any, t bytdb.ColType) (s string, ok bool) {
 		return strconv.FormatInt(x, 10), true
 	case float64:
 		return formatFloat(x), true
+	case bytdb.Decimal:
+		return x.String(), true
 	case string:
 		return x, true
 	case []byte:
@@ -166,6 +185,10 @@ func sqlLiteral(v any, t bytdb.ColType) string {
 		// 'g' with -1 precision is the shortest text that parses back
 		// to the identical float64, so a dump round-trips exactly.
 		return strconv.FormatFloat(x, 'g', -1, 64)
+	case bytdb.Decimal:
+		// Unquoted, the exact digits and scale: it reads back as a
+		// numeric literal, so 19.90 reloads as 19.90.
+		return x.String()
 	}
 	s, _ := displayValue(v, t)
 	return quoteString(s)
@@ -215,6 +238,11 @@ func jsonValue(v any, t bytdb.ColType) string {
 		if !math.IsNaN(x) && !math.IsInf(x, 0) {
 			return strconv.FormatFloat(x, 'g', -1, 64)
 		}
+	case bytdb.Decimal:
+		// numeric text is always a valid JSON number (no exponent, no
+		// NaN), and emitting it bare keeps every digit a float would
+		// round away.
+		return x.String()
 	}
 	s, _ := displayValue(v, t)
 	b, _ := json.Marshal(s) // a string always marshals

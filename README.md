@@ -408,11 +408,13 @@ functions (ranking, value, and aggregate — DISTINCT included — with
 explicit ROWS/RANGE/GROUPS frames, RANGE offsets on the sort key, and
 frame EXCLUDE).
 
-Types: int, float, string/text, bool, bytes, `timestamp`,
-`timestamptz`, `date`, `uuid`, `text[]`, and `jsonb` — the date/time
-and UUID types stored so they order chronologically in keys and
-indexes, `jsonb` in a canonical rendering so plain `=` is document
-equality.
+Types: int, float, exact `numeric`/`decimal(p,s)`, string/text, bool,
+bytes, `timestamp`, `timestamptz`, `date`, `uuid`, `text[]`, and
+`jsonb` — the date/time and UUID types stored so they order
+chronologically in keys and indexes, `numeric` with Postgres's
+rounding, division scales and `1.0 = 1.00` equality (decimal literals
+are numeric, so `0.1 + 0.2` is `0.3`), `jsonb` in a canonical rendering
+so plain `=` is document equality.
 
 The full feature inventory — every constraint, function, and
 statement, with its exact semantics — lives in

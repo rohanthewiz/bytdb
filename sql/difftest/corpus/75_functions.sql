@@ -1,6 +1,7 @@
--- The scalar function library (plan D-53). bytdb has no numeric type
--- (numeric is float8), so results Postgres types as numeric compare by
--- value only (@notype).
+-- The scalar function library (plan D-53). Since N-048 bytdb has a real
+-- numeric type, and a decimal literal is numeric, so round/trunc over
+-- one compare digit for digit (difftest compares numeric columns as
+-- exact text). The numeric file is 77_numeric.sql.
 
 -- @setup
 set timezone = 'UTC';
@@ -13,7 +14,6 @@ insert into f values
 -- @queries
 -- @ordered
 select id, abs(i), abs(x), sign(i), sign(x), mod(i, 5), ceil(x), floor(x) from f order by id;
--- @notype
 select round(2.5), round(-2.5), round(2.345, 2), trunc(-2.7), trunc(1.239, 2);
 select power(2, 10), sqrt(16), cbrt(27), exp(0), ln(1), log(100), log(2, 8), pi() > 3.14;
 select greatest(1, 5, 3), least(4, null, 2), greatest(null::int, null);

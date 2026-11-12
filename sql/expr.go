@@ -803,6 +803,18 @@ func arith(op string, l, r any) (any, error) {
 			return li % ri, nil
 		}
 	}
+	// numeric (N-048): exact when both operands are exact (a Decimal and
+	// a Decimal or an integer); a float on either side makes the result
+	// float8, Postgres's numeric -> float8 implicit cast.
+	_, lFloat := l.(float64)
+	_, rFloat := r.(float64)
+	if !lFloat && !rFloat {
+		if ld, ok := asDecimal(l); ok {
+			if rd, ok := asDecimal(r); ok {
+				return decimalArith(op, ld, rd)
+			}
+		}
+	}
 	lf, lOK := asFloat(l)
 	rf, rOK := asFloat(r)
 	if !lOK || !rOK {
@@ -878,6 +890,11 @@ func asFloat(v any) (float64, bool) {
 		return float64(n), true
 	case float64:
 		return n, true
+	case bytdb.Decimal:
+		// numeric -> float8, where a float context demands it: float
+		// arithmetic, and the math functions without a numeric
+		// implementation (plan decision Q9).
+		return n.Float64(), true
 	}
 	return 0, false
 }
@@ -892,6 +909,8 @@ func valText(v any) string {
 	case float64:
 		// Postgres's float8 output, not Go's %g: 1000000, not 1e+06.
 		return bytdb.FormatFloat(x)
+	case bytdb.Decimal:
+		return x.String()
 	case bool:
 		if x {
 			return "true"
@@ -1016,6 +1035,14 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			return x, nil
 		case float64:
 			return floatToInt(x)
+		case bytdb.Decimal:
+			// numeric -> bigint rounds half away from zero (2.5 is 3),
+			// unlike float8 -> bigint's half to even.
+			n, ok := x.Int64()
+			if !ok {
+				return nil, errIntRange()
+			}
+			return n, nil
 		case string:
 			n, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
 			if err != nil {
@@ -1062,7 +1089,7 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			return nil, nil
 		}
 		return coerceLit(v, bytdb.TBool)
-	case "float", "float4", "float8", "real", "numeric", "decimal":
+	case "float", "float4", "float8", "real":
 		switch x := v.(type) {
 		case nil:
 			return nil, nil
@@ -1070,6 +1097,8 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			return float64(x), nil
 		case float64:
 			return x, nil
+		case bytdb.Decimal:
+			return x.Float64(), nil
 		case string:
 			return coerceLit(x, bytdb.TFloat)
 		}
@@ -1112,6 +1141,9 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 		case string:
 			return bytdb.CanonJSONB(x)
 		}
+	}
+	if isNumericCast(typ) {
+		return castToNumeric(v, typ)
 	}
 	return nil, serr.New("unsupported cast", "type", typ)
 }
@@ -1409,6 +1441,19 @@ func formatType(typid, typmod any) any {
 		name = "uuid"
 	case 3802:
 		name = "jsonb"
+	case 1700:
+		// numeric's typmod packs precision in the high 16 bits and an
+		// 11-bit two's-complement scale (Postgres 15+ allows negative
+		// ones) in the low bits, plus the 4-byte header Postgres counts.
+		name = "numeric"
+		if m, ok := typmod.(int64); ok && m >= 4 {
+			m -= 4
+			scale := m & 0x7ff
+			if scale >= 0x400 {
+				scale -= 0x800
+			}
+			return fmt.Sprintf("numeric(%d,%d)", m>>16&0xffff, scale)
+		}
 	default:
 		return "???"
 	}
@@ -1557,14 +1602,14 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 				return nil, err
 			}
 			t := fp.sc.column(ord).Type
-			if (it.Agg == AggSum || it.Agg == AggAvg) && t != bytdb.TInt && t != bytdb.TFloat {
+			if (it.Agg == AggSum || it.Agg == AggAvg) && !numericType(t) {
 				return nil, serr.New(it.Agg.name()+" requires a numeric column",
 					"column", it.Col.String())
 			}
 			if err := aggArgCheck(it.Agg, t, ""); err != nil {
 				return nil, err
 			}
-			acc.ord, acc.intSum = ord, t == bytdb.TInt
+			acc.ord, acc.intSum, acc.numArg = ord, t == bytdb.TInt, t == bytdb.TNumeric
 			acc.spec = &accumSpec{elemType: t} // array_agg renders by it
 		} else if it.Agg != AggCount {
 			return nil, serr.New("only COUNT takes *", "function", it.Agg.name())
@@ -1928,22 +1973,24 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 	case *ExCmp, *ExAny, *ExIsNull, *ExIn, *ExAnd, *ExOr, *ExNot:
 		return bytdb.TBool
 	case *ExAgg:
-		if t, ok := n.Fn.fixedType(); ok { // count, avg, the D-53 aggregates
+		if t, ok := n.Fn.fixedType(); ok { // count, the D-53 aggregates
 			return t
 		}
-		// Mirrors accumType: SUM over anything not statically integer
-		// accumulates as float; MIN/MAX surface the argument's type.
-		if n.Arg != nil {
-			t := exprType(sc, n.Arg)
-			if n.Fn == AggSum && t != bytdb.TInt {
-				return bytdb.TFloat
-			}
-			return t
-		}
-		if !n.Star {
+		// Mirrors the accumulator: SUM keeps an integer or numeric
+		// argument's type and is float otherwise; AVG is numeric over
+		// integers and numerics, float otherwise; MIN/MAX surface the
+		// argument's type.
+		var t bytdb.ColType
+		switch {
+		case n.Arg != nil:
+			t = exprType(sc, n.Arg)
+		case !n.Star:
 			if ord, err := sc.resolve(n.Col); err == nil {
-				return sc.column(ord).Type
+				t = sc.column(ord).Type
 			}
+		}
+		if t != "" {
+			return sumAvgType(n.Fn, t)
 		}
 	case *ExFunc:
 		switch n.Name {
@@ -2025,9 +2072,33 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 		if lt == bytdb.TFloat || rt == bytdb.TFloat {
 			return bytdb.TFloat
 		}
+		if lt == bytdb.TNumeric || rt == bytdb.TNumeric {
+			return bytdb.TNumeric
+		}
 		return bytdb.TInt
 	}
 	return bytdb.TString
+}
+
+// sumAvgType is an aggregate's result type given its argument's: SUM
+// keeps an integer or numeric type and is float otherwise; AVG is
+// numeric over integers and numerics (Postgres: avg(bigint) is
+// numeric), float otherwise. Other aggregates (MIN, MAX) keep the
+// argument's type.
+func sumAvgType(fn AggFunc, arg bytdb.ColType) bytdb.ColType {
+	switch fn {
+	case AggSum:
+		if arg == bytdb.TInt || arg == bytdb.TNumeric {
+			return arg
+		}
+		return bytdb.TFloat
+	case AggAvg:
+		if arg == bytdb.TInt || arg == bytdb.TNumeric {
+			return bytdb.TNumeric
+		}
+		return bytdb.TFloat
+	}
+	return arg
 }
 
 // branchType is the common type of expressions that must agree (CASE
@@ -2048,7 +2119,7 @@ func branchType(sc *scope, es []Expr) bytdb.ColType {
 		case out == "":
 			out = t
 		case numericType(out) && numericType(t) && out != t:
-			out = bytdb.TFloat
+			out = widerNumeric(out, t)
 		}
 	}
 	if out == "" {
@@ -2089,8 +2160,10 @@ func castColType(typ string) bytdb.ColType {
 		return bytdb.TInt
 	case "bool", "boolean":
 		return bytdb.TBool
-	case "float", "float4", "float8", "real", "numeric", "decimal":
+	case "float", "float4", "float8", "real":
 		return bytdb.TFloat
+	case "numeric", "decimal":
+		return bytdb.TNumeric
 	case "timestamp", "timestamptz":
 		return bytdb.TTimestamp
 	case "date":
@@ -2103,6 +2176,9 @@ func castColType(typ string) bytdb.ColType {
 		// castVal canonicalizes these into the one array type; typing
 		// them as text let '{a}'::text[] slip past array-only checks.
 		return bytdb.TTextArray
+	}
+	if isNumericCast(typ) { // numeric(p,s)
+		return bytdb.TNumeric
 	}
 	return bytdb.TString
 }

@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 
 	"github.com/rohanthewiz/btypedb"
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
@@ -80,7 +81,23 @@ const (
 	// the canonical text, not Postgres's jsonb type ordering; jsonb
 	// columns are for storage and equality, not range scans.
 	TJSONB ColType = "jsonb"
+	// TNumeric is Postgres's exact numeric / decimal (N-048). Unlike the
+	// types above it has its own runtime representation, Decimal, and
+	// its own tuple encoding: equality ignores scale (1.0 = 1.00, one
+	// key) while the stored value keeps it, which no existing
+	// representation can do. Column.Precision / Column.Scale carry a
+	// numeric(p, s) declaration.
+	TNumeric ColType = "numeric"
 )
+
+// Decimal is the runtime value of a TNumeric column: an exact decimal
+// with a display scale (see package decimal). Insert accepts it, any Go
+// integer, a float64 (its shortest round-trip text, so 0.1 stays 0.1)
+// and numeric text ("19.99", "1e3").
+type Decimal = decimal.Decimal
+
+// ParseDecimal reads Postgres numeric text into a Decimal.
+func ParseDecimal(s string) (Decimal, error) { return parseDecimalErr(s) }
 
 // Column describes one table column. ID is assigned by the engine
 // when the column is created and is never reused within its table —
@@ -110,6 +127,17 @@ type Column struct {
 	// spaces, which truncates silently (the SQL standard's one
 	// concession). Only valid on string columns.
 	MaxLen int `json:"max_len,omitempty"`
+	// Precision and Scale are a numeric column's numeric(p, s) typmod.
+	// Precision 0 means unconstrained (plain numeric: any value, scale
+	// kept as written). Otherwise every write rounds half away from zero
+	// to Scale places and refuses a value that then needs more than
+	// Precision - Scale digits before the point ("numeric field
+	// overflow"), as Postgres does. Scale may be negative or exceed
+	// Precision (Postgres 15+): numeric(2,-3) rounds to thousands,
+	// numeric(3,5) holds values below 0.01. Only valid on numeric
+	// columns.
+	Precision int32 `json:"precision,omitempty"`
+	Scale     int32 `json:"scale,omitempty"`
 }
 
 // CheckDesc is one CHECK constraint: a SQL boolean expression over the

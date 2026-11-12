@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -378,6 +379,8 @@ func kindOf(v any) bytdb.ColType {
 		return bytdb.TInt
 	case float64:
 		return bytdb.TFloat
+	case bytdb.Decimal:
+		return bytdb.TNumeric
 	case bool:
 		return bytdb.TBool
 	case []byte:
@@ -407,6 +410,8 @@ func compareVals(a, b any) (int, bool) {
 			return cmp.Compare(av, bv), true
 		case float64:
 			return cmpFloat(float64(av), bv), true
+		case bytdb.Decimal:
+			return decimal.FromInt64(av).Cmp(bv), true
 		}
 	case float64:
 		switch bv := b.(type) {
@@ -414,6 +419,18 @@ func compareVals(a, b any) (int, bool) {
 			return cmpFloat(av, bv), true
 		case int64:
 			return cmpFloat(av, float64(bv)), true
+		case bytdb.Decimal:
+			// numeric meets float8 as float8, Postgres's implicit cast.
+			return cmpFloat(av, bv.Float64()), true
+		}
+	case bytdb.Decimal:
+		switch bv := b.(type) {
+		case bytdb.Decimal:
+			return av.Cmp(bv), true // by value: 1.0 = 1.00
+		case int64:
+			return av.Cmp(decimal.FromInt64(bv)), true
+		case float64:
+			return cmpFloat(av.Float64(), bv), true
 		}
 	case string:
 		if bv, ok := b.(string); ok {
@@ -802,6 +819,8 @@ func litType(v any) bytdb.ColType {
 		return bytdb.TInt
 	case float64:
 		return bytdb.TFloat
+	case bytdb.Decimal:
+		return bytdb.TNumeric
 	case bool:
 		return bytdb.TBool
 	case []byte:

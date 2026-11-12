@@ -50,6 +50,9 @@ func colTypmod(c bytdb.Column) any {
 	if c.Type == bytdb.TString && c.MaxLen > 0 {
 		return int64(c.MaxLen) + 4
 	}
+	if c.Type == bytdb.TNumeric && c.Precision > 0 {
+		return bytdb.NumericTypmod(c) // numeric(p, s): ((p << 16) | s) + 4
+	}
 	return typmodNone
 }
 
@@ -82,6 +85,19 @@ func numericPrecision(t bytdb.ColType) (prec, radix, scale any) {
 		return int64(53), int64(2), nil
 	}
 	return nil, nil, nil
+}
+
+// colNumericPrecision is numericPrecision for one column: a numeric's
+// precision and scale are its declaration's, in decimal digits (radix
+// 10), and NULL for an unconstrained numeric, as Postgres reports them.
+func colNumericPrecision(c bytdb.Column) (prec, radix, scale any) {
+	if c.Type != bytdb.TNumeric {
+		return numericPrecision(c.Type)
+	}
+	if c.Precision == 0 {
+		return nil, int64(10), nil
+	}
+	return int64(c.Precision), int64(10), int64(c.Scale)
 }
 
 // datetimePrecision is information_schema.columns.datetime_precision:

@@ -134,7 +134,7 @@ func TestTrickyIntegerArithmetic(t *testing.T) {
 	d := openDB(t)
 
 	wantRows(t, d, `select 7/2, -7/2, 7%2, -7%2, 7.0/2`, [][]any{
-		{int64(3), int64(-3), int64(1), int64(-1), 3.5},
+		{int64(3), int64(-3), int64(1), int64(-1), decv("3.5000000000000000")}, // 7.0 is numeric
 	})
 
 	// The two overflow edges that survive naive checks: MaxInt64+1, and
@@ -269,9 +269,10 @@ func TestTrickyAggregateEdges(t *testing.T) {
 	wantRows(t, d, `select coalesce(dept, '-'), count(*) from emp group by dept order by 1`,
 		[][]any{{"-", int64(2)}, {"eng", int64(2)}, {"ops", int64(2)}})
 
-	// Sum types: pure-int input stays int64; a float in the expression
-	// promotes the whole sum.
-	wantRows(t, d, `select sum(sal), sum(sal + 0.0) from emp`, [][]any{{int64(610), 610.0}})
+	// Sum types: pure-int input stays int64; a numeric in the expression
+	// (0.0 is a numeric literal) makes the sum numeric, a float float.
+	wantRows(t, d, `select sum(sal), sum(sal + 0.0), sum(sal + 0.0::float8) from emp`,
+		[][]any{{int64(610), decv("610.0"), 610.0}})
 }
 
 // TestTrickyWindowEdges pins the default-frame trap: with an ORDER BY

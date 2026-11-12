@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/btypedb"
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
@@ -43,6 +44,11 @@ type ColumnTypeChange struct {
 	// (0 = unbounded; only valid on string columns).
 	Type   ColType
 	MaxLen int
+	// Precision and Scale are a numeric column's new numeric(p, s)
+	// (0, 0 = unconstrained; see Column). Narrowing them rewrites and
+	// re-checks every row like any type change: values round to the new
+	// scale, and one that overflows the new precision fails the ALTER.
+	Precision, Scale int32
 
 	// Using, when non-nil, computes each row's new value from the whole
 	// old row — the engine side of SQL's USING expression, which may
@@ -96,6 +102,7 @@ func (e *Engine) AlterColumnType(table, column string, ch ColumnTypeChange) erro
 		oldCol := old.Columns[ord]
 		newCol := oldCol
 		newCol.Type, newCol.MaxLen = ch.Type, ch.MaxLen
+		newCol.Precision, newCol.Scale = ch.Precision, ch.Scale
 		if err := validMaxLen(newCol); err != nil {
 			return nil, serr.Wrap(err, "table", table)
 		}
@@ -103,7 +110,8 @@ func (e *Engine) AlterColumnType(table, column string, ch ColumnTypeChange) erro
 			return nil, serr.New("identity column must be an int column",
 				"table", table, "column", column, "type", string(ch.Type))
 		}
-		if ch.Using == nil && oldCol.Type == ch.Type && oldCol.MaxLen == ch.MaxLen {
+		if ch.Using == nil && oldCol.Type == ch.Type && oldCol.MaxLen == ch.MaxLen &&
+			oldCol.Precision == ch.Precision && oldCol.Scale == ch.Scale {
 			return nil, nil // nothing changes; Postgres also skips the rewrite
 		}
 		if err := refuseFKColumn(e, tx, old, ord, "change the type of"); err != nil {
@@ -421,6 +429,8 @@ func sqlTypeName(t ColType) string {
 		return "text[]"
 	case TJSONB:
 		return "jsonb"
+	case TNumeric:
+		return "numeric"
 	}
 	return string(t)
 }
@@ -460,6 +470,17 @@ func assignmentCast(from, to ColType) func(any) (any, error) {
 			}
 			return int64(r), nil
 		}
+	// Numeric's implicit and assignment casts (N-048). Postgres casts
+	// int -> numeric and numeric -> float8 implicitly, float8 ->
+	// numeric and numeric -> int by assignment: all four need no USING.
+	case from == TInt && to == TNumeric:
+		return func(v any) (any, error) { return decimal.FromInt64(v.(int64)), nil }
+	case from == TFloat && to == TNumeric:
+		return func(v any) (any, error) { return floatToNumeric(v.(float64)) }
+	case from == TNumeric && to == TFloat:
+		return func(v any) (any, error) { return numericToFloat(v.(Decimal)), nil }
+	case from == TNumeric && to == TInt:
+		return func(v any) (any, error) { return numericToInt(v.(Decimal)) }
 	case from == TDate && to == TTimestamp:
 		return func(v any) (any, error) {
 			days := v.(int64)
@@ -506,6 +527,8 @@ func castToText(v any, t ColType) (string, error) {
 		return FormatDate(v.(int64)), nil
 	case TUUID:
 		return FormatUUID(v.([]byte)), nil
+	case TNumeric:
+		return v.(Decimal).String(), nil
 	}
 	return "", serr.New("no text form for column type", "type", string(t))
 }
@@ -568,6 +591,8 @@ func castDefault(oldCol, newCol *Column) (string, error) {
 		out = strconv.FormatBool(x)
 	case string:
 		out = "'" + strings.ReplaceAll(x, "'", "''") + "'"
+	case Decimal:
+		out = x.String() // read back exactly by decodeDefaultLiteral
 	default:
 		// []byte (bytea, uuid) has no literal form default.go reads.
 		return "", fail(nil)

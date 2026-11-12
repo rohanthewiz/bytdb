@@ -27,12 +27,13 @@ import (
 var ErrUnsupportedValue = errors.New("unsupported value type")
 
 // NormalizeValue reduces a Go value to the kinds the engine stores and
-// compares: nil, int64, float64, string, bool, []byte, time.Time, or
-// []string (a text[] value). It accepts what callers naturally hold:
+// compares: nil, int64, float64, string, bool, []byte, time.Time,
+// []string (a text[] value), or Decimal (a numeric value). It accepts
+// what callers naturally hold:
 //
 //	type UserID int64 / type Code string   named types, by reflect kind
 //	*int64, *string, ...                   pointers (nil is SQL NULL)
-//	driver.Valuer                          uuid.UUID, sql.NullString, ...
+//	driver.Valuer                          uuid.UUID, sql.NullString, a decimal library's type, ...
 //	uint, uint64                           when they fit in int64
 //	[16]byte and named 16-byte arrays      a uuid
 //	[]string                               a text[] value
@@ -42,7 +43,7 @@ var ErrUnsupportedValue = errors.New("unsupported value type")
 // common path pays nothing for the reflection.
 func NormalizeValue(v any) (any, error) {
 	switch x := v.(type) {
-	case nil, int64, float64, string, bool, []byte, time.Time, []string:
+	case nil, int64, float64, string, bool, []byte, time.Time, []string, Decimal:
 		return v, nil
 	case driver.Valuer:
 		dv, err := x.Value()
@@ -133,6 +134,14 @@ func (r Row) Float(name string) (float64, bool) {
 // column, or another type.
 func (r Row) String(name string) (string, bool) {
 	v, ok := r.Col(name).(string)
+	return v, ok
+}
+
+// Decimal returns a numeric column's value; ok is false for NULL, a
+// missing column, or another type. Its String is the Postgres text
+// form ("19.99"); Float64 converts when exactness is not needed.
+func (r Row) Decimal(name string) (Decimal, bool) {
+	v, ok := r.Col(name).(Decimal)
 	return v, ok
 }
 

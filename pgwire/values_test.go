@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -52,12 +53,20 @@ func TestDecodeClientTypes(t *testing.T) {
 	if v, err := decodeParam([]byte("2.5"), fmtText, oidFloat4); err != nil || v != 2.5 {
 		t.Errorf("float4 text: %v %v", v, err)
 	}
-	// Unknown OID: text passes through as a string, binary refuses.
-	if v, err := decodeParam([]byte("1700"), fmtText, 1700); err != nil || v != "1700" {
+	// Unknown OID (money, 790): text passes through as a string, binary
+	// refuses. (This used numeric, 1700, until N-048 made it known.)
+	if v, err := decodeParam([]byte("790"), fmtText, 790); err != nil || v != "790" {
 		t.Errorf("unknown text: %v %v", v, err)
 	}
-	if _, err := decodeParam([]byte{1}, fmtBinary, 1700); err == nil {
+	if _, err := decodeParam([]byte{1}, fmtBinary, 790); err == nil {
 		t.Error("unknown binary: want error")
+	}
+	// numeric parses in text and checks its binary framing.
+	if v, err := decodeParam([]byte("12.50"), fmtText, oidNumeric); err != nil || fmt.Sprint(v) != "12.50" {
+		t.Errorf("numeric text: %v %v", v, err)
+	}
+	if _, err := decodeParam([]byte{1}, fmtBinary, oidNumeric); err == nil {
+		t.Error("numeric binary: short body must be refused")
 	}
 }
 

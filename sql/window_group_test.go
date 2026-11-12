@@ -195,7 +195,7 @@ func TestWindowDistinct(t *testing.T) {
 
 	// AVG(DISTINCT) averages the deduped values: (1+2+3)/3.
 	res = exec(t, d, `select avg(distinct k) over () from f limit 1`)
-	if !reflect.DeepEqual(res.Rows, [][]any{{float64(2)}}) {
+	if !reflect.DeepEqual(res.Rows, [][]any{{decv("2.0000000000000000")}}) { // numeric, as in Postgres
 		t.Fatalf("avg distinct: %v", res.Rows)
 	}
 

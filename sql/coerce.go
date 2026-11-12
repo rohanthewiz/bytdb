@@ -55,6 +55,8 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 			return nil, serr.New("invalid input syntax for type float", "value", s)
 		}
 		return f, nil
+	case bytdb.TNumeric:
+		return bytdb.ParseDecimal(s)
 	case bytdb.TBool:
 		b, err := bytdb.ParseBool(s)
 		if err != nil {

@@ -220,7 +220,8 @@ func TestExprArithCastsFuncs(t *testing.T) {
 		t.Fatalf("got %v %v", res.Rows, res.Cols)
 	}
 	res = exec(t, d, `select '41'::int + 1, 7 / 2, 7 % 2, 7.0 / 2, age::text from users where id = 3`)
-	if !reflect.DeepEqual(res.Rows, [][]any{{int64(42), int64(3), int64(1), 3.5, "41"}}) {
+	// 7.0 / 2 is numeric division: 16 significant digits (N-048).
+	if !reflect.DeepEqual(res.Rows, [][]any{{int64(42), int64(3), int64(1), decv("3.5000000000000000"), "41"}}) {
 		t.Fatalf("got %v", res.Rows)
 	}
 	if _, err := d.Exec(`select 1 / 0`); err == nil || !strings.Contains(err.Error(), "division by zero") {

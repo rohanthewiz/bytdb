@@ -55,11 +55,14 @@ func (w *ExWindow) resultType(sc *scope) bytdb.ColType {
 	switch w.Agg {
 	case AggCount:
 		return bytdb.TInt
-	case AggAvg:
-		return bytdb.TFloat
 	}
 	if w.Arg != nil {
-		return exprType(sc, w.Arg)
+		// SUM/AVG by the accumulator's rule (numeric over integers and
+		// numerics for AVG); MIN/MAX and the rest keep the argument's.
+		return sumAvgType(w.Agg, exprType(sc, w.Arg))
+	}
+	if w.Agg == AggAvg {
+		return bytdb.TFloat
 	}
 	return bytdb.TInt
 }
@@ -1167,9 +1170,13 @@ func assignValueFrame(env *exEnv, w *ExWindow, fr *framer, base [][]any, idxs []
 // peer groups still share segment lists, so the memo keeps RANGE/
 // GROUPS frames at one aggregation per group.
 func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fr *framer, base [][]any, idxs []int, wi int, winvals [][]any) error {
-	intSum := w.Arg != nil && exprType(sc, w.Arg) == bytdb.TInt
+	var argType bytdb.ColType
+	if w.Arg != nil {
+		argType = exprType(sc, w.Arg)
+	}
+	intSum, numArg := argType == bytdb.TInt, argType == bytdb.TNumeric
 	newAcc := func() *accum {
-		a := &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum, distinct: w.Distinct}
+		a := &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum, numArg: numArg, distinct: w.Distinct}
 		if a.distinct {
 			// Dedup state is per accumulation: the anchored fast path
 			// reuses one accumulator over a growing frame (its seen set

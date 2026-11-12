@@ -708,7 +708,7 @@ func (s *Stmt) ExecCtx(ctx context.Context, args ...any) (*Result, error) {
 // and nothing else).
 func toEngineColumn(c ColDef) (bytdb.Column, error) {
 	col := bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull,
-		Identity: c.Identity, MaxLen: c.MaxLen}
+		Identity: c.Identity, MaxLen: c.MaxLen, Precision: c.Precision, Scale: c.Scale}
 	if c.HasDefault {
 		text, err := renderDefault(c.Default, c.Type, c.Name)
 		if err != nil {

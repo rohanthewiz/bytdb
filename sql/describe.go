@@ -423,13 +423,13 @@ func columnType(sc *scope) func(SelectItem) (bytdb.ColType, error) {
 // argument's type.
 func itemType(sc *scope) func(SelectItem) (bytdb.ColType, error) {
 	return func(it SelectItem) (bytdb.ColType, error) {
-		if t, ok := it.Agg.fixedType(); ok { // count, avg, the D-53 aggregates
+		if t, ok := it.Agg.fixedType(); ok { // count, the D-53 aggregates
 			return t, nil
 		}
 		ord, err := sc.resolve(it.Col)
 		if err != nil {
 			return "", err
 		}
-		return sc.column(ord).Type, nil
+		return sumAvgType(it.Agg, sc.column(ord).Type), nil
 	}
 }

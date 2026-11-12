@@ -71,7 +71,9 @@ const (
 // ("" means the pass could not determine one).
 func concrete(t bytdb.ColType) bool { return t != "" && t != tyUnknown && t != tyNull }
 
-func numericType(t bytdb.ColType) bool { return t == bytdb.TInt || t == bytdb.TFloat }
+func numericType(t bytdb.ColType) bool {
+	return t == bytdb.TInt || t == bytdb.TFloat || t == bytdb.TNumeric
+}
 
 func temporalType(t bytdb.ColType) bool { return t == bytdb.TDate || t == bytdb.TTimestamp }
 
@@ -98,6 +100,8 @@ func pgTypeName(t bytdb.ColType) string {
 		return "text[]"
 	case bytdb.TJSONB:
 		return "jsonb"
+	case bytdb.TNumeric:
+		return "numeric"
 	case tyUnknown:
 		return "unknown"
 	}
@@ -468,16 +472,16 @@ func outputType(t bytdb.ColType) bytdb.ColType {
 }
 
 func (t *typer) aggType(fn AggFunc, star bool, arg bytdb.ColType, _ ColRef) bytdb.ColType {
-	if typ, ok := fn.fixedType(); ok { // count, avg, the D-53 aggregates
+	if typ, ok := fn.fixedType(); ok { // count, the D-53 aggregates
 		return typ
 	}
 	switch fn {
-	case AggSum:
-		if arg == bytdb.TInt {
-			return bytdb.TInt
-		}
+	case AggSum, AggAvg:
 		if concrete(arg) {
-			return bytdb.TFloat
+			return sumAvgType(fn, arg)
+		}
+		if fn == AggAvg {
+			return bytdb.TFloat // avg of an untyped argument: as before
 		}
 		return ""
 	}
@@ -1651,7 +1655,7 @@ func unifyTypes(ts []bytdb.ColType) bytdb.ColType {
 		case out == "":
 			out = t
 		case numericType(out) && numericType(t) && out != t:
-			out = bytdb.TFloat
+			out = widerNumeric(out, t)
 		}
 	}
 	return out
@@ -1878,10 +1882,7 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 		// Postgres rather than read as microseconds.
 		return nil, "", noOperator(n.Op, lt, rt)
 	case numericType(lt) && numericType(rt):
-		if lt == bytdb.TFloat || rt == bytdb.TFloat {
-			return rebuilt(bytdb.TFloat)
-		}
-		return rebuilt(bytdb.TInt)
+		return rebuilt(widerNumeric(lt, rt))
 	}
 	return nil, "", noOperator(n.Op, lt, rt)
 }

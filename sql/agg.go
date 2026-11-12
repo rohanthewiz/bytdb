@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -55,11 +56,17 @@ type accum struct {
 	seen     map[string]bool // per group; allocated by newGroup
 	intSum   bool
 	sawFloat bool // a float value actually arrived at runtime
+	// hasDec: sumD holds part of the total — a numeric input arrived,
+	// or AVG's integer total outgrew int64 and was folded in (N-048).
+	hasDec   bool
+	sawDec   bool // a numeric value arrived (not just a fold)
+	numArg   bool // the argument is statically numeric: the total is exact even if only integers arrive
 	sorted   bool // items are in spec.order's order; collect clears it
 	boolVal  bool // bool_and / bool_or running result once count > 0
 	count    int64
 	sumI     int64
-	sumF     float64
+	sumF     float64      // the float inputs only; see floatTotal
+	sumD     *decimal.Sum // exact part of the total beyond sumI; see exactTotal (nil until needed)
 	min, max any
 
 	// spec holds the call's static parts, shared by pointer: every
@@ -157,18 +164,33 @@ func (a *accum) add(env *exEnv, vals []any) error {
 	case AggSum, AggAvg:
 		switch n := v.(type) {
 		case int64:
-			// SUM over an integer argument returns int64, so the running
-			// total is overflow-checked like scalar '+' (Postgres widens
-			// SUM(bigint) to numeric; bytdb has no wider integer type, so
-			// a sum that leaves int64's range errors instead of silently
-			// wrapping). AVG reads only sumF, so its int input never
-			// takes this error — a wrapped sumI is dead state there.
-			if a.fn == AggSum && a.intSum &&
-				((n > 0 && a.sumI > math.MaxInt64-n) || (n < 0 && a.sumI < math.MinInt64-n)) {
-				return errIntRange()
+			// Integers sum exactly in sumI. SUM over an integer argument
+			// returns int64, so its running total is overflow-checked like
+			// scalar '+' (Postgres widens SUM(bigint) to numeric; bytdb's
+			// sum(int) stays bigint, so a sum that leaves int64's range
+			// errors instead of silently wrapping). Every other total
+			// (AVG, which is numeric over integers, and a SUM that has
+			// already met a numeric) folds sumI into the exact sumD
+			// instead, and keeps going.
+			if (n > 0 && a.sumI > math.MaxInt64-n) || (n < 0 && a.sumI < math.MinInt64-n) {
+				if a.fn == AggSum && a.intSum && !a.sawDec {
+					return errIntRange()
+				}
+				if err := a.foldInt(); err != nil {
+					return err
+				}
 			}
 			a.sumI += n
-			a.sumF += float64(n)
+		case bytdb.Decimal:
+			// Added in place (decimal.Sum): one allocation per group
+			// rather than one per row.
+			if a.sumD == nil {
+				a.sumD = new(decimal.Sum)
+			}
+			if err := a.sumD.Add(n); err != nil {
+				return decimalErr(err)
+			}
+			a.hasDec, a.sawDec = true, true
 		case float64:
 			// intSum is a STATIC property (the argument's declared type is
 			// int), but an expression argument can yield a float at runtime
@@ -207,6 +229,38 @@ func (a *accum) add(env *exEnv, vals []any) error {
 		return a.collect(env, v)
 	}
 	return nil
+}
+
+// foldInt moves the integer running total into the exact one, making
+// room in sumI (whose next addition would overflow).
+func (a *accum) foldInt() error {
+	if a.sumD == nil {
+		a.sumD = new(decimal.Sum)
+	}
+	if err := a.sumD.AddInt64(a.sumI); err != nil {
+		return decimalErr(err)
+	}
+	a.sumI, a.hasDec = 0, true
+	return nil
+}
+
+// exactTotal is the sum of every integer and numeric input.
+func (a *accum) exactTotal() bytdb.Decimal {
+	t := decimal.FromInt64(a.sumI)
+	if a.sumD != nil {
+		t, _ = a.sumD.Value().Add(t) // a numeric ± one int64 cannot overflow numeric
+	}
+	return t
+}
+
+// floatTotal is the whole total as a float: the float inputs, plus the
+// exact part converted once (not per row).
+func (a *accum) floatTotal() float64 {
+	t := a.sumF + float64(a.sumI)
+	if a.hasDec && a.sumD != nil {
+		t += a.sumD.Value().Float64()
+	}
+	return t
 }
 
 // collect keeps one string_agg / array_agg input: its value, its row's
@@ -301,18 +355,35 @@ func (a *accum) value() any {
 		if a.count == 0 {
 			return nil
 		}
-		// A pure-int sum returns the exact, overflow-checked int64. If any
-		// float slipped in through an expression argument, sumF holds the
-		// complete total (int rows were added to it too), so return that.
-		if a.intSum && !a.sawFloat {
+		// The result's kind follows the widest input that arrived
+		// (integer < numeric < float), not just the static type: an
+		// expression argument such as CASE ... THEN 1 ELSE 1.5 END can
+		// yield a wider kind than its first branch suggests, and the
+		// narrower total would silently drop those rows.
+		switch {
+		case a.sawFloat:
+			return a.floatTotal()
+		case a.hasDec || a.numArg:
+			return a.exactTotal()
+		case a.intSum:
 			return a.sumI
 		}
-		return a.sumF
+		return a.floatTotal() // integers under an argument typed float
 	case AggAvg:
 		if a.count == 0 {
 			return nil
 		}
-		return a.sumF / float64(a.count)
+		// numeric over integers and numerics (Postgres: avg(bigint) and
+		// avg(numeric) are numeric), with numeric division's scale;
+		// float when a float arrived or the argument is not exact.
+		if a.sawFloat || (!a.intSum && !a.hasDec && !a.numArg) {
+			return a.floatTotal() / float64(a.count)
+		}
+		avg, err := a.exactTotal().Div(decimal.FromInt64(a.count))
+		if err != nil {
+			return nil // count > 0, so only an overflow; unreachable in practice
+		}
+		return avg
 	case AggMin:
 		return a.min
 	case AggMax:
@@ -753,7 +824,7 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 			return 0, err
 		}
 		argType = exprType(q.sc, n.Arg)
-		a.argEx, a.intSum = n.Arg, argType == bytdb.TInt
+		a.argEx, a.intSum, a.numArg = n.Arg, argType == bytdb.TInt, argType == bytdb.TNumeric
 		key = "e:" + txt
 	case !n.Star:
 		ord, err := q.sc.resolve(n.Col)
@@ -761,11 +832,11 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 			return 0, err
 		}
 		t := q.sc.column(ord).Type
-		if (n.Fn == AggSum || n.Fn == AggAvg) && t != bytdb.TInt && t != bytdb.TFloat {
+		if (n.Fn == AggSum || n.Fn == AggAvg) && !numericType(t) {
 			return 0, serr.New(n.Fn.name()+" requires a numeric column",
 				"column", n.Col.String(), "type", string(t))
 		}
-		a.ord, a.intSum = ord, t == bytdb.TInt
+		a.ord, a.intSum, a.numArg = ord, t == bytdb.TInt, t == bytdb.TNumeric
 		argType = t
 		key = fmt.Sprintf("c%d", ord)
 	}
@@ -879,18 +950,15 @@ func aggArgCheck(fn AggFunc, arg, sep bytdb.ColType) error {
 // int, AVG -> float, SUM/MIN/MAX -> the argument's type (float for
 // SUM over an expression that is not statically integer).
 func (q *aggQuery) accumType(n *ExAgg, i int) bytdb.ColType {
-	if t, ok := n.Fn.fixedType(); ok { // count, avg and the D-53 aggregates
+	if t, ok := n.Fn.fixedType(); ok { // count and the D-53 aggregates
 		return t
 	}
 	a := q.accums[i]
 	switch {
 	case a.argEx != nil:
-		if n.Fn == AggSum && !a.intSum {
-			return bytdb.TFloat
-		}
-		return exprType(q.sc, a.argEx)
+		return sumAvgType(n.Fn, exprType(q.sc, a.argEx))
 	case a.ord >= 0:
-		return q.sc.column(a.ord).Type
+		return sumAvgType(n.Fn, q.sc.column(a.ord).Type)
 	}
 	return bytdb.TInt
 }

@@ -134,7 +134,8 @@ outer row. `$n` placeholders bind in
 WHERE/ON/HAVING, INSERT/UPDATE values, `BETWEEN` bounds, and
 `LIMIT`/`OFFSET` counts.
 
-Types: `int`, `float`, `text`/`varchar(n)` (length enforced), `bool`,
+Types: `int`, `float`, `numeric`/`decimal(p,s)` (exact, typmod
+enforced), `text`/`varchar(n)` (length enforced), `bool`,
 `bytea`, `timestamp[tz]`, `date`, `uuid`, `text[]`, `jsonb` — jsonb
 with `-> ->> #> #>> @> <@ ? ?| ?& || -` and canonical-text equality.
 
@@ -312,7 +313,11 @@ bytes, 64 hex chars, or base64 of 32).
 - Errors are [serr](https://github.com/rohanthewiz/serr) structured
   errors: log with `logger.LogErr(err, "context")`, render user-facing
   text with `bytdb.ErrText(err)`.
-- Not implemented: RIGHT/FULL joins, triggers, NUMERIC(p,s), arrays
+- `numeric` / `decimal(p,s)` is exact (Go value `bytdb.Decimal`,
+  `Row.Decimal`; the `database/sql` driver returns its text, "19.99";
+  decimal literals like `1.5` are numeric, as in Postgres). No numeric
+  `NaN`/`Infinity`; `sqrt`/`ln`/`exp`/`power` of a numeric return float8.
+- Not implemented: RIGHT/FULL joins, triggers, arrays
   beyond `text[]`, jsonb indexing, COPY, live HA/failover (replication
   is async recovery, see above). Datasets must fit in RAM.
 - **Watching RAM:** `e.Stats()` returns keys, tables, log bytes and

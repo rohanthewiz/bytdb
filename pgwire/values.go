@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -70,6 +71,8 @@ func oidForType(t bytdb.ColType) uint32 {
 		return oidTextArray
 	case bytdb.TJSONB:
 		return oidJSONB
+	case bytdb.TNumeric:
+		return oidNumeric
 	}
 	return oidText
 }
@@ -141,6 +144,13 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 		if n, ok := v.(int64); ok {
 			v = float64(n) // exact for any count a float column could describe
 		}
+	case bytdb.TNumeric:
+		// A numeric-typed expression can yield an integer at runtime (a
+		// CASE whose THEN 1 is integer and whose ELSE 1.5 is numeric);
+		// the integer is that numeric exactly.
+		if n, ok := v.(int64); ok {
+			v = decimal.FromInt64(n)
+		}
 	}
 	if !kindFits(v, t) {
 		return dst, serr.New("result value does not match its column type",
@@ -190,6 +200,13 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 				return append(dst, x...), nil
 			}
 			return append(append(dst, 1), x...), nil
+		}
+	case bytdb.TNumeric:
+		if x, ok := v.(bytdb.Decimal); ok {
+			if format == fmtText {
+				return x.AppendText(dst), nil
+			}
+			return appendNumericBinary(dst, x), nil
 		}
 	}
 	return appendByKind(dst, v, format)
@@ -254,6 +271,9 @@ func kindFits(v any, t bytdb.ColType) bool {
 	case bytdb.TTextArray, bytdb.TJSONB:
 		_, ok := v.(string)
 		return ok
+	case bytdb.TNumeric:
+		_, ok := v.(bytdb.Decimal)
+		return ok
 	}
 	return true
 }
@@ -274,6 +294,8 @@ func appendByKind(dst []byte, v any, format int) ([]byte, error) {
 			// Postgres's float8 text: 1000000 not 1e+06, Infinity not +Inf
 			// (deep-look D-24, D-55).
 			return bytdb.AppendFloat(dst, x), nil
+		case bytdb.Decimal:
+			return x.AppendText(dst), nil
 		case string:
 			return append(dst, x...), nil
 		case []byte:
@@ -346,6 +368,8 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			// and coerceLit canonicalizes comparisons, so the wire text
 			// need not be canonical here.
 			return s, nil
+		case oidNumeric:
+			return bytdb.ParseDecimal(s)
 		}
 		return s, nil
 	}
@@ -413,6 +437,8 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			return nil, serr.New("bad binary jsonb parameter")
 		}
 		return string(raw[1:]), nil
+	case oidNumeric:
+		return decodeNumericBinary(raw)
 	}
 	return nil, serr.New("unsupported binary parameter type", "oid", fmt.Sprint(oid))
 }

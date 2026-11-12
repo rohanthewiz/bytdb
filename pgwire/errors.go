@@ -97,6 +97,18 @@ func sqlstate(msg string, hasPos bool) string {
 	// date, timestamp, uuid, json) shares this wording, as in Postgres.
 	case strings.Contains(msg, "invalid input syntax for type"):
 		return "22P02" // invalid_text_representation
+	// Arithmetic range and domain errors, numeric's (N-048) and the
+	// integer ones that predate it, which used to fall through to XX000.
+	case msg == "bigint out of range",
+		msg == "numeric field overflow",
+		msg == "value overflows numeric format":
+		return "22003" // numeric_value_out_of_range
+	case msg == "division by zero":
+		return "22012" // division_by_zero
+	case strings.HasPrefix(msg, "NUMERIC precision "), strings.HasPrefix(msg, "NUMERIC scale "):
+		return "22023" // invalid_parameter_value
+	case msg == "numeric NaN and Infinity are not supported":
+		return "0A000" // feature_not_supported: Postgres has them, bytdb's numeric does not
 	// Bind-time parameter decoding (values.go). A malformed binary value
 	// is Postgres's 22P03; a malformed text value is the same 22P02 as a
 	// bad literal. The space count pins the text form to "bad <type>
@@ -363,6 +375,7 @@ func errorBody(err error, query string, base int) wbuf {
 	flds := serr.SErrFromErr(err).UserFields()
 	pos := -1
 	var detail []string
+	var explicit string
 	for i := 0; i+1 < len(flds); i += 2 {
 		k, v := flds[i], flds[i+1]
 		if k == "pos" {
@@ -371,7 +384,19 @@ func errorBody(err error, query string, base int) wbuf {
 			}
 			continue
 		}
+		if k == "detail" {
+			// A field named detail already holds Postgres's DETAIL
+			// sentence ("A field with precision 5, scale 2 must round
+			// to ..."), so it goes out as written and alone: the context
+			// fields that ride along (table, column, op) would make it a
+			// line no client matches.
+			explicit = v
+			continue
+		}
 		detail = append(detail, k+": "+v)
+	}
+	if explicit != "" {
+		detail = []string{explicit}
 	}
 	var b wbuf
 	b.byte('S')

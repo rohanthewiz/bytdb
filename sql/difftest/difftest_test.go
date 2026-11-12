@@ -277,6 +277,11 @@ func compare(b, p result, e entry) string {
 				i+1, b.oids[i], classOf(b.oids[i]), p.oids[i], classes[i])
 		}
 	}
+	for i := range p.oids {
+		if p.oids[i] == 1700 && b.oids[i] == 1700 {
+			classes[i] = clsNumericExact
+		}
+	}
 	bk := keys(b.rows, classes)
 	pk := keys(p.rows, classes)
 	if !e.ordered {
@@ -291,16 +296,23 @@ func compare(b, p result, e entry) string {
 }
 
 // typeClass groups type OIDs whose values compare the same way. bytdb
-// has no numeric type and Postgres has no unsized "int" (sum(int)
+// has no int4 or int2 and Postgres has no unsized "int" (sum(int)
 // yields numeric there, int8 here), so exact OID equality would flag
 // differences that are not bugs. A class mismatch (a number described
 // as text) is a real client-visible bug and is reported.
+//
+// clsNumericExact is not an OID's class: compare assigns it to a column
+// both sides type numeric (OID 1700), whose values must then agree as
+// exact text — digits and display scale, 2.5000000000000000 vs 2.5 —
+// rather than through float64 (N-048: bytdb has a real numeric now,
+// and numeric's point is that its digits are exact).
 type typeClass string
 
 const (
-	clsNumber typeClass = "number"
-	clsText   typeClass = "text"
-	clsOther  typeClass = "other" // compared as exact text, class by OID
+	clsNumber       typeClass = "number"
+	clsNumericExact typeClass = "numeric-exact"
+	clsText         typeClass = "text"
+	clsOther        typeClass = "other" // compared as exact text, class by OID
 )
 
 func classOf(oid uint32) typeClass {

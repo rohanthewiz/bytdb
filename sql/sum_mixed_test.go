@@ -9,7 +9,10 @@ package sql
 // accumulator, so it stayed correct — a divergence that made the SUM
 // bug easy to miss.
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // mixedSumRows: SUM(CASE WHEN id=1 THEN 1 ELSE 1.5 END) over ids 1..5
 // is 1 + 1.5*4 = 7.0; the pre-fix code returned 1.
@@ -24,18 +27,30 @@ func TestSumMixedIntFloatExpr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sum: %v", err)
 	}
-	if got := res.Rows[0][0]; got != 7.0 {
-		t.Errorf("sum(mixed) = %v (%T), want 7.0 — float rows were dropped", got, got)
+	// The CASE is numeric (1.5 is a numeric literal, N-048), so the sum
+	// is the exact numeric 7.0, as in Postgres.
+	if got := res.Rows[0][0]; !reflect.DeepEqual(got, decv("7.0")) {
+		t.Errorf("sum(mixed) = %v (%T), want 7.0 — rows were dropped", got, got)
 	}
 
-	// AVG reads the float accumulator and was always right; assert it
-	// agrees so the two can't silently diverge again. 7.0 / 5 = 1.4.
+	// AVG must agree so the two can't silently diverge again: 7.0 / 5,
+	// at numeric division's scale.
 	res, err = d.Exec(`select avg(` + mixedCase + `) from t`)
 	if err != nil {
 		t.Fatalf("avg: %v", err)
 	}
-	if got := res.Rows[0][0]; got != 1.4 {
-		t.Errorf("avg(mixed) = %v, want 1.4", got)
+	if got := res.Rows[0][0]; !reflect.DeepEqual(got, decv("1.4000000000000000")) {
+		t.Errorf("avg(mixed) = %v, want 1.4000000000000000", got)
+	}
+
+	// The float form of the original regression: an int branch and a
+	// float branch still sum to the float total.
+	res, err = d.Exec(`select sum(CASE WHEN id = 1 THEN 1 ELSE 1.5::float8 END) from t`)
+	if err != nil {
+		t.Fatalf("float sum: %v", err)
+	}
+	if got := res.Rows[0][0]; got != 7.0 {
+		t.Errorf("sum(mixed float) = %v (%T), want 7.0", got, got)
 	}
 }
 
@@ -50,7 +65,7 @@ func TestSumMixedDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sum distinct: %v", err)
 	}
-	if got := res.Rows[0][0]; got != 2.5 {
+	if got := res.Rows[0][0]; !reflect.DeepEqual(got, decv("2.5")) {
 		t.Errorf("sum(distinct mixed) = %v, want 2.5", got)
 	}
 }
@@ -67,7 +82,7 @@ func TestSumMixedWindow(t *testing.T) {
 		t.Fatalf("window sum: %v", err)
 	}
 	for i, row := range res.Rows {
-		if got := row[0]; got != 2.5 {
+		if got := row[0]; !reflect.DeepEqual(got, decv("2.5")) {
 			t.Errorf("row %d: sum() over () = %v, want 2.5", i, got)
 		}
 	}

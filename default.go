@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -69,7 +70,7 @@ func columnDefaultValue(col *Column, now time.Time) (any, error) {
 		return nil, serr.Wrap(err, "op", "coerce column default",
 			"column", col.Name, "default", col.Default)
 	}
-	if cv, err = enforceMaxLen(cv, col); err != nil {
+	if cv, err = enforceTypmod(cv, col); err != nil {
 		return nil, serr.Wrap(err, "column", col.Name, "default", col.Default)
 	}
 	return cv, nil
@@ -106,6 +107,14 @@ func decodeDefaultLiteral(text string, now time.Time) (any, error) {
 	}
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return n, nil
+	}
+	// A decimal literal is numeric (N-048): read it exactly, scale
+	// included, so DEFAULT 0.00 backfills 0.00. coerce takes a Decimal
+	// into a float column too, so a float default stored as "1.5" still
+	// lands as 1.5. NaN and Infinity are not decimals and fall through
+	// to ParseFloat.
+	if d, err := decimal.Parse(s); err == nil {
+		return d, nil
 	}
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
 		return f, nil

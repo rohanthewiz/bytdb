@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-050
+**Next ID:** N-055
 
 ## Open
 
@@ -64,18 +64,6 @@ recommendations. Every phase of it (0–9) is on main and released in
   identity-counter batching (keep default-mode counters in the `Txn` until
   commit) and lazy counter names.
 
-- **N-048** · raised `2026-1110-0700-deep-look-phase8-d52-d53-d51` · value medium
-  **`numeric` / `decimal` columns are refused in CREATE TABLE.** `create
-  table t (x numeric(10,2))` fails with "unknown column type", so a schema
-  dumped from Postgres with a money column does not load. Casts already
-  treat `numeric` as float8. Mapping the column type to float8 the same way
-  is a one-line change but silently loses exactness (0.1 + 0.2), which is
-  exactly what a `numeric(10,2)` column exists to avoid; a real decimal type
-  is a new value kind through tuple encoding, wire codecs and arithmetic.
-  Needs the user's call: lossy alias, refuse with a hint (today, minus the
-  hint), or a decimal type. `interval`, `money`, `bit` and `citext` are
-  refused the same way and are lower value.
-
 - **N-049** · raised `2026-1110-0757-deep-look-phase8-close` · value low
   **Capture GORM v2, golang-migrate and atlas statements verbatim.**
   `pgwire/orm_verbatim_test.go` holds goose, lib/pq and pgx statements copied
@@ -85,6 +73,44 @@ recommendations. Every phase of it (0–9) is on main and released in
   `database/postgres`, GORM's `gorm.io/driver/postgres` migrator, atlas's
   inspect queries), copy the connect- and migration-time SQL into the same
   test file, and fix whatever fails.
+
+- **N-050** · raised `2026-1111-1759-numeric-type-n048` · value low
+  **Small-coefficient fast path for numeric (plan Q2).** `decimal.Decimal`
+  holds a `*big.Int` even for money-sized values. After this session's
+  cheap wins (shared powers of ten, allocation-free `Cmp`, numeric
+  mantissa decode, in-place `decimal.Sum`), `sum`+`avg` over 100k
+  `numeric(10,2)` rows is 18 ms against 11.7 ms for float8, and a
+  cross-scale filter 18 ms (`sql/numeric_bench_test.go`). An `int64`
+  coefficient for values that fit would remove most remaining
+  allocations. Measure a real workload before starting.
+- **N-051** · raised `2026-1111-1759-numeric-type-n048` · value low
+  **numeric `NaN` and `±Infinity`.** Refused today (0A000 over the wire,
+  plan Q7). Postgres has them; adding them means special cases in every
+  arithmetic, comparison and aggregate path plus two tuple classes (the
+  encoding's class byte has room: 0x01/0x02/0x03 are used). Trigger: a
+  dump or a client that writes one.
+- **N-052** · raised `2026-1111-1759-numeric-type-n048` · value low
+  **Exact numeric transcendental functions and `round(int)`'s type.**
+  `sqrt`, `exp`, `ln`, `log`, `power`, `cbrt` convert a numeric argument
+  to float8 and return float8, where Postgres returns numeric with its
+  own scale rules (`sqrt(16.0)` = `4.000000000000000`). Separately,
+  `round/ceil/floor/trunc/sign` of an integer return bigint here and
+  double precision in Postgres (values agree). Both are documented in
+  `docs/gotchas.md`.
+- **N-053** · raised `2026-1111-1759-numeric-type-n048` · value low
+  **The rest of N-048's refused types: `interval`, `money`, `bit`,
+  `citext`.** Still "unknown column type". `money` maps naturally onto
+  `numeric(p,2)` now; `citext` onto text with case-insensitive
+  comparison; `interval` is the largest (a new value kind with calendar
+  arithmetic). No consumer has asked.
+
+- **N-054** · raised `2026-1111-1759-numeric-type-n048` · value medium
+  **A duplicate CREATE TABLE is SQLSTATE XX000.** `ddl.go:91` raises
+  "table already exists", which no `pgwire/errors.go` case maps, so a
+  client sees internal_error where Postgres sends 42P07
+  (duplicate_table) with `relation "t" already exists`. Found while
+  verifying N-048 over the wire. Check CREATE INDEX / VIEW / SEQUENCE
+  duplicates in the same pass (Postgres: 42P07 for all relations).
 
 ## Validate
 
@@ -164,6 +190,33 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   imports it.
 
 ## Closed
+
+- **N-048** · raised `2026-1110-0700-deep-look-phase8-d52-d53-d51` · closed
+  2026-11-11, `2026-1111-1759-numeric-type-n048`. **`numeric` / `decimal`
+  columns were refused in CREATE TABLE.** The user chose a real decimal
+  type over a lossy float8 alias or a better refusal. Plan
+  `ai_docs/todo/2026-1111-numeric-type-plan.md` (Q1–Q10), all six phases:
+  package `decimal` (exact arithmetic, Postgres's division scale and
+  half-away rounding, typmod); tuple tags 0x08 (key, scale-normalized, so
+  `1.0` and `1.00` are one key) and 0x09 (stored value, scale kept);
+  `TNumeric` with `Column.Precision/Scale`, numeric primary keys also
+  written into the row value so they read back at their scale; the SQL
+  layer (decimal literals are numeric, int < numeric < float8 promotion,
+  casts with typmod, comparisons, hash keys, sum/avg, numeric versions of
+  `abs round trunc ceil floor sign mod`, `scale min_scale trim_scale`);
+  pgwire OID 1700 text and binary both ways (encoder byte-identical to
+  Postgres's `numeric_send`), pg_type/pg_attribute typmod/format_type/
+  information_schema; the `database/sql` driver returns exact text; the
+  shell's `.dump` round-trips. Evidence: `sql/difftest/corpus/77_numeric.sql`
+  (40 statements) matches Postgres 16.15 exactly, and difftest now
+  compares numeric columns as exact text; fuzzers for parse and tuple
+  order/round-trip; race suite green. **Release notes:** a literal with a
+  point or exponent (`1.5`) is now numeric (OID 1700) instead of float8,
+  so `select 1.5`, `7.0/2` and `avg(int_col)` return numeric (Go API:
+  `bytdb.Decimal`; driver: a string); `2.5::int` is 3 (numeric rounds
+  half away from zero); `x::numeric(p,s)` rounds; `bigint out of range`
+  and `division by zero` now carry SQLSTATE 22003 / 22012 (were XX000).
+  Follow-ups raised: N-050 to N-053.
 
 - **N-044** · raised `2026-1109-2243-deep-look-phase0-phase1` · closed
   2026-11-11, `2026-1111-1625-release-v0.23.0`. **Cut the deep-look release.** One release of

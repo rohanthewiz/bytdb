@@ -143,8 +143,9 @@ func TestCastTypeSpellings(t *testing.T) {
 	r := exec(t, d, `select 'abc'::character varying, 'abc'::varchar(2), '2024-01-02 03:04'::timestamp without time zone,
 		'2024-01-02 03:04+00'::timestamp(3) with time zone, 1.5::numeric(10,2), 'x'::character(1)`)
 	// Timestamps are microsecond counts at this layer; modifiers parse and
-	// are not applied ('abc'::varchar(2) stays 'abc' — docs/gotchas.md).
-	if got := fmt.Sprint(r.Rows); got != "[[abc abc 1704164640000000 1704164640000000 1.5 x]]" {
+	// are not applied ('abc'::varchar(2) stays 'abc' — docs/gotchas.md),
+	// except numeric(p,s), which rounds to its scale as in Postgres (N-048).
+	if got := fmt.Sprint(r.Rows); got != "[[abc abc 1704164640000000 1704164640000000 1.50 x]]" {
 		t.Fatalf("casts = %s", got)
 	}
 }

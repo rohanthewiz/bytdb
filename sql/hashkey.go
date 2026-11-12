@@ -16,7 +16,14 @@ package sql
 //
 //	float64 with an integral value in int64 range → that int64
 //	NaN                                            → nanKey (one group, sorts after every number)
+//	Decimal with an integral value in int64 range  → that int64 (N-048)
+//	any other Decimal                              → unchanged (its key encoding ignores scale)
 //	anything else                                  → unchanged
+//
+// A Decimal needs no normalization of its own for 1.0 = 1.00: the tuple
+// key form already drops the display scale. Folding integral values to
+// int64 is what lets an integer and a numeric holding the same number
+// meet in one group, as they do under SQL equality.
 //
 // The tuple encoding is kept (rather than a plain hash) because group
 // keys' byte order is also used as the groups' order.
@@ -24,6 +31,7 @@ package sql
 import (
 	"math"
 
+	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/tuple"
 )
 
@@ -34,6 +42,14 @@ var nanKey = []byte("\xff\xffNaN")
 
 // hashNorm is one value's canonical key form.
 func hashNorm(v any) any {
+	if d, ok := v.(bytdb.Decimal); ok {
+		if d.IsInteger() {
+			if n, ok := d.Int64(); ok {
+				return n
+			}
+		}
+		return d
+	}
 	f, ok := v.(float64)
 	if !ok {
 		return v
@@ -51,7 +67,9 @@ func hashNorm(v any) any {
 func hashKey(vals ...any) ([]byte, error) {
 	norm := vals
 	for i, v := range vals {
-		if _, isFloat := v.(float64); isFloat {
+		_, isFloat := v.(float64)
+		_, isDec := v.(bytdb.Decimal)
+		if isFloat || isDec {
 			if &norm[0] == &vals[0] {
 				norm = append([]any(nil), vals...) // copy before the first change
 			}

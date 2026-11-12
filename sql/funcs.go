@@ -36,6 +36,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -86,7 +87,7 @@ func noFunc(name string, types []bytdb.ColType) error {
 
 // Static type classes for argument checks.
 func numericOrUnknown(t bytdb.ColType) bool {
-	return t == bytdb.TInt || t == bytdb.TFloat || t == tyUnknown || t == tyNull
+	return numericType(t) || t == tyUnknown || t == tyNull
 }
 func textOrUnknown(t bytdb.ColType) bool {
 	return t == bytdb.TString || t == tyUnknown || t == tyNull
@@ -100,10 +101,42 @@ func numericResult(f *funcCall) (bytdb.ColType, error) {
 			return "", noFunc(f.name, f.types)
 		}
 	}
+	// A numeric argument makes the result numeric unless a float one
+	// makes it float (N-048: the math functions have numeric
+	// implementations, which Postgres prefers for numeric input).
+	var widest bytdb.ColType
+	for _, t := range f.types {
+		widest = widerNumeric(widest, t)
+	}
+	if widest == bytdb.TNumeric {
+		return bytdb.TNumeric, nil
+	}
 	if len(f.types) > 0 && f.types[0] == bytdb.TInt {
 		return bytdb.TInt, nil
 	}
 	return bytdb.TFloat, nil
+}
+
+// roundResult types round(x, n) and trunc(x, n): numeric when x is an
+// integer or a numeric, as Postgres resolves the two-argument forms
+// (only numeric has them); otherwise numericResult's rule.
+func roundResult(f *funcCall) (bytdb.ColType, error) {
+	t, err := numericResult(f)
+	if err == nil && len(f.types) == 2 && (f.types[0] == bytdb.TInt || f.types[0] == bytdb.TNumeric) {
+		return bytdb.TNumeric, nil
+	}
+	return t, err
+}
+
+// numericArg types the scale functions: one numeric (or integer)
+// argument, result ret.
+func numericArg(ret bytdb.ColType) func(f *funcCall) (bytdb.ColType, error) {
+	return func(f *funcCall) (bytdb.ColType, error) {
+		if len(f.types) != 1 || !numericOrUnknown(f.types[0]) || f.types[0] == bytdb.TFloat {
+			return "", noFunc(f.name, f.types)
+		}
+		return ret, nil
+	}
 }
 
 // floatResult accepts numeric arguments and returns float.
@@ -167,12 +200,17 @@ func textArg(f *funcCall, i int) {
 var scalarFuncs map[string]*scalarFunc
 
 func init() {
+	// num reads a float argument. A numeric converts here, which is the
+	// float8 fallback for the functions without a numeric
+	// implementation (sqrt, exp, ln, log, power, cbrt; plan decision Q9).
 	num := func(v any) (float64, bool) {
 		switch n := v.(type) {
 		case int64:
 			return float64(n), true
 		case float64:
 			return n, true
+		case bytdb.Decimal:
+			return n.Float64(), true
 		}
 		return 0, false
 	}
@@ -203,10 +241,15 @@ func init() {
 			return fn(x)
 		}
 	}
-	keepInt := func(fn func(float64) float64) func([]any) (any, error) {
+	// keepInt applies a whole-number function: an integer is itself, a
+	// numeric goes through decFn (exact, scale 0), a float through fn.
+	keepIntDec := func(fn func(float64) float64, decFn func(bytdb.Decimal) bytdb.Decimal) func([]any) (any, error) {
 		return func(a []any) (any, error) {
 			if n, ok := a[0].(int64); ok {
 				return n, nil // ceil/floor/round/trunc of an integer is itself
+			}
+			if d, ok := a[0].(bytdb.Decimal); ok {
+				return decFn(d), nil
 			}
 			x, ok := num(a[0])
 			if !ok {
@@ -215,12 +258,24 @@ func init() {
 			return fn(x), nil
 		}
 	}
-	// scaled applies fn at n decimal places: round(2.345, 2) = 2.35.
-	scaled := func(fn func(float64) float64) func([]any) (any, error) {
-		one := keepInt(fn)
+	// scaled applies fn at n decimal places: round(2.345, 2) = 2.35. An
+	// integer or numeric x takes numeric's exact path (decFn at the
+	// places, half away from zero for round), whose result is numeric
+	// with max(places, 0) digits after the point: round(5, 1) is 5.0.
+	scaled := func(fn func(float64) float64, decFn func(bytdb.Decimal, int32) bytdb.Decimal) func([]any) (any, error) {
+		one := keepIntDec(fn, func(d bytdb.Decimal) bytdb.Decimal { return decFn(d, 0) })
 		return func(a []any) (any, error) {
 			if len(a) == 1 {
 				return one(a)
+			}
+			if d, ok := asDecimal(a[0]); ok {
+				places, err := intArg(a[1])
+				if err != nil {
+					return nil, err
+				}
+				// Postgres clamps the places to numeric's display range.
+				places = max(min(places, decimal.MaxScale), -decimal.MaxIntDigits)
+				return decFn(d, int32(places)), nil
 			}
 			x, ok := num(a[0])
 			if !ok {
@@ -319,6 +374,9 @@ func init() {
 				}
 				return n, nil
 			}
+			if d, ok := a[0].(bytdb.Decimal); ok {
+				return d.Abs(), nil // keeps the scale: abs(-2.50) is 2.50
+			}
 			x, ok := num(a[0])
 			if !ok {
 				return nil, serr.New("numeric argument expected")
@@ -327,12 +385,15 @@ func init() {
 		}},
 		// round and trunc follow numeric's rules: half away from zero, and
 		// an optional number of decimal places.
-		"round":   {min: 1, max: 2, typ: numericResult, eval: scaled(math.Round)},
-		"trunc":   {min: 1, max: 2, typ: numericResult, eval: scaled(math.Trunc)},
-		"ceil":    {min: 1, max: 1, typ: numericResult, eval: keepInt(math.Ceil)},
-		"ceiling": {min: 1, max: 1, typ: numericResult, eval: keepInt(math.Ceil)},
-		"floor":   {min: 1, max: 1, typ: numericResult, eval: keepInt(math.Floor)},
+		"round":   {min: 1, max: 2, typ: roundResult, eval: scaled(math.Round, bytdb.Decimal.Round)},
+		"trunc":   {min: 1, max: 2, typ: roundResult, eval: scaled(math.Trunc, bytdb.Decimal.Trunc)},
+		"ceil":    {min: 1, max: 1, typ: numericResult, eval: keepIntDec(math.Ceil, bytdb.Decimal.Ceil)},
+		"ceiling": {min: 1, max: 1, typ: numericResult, eval: keepIntDec(math.Ceil, bytdb.Decimal.Ceil)},
+		"floor":   {min: 1, max: 1, typ: numericResult, eval: keepIntDec(math.Floor, bytdb.Decimal.Floor)},
 		"sign": {min: 1, max: 1, typ: numericResult, eval: func(a []any) (any, error) {
+			if d, ok := a[0].(bytdb.Decimal); ok {
+				return decimal.FromInt64(int64(d.Sign())), nil // numeric -1, 0 or 1
+			}
 			if n, ok := a[0].(int64); ok {
 				switch {
 				case n > 0:
@@ -352,6 +413,15 @@ func init() {
 			return 0.0, nil
 		}},
 		"mod": {min: 2, max: 2, typ: numericResult, eval: func(a []any) (any, error) {
+			_, xd := a[0].(bytdb.Decimal)
+			_, yd := a[1].(bytdb.Decimal)
+			if xd || yd {
+				x, xok := asDecimal(a[0])
+				y, yok := asDecimal(a[1])
+				if xok && yok {
+					return decimalArith("%", x, y)
+				}
+			}
 			if x, ok := a[0].(int64); ok {
 				if y, ok := a[1].(int64); ok {
 					if y == 0 {
@@ -404,6 +474,21 @@ func init() {
 				return nil, serr.New("cannot take logarithm of zero or a negative number")
 			}
 			return math.Log(x) / math.Log(b), nil
+		}},
+		// The scale functions (Postgres 13+): scale is the display
+		// scale; min_scale the smallest that shows the value exactly;
+		// trim_scale the value at that scale.
+		"scale": {min: 1, max: 1, typ: numericArg(bytdb.TInt), eval: func(a []any) (any, error) {
+			d, _ := asDecimal(a[0])
+			return int64(d.Scale()), nil
+		}},
+		"min_scale": {min: 1, max: 1, typ: numericArg(bytdb.TInt), eval: func(a []any) (any, error) {
+			d, _ := asDecimal(a[0])
+			return int64(d.Normalize().Scale()), nil
+		}},
+		"trim_scale": {min: 1, max: 1, typ: numericArg(bytdb.TNumeric), eval: func(a []any) (any, error) {
+			d, _ := asDecimal(a[0])
+			return d.Normalize(), nil
 		}},
 		"pi":     {min: 0, max: 0, ret: bytdb.TFloat, eval: func([]any) (any, error) { return math.Pi, nil }},
 		"random": {min: 0, max: 0, ret: bytdb.TFloat, eval: func([]any) (any, error) { return rand.Float64(), nil }},

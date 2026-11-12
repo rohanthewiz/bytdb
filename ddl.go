@@ -14,7 +14,7 @@ import (
 var validTypes = map[ColType]bool{
 	TBool: true, TInt: true, TFloat: true, TString: true, TBytes: true,
 	TTimestamp: true, TDate: true, TUUID: true, TTextArray: true,
-	TJSONB: true,
+	TJSONB: true, TNumeric: true,
 }
 
 // CreateTable registers a table. pk names the primary-key columns in
@@ -111,8 +111,13 @@ func (e *Engine) CreateTableWithChecks(name string, cols []Column, checks []Chec
 
 // validMaxLen checks a column's declared VARCHAR(n) limit: only string
 // columns take one, and n must be positive (a zero-or-negative length
-// admits no value at all — Postgres rejects it at parse too).
+// admits no value at all — Postgres rejects it at parse too). It also
+// checks a numeric(p, s) declaration (validTypmod), since every caller
+// validating one declared limit must validate the other.
 func validMaxLen(c Column) error {
+	if err := validTypmod(c); err != nil {
+		return err
+	}
 	if c.MaxLen == 0 {
 		return nil
 	}

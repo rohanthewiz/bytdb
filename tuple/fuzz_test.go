@@ -3,7 +3,10 @@ package tuple
 import (
 	"bytes"
 	"math"
+	"math/big"
 	"testing"
+
+	"github.com/rohanthewiz/bytdb/decimal"
 )
 
 // Fuzz targets for the codec — the correctness foundation of the whole
@@ -32,10 +35,18 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{0.0}, {-1.5}, {math.Inf(1)}, {math.Inf(-1)}, {math.SmallestNonzeroFloat64},
 		{""}, {"a\x00b"}, {"a\x00"}, {[]byte{}}, {[]byte{0x00, 0xFF, 0x00}},
 		{nil, false, int64(-7), 2.5, "k\x00ey", []byte{0}, true},
+		{decimal.MustParse("0")}, {decimal.MustParse("-12.50")}, {decimal.MustParse("1e30")},
+		{decimal.MustParse("0.000123"), int64(1), decimal.MustParse("-7")},
 	}
 	for _, vals := range seeds {
 		enc, err := Encode(vals...)
 		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(enc)
+		// The stored-value form too: decimals then carry their scale
+		// (tagDecimalScaled), a form keys never use.
+		if enc, err = AppendValue(nil, vals...); err != nil {
 			f.Fatal(err)
 		}
 		f.Add(enc)
@@ -50,6 +61,12 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{tagString, 'a', 0x00, 0x77},
 		{0x7F},
 		{},
+		{tagDecimal},
+		{tagDecimal, decPos, 0x80, 0, 0, 1},
+		{tagDecimal, decPos, 0x80, 0, 0, 1, 0xC8, decEnd},
+		{tagDecimal, decNeg, 0x7F, 0xFF, 0xFF, 0xFE, 0xFE},
+		{tagDecimal, 0x09},
+		{tagDecimalScaled, decZero, 0x00},
 	} {
 		f.Add(corrupt)
 	}
@@ -175,6 +192,10 @@ var boundaryVals = []any{
 	math.Inf(-1), -math.MaxFloat64, -0.5, 0.0, math.SmallestNonzeroFloat64, 0.5, math.MaxFloat64, math.Inf(1),
 	"", "\x00", "\x00\x01", "\x01", "\xff", "a", "a\x00", "a\x00b", "a\x01", "ab",
 	[]byte{}, []byte{0x00}, []byte{0x00, 0xFF}, []byte{0x01}, []byte{0xFF},
+	decimal.MustParse("-1e40"), decimal.MustParse("-100"), decimal.MustParse("-1"), decimal.MustParse("-0.5"),
+	decimal.MustParse("-0.05"), decimal.MustParse("0.00"), decimal.MustParse("0.05"), decimal.MustParse("0.5"),
+	decimal.MustParse("1"), decimal.MustParse("1.000"), decimal.MustParse("1.1"), decimal.MustParse("10"),
+	decimal.MustParse("99.99"), decimal.MustParse("100"), decimal.MustParse("1e40"),
 }
 
 // genTuple deterministically maps raw fuzz bytes onto a tuple of
@@ -185,7 +206,7 @@ var boundaryVals = []any{
 func genTuple(data []byte) []any {
 	var vals []any
 	for len(data) > 0 && len(vals) < 6 {
-		sel := data[0] % 7
+		sel := data[0] % 8
 		data = data[1:]
 		switch sel {
 		case 0:
@@ -235,6 +256,27 @@ func genTuple(data []byte) []any {
 				data = data[1:]
 			}
 			vals = append(vals, boundaryVals[idx])
+		case 7: // decimal: sign+scale byte, digit count, digits (trailing
+			// zeros included, so equal values at different scales occur)
+			var flags, n int
+			if len(data) > 0 {
+				flags = int(data[0])
+				data = data[1:]
+			}
+			if len(data) > 0 {
+				n = int(data[0] % 13)
+				data = data[1:]
+			}
+			n = min(n, len(data))
+			coef := new(big.Int)
+			for _, c := range data[:n] {
+				coef.Mul(coef, big.NewInt(10)).Add(coef, big.NewInt(int64(c%10)))
+			}
+			data = consume(data, n)
+			if flags&1 == 1 {
+				coef.Neg(coef)
+			}
+			vals = append(vals, decimal.New(coef, int32(flags>>1%8)))
 		}
 	}
 	return vals

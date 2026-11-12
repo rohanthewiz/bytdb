@@ -146,7 +146,7 @@ func TestParseInsert(t *testing.T) {
 		Table: "t",
 		Cols:  []string{"a", "b", "c", "d"},
 		Rows: [][]any{
-			{int64(1), -2.5, "x", nil},
+			{int64(1), decv("-2.5"), "x", nil}, // a decimal literal is numeric (N-048)
 			{int64(2), int64(3), "y", true},
 		},
 	}

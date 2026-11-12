@@ -6,7 +6,8 @@
 //
 //   - Both the simple ('Q') and extended (Parse/Bind/Describe/
 //     Execute/Sync) query protocols, in text and binary formats for
-//     the five column types (bool, int8, float8, text, bytea).
+//     every column type (bool, int8, float8, numeric, text, bytea,
+//     timestamptz, date, uuid, text[], jsonb).
 //
 //   - Parse maps onto sql.Prepare and Describe onto sql.Stmt.Describe,
 //     so drivers see real parameter types (inferred from the columns

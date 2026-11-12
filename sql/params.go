@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"time"
 
@@ -539,7 +540,7 @@ func bindExpr(e Expr, b *binder) Expr {
 // engine's coerce); a [16]byte is a UUID's natural Go shape.
 func bindArg(a any) (any, error) {
 	switch v := a.(type) {
-	case nil, int64, float64, string, bool, []byte, time.Time:
+	case nil, int64, float64, string, bool, []byte, time.Time, bytdb.Decimal:
 		return v, nil
 	case [16]byte:
 		return v[:], nil
@@ -586,6 +587,13 @@ func bindArg(a any) (any, error) {
 			elems[i] = s
 		}
 		return bytdb.FormatTextArray(elems), nil
+	}
+	// Recurse only on a value NormalizeValue actually changed. Every kind
+	// it returns as is must be bound by the switch above; one that is not
+	// would recurse forever (a Decimal did, before N-048 listed it), so
+	// refuse it instead of overflowing the stack.
+	if reflect.TypeOf(nv) == reflect.TypeOf(a) {
+		return nil, serr.New("unsupported parameter type", "type", fmt.Sprintf("%T", a))
 	}
 	return bindArg(nv)
 }

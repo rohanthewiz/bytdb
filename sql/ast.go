@@ -422,8 +422,6 @@ func (f AggFunc) fixedType() (bytdb.ColType, bool) {
 	switch f {
 	case AggCount:
 		return bytdb.TInt, true
-	case AggAvg:
-		return bytdb.TFloat, true
 	case AggStringAgg:
 		return bytdb.TString, true
 	case AggArrayAgg:
@@ -637,6 +635,8 @@ type ColDef struct {
 	Identity bool
 	// MaxLen is a VARCHAR(n) length limit in characters (0: none).
 	MaxLen int
+	// Precision and Scale are numeric(p, s) (0, 0: unconstrained).
+	Precision, Scale int32
 	// Unique marks a UNIQUE column constraint — sugar the executor
 	// lowers to a single-column unique index named table_col_key.
 	Unique bool
@@ -873,6 +873,8 @@ type AlterColumnType struct {
 	Col       string
 	Type      bytdb.ColType
 	MaxLen    int
+	Precision int32 // numeric(p, s); 0, 0 when unconstrained or not numeric
+	Scale     int32
 	Using     Expr
 	UsingText string
 }

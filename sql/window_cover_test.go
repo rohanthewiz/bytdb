@@ -58,13 +58,13 @@ func TestWindowResultTypes(t *testing.T) {
 		min(name) over (partition by city) as mn,
 		max(age) over () as mx
 		from users order by id`)
-	wantTypes := []bytdb.ColType{bytdb.TFloat, bytdb.TInt, bytdb.TString, bytdb.TInt}
+	wantTypes := []bytdb.ColType{bytdb.TNumeric, bytdb.TInt, bytdb.TString, bytdb.TInt} // avg(int) is numeric
 	if !reflect.DeepEqual(res.Types, wantTypes) {
 		t.Fatalf("types %v", res.Types)
 	}
 	// Row 1 is ada (london): ages 36, 41 -> avg 38.5, min name "ada";
 	// whole set: 5 rows, max age 45.
-	if len(res.Rows) != 5 || !reflect.DeepEqual(res.Rows[0], []any{38.5, int64(5), "ada", int64(45)}) {
+	if len(res.Rows) != 5 || !reflect.DeepEqual(res.Rows[0], []any{decv("38.5000000000000000"), int64(5), "ada", int64(45)}) {
 		t.Fatalf("got %v", res.Rows)
 	}
 
@@ -72,7 +72,7 @@ func TestWindowResultTypes(t *testing.T) {
 	// exprName take the ExWindow branches there.
 	info := describe(t, d, `select rank() over (order by age), avg(age) over () from users`)
 	if !reflect.DeepEqual(info.Cols, []string{"rank", "avg"}) ||
-		!reflect.DeepEqual(info.Types, []bytdb.ColType{bytdb.TInt, bytdb.TFloat}) {
+		!reflect.DeepEqual(info.Types, []bytdb.ColType{bytdb.TInt, bytdb.TNumeric}) {
 		t.Fatalf("describe window: %v %v", info.Cols, info.Types)
 	}
 }

@@ -215,6 +215,8 @@ func typeOID(t bytdb.ColType) int64 {
 		return 1009 // _text
 	case bytdb.TJSONB:
 		return 3802
+	case bytdb.TNumeric:
+		return 1700
 	}
 	return 25 // text
 }
@@ -255,6 +257,8 @@ func sqlTypeName(t bytdb.ColType) string {
 		return "ARRAY" // information_schema spells every array type this way
 	case bytdb.TJSONB:
 		return "jsonb"
+	case bytdb.TNumeric:
+		return "numeric"
 	}
 	return "text"
 }
@@ -281,6 +285,8 @@ func udtName(t bytdb.ColType) string {
 		return "_text" // pg_type's array-of-text name
 	case bytdb.TJSONB:
 		return "jsonb"
+	case bytdb.TNumeric:
+		return "numeric"
 	}
 	return "text"
 }
@@ -581,7 +587,7 @@ var sysTables = map[string]*sysTableDef{
 				{1009, "_text", -1, "A"},
 				{1082, "date", 4, "D"}, {1114, "timestamp", 8, "D"},
 				{1184, "timestamptz", 8, "D"}, {2950, "uuid", 16, "U"},
-				{3802, "jsonb", -1, "U"},
+				{3802, "jsonb", -1, "U"}, {1700, "numeric", -1, "N"},
 			} {
 				rows = append(rows, []any{t.oid, t.name, oidPGCatalog, t.len, "b", t.cat, int64(0)})
 			}
@@ -1056,7 +1062,7 @@ var sysTables = map[string]*sysTableDef{
 					// Postgres serial does: its default is the nextval above.
 					// The numeric and datetime precisions describe the binary
 					// types (int8: 64 bits, float8: 53; timestamps: 6).
-					prec, radix, scale := numericPrecision(c.Type)
+					prec, radix, scale := colNumericPrecision(c)
 					start := len(slab)
 					slab = append(slab,
 						sysDatabase, "public", desc.Name, c.Name,
@@ -1073,7 +1079,7 @@ var sysTables = map[string]*sysTableDef{
 			// only the type.
 			for _, v := range d.viewColumns() {
 				for j, c := range v.cols {
-					prec, radix, scale := numericPrecision(c.Type)
+					prec, radix, scale := colNumericPrecision(c)
 					rows = append(rows, []any{
 						sysDatabase, "public", v.name, c.Name,
 						int64(j + 1), nil, "YES", sqlTypeName(c.Type), udtName(c.Type),

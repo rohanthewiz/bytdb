@@ -26,6 +26,17 @@ func TestSQLStateMapping(t *testing.T) {
 		{"query would hold more rows in memory than the result row limit allows; narrow it", false, "54000"},
 		{"transaction write limit exceeded", false, "54000"},
 		{"out of memory", false, "53200"},
+		// Arithmetic range and domain errors (N-048 mapped the integer
+		// ones too, which were XX000).
+		{"numeric field overflow", false, "22003"},
+		{"value overflows numeric format", false, "22003"},
+		{"bigint out of range", false, "22003"},
+		{"division by zero", false, "22012"},
+		{`invalid input syntax for type numeric: "abc"`, false, "22P02"},
+		{"NUMERIC precision 0 must be between 1 and 1000", false, "22023"},
+		{"NUMERIC scale 1001 must be between -1000 and 1000", false, "22023"},
+		{"numeric NaN and Infinity are not supported", false, "0A000"},
+		{"bad binary numeric parameter", false, "22P03"},
 
 		// A position always means the parser rejected the text,
 		// regardless of the message wording.

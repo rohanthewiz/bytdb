@@ -5,13 +5,14 @@ references point at the proof.
 
 ## Column types
 
-Ten storage types, with the Postgres aliases you'd expect
+Eleven storage types, with the Postgres aliases you'd expect
 (`sql/parser.go`, `typeName`):
 
 | Declared as | Stored as | Notes |
 |---|---|---|
 | `INT`, `INTEGER`, `BIGINT`, `INT2/4/8`, `SMALLINT` | `int64` | |
-| `FLOAT`, `FLOAT4/8`, `REAL`, `DOUBLE PRECISION` | `float64` | `numeric` casts land here — there is no decimal type |
+| `FLOAT`, `FLOAT4/8`, `REAL`, `DOUBLE PRECISION` | `float64` | |
+| `NUMERIC`, `DECIMAL`, `DEC`, with optional `(p)` / `(p, s)` | `bytdb.Decimal`, exact | arbitrary precision with a display scale, as Postgres's numeric: `1.0 = 1.00` (one key in a unique index) but each reads back as written. `numeric(p, s)` rounds half away from zero to `s` places on every write and refuses a value needing more than `p - s` integer digits (`numeric field overflow`, 22003, with Postgres's DETAIL); negative `s` and `s > p` work as in Postgres 15+. A literal with a point or an exponent (`1.5`, `1e3`) is numeric, so `0.1 + 0.2` is exactly `0.3`; `int` ∘ `numeric` is numeric, `numeric` ∘ `float8` is float8. Division keeps at least 16 significant digits (`1/3.0` = `0.33333333333333333333`), `avg` over integers or numerics is numeric. OID 1700 in both wire formats; the `database/sql` driver returns the exact text (`"19.99"`), the Go API a `Decimal` (`Row.Decimal`). No `NaN` or `Infinity` (see Gotchas) |
 | `TEXT`, `STRING`, `VARCHAR(n)` | `string` | the `(n)` limit is **enforced** on every write, Postgres wording, SQLSTATE 22001 |
 | `BOOL`, `BOOLEAN` | `bool` | text input as Postgres reads it: `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`, and unique prefixes (`t`, `fa`, `y`); an integer `0`/`1` is also accepted (SQLite booleans, `database/sql`'s `driver.Bool` rule); any other integer is refused. Unlike Postgres, this includes a literal `VALUES (1)` |
 | `BYTEA`, `BYTES` | `[]byte` | |
@@ -28,8 +29,10 @@ scans. `now()`, `transaction_timestamp()`, `statement_timestamp()`,
 `gen_random_uuid()` all evaluate for real.
 *(verified in `sql/datetime_uuid_test.go`)*
 
-There is deliberately **no** decimal/numeric type, no time-of-day type, and no
-array element type other than text — see [Gotchas](gotchas.md).
+There is deliberately **no** time-of-day type and no array element type
+other than text — see [Gotchas](gotchas.md). Numeric's arithmetic,
+rounding and division scales are checked digit for digit against
+Postgres 16 (`sql/difftest/corpus/77_numeric.sql`).
 
 ## Tables and constraints
 
@@ -721,9 +724,10 @@ text (OID 1009 in both wire formats). No array operators (`@>`, `&&`),
   `op ANY(...)` / `op ALL(...)` with `ARRAY[...]`, subqueries, or `'{...}'`
   literals
 - `::` casts and `CAST(x AS t)` (int family, text family, bool,
-  float/numeric, timestamp/date, uuid, jsonb, reg* types; `character
+  float, numeric, timestamp/date, uuid, jsonb, reg* types; `character
   varying`, `timestamp with time zone` and modifiers such as `varchar(10)`
-  parse, the modifiers unapplied), and typed literals `date '…'`,
+  parse, the modifiers unapplied except `numeric(p, s)`, which rounds and
+  range-checks as in Postgres), and typed literals `date '…'`,
   `timestamp '…'`, `uuid '…'`, …
 - String constants: `'…'`, `E'…'`, dollar quotes `$$…$$` / `$tag$…$tag$`,
   and constants continued across a newline (`'foo'` newline `'bar'`);
@@ -741,7 +745,10 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
   `pg_table_is_visible`, ...), and the library (deep-look D-53):
   - math: `abs round trunc ceil ceiling floor sign mod power pow sqrt cbrt
     exp ln log pi random` (`round`/`trunc` take an optional number of
-    places and round half away from zero, numeric's rule);
+    places and round half away from zero, numeric's rule), and numeric's
+    `scale min_scale trim_scale`. `abs round trunc ceil floor sign mod`
+    are exact over numeric arguments and return numeric; the
+    transcendental ones convert numeric to float8 (see Gotchas);
   - text: `substring`/`substr` (and `SUBSTRING(s FROM a FOR n)`), `left
     right`, `trim`/`btrim`/`ltrim`/`rtrim` (and `TRIM([BOTH|LEADING|
     TRAILING] [chars] FROM s)`), `replace strpos` (and `POSITION(a IN b)`),

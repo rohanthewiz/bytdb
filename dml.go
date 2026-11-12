@@ -274,7 +274,7 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 		if err != nil {
 			return nil, false, serr.Wrap(err, "table", desc.Name, "column", col)
 		}
-		if cv, err = enforceMaxLen(cv, &desc.Columns[ord]); err != nil {
+		if cv, err = enforceTypmod(cv, &desc.Columns[ord]); err != nil {
 			return nil, false, serr.Wrap(err, "table", desc.Name, "column", col)
 		}
 		if cv == nil {
@@ -602,7 +602,7 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 		if err != nil {
 			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
 		}
-		if cv, err = enforceMaxLen(cv, &c); err != nil {
+		if cv, err = enforceTypmod(cv, &c); err != nil {
 			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
 		}
 		if cv == nil {
@@ -715,6 +715,11 @@ func coerce(v any, t ColType) (any, error) {
 		switch n := v.(type) {
 		case float64:
 			return n, nil
+		case Decimal:
+			// Postgres's assignment cast numeric -> float8: the nearest
+			// float. Decimal literals are numeric (N-048), so this is
+			// how `insert into t (f) values (1.5)` reaches a float column.
+			return n.Float64(), nil
 		case float32:
 			return float64(n), nil
 		case int:
@@ -791,6 +796,16 @@ func coerce(v any, t ColType) (any, error) {
 			return CanonJSONB(x)
 		case []byte:
 			return CanonJSONB(string(x))
+		}
+	case TNumeric:
+		// The typmod (numeric(p, s)) is applied after coercion, by
+		// enforceTypmod, with the column in hand.
+		d, ok, err := coerceNumeric(v)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return d, nil
 		}
 	}
 	// The value is not one of the shapes above as is. A named type
@@ -876,7 +891,11 @@ func encodeRowValue(desc *TableDesc, row []any) ([]byte, error) {
 	buf := []byte{}
 	var err error
 	for i := range desc.Columns {
-		if desc.isPK(i) || row[i] == nil {
+		// Key columns live in the key, except numeric ones: a key
+		// collapses a decimal's display scale (1.50 and 1.5 are one key),
+		// so the row value carries the scaled value too, and decodeRow,
+		// which reads the value after the key, lets it win.
+		if row[i] == nil || (desc.isPK(i) && desc.Columns[i].Type != TNumeric) {
 			continue
 		}
 		// AppendValue, not Append: a stored float keeps -0's sign

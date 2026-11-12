@@ -5,7 +5,7 @@
 // key-value store and answer range queries with key scans.
 //
 // Supported element types (after normalization): nil (NULL), bool,
-// int64, float64, string, []byte. Inputs of any Go integer width are
+// int64, float64, string, []byte, decimal.Decimal. Inputs of any Go integer width are
 // normalized to int64, float32 to float64. Every NaN normalizes to one
 // canonical NaN, which sorts above +Inf (Postgres's order: NaN is
 // greater than every number and equal to itself). Negative zero
@@ -18,7 +18,7 @@
 // byte an earlier version wrote.
 //
 // Elements of different types order by type tag: NULL < false < true <
-// ints < floats < bytes < strings. Within a typed column only one tag
+// ints < floats < bytes < strings < decimals. Within a typed column only one tag
 // ever appears, so cross-type order only matters for NULL, which sorts
 // before everything. A tuple that is a prefix of another sorts first,
 // matching byte order of the encodings.
@@ -32,6 +32,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -44,6 +45,38 @@ const (
 	tagFloat  byte = 0x05
 	tagBytes  byte = 0x06
 	tagString byte = 0x07
+	// Decimals (N-048) have two forms sharing one body, the way float
+	// keys collapse -0 while stored floats keep it. A key (Append)
+	// encodes the value alone, so 1.0 and 1.00 encode identically and
+	// a unique index treats them as the duplicates Postgres says they
+	// are. A stored value (AppendValue) appends the display scale, so
+	// the row reads back as written. Both decode to decimal.Decimal;
+	// both rank as tagDecimal.
+	tagDecimal       byte = 0x08
+	tagDecimalScaled byte = 0x09
+)
+
+// Decimal body, after the tag:
+//
+//	class     1 byte   0x01 negative, 0x02 zero, 0x03 positive
+//	exponent  4 bytes  int32 E, sign bit flipped        (absent for zero)
+//	digits    n bytes  1 + each base-100 digit pair     (absent for zero)
+//	end       1 byte   0x00                             (absent for zero)
+//
+// where |v| = 0.d1d2...dk × 10^E with no leading or trailing zero
+// digits (decimal.Mantissa); an odd final digit is padded with 0 in its
+// pair, which cannot collide with a longer mantissa because mantissas
+// never end in 0. For a negative value, exponent, digit and end bytes
+// are all inverted, so a larger magnitude sorts lower and a shorter
+// mantissa (smaller magnitude) higher. Every part is fixed-width or
+// terminated, so whole-element inversion (AppendDesc) still reverses the
+// order. tagDecimalScaled then adds the display scale as a big-endian
+// uint16.
+const (
+	decNeg  byte = 0x01
+	decZero byte = 0x02
+	decPos  byte = 0x03
+	decEnd  byte = 0x00
 )
 
 // Byte-string escaping: 0x00 inside the data becomes 0x00 0xFF, and
@@ -96,6 +129,12 @@ func appendVals(buf []byte, mask byte, vals []any, keepNegZero bool) ([]byte, er
 			buf = appendValue(buf, mask, f) // ±0 as given
 			continue
 		}
+		if d, ok := v.(decimal.Decimal); ok {
+			// keepNegZero is AppendValue's mode: a stored value keeps
+			// its display scale, a key does not (see tagDecimal).
+			buf = appendDecimal(buf, mask, d, keepNegZero)
+			continue
+		}
 		n, err := normalize(v)
 		if err != nil {
 			return nil, err
@@ -138,6 +177,182 @@ func appendValue(buf []byte, mask byte, v any) []byte {
 		return appendEscaped(append(buf, tagString^mask), mask, []byte(t))
 	}
 	panic(fmt.Sprintf("tuple: unreachable type %T after normalize", v))
+}
+
+// appendDecimal appends one decimal element (see the body layout at
+// tagDecimal); withScale selects the stored-value form.
+func appendDecimal(buf []byte, mask byte, d decimal.Decimal, withScale bool) []byte {
+	tag := tagDecimal
+	if withScale {
+		tag = tagDecimalScaled
+	}
+	buf = append(buf, tag^mask)
+	neg, digits, exp := d.Mantissa()
+	switch {
+	case digits == "":
+		buf = append(buf, decZero^mask)
+	default:
+		// inv flips the magnitude bytes of a negative value so that its
+		// order reverses; it composes with mask (descending keys).
+		inv := mask
+		cls := decPos
+		if neg {
+			inv ^= 0xFF
+			cls = decNeg
+		}
+		buf = append(buf, cls^mask)
+		var eb [4]byte
+		binary.BigEndian.PutUint32(eb[:], uint32(int32(exp))^(1<<31))
+		for _, b := range eb {
+			buf = append(buf, b^inv)
+		}
+		for i := 0; i < len(digits); i += 2 {
+			pair := (digits[i] - '0') * 10
+			if i+1 < len(digits) {
+				pair += digits[i+1] - '0'
+			}
+			buf = append(buf, (1+pair)^inv)
+		}
+		buf = append(buf, decEnd^inv)
+	}
+	if withScale {
+		var sb [2]byte
+		binary.BigEndian.PutUint16(sb[:], uint16(d.Scale()))
+		buf = append(buf, sb[0]^mask, sb[1]^mask)
+	}
+	return buf
+}
+
+// decScan is one decimal element's parts as scanDecimal validated them.
+type decScan struct {
+	neg   bool
+	pairs []byte // the stored digit-pair bytes (still XOR inv); nil for zero
+	inv   byte   // what the pair bytes are XORed with
+	exp   int
+	scale int32
+}
+
+// scanDecimal validates a decimal body (after its tag) whose stored
+// bytes are XOR mask, without building the value; withScale is
+// tagDecimalScaled. Decode and Skip both go through it, so they reject
+// exactly the same input, and anything it accepts builds without error.
+// Malformed input is an error, never a panic: keys and values come from
+// disk.
+func scanDecimal(data []byte, mask byte, withScale bool) (sc decScan, rest []byte, err error) {
+	if len(data) < 1 {
+		return sc, nil, serr.New("tuple: truncated decimal element")
+	}
+	cls, data := data[0]^mask, data[1:]
+	switch cls {
+	case decZero:
+	case decPos, decNeg:
+		sc.neg = cls == decNeg
+		sc.inv = mask
+		if sc.neg {
+			sc.inv ^= 0xFF
+		}
+		if len(data) < 4 {
+			return sc, nil, serr.New("tuple: truncated decimal exponent")
+		}
+		var eb [4]byte
+		for i := range eb {
+			eb[i] = data[i] ^ sc.inv
+		}
+		sc.exp = int(int32(binary.BigEndian.Uint32(eb[:]) ^ (1 << 31)))
+		data = data[4:]
+		end := bytes.IndexByte(data, decEnd^sc.inv)
+		if end < 1 {
+			return sc, nil, serr.New("tuple: malformed decimal digits")
+		}
+		sc.pairs = data[:end]
+		for _, b := range sc.pairs {
+			if p := b ^ sc.inv; p < 1 || p > 100 {
+				return sc, nil, serr.New("tuple: malformed decimal digit pair")
+			}
+		}
+		data = data[end+1:]
+	default:
+		return sc, nil, serr.New("tuple: unknown decimal class", "class", fmt.Sprintf("0x%02x", cls))
+	}
+	if withScale {
+		if len(data) < 2 {
+			return sc, nil, serr.New("tuple: truncated decimal scale")
+		}
+		sc.scale = int32(binary.BigEndian.Uint16([]byte{data[0] ^ mask, data[1] ^ mask}))
+		data = data[2:]
+	}
+	// The limits decimal.FromMantissa enforces, checked here so the
+	// build cannot fail: at most MaxIntDigits before the point, and a
+	// scale (own or displayed) of at most MaxScale. 2·len(pairs) bounds
+	// the digit count; the pad digit makes it at most one too high, which
+	// only matters right at the limit and errs toward refusing.
+	if sc.pairs != nil {
+		if own := 2*len(sc.pairs) - sc.exp; sc.exp > decimal.MaxIntDigits || own > decimal.MaxScale {
+			return sc, nil, serr.New("tuple: decimal element out of range")
+		}
+	}
+	if sc.scale > decimal.MaxScale {
+		return sc, nil, serr.New("tuple: decimal scale out of range")
+	}
+	return sc, data, nil
+}
+
+// decodeDecimal reads one decimal body (see scanDecimal).
+func decodeDecimal(data []byte, mask byte, withScale bool) (decimal.Decimal, []byte, error) {
+	sc, rest, err := scanDecimal(data, mask, withScale)
+	if err != nil {
+		return decimal.Decimal{}, nil, err
+	}
+	if len(sc.pairs) > 0 && len(sc.pairs) <= 9 {
+		// Up to 18 digits: accumulate the mantissa as a number, no digit
+		// string (most money-sized values; this runs per row per column).
+		var mant uint64
+		for _, b := range sc.pairs {
+			mant = mant*100 + uint64(b^sc.inv-1)
+		}
+		n := 2 * len(sc.pairs)
+		// Drop trailing zeros: the pad digit of an odd-length mantissa,
+		// and any more a crafted pair carries.
+		for mant != 0 && mant%10 == 0 {
+			mant /= 10
+			n--
+		}
+		if mant == 0 { // crafted all-zero pairs: the value is 0
+			return decimal.Decimal{}, rest, nil
+		}
+		d, err := decimal.FromMantissaU64(sc.neg, mant, n, sc.exp, sc.scale)
+		if err != nil {
+			return decimal.Decimal{}, nil, serr.Wrap(err, "op", "decode decimal element")
+		}
+		return d, rest, nil
+	}
+	var digits []byte
+	if sc.pairs != nil {
+		digits = make([]byte, 0, 2*len(sc.pairs))
+		for _, b := range sc.pairs {
+			p := b ^ sc.inv - 1
+			digits = append(digits, '0'+p/10, '0'+p%10)
+		}
+		// An odd-length mantissa's final pair carries a pad zero; a
+		// mantissa never ends in 0, so dropping trailing zeros removes
+		// exactly the pad (and normalizes crafted input that has more).
+		digits = bytes.TrimRight(digits, "0")
+		if len(digits) == 0 { // crafted all-zero pairs: the value is 0
+			return decimal.Decimal{}, rest, nil
+		}
+	}
+	d, err := decimal.FromMantissa(sc.neg, string(digits), sc.exp, sc.scale)
+	if err != nil {
+		return decimal.Decimal{}, nil, serr.Wrap(err, "op", "decode decimal element")
+	}
+	return d, rest, nil
+}
+
+// skipDecimal is decodeDecimal without building the value (ascending
+// encoding only, as Skip).
+func skipDecimal(data []byte, withScale bool) ([]byte, error) {
+	_, rest, err := scanDecimal(data, 0x00, withScale)
+	return rest, err
 }
 
 func appendEscaped(buf []byte, mask byte, s []byte) []byte {
@@ -227,6 +442,12 @@ func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
 			return nil, nil, err
 		}
 		return raw, rest, nil
+	case tagDecimal, tagDecimalScaled:
+		d, rest, err := decodeDecimal(data, mask, tag == tagDecimalScaled)
+		if err != nil {
+			return nil, nil, err
+		}
+		return d, rest, nil
 	}
 	return nil, nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
@@ -262,6 +483,8 @@ func Skip(data []byte) (rest []byte, err error) {
 			return nil, err
 		}
 		return data[end+2:], nil
+	case tagDecimal, tagDecimalScaled:
+		return skipDecimal(data, tag == tagDecimalScaled)
 	}
 	return nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
@@ -405,6 +628,8 @@ func compareValues(av, bv any) int {
 		return bytes.Compare(t, b.([]byte))
 	case string:
 		return cmp.Compare(t, b.(string))
+	case decimal.Decimal:
+		return t.Cmp(b.(decimal.Decimal))
 	}
 	return 0 // nil, false, true carry their value in the rank
 }
@@ -426,6 +651,8 @@ func rank(v any) int {
 		return int(tagBytes)
 	case string:
 		return int(tagString)
+	case decimal.Decimal:
+		return int(tagDecimal)
 	}
 	panic(fmt.Sprintf("tuple: unrankable type %T", v))
 }
@@ -433,7 +660,7 @@ func rank(v any) int {
 // normalize maps supported inputs onto the canonical element types.
 func normalize(v any) (any, error) {
 	switch t := v.(type) {
-	case nil, bool, int64, string, []byte:
+	case nil, bool, int64, string, []byte, decimal.Decimal:
 		return t, nil
 	case int:
 		return int64(t), nil

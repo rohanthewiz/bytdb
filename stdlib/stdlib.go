@@ -1010,7 +1010,8 @@ func (r *rows) ColumnTypeScanType(i int) reflect.Type {
 		return reflect.TypeFor[[]byte]()
 	case bytdb.TTimestamp, bytdb.TDate:
 		return reflect.TypeFor[time.Time]()
-	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB:
+	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric:
+		// numeric arrives as its exact text, see convert.
 		return reflect.TypeFor[string]()
 	}
 	return reflect.TypeFor[any]()
@@ -1056,6 +1057,24 @@ func convert(v any, t bytdb.ColType) (driver.Value, error) {
 		if b, ok := v.([]byte); ok {
 			return bytdb.FormatUUID(b), nil
 		}
+	}
+	// A numeric (N-048) arrives as its exact text ("19.99"), as it does
+	// from pgx's and lib/pq's drivers: driver.Value has no decimal kind,
+	// a float64 would lose the exactness the column exists for, and
+	// database/sql converts the text into a float64, an int or a
+	// string destination, and into any sql.Scanner a decimal library
+	// provides. A numeric-typed expression yielding an integer at
+	// runtime renders the same way.
+	if t == bytdb.TNumeric {
+		switch x := v.(type) {
+		case bytdb.Decimal:
+			return x.String(), nil
+		case int64:
+			return strconv.FormatInt(x, 10), nil
+		}
+	}
+	if d, ok := v.(bytdb.Decimal); ok { // a numeric under an untyped column
+		return d.String(), nil
 	}
 	switch tv := v.(type) {
 	case nil:

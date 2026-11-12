@@ -413,3 +413,38 @@ CREATE TABLE t (id int PRIMARY KEY);
 		t.Errorf("stdout %q: .tables should print to stdout after .once fired", out)
 	}
 }
+
+// TestDumpNumeric (N-048): numeric columns dump with their typmod and
+// DEFAULT, values dump as exact unquoted literals (trailing zeros and
+// all), and the restored database dumps identically.
+func TestDumpNumeric(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src.bytdb"), filepath.Join(dir, "dst.bytdb")
+	if _, errOut, code := runShell(t, `
+CREATE TABLE price (sku numeric PRIMARY KEY, amt numeric(10,2) NOT NULL DEFAULT 0.00 CHECK (amt >= 0), rate numeric(5,-1));
+INSERT INTO price VALUES (1.50, 19.999, 12345), (-0.001, 0, NULL), (123456789012345678901234567890.5, 3, 4);
+INSERT INTO price (sku) VALUES (7);
+`, "-batch", src); code != 0 {
+		t.Fatalf("setup: code %d stderr %s", code, errOut)
+	}
+	dump, errOut, code := runShell(t, "", src, ".dump")
+	if code != 0 {
+		t.Fatalf("dump: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, dump, "sku numeric", "amt numeric(10,2) NOT NULL DEFAULT 0.00", "rate numeric(5,-1)",
+		"1.50, 20.00, 12350", "-0.001, 0.00, NULL", "123456789012345678901234567890.5, 3.00, 0", "7, 0.00, NULL")
+	if _, errOut, code = runShell(t, dump, "-batch", dst); code != 0 {
+		t.Fatalf("restore: code %d stderr %s", code, errOut)
+	}
+	if again, _, _ := runShell(t, "", dst, ".dump"); again != dump {
+		t.Errorf("dump of the restored database differs.\nfirst:\n%s\nsecond:\n%s", dump, again)
+	}
+	out, errOut, code := runShell(t, "", "-list", "-noheader", dst,
+		"SELECT sum(amt), avg(amt) FROM price", "SELECT sku FROM price WHERE sku = 1.5")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, errOut)
+	}
+	if want := "23.00|5.7500000000000000\n1.50\n"; out != want {
+		t.Errorf("restored values %q, want %q", out, want)
+	}
+}
