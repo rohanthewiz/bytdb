@@ -41,14 +41,9 @@ are that plan's item IDs. The user asked for the plan to be implemented as
 written, so its six decisions (Q1–Q6) are taken at the plan's
 recommendations. Every phase of it (0–9) is on main and released in
 `v0.23.0` (N-044, closed); what remains is the pieces deliberately deferred
-(N-046, N-047, N-049; N-045 was declined after measuring, see Non-goals).
+(N-047, N-049; N-045 was declined after measuring, see Non-goals; N-046 is
+closed).
 
-- **N-046** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
-  **Shared read snapshot for one-shot reads (D-46).** `Engine.Get` opens and
-  releases a btypedb snapshot per call, both under btypedb's mutex, so
-  concurrent one-shot reads do not scale. Reusing one refcounted snapshot per
-  commit version needs btypedb to guarantee concurrent reads of one snapshot
-  and ships with a btypedb release. Documented workaround: `ReadTxn`.
 - **N-047** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
   **Remaining Phase 7 pieces.** D-47 second half (memoize catalog rows per
   catalog version, excluding live tables such as `pg_stat_activity` and
@@ -191,6 +186,46 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   typing well above this share of a hot statement.
 
 ## Closed
+
+- **N-046** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` ·
+  closed 2026-11-13, session doc at wrap. **Shared read snapshot for one-shot
+  reads (D-46).** Done in btypedb, not the engine: every read-only `Begin`
+  shares one refcounted snapshot of the head (`readsnap.go`), so Engine.Get,
+  ReadTxn and every SQL read benefit with no bytdb code change. The fast path
+  is an atomic pointer load plus one atomic add, with no lock and no copy. A
+  new snapshot is copied under `mu` only after the head changes, and every
+  head mutation (commit swap, direct Set/Delete, CreateIndex, DropIndex,
+  Close) uncaches it first, under `mu`, so a Begin after a write always sees
+  it. The last holder releases the trees (refcount to a dead sentinel, so a
+  late acquire cannot resurrect it). Read-only savepoints now take no copy.
+  The premise held: btype's read paths are write-free (`mut=false`
+  short-circuits every COW step; checked in source), and DB.Get already read
+  one tree from many goroutines under RLock. The pin comment and README now
+  name this as a third relied-on btype property. Measured on this M-series,
+  8 cores: btypedb one-shot View+Get went from 275 to 105 ns serial (6 allocs
+  to 1) and 407 to 98 ns/op parallel. bytdb `Engine.Get` went from 690 to
+  500 ns serial and 565 to 185-215 ns/op across 8 (`bench_read_test.go`;
+  `ReadTxn` loop: 265 / 70 ns). Not pursued: per-core striped refcounts.
+  With refcounting stubbed out, Engine.Get only reached ~165 ns; the rest is
+  its own 12 allocs/op (profile: heap growth and scavenging) and per-call
+  descriptor resolution (`descKey` alloc, `cacheMu.RLock`, blob compare).
+  **Found on the way, fixed:** in btypedb's concurrent-writes mode, an OCC
+  transaction open across `CreateIndex`/`DropIndex` committed its Begin-time
+  index map by pointer swap, dropping the new index or resurrecting the
+  dropped one. Now an empty ring entry bumps `commitVersion`, so such
+  commits take the rebase path (`indexChanged`,
+  `TestOCCIndexChangeSurvivesOpenTxCommit`). bytdb never uses btypedb-native
+  indexes, so it was unaffected. Evidence: `readsnap_test.go` (sharing,
+  freshness after each mutation kind in both modes, TTL expiry through a
+  cached snapshot, Close, savepoints, ref-protocol hammer, and a race hammer
+  with read-after-commit checks: 20 runs under -race); btypedb and bytdb
+  suites under -race; pgwire suite.
+  btypedb `7c06d99`, tagged v0.11.0; bytdb's root pin bumped to it.
+  **Release notes:** one-shot reads (`Engine.Get`, every SQL read) no
+  longer take btypedb's mutex or copy a snapshot, and scale with cores.
+  btypedb v0.11.0: read-only transactions share snapshots (Begin(false)/
+  View no longer lock or copy); OCC CreateIndex/DropIndex no longer lost
+  or resurrected by an open transaction's commit.
 
 - **N-054** · raised `2026-1111-1759-numeric-type-n048` · closed
   2026-11-11, `2026-1111-1808-duplicate-relation-42p07-n054`. **A

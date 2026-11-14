@@ -372,13 +372,14 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 // and row come from one snapshot, so the decode always matches the
 // schema the row was stored under (as of that snapshot).
 //
-// Each call opens and releases its own storage snapshot, and both steps
-// take the store's internal mutex briefly, so one-shot Gets from many
-// goroutines contend on it: ~1.1 µs serially, and no faster per call
-// across 8 goroutines. For read-heavy loops, read inside one ReadTxn per
-// goroutine instead — Txn.Get there costs ~0.6 µs and scales with
-// cores (~0.2 µs per call across 8) — at the price of reading one
-// snapshot for the whole loop (deep-look D-46).
+// Each call opens its own storage snapshot. Since btypedb v0.11.0,
+// read-only transactions begun while nothing has committed share one
+// snapshot, so opening and releasing it is a reference-count update
+// with no lock and no copy, and one-shot Gets from many goroutines
+// scale with cores (deep-look D-46, N-046). A ReadTxn around a loop of
+// Txn.Get is still cheaper per row — it resolves the descriptor once
+// rather than per call — at the price of one snapshot for the whole
+// loop.
 func (e *Engine) Get(table string, pkVals ...any) (Row, bool, error) {
 	var row Row
 	found := false

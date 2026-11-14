@@ -42,14 +42,15 @@ err := e.WriteTxnCtx(ctx, func(tx *bytdb.Txn) error { return tx.Insert("t", 2) }
 // errors.Is(err, context.DeadlineExceeded) when another block held the lock
 ```
 
-**Reads in a hot loop: use one `ReadTxn`.** Reads never block, but each
-one-shot `Engine.Get` opens and releases its own snapshot, and both steps take
-the store's internal mutex for a moment, so many goroutines doing one-shot
-reads contend there: about 1.1 µs per call serially and no faster per call
-across 8 goroutines. Inside a `ReadTxn`, `Txn.Get` costs about 0.6 µs and
-scales with cores (about 0.2 µs per call across 8 goroutines), because the
-snapshot is opened once. The trade is staleness: the whole loop reads one
-snapshot.
+**Reads in a hot loop: one `ReadTxn` is still the cheapest.** Reads never
+block. A one-shot `Engine.Get` opens its own snapshot, but read-only snapshots
+are shared: every read begun since the last commit reuses the same one, so
+opening and releasing it is a reference-count update with no lock and no copy
+(btypedb v0.11.0). One-shot Gets therefore scale with cores: about 0.5 µs per
+call on one goroutine and about 0.2 µs per call across 8. Inside a `ReadTxn`,
+`Txn.Get` resolves the table once for the whole loop instead of per call, and
+costs about 0.26 µs on one goroutine and 0.07 µs per call across 8. The trade
+is staleness: the whole loop reads one snapshot.
 
 ```go
 err := e.ReadTxn(func(tx *bytdb.Txn) error {
