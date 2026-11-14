@@ -151,7 +151,6 @@ Parse-time rejections with pointed errors:
 | `ON CONFLICT ON CONSTRAINT name`, index predicates in the conflict target | Name the columns: `ON CONFLICT (col, ...)` |
 | Time-of-day, `CHAR(n)`, interval, `money`, `bit`, `citext` | `TIME` → use `TIMESTAMP`; `money` → `numeric(p,2)` |
 | `numeric` `NaN` / `Infinity` | Refused (0A000): store them in a `double precision` column, or use NULL |
-| Exact numeric `sqrt`, `exp`, `ln`, `log`, `power`, `cbrt` | They convert a numeric argument to float8 and return float8 (Postgres returns numeric for some): cast back, `sqrt(x)::numeric(20,10)`, when you need a numeric. `abs round trunc ceil floor sign mod` are exact |
 | `round(int)`, `ceil(int)`, `trunc(int)`, `sign(int)` result type | bigint here, double precision in Postgres (values agree); `round(int, n)` is numeric in both |
 | Array types other than `TEXT[]`; multi-dimensional arrays; array `@>`/`&&`/`unnest`/subscripts | One-dimensional text arrays with `= ANY(col)`, `array_to_string`, `array_length` |
 | `jsonb_set`, `jsonb_build_*`, `jsonb_agg`, `to_jsonb`, jsonpath (`@?` `@@`), `#-`, jsonb indexes | Read-modify-write with `\|\|` and `-`; the operator family covers reads |

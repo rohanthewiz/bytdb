@@ -60,13 +60,17 @@ and N-049 are closed.
   encoding's class byte has room: 0x01/0x02/0x03 are used). Trigger: a
   dump or a client that writes one.
 - **N-052** · raised `2026-1111-1759-numeric-type-n048` · value low
-  **Exact numeric transcendental functions and `round(int)`'s type.**
-  `sqrt`, `exp`, `ln`, `log`, `power`, `cbrt` convert a numeric argument
-  to float8 and return float8, where Postgres returns numeric with its
-  own scale rules (`sqrt(16.0)` = `4.000000000000000`). Separately,
+  **`round(int)`'s result type: keep bigint, or follow Postgres's double
+  precision?** The item's first half, exact numeric `sqrt/exp/ln/log/
+  power`, was done in `2026-1114-1640-n052-exact-numeric-math`. Its premise was partly wrong: Postgres
+  has no numeric `cbrt`, so float8 there was already right. What remains:
   `round/ceil/floor/trunc/sign` of an integer return bigint here and
-  double precision in Postgres (values agree). Both are documented in
-  `docs/gotchas.md`.
+  double precision in Postgres (the values agree; `docs/gotchas.md`).
+  Switching would change the type embedded callers read (int64 →
+  float64) without changing any value, while a client written for
+  Postgres already reads the bigint (pgx and database/sql scan int8 into
+  a float64). Recommendation: keep bigint and move this to Non-goals.
+  **The user's call.**
 - **N-053** · raised `2026-1111-1759-numeric-type-n048` · value low
   **The rest of N-048's refused types: `interval`, `money`, `bit`,
   `citext`.** Still "unknown column type". `money` maps naturally onto

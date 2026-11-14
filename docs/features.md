@@ -762,11 +762,20 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
   functions ORMs call (`format_type`, `pg_get_indexdef`,
   `pg_table_is_visible`, ...), and the library (deep-look D-53):
   - math: `abs round trunc ceil ceiling floor sign mod power pow sqrt cbrt
-    exp ln log pi random` (`round`/`trunc` take an optional number of
-    places and round half away from zero, numeric's rule), and numeric's
-    `scale min_scale trim_scale`. `abs round trunc ceil floor sign mod`
-    are exact over numeric arguments and return numeric; the
-    transcendental ones convert numeric to float8 (see Gotchas);
+    exp ln log log10 pi random` (`round`/`trunc` take an optional number
+    of places and round half away from zero, numeric's rule), and
+    numeric's `scale min_scale trim_scale`. `abs round trunc ceil floor
+    sign mod` are exact over numeric arguments and return numeric. `sqrt
+    exp ln log log10 power` have numeric versions, as in Postgres. A
+    numeric argument with no float one gets the numeric version, and
+    two-argument `log` always does. Results have Postgres's digits and
+    scale (`sqrt(16.0)` is `4.000000000000000`, `log(2, 8)`
+    `3.0000000000000000`), checked against Postgres 16 on 14,683 calls
+    including near-ties and 1000-digit results, because its series are
+    ported step for step (`decimal/math.go`). Integer and untyped
+    arguments get the double precision version (`sqrt(2)`), as do
+    `cbrt` and every call with a float argument. Domain errors are
+    Postgres's: 2201F for square root and power, 2201E for logarithms;
   - text: `substring`/`substr` (and `SUBSTRING(s FROM a FOR n)`), `left
     right`, `trim`/`btrim`/`ltrim`/`rtrim` (and `TRIM([BOTH|LEADING|
     TRAILING] [chars] FROM s)`), `replace strpos` (and `POSITION(a IN b)`),

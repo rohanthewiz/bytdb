@@ -139,6 +139,119 @@ func numericArg(ret bytdb.ColType) func(f *funcCall) (bytdb.ColType, error) {
 	}
 }
 
+// mathResult types sqrt, exp, ln, power and one-argument log, which
+// Postgres defines for both double precision and numeric. A numeric
+// argument with no float one resolves to the numeric version, the only
+// exact match. Anything else resolves to double precision, the numeric
+// category's preferred type, so integer and untyped arguments land
+// there: sqrt(2) is float8, sqrt(2.0) numeric, power(2, 3.0) numeric,
+// power(2.0, 3::float8) float8. Checked against Postgres 16's pg_typeof.
+func mathResult(f *funcCall) (bytdb.ColType, error) {
+	return pickMathVersion(f, false)
+}
+
+// logResult types log. One argument follows mathResult. Two-argument
+// log exists only as log(numeric, numeric), so integers and untyped
+// arguments resolve to numeric too (log(2, 8) is 3.0000000000000000). A
+// float argument, which Postgres refuses outright (no
+// log(double precision, double precision)), keeps bytdb's float version,
+// as before.
+func logResult(f *funcCall) (bytdb.ColType, error) {
+	return pickMathVersion(f, len(f.types) == 2)
+}
+
+// pickMathVersion is the shared rule: numeric when there is a numeric
+// argument (or numericDefault) and no float one, else float. Untyped
+// arguments are cast to the chosen type, and for the numeric version
+// integer ones too. Evaluation then picks the version from the values
+// alone (log(2, 8) arrives as two Decimals), and a placeholder describes
+// as the chosen type.
+func pickMathVersion(f *funcCall, numericDefault bool) (bytdb.ColType, error) {
+	hasNum, hasFloat := false, false
+	for _, t := range f.types {
+		if !numericOrUnknown(t) {
+			return "", noFunc(f.name, f.types)
+		}
+		hasNum = hasNum || t == bytdb.TNumeric
+		hasFloat = hasFloat || t == bytdb.TFloat
+	}
+	res, cast := bytdb.ColType(bytdb.TFloat), "float8"
+	if !hasFloat && (hasNum || numericDefault) {
+		res, cast = bytdb.TNumeric, "numeric"
+	}
+	for i, t := range f.types {
+		if t == tyUnknown || (t == bytdb.TInt && res == bytdb.TNumeric) {
+			f.castArg(i, cast)
+		}
+	}
+	return res, nil
+}
+
+// mathEval evaluates a function typed by mathResult or logResult. The
+// version follows the values, which the typing made consistent: any
+// float argument means the float version, and otherwise integers and
+// Decimals go to the numeric one. A numeric-typed call never sees a
+// float, and a float-typed call with integer-only arguments promotes
+// them to float. Untyped arguments arrive already cast.
+func mathEval(fl func([]float64) (float64, error), dec func([]bytdb.Decimal) (bytdb.Decimal, error)) func([]any) (any, error) {
+	return func(a []any) (any, error) {
+		numeric, float := false, false
+		for _, v := range a {
+			switch v.(type) {
+			case bytdb.Decimal:
+				numeric = true
+			case float64:
+				float = true
+			}
+		}
+		if numeric && !float {
+			ds := make([]bytdb.Decimal, len(a))
+			for i, v := range a {
+				d, ok := asDecimal(v)
+				if !ok {
+					return nil, serr.New("numeric argument expected")
+				}
+				ds[i] = d
+			}
+			r, err := dec(ds)
+			if err != nil {
+				return nil, decimalErr(err)
+			}
+			return r, nil
+		}
+		xs := make([]float64, len(a))
+		for i, v := range a {
+			switch n := v.(type) {
+			case int64:
+				xs[i] = float64(n)
+			case float64:
+				xs[i] = n
+			case bytdb.Decimal:
+				xs[i] = n.Float64()
+			default:
+				return nil, serr.New("numeric argument expected")
+			}
+		}
+		r, err := fl(xs)
+		if err != nil {
+			return nil, decimalErr(err)
+		}
+		return r, nil
+	}
+}
+
+// floatLogArg is the float logarithms' domain check, worded as
+// Postgres's dlog1/dlog10 word it.
+func floatLogArg(x float64) error {
+	switch {
+	case x == 0:
+		return decimal.ErrLogZero
+	case x < 0:
+		return decimal.ErrLogNegative
+	}
+	return nil
+}
+
 // floatResult accepts numeric arguments and returns float.
 func floatResult(f *funcCall) (bytdb.ColType, error) {
 	for _, t := range f.types {
@@ -440,41 +553,70 @@ func init() {
 			}
 			return math.Mod(x, y), nil
 		}},
-		"power": {min: 2, max: 2, typ: floatResult, eval: func(a []any) (any, error) {
-			x, _ := num(a[0])
-			y, _ := num(a[1])
-			return math.Pow(x, y), nil
-		}},
-		"sqrt": {min: 1, max: 1, typ: floatResult, eval: floatFn(func(x float64) (float64, error) {
-			if x < 0 {
-				return 0, serr.New("cannot take square root of a negative number")
-			}
-			return math.Sqrt(x), nil
-		})},
-		"cbrt": {min: 1, max: 1, typ: floatResult, eval: floatFn(func(x float64) (float64, error) { return math.Cbrt(x), nil })},
-		"exp":  {min: 1, max: 1, typ: floatResult, eval: floatFn(func(x float64) (float64, error) { return math.Exp(x), nil })},
-		"ln": {min: 1, max: 1, typ: floatResult, eval: floatFn(func(x float64) (float64, error) {
-			if x <= 0 {
-				return 0, serr.New("cannot take logarithm of zero or a negative number")
-			}
-			return math.Log(x), nil
-		})},
-		// log(x) is base 10; log(b, x) is base b.
-		"log": {min: 1, max: 2, typ: floatResult, eval: func(a []any) (any, error) {
-			if len(a) == 1 {
-				x, _ := num(a[0])
-				if x <= 0 {
-					return nil, serr.New("cannot take logarithm of zero or a negative number")
+		// sqrt, exp, ln, log and power exist for double precision and for
+		// numeric, as in Postgres: mathResult (logResult for log) picks
+		// the version, and mathEval runs the matching one. The numeric
+		// versions are decimal.Sqrt/Exp/Ln/Log/Pow, which reproduce
+		// Postgres's result scales and digits (sqrt(16.0) is
+		// 4.000000000000000). cbrt has no numeric version in Postgres
+		// either, so a numeric argument converts to float8.
+		"power": {min: 2, max: 2, typ: mathResult, eval: mathEval(
+			func(x []float64) (float64, error) {
+				switch {
+				case x[0] == 0 && x[1] < 0:
+					return 0, decimal.ErrPowZeroNeg
+				case x[0] < 0 && x[1] != math.Trunc(x[1]):
+					return 0, decimal.ErrPowNegNonInt
 				}
-				return math.Log10(x), nil
-			}
-			b, _ := num(a[0])
-			x, _ := num(a[1])
-			if b <= 0 || x <= 0 || b == 1 {
-				return nil, serr.New("cannot take logarithm of zero or a negative number")
-			}
-			return math.Log(x) / math.Log(b), nil
-		}},
+				return math.Pow(x[0], x[1]), nil
+			},
+			func(d []bytdb.Decimal) (bytdb.Decimal, error) { return decimal.Pow(d[0], d[1]) })},
+		"sqrt": {min: 1, max: 1, typ: mathResult, eval: mathEval(
+			func(x []float64) (float64, error) {
+				if x[0] < 0 {
+					return 0, decimal.ErrSqrtNegative
+				}
+				return math.Sqrt(x[0]), nil
+			},
+			func(d []bytdb.Decimal) (bytdb.Decimal, error) { return decimal.Sqrt(d[0]) })},
+		"cbrt": {min: 1, max: 1, typ: floatResult, eval: floatFn(func(x float64) (float64, error) { return math.Cbrt(x), nil })},
+		"exp": {min: 1, max: 1, typ: mathResult, eval: mathEval(
+			func(x []float64) (float64, error) { return math.Exp(x[0]), nil },
+			func(d []bytdb.Decimal) (bytdb.Decimal, error) { return decimal.Exp(d[0]) })},
+		"ln": {min: 1, max: 1, typ: mathResult, eval: mathEval(
+			func(x []float64) (float64, error) {
+				if err := floatLogArg(x[0]); err != nil {
+					return 0, err
+				}
+				return math.Log(x[0]), nil
+			},
+			func(d []bytdb.Decimal) (bytdb.Decimal, error) { return decimal.Ln(d[0]) })},
+		// log(x) is base 10; log(b, x) is base b.
+		"log": {min: 1, max: 2, typ: logResult, eval: mathEval(
+			func(x []float64) (float64, error) {
+				if len(x) == 1 {
+					if err := floatLogArg(x[0]); err != nil {
+						return 0, err
+					}
+					return math.Log10(x[0]), nil
+				}
+				if err := floatLogArg(x[0]); err != nil {
+					return 0, err
+				}
+				if err := floatLogArg(x[1]); err != nil {
+					return 0, err
+				}
+				if x[0] == 1 {
+					return 0, decimal.ErrDivByZero
+				}
+				return math.Log(x[1]) / math.Log(x[0]), nil
+			},
+			func(d []bytdb.Decimal) (bytdb.Decimal, error) {
+				if len(d) == 1 {
+					return decimal.Log(decimal.FromInt64(10), d[0])
+				}
+				return decimal.Log(d[0], d[1])
+			})},
 		// The scale functions (Postgres 13+): scale is the display
 		// scale; min_scale the smallest that shows the value exactly;
 		// trim_scale the value at that scale.
@@ -818,6 +960,11 @@ func init() {
 	}
 	// Postgres's other spellings.
 	scalarFuncs["pow"] = scalarFuncs["power"]
+	// log10 (Postgres 12+) is one-argument log under its own name. The
+	// map holds pointers, so it gets its own copy to narrow.
+	log10 := *scalarFuncs["log"]
+	log10.max = 1
+	scalarFuncs["log10"] = &log10
 	scalarFuncs["substr"] = scalarFuncs["substring"]
 	scalarFuncs["json_typeof"] = scalarFuncs["jsonb_typeof"]
 	scalarFuncs["json_array_length"] = scalarFuncs["jsonb_array_length"]

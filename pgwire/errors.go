@@ -116,6 +116,14 @@ func sqlstate(msg string, hasPos bool) string {
 		return "22003" // numeric_value_out_of_range
 	case msg == "division by zero":
 		return "22012" // division_by_zero
+	// The math functions' domain errors, in Postgres's wording and codes
+	// (N-052: decimal.ErrSqrtNegative etc., and the float versions).
+	case strings.HasPrefix(msg, "cannot take logarithm of "):
+		return "2201E" // invalid_argument_for_logarithm
+	case msg == "cannot take square root of a negative number",
+		msg == "zero raised to a negative power is undefined",
+		msg == "a negative number raised to a non-integer power yields a complex result":
+		return "2201F" // invalid_argument_for_power_function
 	case strings.HasPrefix(msg, "NUMERIC precision "), strings.HasPrefix(msg, "NUMERIC scale "):
 		return "22023" // invalid_parameter_value
 	case msg == "numeric NaN and Infinity are not supported":
