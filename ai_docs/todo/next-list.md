@@ -41,16 +41,8 @@ are that plan's item IDs. The user asked for the plan to be implemented as
 written, so its six decisions (Q1–Q6) are taken at the plan's
 recommendations. Every phase of it (0–9) is on main and released in
 `v0.23.0` (N-044, closed); what remains is the pieces deliberately deferred
-(N-045 to N-047, N-049).
+(N-046, N-047, N-049; N-045 was declined after measuring, see Non-goals).
 
-- **N-045** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
-  **Cache the typed tree on prepared statements (D-40 step 3).** Typing
-  runs after parameter binding because it converts parameter values (a text
-  `$1` against a uuid column becomes 16 bytes), so a typed tree cannot be
-  reused as is. A design would type the unbound tree once per catalog
-  version and replay only the per-value conversions. After D-40's descriptor
-  memo, typing is a smaller share of a prepared point read; measure before
-  starting.
 - **N-046** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
   **Shared read snapshot for one-shot reads (D-46).** `Engine.Get` opens and
   releases a btypedb snapshot per call, both under btypedb's mutex, so
@@ -180,6 +172,22 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 - **N-015** · declined `2026-0916-1611-license-and-release-v0.15.0`:
   **License file in `bench/`.** It is an internal harness module and nothing
   imports it.
+- **N-045** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` ·
+  declined 2026-11-13 by the user after measuring (no session doc yet):
+  **Cache the typed tree on prepared statements (D-40 step 3).** Measured
+  on `BenchmarkDLPointSelectPrepared` (Apple M-series): the prepared point
+  read is now 2.27 µs and 75 allocations (the plan's 3.9–4.9 µs and
+  117–128 allocations predate D-40's other steps), and typing is about 6.5%
+  of its CPU (~145 ns) and 9 of its allocations. A cache saves at most that
+  in-process and under 1% over the wire (a point read is 11–27 µs), yet it
+  must key on the Go types of the bound arguments as well as the catalog
+  version (a string `$1` is untyped and takes its column's type, an
+  `int64` is int, and refusals such as `1 = true` depend on it) and replay
+  every conversion and error exactly: correctness risk in the D-23 pass
+  for ~145 ns. The profile's cheap part landed instead: `typer.sel` and
+  `typer.core` copy the 224-byte `Select` only when something changed (75
+  → 73 allocations, 4,680 → 4,232 B/op). Revisit only if a profile shows
+  typing well above this share of a hot statement.
 
 ## Closed
 

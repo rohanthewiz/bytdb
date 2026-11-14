@@ -254,7 +254,12 @@ func (t *typer) sel(s *Select, outer *tscope) (*Select, []bytdb.ColType, error) 
 	if s == nil {
 		return nil, nil, nil
 	}
-	c := *s
+	// The copy of *s is made only at the end, when something changed.
+	// Taking it up front (c := *s) put a 224-byte Select on the heap for
+	// every SELECT typed, and almost every execution of a prepared or
+	// parse-cached statement changes nothing (N-045's measurement: two
+	// such copies were 2 of a prepared point read's 75 allocations).
+	var newWith []CTE
 	changed := false
 	if len(s.With) > 0 {
 		with := make([]CTE, len(s.With))
@@ -280,7 +285,7 @@ func (t *typer) sel(s *Select, outer *tscope) (*Select, []bytdb.ColType, error) 
 			}
 		}
 		if changed {
-			c.With = with
+			newWith = with
 		}
 	}
 	core, types, err := t.core(s, outer)
@@ -289,9 +294,8 @@ func (t *typer) sel(s *Select, outer *tscope) (*Select, []bytdb.ColType, error) 
 	}
 	if core != s {
 		changed = true
-		c.From, c.Where, c.Items, c.GroupBy, c.Having, c.OrderBy =
-			core.From, core.Where, core.Items, core.GroupBy, core.Having, core.OrderBy
 	}
+	var newUnion []UnionArm
 	if len(s.Union) > 0 {
 		arms := make([]UnionArm, len(s.Union))
 		armsChanged := false
@@ -305,12 +309,23 @@ func (t *typer) sel(s *Select, outer *tscope) (*Select, []bytdb.ColType, error) 
 			armsChanged = armsChanged || typed != arm.Sel
 		}
 		if armsChanged {
-			c.Union = arms
+			newUnion = arms
 			changed = true
 		}
 	}
 	if !changed {
 		return s, types, nil
+	}
+	c := *s
+	if newWith != nil {
+		c.With = newWith
+	}
+	if core != s {
+		c.From, c.Where, c.Items, c.GroupBy, c.Having, c.OrderBy =
+			core.From, core.Where, core.Items, core.GroupBy, core.Having, core.OrderBy
+	}
+	if newUnion != nil {
+		c.Union = newUnion
 	}
 	return &c, types, nil
 }
@@ -326,7 +341,10 @@ func (t *typer) core(s *Select, outer *tscope) (*Select, []bytdb.ColType, error)
 		}
 		ts.sc = sc
 	}
-	c := *s
+	// Each rebuilt part lands in its own local, and *s is copied only
+	// at the end if one of them differs: see sel for why the copy is
+	// deferred.
+	from, groupBy, orderBy := s.From, s.GroupBy, s.OrderBy
 	changed := false
 
 	fromCopied := false
@@ -340,9 +358,9 @@ func (t *typer) core(s *Select, outer *tscope) (*Select, []bytdb.ColType, error)
 		}
 		if on != it.On {
 			if !fromCopied {
-				c.From, fromCopied = append([]FromItem(nil), s.From...), true
+				from, fromCopied = append([]FromItem(nil), s.From...), true
 			}
-			c.From[k].On = on
+			from[k].On = on
 			changed = true
 		}
 	}
@@ -352,7 +370,7 @@ func (t *typer) core(s *Select, outer *tscope) (*Select, []bytdb.ColType, error)
 		return nil, nil, err
 	}
 	if where != s.Where {
-		c.Where, changed = where, true
+		changed = true
 	}
 
 	items, types, itemsChanged, err := t.items(s.Items, ts)
@@ -360,7 +378,7 @@ func (t *typer) core(s *Select, outer *tscope) (*Select, []bytdb.ColType, error)
 		return nil, nil, err
 	}
 	if itemsChanged {
-		c.Items, changed = items, true
+		changed = true
 	}
 	if s.Star && ts.sc != nil {
 		for i := range ts.sc.width {
@@ -386,7 +404,7 @@ func (t *typer) core(s *Select, outer *tscope) (*Select, []bytdb.ColType, error)
 			}
 		}
 		if group != nil {
-			c.GroupBy, changed = group, true
+			groupBy, changed = group, true
 		}
 	}
 
@@ -395,7 +413,7 @@ func (t *typer) core(s *Select, outer *tscope) (*Select, []bytdb.ColType, error)
 		return nil, nil, err
 	}
 	if having != s.Having {
-		c.Having, changed = having, true
+		changed = true
 	}
 
 	if len(s.OrderBy) > 0 {
@@ -416,12 +434,14 @@ func (t *typer) core(s *Select, outer *tscope) (*Select, []bytdb.ColType, error)
 			}
 		}
 		if order != nil {
-			c.OrderBy, changed = order, true
+			orderBy, changed = order, true
 		}
 	}
 	if !changed {
 		return s, types, nil
 	}
+	c := *s
+	c.From, c.Where, c.Items, c.GroupBy, c.Having, c.OrderBy = from, where, items, groupBy, having, orderBy
 	return &c, types, nil
 }
 
