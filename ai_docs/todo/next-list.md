@@ -87,13 +87,24 @@ are closed).
 ## Validate
 
 - **N-033** · raised `2026-1104-1337-bytdb-cli-shell` · value low
-  **Run the `bytdb` shell interactively on Linux and Windows terminals.**
+  **Run the `bytdb` shell interactively on a Windows terminal.**
   Interactive mode (liner line editing, raw/cooked terminal handoff
   around `.shell` / `.edit`, Ctrl-C cancelling a running query, Tab
   completion, history, width fitting) was exercised through a pty on
-  macOS only. Linux and Windows were cross-compiled, never run. Check
-  each: prompt editing, Ctrl-C mid-query, `.shell`, `.edit`, and that the
-  terminal is sane after exit.
+  macOS in `2026-1104-1337`. **Linux done 2026-11-14:**
+  `pgwire/cmd/bytdb/testdata/ptydrive.py` drove the shell through a pty
+  in docker (`golang:1.26.1` on arm64 natively, `python:3.13-slim` on
+  amd64 under emulation), and all 23 checks passed on both. The checks
+  cover arrow/Ctrl-E/Backspace editing, the continuation prompt, history Up
+  and the history file, Ctrl-C at the prompt, Tab completion, Ctrl-C
+  cancelling a 100M-row cross join, `.shell` and `.edit` (whose children
+  saw cooked mode, and whose editor did a canonical-mode read), editing
+  after each, Ctrl-D exiting 0, `stty -g` the same before and after, and
+  box output fitting 40 columns. **Still open: Windows**
+  (cross-compiled only, and the script doesn't apply). In Windows
+  Terminal and in a plain `cmd.exe` console, check prompt editing, Ctrl-C
+  mid-query, `.shell` (`cmd /C`), `.edit` (notepad by default), and that
+  the console is sane after exit.
 
 ## Roadmap
 
