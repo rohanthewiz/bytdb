@@ -6,8 +6,8 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mattn/go-runewidth v0.0.31
 	github.com/peterh/liner v1.2.3
-	github.com/rohanthewiz/btypedb v0.10.0
-	github.com/rohanthewiz/bytdb v0.23.0
+	github.com/rohanthewiz/btypedb v0.11.0
+	github.com/rohanthewiz/bytdb v0.24.0
 	github.com/rohanthewiz/serr v1.4.0
 	golang.org/x/term v0.47.0
 	golang.org/x/text v0.29.0
