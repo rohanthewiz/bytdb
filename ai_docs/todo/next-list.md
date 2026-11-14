@@ -188,12 +188,14 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 ## Closed
 
 - **N-046** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` ·
-  closed 2026-11-13, session doc at wrap. **Shared read snapshot for one-shot
-  reads (D-46).** Done in btypedb, not the engine: every read-only `Begin`
-  shares one refcounted snapshot of the head (`readsnap.go`), so Engine.Get,
-  ReadTxn and every SQL read benefit with no bytdb code change. The fast path
-  is an atomic pointer load plus one atomic add, with no lock and no copy. A
-  new snapshot is copied under `mu` only after the head changes, and every
+  closed 2026-11-14,
+  `2026-1114-0032-n046-shared-read-snapshots-release-v0.24.0`. **Shared
+  read snapshot for one-shot reads (D-46).** Done in btypedb, not the
+  engine: every read-only `Begin` shares one refcounted snapshot of the
+  head (`readsnap.go`), so Engine.Get, ReadTxn and every SQL read benefit
+  with no bytdb code change. The fast path is an atomic pointer load plus
+  one atomic add, with no lock and no copy. A new snapshot is copied under
+  `mu` only after the head changes, and every
   head mutation (commit swap, direct Set/Delete, CreateIndex, DropIndex,
   Close) uncaches it first, under `mu`, so a Begin after a write always sees
   it. The last holder releases the trees (refcount to a dead sentinel, so a
