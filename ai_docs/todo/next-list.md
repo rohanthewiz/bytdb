@@ -59,18 +59,6 @@ and N-049 are closed.
   arithmetic, comparison and aggregate path plus two tuple classes (the
   encoding's class byte has room: 0x01/0x02/0x03 are used). Trigger: a
   dump or a client that writes one.
-- **N-052** · raised `2026-1111-1759-numeric-type-n048` · value low
-  **`round(int)`'s result type: keep bigint, or follow Postgres's double
-  precision?** The item's first half, exact numeric `sqrt/exp/ln/log/
-  power`, was done in `2026-1114-1640-n052-exact-numeric-math`. Its premise was partly wrong: Postgres
-  has no numeric `cbrt`, so float8 there was already right. What remains:
-  `round/ceil/floor/trunc/sign` of an integer return bigint here and
-  double precision in Postgres (the values agree; `docs/gotchas.md`).
-  Switching would change the type embedded callers read (int64 →
-  float64) without changing any value, while a client written for
-  Postgres already reads the bigint (pgx and database/sql scan int8 into
-  a float64). Recommendation: keep bigint and move this to Non-goals.
-  **The user's call.**
 - **N-053** · raised `2026-1111-1759-numeric-type-n048` · value low
   **The rest of N-048's refused types: `interval`, `money`, `bit`,
   `citext`.** Still "unknown column type". `money` maps naturally onto
@@ -103,11 +91,23 @@ and N-049 are closed.
   even without CASCADE. `DropTable` sends `DROP TABLE IF EXISTS parent
   CASCADE` before the child when its model order puts the parent first, and
   that fails with 2BP01, where Postgres drops the child's foreign-key
-  constraint. Changing either reverses D-54, so it's **the user's call**:
-  keep RESTRICT, or cascade to indexes on DROP COLUMN and to referencing
-  FK constraints (not tables) on DROP TABLE ... CASCADE, with Postgres's
-  `drop cascades to ...` notices. `TestGormVerbatim` drops the index and the
-  child first to work around it.
+  constraint. **Decided 2026-11-14 (user): do what Postgres does, where
+  it works for bytdb.** That reverses D-54's RESTRICT-only rule for these
+  cases. To build, checking each against PG16 first:
+  - `DROP COLUMN` drops every index that includes the column, with no
+    CASCADE needed. Postgres does it silently, multi-column indexes
+    included. A FK constraint on the column goes too, with CASCADE.
+  - `DROP TABLE … CASCADE` drops the foreign-key constraints of other
+    tables that reference it (not the tables), with Postgres's `drop
+    cascades to constraint x on table y` notice. Dependent views go too,
+    if bytdb can tell which views depend on the table. Without CASCADE
+    it stays refused (2BP01).
+  - Do each inside one DDL transaction, so a failure leaves nothing
+    half-dropped.
+  - Afterwards, update the RESTRICT wording in `docs/features.md` (D-54
+    paragraph), `docs/gotchas.md`, `pgwire/errors.go`'s 2BP01 comment and
+    the parser's `dropBehavior` comment. Remove the work-around in
+    `TestGormVerbatim` (it drops the index and the child first).
 
 ## Validate
 
@@ -210,6 +210,15 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   `typer.core` copy the 224-byte `Select` only when something changed (75
   → 73 allocations, 4,680 → 4,232 B/op). Revisit only if a profile shows
   typing well above this share of a hot statement.
+- **N-052** · raised `2026-1111-1759-numeric-type-n048` · declined
+  2026-11-14 by the user: **`round(int)`'s result type stays bigint.**
+  `round/ceil/floor/trunc/sign` of an integer return bigint here and
+  double precision in Postgres (values agree; `docs/gotchas.md`).
+  Switching would change the type embedded callers read (int64 →
+  float64) for no change in value, and a client written for Postgres
+  already reads the bigint. The item's other half, exact numeric
+  `sqrt/exp/ln/log/power`, was done in
+  `2026-1114-1640-n052-exact-numeric-math` (`94be4da`).
 
 ## Closed
 
