@@ -459,6 +459,10 @@ type DB struct {
 	// this DB (parsecache.go); nil parses every time.
 	parses *parseCache
 
+	// cat memoizes catalog-derived system-table rows per catalog version
+	// for every session of this DB (catmemo.go); nil builds every time.
+	cat *catalogMemo
+
 	// tx, when set, is a Session's open transaction: every statement
 	// runs inside it instead of opening its own.
 	tx *bytdb.Txn
@@ -553,7 +557,7 @@ type vtab struct {
 
 // New wraps an Engine for SQL execution.
 func New(e *bytdb.Engine) *DB {
-	return &DB{e: e, seq: &seqSession{}, parses: newParseCache(),
+	return &DB{e: e, seq: &seqSession{}, parses: newParseCache(), cat: &catalogMemo{},
 		ss: newSessState(nil), adv: newAdvLocks()}
 }
 

@@ -326,6 +326,7 @@ func moreSysTables() map[string]*sysTableDef {
 	str, i64, boolean := bytdb.TString, bytdb.TInt, bytdb.TBool
 	return map[string]*sysTableDef{
 		"pg_catalog.pg_tables": {
+			byVersion: true,
 			desc: sysDesc("pg_tables",
 				sysCol("schemaname", str), sysCol("tablename", str),
 				sysCol("tableowner", str), sysCol("tablespace", str),
@@ -343,6 +344,7 @@ func moreSysTables() map[string]*sysTableDef {
 			},
 		},
 		"pg_catalog.pg_indexes": {
+			byVersion: true,
 			desc: sysDesc("pg_indexes",
 				sysCol("schemaname", str), sysCol("tablename", str),
 				sysCol("indexname", str), sysCol("tablespace", str),
@@ -363,6 +365,7 @@ func moreSysTables() map[string]*sysTableDef {
 			},
 		},
 		"pg_catalog.pg_views": {
+			byVersion: true,
 			desc: sysDesc("pg_views",
 				sysCol("schemaname", str), sysCol("viewname", str),
 				sysCol("viewowner", str), sysCol("definition", str)),
@@ -468,6 +471,7 @@ func moreSysTables() map[string]*sysTableDef {
 			},
 		},
 		"information_schema.views": {
+			byVersion: true,
 			desc: sysDesc("views",
 				sysCol("table_catalog", str), sysCol("table_schema", str),
 				sysCol("table_name", str), sysCol("view_definition", str),
@@ -488,6 +492,7 @@ func moreSysTables() map[string]*sysTableDef {
 		// (unique_constraint_name): the parent's primary key, or the
 		// unique index over exactly the referenced columns.
 		"information_schema.referential_constraints": {
+			byVersion: true,
 			desc: sysDesc("referential_constraints",
 				sysCol("constraint_catalog", str), sysCol("constraint_schema", str),
 				sysCol("constraint_name", str), sysCol("unique_constraint_catalog", str),
@@ -520,6 +525,7 @@ func moreSysTables() map[string]*sysTableDef {
 		// what ORMs join it for. CHECK constraints are left out: listing
 		// their columns would mean parsing the stored expression.
 		"information_schema.constraint_column_usage": {
+			byVersion: true,
 			desc: sysDesc("constraint_column_usage",
 				sysCol("table_catalog", str), sysCol("table_schema", str),
 				sysCol("table_name", str), sysCol("column_name", str),

@@ -57,7 +57,7 @@ func (d *DB) lookup(base func(string) *bytdb.TableDesc) tableLookup {
 		if st := sysLookup(name); st != nil {
 			var rows [][]any
 			if st.rows != nil && !d.catalogShapes {
-				rows = st.rows(d)
+				rows = d.sysRows(st) // memoized per catalog version when st allows it
 			}
 			if rows == nil {
 				rows = [][]any{} // non-nil marks the table virtual
@@ -172,6 +172,13 @@ func writeTarget(st Statement) string {
 type sysTableDef struct {
 	desc *bytdb.TableDesc
 	rows func(d *DB) [][]any // nil: the table is always empty
+
+	// byVersion marks rows that are a function of the committed catalog
+	// alone (descriptors, views, sequence options), so lookup builds
+	// them once per catalog version and shares them (catmemo.go). Leave
+	// it unset for anything that reads live state: sessions, settings,
+	// sequence positions.
+	byVersion bool
 }
 
 func sysDesc(name string, cols ...bytdb.Column) *bytdb.TableDesc {
@@ -449,6 +456,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"pg_catalog.pg_class": {
+		byVersion: true,
 		desc: sysDesc("pg_class",
 			sysCol("oid", bytdb.TInt), sysCol("relname", bytdb.TString),
 			sysCol("relnamespace", bytdb.TInt), sysCol("relkind", bytdb.TString),
@@ -508,6 +516,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"pg_catalog.pg_attribute": {
+		byVersion: true,
 		desc: sysDesc("pg_attribute",
 			sysCol("attrelid", bytdb.TInt), sysCol("attname", bytdb.TString),
 			sysCol("atttypid", bytdb.TInt), sysCol("attlen", bytdb.TInt),
@@ -595,6 +604,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"pg_catalog.pg_index": {
+		byVersion: true,
 		desc: sysDesc("pg_index",
 			sysCol("indexrelid", bytdb.TInt), sysCol("indrelid", bytdb.TInt),
 			sysCol("indisunique", bytdb.TBool), sysCol("indisprimary", bytdb.TBool),
@@ -644,6 +654,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"pg_catalog.pg_attrdef": {
+		byVersion: true,
 		desc: sysDesc("pg_attrdef",
 			sysCol("oid", bytdb.TInt), sysCol("adrelid", bytdb.TInt),
 			sysCol("adnum", bytdb.TInt), sysCol("adbin", bytdb.TString)),
@@ -668,6 +679,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"pg_catalog.pg_sequence": {
+		byVersion: true,
 		desc: sysDesc("pg_sequence",
 			sysCol("seqrelid", bytdb.TInt), sysCol("seqtypid", bytdb.TInt),
 			sysCol("seqstart", bytdb.TInt), sysCol("seqincrement", bytdb.TInt),
@@ -690,6 +702,7 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("collnamespace", bytdb.TInt)),
 	},
 	"pg_catalog.pg_constraint": {
+		byVersion: true,
 		desc: sysDesc("pg_constraint",
 			sysCol("oid", bytdb.TInt), sysCol("conname", bytdb.TString),
 			sysCol("connamespace", bytdb.TInt), sysCol("contype", bytdb.TString),
@@ -874,6 +887,7 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("pnnspid", bytdb.TInt)),
 	},
 	"information_schema.tables": {
+		byVersion: true,
 		desc: sysDesc("tables",
 			sysCol("table_catalog", bytdb.TString), sysCol("table_schema", bytdb.TString),
 			sysCol("table_name", bytdb.TString), sysCol("table_type", bytdb.TString)),
@@ -894,6 +908,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"information_schema.sequences": {
+		byVersion: true,
 		desc: sysDesc("sequences",
 			sysCol("sequence_catalog", bytdb.TString), sysCol("sequence_schema", bytdb.TString),
 			sysCol("sequence_name", bytdb.TString), sysCol("data_type", bytdb.TString),
@@ -930,6 +945,7 @@ var sysTables = map[string]*sysTableDef{
 	//     (Postgres < 18 lists them as "<oid>_<oid>_<n>_not_null");
 	//     nullability is already in information_schema.columns.
 	"information_schema.table_constraints": {
+		byVersion: true,
 		desc: sysDesc("table_constraints",
 			sysCol("constraint_catalog", bytdb.TString), sysCol("constraint_schema", bytdb.TString),
 			sysCol("constraint_name", bytdb.TString), sysCol("table_catalog", bytdb.TString),
@@ -968,6 +984,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"information_schema.key_column_usage": {
+		byVersion: true,
 		desc: sysDesc("key_column_usage",
 			sysCol("constraint_catalog", bytdb.TString), sysCol("constraint_schema", bytdb.TString),
 			sysCol("constraint_name", bytdb.TString), sysCol("table_catalog", bytdb.TString),
@@ -1009,6 +1026,7 @@ var sysTables = map[string]*sysTableDef{
 		},
 	},
 	"information_schema.columns": {
+		byVersion: true,
 		desc: sysDesc("columns",
 			sysCol("table_catalog", bytdb.TString), sysCol("table_schema", bytdb.TString),
 			sysCol("table_name", bytdb.TString), sysCol("column_name", bytdb.TString),
@@ -1022,9 +1040,10 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("is_generated", bytdb.TString), sysCol("is_updatable", bytdb.TString)),
 		rows: func(d *DB) [][]any {
 			// One row per column of every table: rows come from a slab
-			// sized up front rather than one allocation each, since the
-			// table is read whole for every introspection query (a
-			// table_name filter applies after the build; see N-047).
+			// sized up front rather than one allocation each. A
+			// table_name filter applies after the build, so the build
+			// covers the whole catalog; byVersion makes that happen once
+			// per schema change rather than once per query (catmemo.go).
 			descs := d.userDescs()
 			n := 0
 			for _, desc := range descs {

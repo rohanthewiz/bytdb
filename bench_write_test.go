@@ -63,6 +63,39 @@ func BenchmarkDLUpdateUnindexedCol(b *testing.B) {
 	}
 }
 
+// BenchmarkDLInsertIdentity is a bulk insert into a table keyed by an
+// identity column, 100 rows per transaction: the shape of a multi-row
+// INSERT into a serial table. One op is one row. Each default-mode
+// draw used to stage its own counter write, a WAL record per row
+// (deep-look D-45); the counter now lives in the Txn until commit.
+func BenchmarkDLInsertIdentity(b *testing.B) {
+	e, err := Open(filepath.Join(b.TempDir(), "id.db"), WithSyncNever())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer e.Close()
+	if _, err := e.CreateTable("t", []Column{{Name: "id", Type: TInt, Identity: true},
+		{Name: "v", Type: TInt}}, "id"); err != nil {
+		b.Fatal(err)
+	}
+	const batch = 100
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i += batch {
+		n := min(batch, b.N-i)
+		if err := e.WriteTxn(func(tx *Txn) error {
+			for j := range n {
+				if err := tx.Insert("t", nil, i+j); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkDLInsertIndexed inserts into a table with two secondary
 // indexes, one row per transaction (D-45's key building).
 func BenchmarkDLInsertIndexed(b *testing.B) {

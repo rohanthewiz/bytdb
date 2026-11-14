@@ -84,6 +84,12 @@ type Txn struct {
 	//	ROLLBACK TO a  →  writes = 40, stack = [{a, 40}]
 	//	RELEASE a      →  writes kept, stack = []
 	saveWrites []savepointMark
+	// ids caches the identity counters this transaction draws from in
+	// serialized mode, written back at commit and at savepoints instead
+	// of once per row (deep-look D-45; see idCounters for the rules
+	// every counter access in a Txn follows). Unused, and empty, under
+	// concurrent writes.
+	ids idCounters
 }
 
 // savepointMark is one saveWrites entry.
@@ -223,7 +229,12 @@ func (e *Engine) writeTxn(ctx context.Context, serializable bool, fn func(tx *Tx
 		// releases the lock, preserving the same ordering.
 		defer e.writerGID.Store(0)
 		txn = &Txn{tx: tx, e: e}
-		return fn(txn)
+		if err := fn(txn); err != nil {
+			return err
+		}
+		// The identity counters fn drew from go into the same commit as
+		// the rows that hold the values.
+		return txn.ids.flush(tx)
 	})
 	if txn != nil {
 		// The kv transaction is finished whatever the outcome; a Txn
@@ -358,6 +369,16 @@ func (e *Engine) readSnapshot() (*Txn, error) {
 // WriteTxn on why a failed commit can leave them visible until the
 // process restarts.
 func (t *Txn) Commit() error {
+	// Write the cached identity counters back while the transaction can
+	// still take writes. If that fails the commit cannot carry them, and
+	// committing rows without the counter that drew their keys would
+	// make later draws collide, so the transaction rolls back instead.
+	if !t.done {
+		if err := t.ids.flush(t.tx); err != nil {
+			t.Rollback()
+			return err
+		}
+	}
 	// Clear the reentrancy marker BEFORE commit releases the writer
 	// lock. Cleared after, the store races with the next writer: it can
 	// acquire the lock and store its own GID in the gap, and our late
@@ -437,6 +458,11 @@ func (t *Txn) Savepoint() (*Savepoint, error) {
 	if err := t.open("savepoint"); err != nil {
 		return nil, err
 	}
+	// The mark must hold the counters as of now, so RollbackTo can
+	// restore them by reloading from the kv state (see idCounters).
+	if err := t.ids.flush(t.tx); err != nil {
+		return nil, err
+	}
 	sp, err := t.tx.Savepoint()
 	if err != nil {
 		return nil, err
@@ -455,6 +481,9 @@ func (t *Txn) RollbackTo(sp *Savepoint) error {
 	if err := t.tx.RollbackTo(sp); err != nil {
 		return err
 	}
+	// Cached counters belong to the discarded branch; the next draw
+	// reloads from the state sp captured, which Savepoint flushed into.
+	t.ids.reset()
 	// The kv layer validated sp, so it is on the mirror stack too.
 	// Later marks are gone from the kv stack, so they go here as well.
 	if i := t.saveMark(sp); i >= 0 {
@@ -573,7 +602,7 @@ func (t *Txn) InsertReturning(table string, vals ...any) (Row, error) {
 	if err != nil {
 		return Row{}, err
 	}
-	stored, err := insertRow(t.e, t.tx, desc, vals)
+	stored, err := insertRow(t.e, t.tx, &t.ids, desc, vals)
 	if err != nil {
 		return Row{}, serr.Wrap(err, "op", "insert", "table", table)
 	}
@@ -611,7 +640,7 @@ func (t *Txn) UpdateReturning(table string, pkVals []any, set map[string]any) (R
 	if err != nil {
 		return Row{}, false, err
 	}
-	newVals, updated, err := updateRow(t.e, t.tx, desc, pkVals, set)
+	newVals, updated, err := updateRow(t.e, t.tx, &t.ids, desc, pkVals, set)
 	if err != nil {
 		return Row{}, false, serr.Wrap(err, "op", "update", "table", table)
 	}
@@ -693,6 +722,9 @@ func (t *Txn) Truncate(table string, restartIdentity bool) error {
 		return serr.Wrap(err, "op", "truncate", "table", table)
 	}
 	if restartIdentity {
+		// The records are deleted below; cached entries flushed after it
+		// would resurrect the old positions (see idCounters).
+		t.ids.forgetTable(desc.ID)
 		idPrefix := identitySeqTablePrefix(desc.ID)
 		if _, err := t.tx.DeleteRange(string(idPrefix), string(tuple.PrefixEnd(idPrefix))); err != nil {
 			return serr.Wrap(err, "op", "truncate", "table", table)

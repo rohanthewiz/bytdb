@@ -480,6 +480,9 @@ func hashJoinKey(vals []any, ord func(hashEqKey) int, keys []hashEqKey) (string,
 // whole join.
 func runJoin(tx *bytdb.Txn, fp *fromPlan, env *exEnv, yield func([]any) bool) error {
 	j := &joinRun{tx: tx, fp: fp, env: env, yield: yield}
+	// A lone virtual table's rows reach the WHERE uncopied (see
+	// stepNext), so the ones that pass are copied on their way out.
+	j.borrowed = len(fp.steps) == 1 && fp.steps[0].st.rows != nil
 	if env != nil && env.d != nil {
 		j.ctx = env.d.ctx // the statement's cancellation scope, polled by each step's scan
 	}
@@ -496,9 +499,22 @@ type joinRun struct {
 	stop  bool
 	err   error
 
+	// borrowed marks a plan whose combined row, at the WHERE, is a
+	// virtual table's own materialized row rather than a fresh slice:
+	// a single-step FROM over a system table, CTE, derived table or
+	// view. Those rows are shared (a memoized catalog table's rows are
+	// shared by every session; see catmemo.go), so rec copies a row
+	// before yielding it to a consumer that may keep or change it.
+	borrowed bool
+
 	// hashes are the hash-join steps' build tables, keyed by
 	// hashJoinKey, built lazily the first time each step runs.
 	hashes []map[string][][]any
+
+	// vrows are the virtual-table steps' rows that pass the step's
+	// static conjuncts, filtered lazily the first time each step runs
+	// (see virtualRows). nil until then.
+	vrows [][][]any
 }
 
 func (j *joinRun) rec(k int, partial []any) {
@@ -508,8 +524,14 @@ func (j *joinRun) rec(k int, partial []any) {
 			j.err = err
 			return
 		}
-		if t == triTrue && !j.yield(partial) {
-			j.stop = true
+		if t == triTrue {
+			row := partial
+			if j.borrowed {
+				row = slices.Clone(partial)
+			}
+			if !j.yield(row) {
+				j.stop = true
+			}
 		}
 		return
 	}
@@ -535,9 +557,13 @@ func (j *joinRun) rec(k int, partial []any) {
 			return j.stepNext(k, partial, rowVals, &matched)
 		}
 		if step.st.rows != nil {
-			// A virtual system table: no pushdown, just its
-			// materialized rows — ON and WHERE still filter fully.
-			for _, rv := range step.st.rows {
+			// A virtual table: its materialized rows, narrowed by the
+			// step's static conjuncts; ON and WHERE still filter fully.
+			rows, ok := j.virtualRows(k)
+			if !ok {
+				return
+			}
+			for _, rv := range rows {
 				if !next(rv) {
 					break
 				}
@@ -569,6 +595,85 @@ func (j *joinRun) rec(k int, partial []any) {
 		copy(vals, partial)
 		j.rec(k+1, vals)
 	}
+}
+
+// virtualRows returns the rows of virtual-table step k that pass the
+// step's static conjuncts, filtering them on first use and reusing the
+// result for the rest of the join. ok is false when a conjunct failed
+// to evaluate; j.err then holds the error.
+//
+// A stored table's statics push into its scan (planScan), so its
+// rejected rows are never decoded. A virtual table has no scan to push
+// into, and its rows used to reach the step unfiltered: every
+// candidate was combined with the outer row, and for a hash step put
+// in the build table, before the WHERE threw it away. An introspection
+// join such as
+//
+//	pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+//	WHERE c.relname = 'users'
+//
+// built a combined row for every attribute in the schema to keep the
+// handful that belong to one table. Filtering by the static
+// c.relname = 'users' first leaves one pg_class row in the build
+// table, so the probes for other tables' attributes miss without
+// building anything (deep-look D-47).
+//
+// The filter is an early application of conjuncts the WHERE (or, for
+// a LEFT JOIN step, the ON) applies anyway, so it changes how much
+// work is done, never which rows come out. Statics are static: they
+// reference only this step's columns and constants or bound
+// parameters, never an outer row, so one pass per join run serves
+// every outer row of a nested loop. The binds address combined-row
+// ordinals, so each candidate is evaluated in a scratch row with its
+// values at the step's offset; statics never read the slots before
+// it, which stay nil.
+//
+//	scratch: [ nil ... nil | rv[0] rv[1] ... rv[n-1] ]
+//	          0 ... off-1    off  ...         off+n-1
+func (j *joinRun) virtualRows(k int) ([][]any, bool) {
+	step := &j.fp.steps[k]
+	if len(step.static) == 0 || j.borrowed {
+		// A lone step's rows go straight to the WHERE, uncopied, and the
+		// WHERE holds these same conjuncts: filtering first would only
+		// evaluate them twice.
+		return step.st.rows, true
+	}
+	if j.vrows == nil {
+		j.vrows = make([][][]any, len(j.fp.steps))
+	}
+	if rows := j.vrows[k]; rows != nil {
+		return rows, true
+	}
+	expr := combineStatic(step.static)
+	rows := step.st.rows
+	scratch := make([]any, step.st.off+len(step.st.desc.Columns))
+	// kept stays nil while every row so far has passed, and is
+	// allocated at the first rejection with the passing prefix. A
+	// conjunct most rows satisfy (pg_attribute's attnum > 0) then costs
+	// no copy of the row list at all; a selective one (relname = 'x')
+	// copies only what it keeps.
+	var kept [][]any
+	for i, rv := range rows {
+		copy(scratch[step.st.off:], rv)
+		t, err := evalPreds(expr, j.fp.b, j.env, scratch)
+		if err != nil {
+			j.err = err
+			return nil, false
+		}
+		switch pass := t == triTrue; {
+		case pass && kept != nil:
+			kept = append(kept, rv)
+		case !pass && kept == nil:
+			kept = append(make([][]any, 0, i+8), rows[:i]...)
+		}
+	}
+	if kept == nil {
+		// Every row passed. rows is non-nil (it marks the step
+		// virtual), so the memo entry below still reads as filtered.
+		kept = rows
+	}
+	j.vrows[k] = kept
+	return kept, true
 }
 
 // rowPlan returns the step's inner-scan plan bound to the current
@@ -627,13 +732,27 @@ func (step *joinStep) rowPlan(partial []any) (*plan, error) {
 func (j *joinRun) stepNext(k int, partial, rowVals []any, matched *bool) bool {
 	step := &j.fp.steps[k]
 	var vals []any
-	if len(partial) == 0 && step.st.rows == nil {
-		// The first table of a stored-table scan: the combined row IS the
-		// scanned row, which the engine decoded freshly for this call and
-		// nothing else holds, so it passes through instead of being
-		// copied — about 10% of a one-table scan (deep-look D-44). A
-		// virtual table's rows are shared materializations and are
-		// still copied.
+	if len(partial) == 0 && (step.st.rows == nil || k == 0) {
+		// The first table's row IS the combined row, so it passes
+		// through instead of being copied.
+		//
+		// A stored table's row was decoded freshly for this call and
+		// nothing else holds it: about 10% of a one-table scan
+		// (deep-look D-44).
+		//
+		// A virtual table's row (k == 0 only) is a shared
+		// materialization, so it may only be read. Nothing below
+		// writes into the combined row: ON and WHERE only read it, and
+		// a later step builds a fresh slice for its combination. The
+		// one place a row escapes is the yield after the WHERE, and rec
+		// copies it there when the plan has no later step (borrowed).
+		// Copying only the rows the WHERE keeps matters for catalog
+		// introspection. information_schema.columns filtered to one
+		// table of 200 used to copy all ~1000 rows, 98% of the query's
+		// allocation once the rows themselves were memoized (D-47).
+		// The k == 0 bound keeps a virtual table behind a zero-width
+		// first table (len(partial) is 0 there too) on the copying
+		// path, since borrowed covers single-step plans only.
 		vals = rowVals
 	} else {
 		vals = make([]any, len(partial)+len(rowVals))
@@ -674,7 +793,11 @@ func (j *joinRun) hashStep(k int, partial []any) {
 			}
 		}
 		if step.st.rows != nil {
-			for _, rv := range step.st.rows {
+			rows, ok := j.virtualRows(k)
+			if !ok {
+				return
+			}
+			for _, rv := range rows {
 				add(rv)
 			}
 		} else {

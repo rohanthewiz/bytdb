@@ -41,17 +41,19 @@ func (d *TableDesc) hasIdentity() bool {
 // fillIdentity resolves a row's identity columns, returning the
 // resolved values (the input is not mutated) plus the ordinals of the
 // columns it auto-drew (nil when none). A row with the wrong arity
-// passes through untouched for coerceRow to report. Draws and bumps go
-// through tx in serialized mode and through e's allocators in
-// concurrent-writes mode — the mode split documented in the file
-// header.
+// passes through untouched for coerceRow to report. Draws and bumps
+// follow the mode split documented in the file header: through e's
+// allocators in concurrent-writes mode; in serialized mode through ids,
+// the transaction's in-memory counters, when the caller is a Txn, and
+// straight through tx otherwise (a one-shot write draws once per
+// transaction, so there is nothing to batch).
 //
 // drawn exists for error classification: a uniqueness collision on a
 // value the ENGINE chose (as opposed to one the caller supplied) can
 // only mean the draw raced a concurrent counter reset or bump — under
 // concurrent writes, insertRow reports that as a retryable conflict
 // rather than a data error.
-func fillIdentity(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) (out []any, drawn []int, err error) {
+func fillIdentity(e *Engine, tx *btypedb.Tx[string, []byte], ids *idCounters, desc *TableDesc, vals []any) (out []any, drawn []int, err error) {
 	if !desc.hasIdentity() || len(vals) != len(desc.Columns) {
 		return vals, nil, nil
 	}
@@ -61,15 +63,16 @@ func fillIdentity(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, va
 		if !c.Identity {
 			continue
 		}
-		key := identitySeqKey(desc.ID, c.ID)
-		what := desc.Name + "." + c.Name
 		if out[i] == nil {
 			var v uint64
 			var err error
-			if e.occ {
-				v, err = e.allocCounter(key, 1, what, identityOwner(e, desc))
-			} else {
-				v, err = nextFromCounter(tx, key, 1, what)
+			switch {
+			case e.occ:
+				v, err = e.allocCounter(identitySeqKey(desc.ID, c.ID), 1, identityName(desc, c), identityOwner(e, desc))
+			case ids != nil:
+				v, err = ids.draw(tx, desc, c)
+			default:
+				v, err = nextFromCounter(tx, identitySeqKey(desc.ID, c.ID), 1, identityName(desc, c))
 			}
 			if err != nil {
 				return nil, nil, err
@@ -88,17 +91,197 @@ func fillIdentity(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, va
 			return nil, nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
 		}
 		if n := cv.(int64); n >= 0 {
-			if e.occ {
-				err = e.bumpCounterAllocTo(key, uint64(n)+1, what, identityOwner(e, desc))
-			} else {
-				err = bumpCounterTo(tx, key, uint64(n)+1, what)
-			}
-			if err != nil {
+			if err := bumpIdentity(e, tx, ids, desc, c, uint64(n)+1); err != nil {
 				return nil, nil, err
 			}
 		}
 	}
 	return out, drawn, nil
+}
+
+// bumpIdentity raises column c's counter to at least next, through the
+// same three routes as a draw in fillIdentity.
+func bumpIdentity(e *Engine, tx *btypedb.Tx[string, []byte], ids *idCounters, desc *TableDesc, c *Column, next uint64) error {
+	switch {
+	case e.occ:
+		return e.bumpCounterAllocTo(identitySeqKey(desc.ID, c.ID), next, identityName(desc, c), identityOwner(e, desc))
+	case ids != nil:
+		return ids.bump(tx, desc, c, next)
+	default:
+		return bumpCounterTo(tx, identitySeqKey(desc.ID, c.ID), next, identityName(desc, c))
+	}
+}
+
+// identityName is the "table.column" a counter error names. Built on
+// demand: the batched draw path needs it only when it fails, and it
+// used to cost an allocation per identity column per row.
+func identityName(desc *TableDesc, c *Column) string { return desc.Name + "." + c.Name }
+
+// idCounters holds a serialized-mode write transaction's identity
+// counters in memory between draws (deep-look D-45). A draw used to be
+// a read-modify-write of the counter's kv record, and every write
+// stages a sealed WAL record in the transaction, so a 1000-row INSERT
+// into a table keyed by an identity column logged 1000 counter
+// records, all but the last of them dead on arrival. Now a counter is
+// read from the transaction once, advanced in memory, and written back
+// once:
+//
+//	draw/bump ──► idCounters (next, dirty) ──flush──► tx.Set(key, next)
+//	                                          ▲
+//	              Txn.Commit, WriteTxn's commit, Txn.Savepoint
+//
+// Correctness rests on every reader and writer of a counter inside the
+// transaction going through this cache or settling with it first:
+//
+//   - Commit (Txn.Commit, and WriteTxn after its closure) flushes, so
+//     the final values commit atomically with the rows that drew them.
+//   - Savepoint flushes before taking the kv mark, so the mark holds
+//     the counters as of that moment. RollbackTo restores the kv state
+//     and then drops the cache; the next draw reloads the counter from
+//     the restored state, exactly what the per-row writes used to give.
+//   - Rollback needs nothing: the cache dies with the Txn.
+//   - RestartIdentity and TRUNCATE ... RESTART IDENTITY write or delete
+//     counter records directly, so they drop the affected entries
+//     first; a stale entry flushed later would undo the restart.
+//   - PeekIdentity reads a dirty entry before the stored record.
+//
+// DDL never runs inside a Txn (it commits as its own transaction), so
+// nothing else touches identity counters while one is open, and in
+// serialized mode no other writer runs either. Concurrent-writes mode
+// never uses this: its draws go through the engine's allocators.
+//
+// A Txn is used by one goroutine at a time, like the kv transaction
+// under it, so the map needs no lock.
+type idCounters struct {
+	m map[idCounterKey]*idCounter
+}
+
+// idCounterKey names one identity counter without building its kv key,
+// which takes an encoding and an allocation.
+type idCounterKey struct {
+	table uint64
+	col   uint32
+}
+
+// idCounter is one cached counter.
+type idCounter struct {
+	key   string // the counter's kv key, built once at load for the flush
+	next  uint64 // the value the next draw hands out
+	dirty bool   // next has moved since the counter was loaded or flushed
+}
+
+// load returns c's cached counter, reading it from tx on first use. An
+// absent record reads as 1, the value nextFromCounter starts at.
+func (ic *idCounters) load(tx *btypedb.Tx[string, []byte], desc *TableDesc, c *Column) (*idCounter, error) {
+	k := idCounterKey{desc.ID, c.ID}
+	if ctr, ok := ic.m[k]; ok {
+		return ctr, nil
+	}
+	key := identitySeqKey(desc.ID, c.ID)
+	next := uint64(1)
+	if raw, ok := tx.Get(key); ok {
+		if len(raw) != 8 {
+			return nil, serr.New("sequence value is corrupt",
+				"sequence", identityName(desc, c), "len", fmt.Sprint(len(raw)))
+		}
+		next = binary.BigEndian.Uint64(raw)
+	}
+	ctr := &idCounter{key: key, next: next}
+	if ic.m == nil {
+		ic.m = map[idCounterKey]*idCounter{}
+	}
+	ic.m[k] = ctr
+	return ctr, nil
+}
+
+// draw hands out c's next value: nextFromCounter's semantics, with
+// the write deferred to flush.
+func (ic *idCounters) draw(tx *btypedb.Tx[string, []byte], desc *TableDesc, c *Column) (uint64, error) {
+	// Refuse where the immediate write would have. insertRow already
+	// refuses a read-only transaction before drawing, so this is the
+	// backstop for any other caller: a cached draw there would
+	// "succeed", leave the cache dirty, and fail later at commit, far
+	// from the insert that caused it.
+	if !tx.Writable() {
+		return 0, btypedb.ErrTxNotWritable
+	}
+	ctr, err := ic.load(tx, desc, c)
+	if err != nil {
+		return 0, err
+	}
+	if ctr.next == math.MaxUint64 {
+		return 0, serr.New("sequence exhausted", "sequence", identityName(desc, c))
+	}
+	v := ctr.next
+	ctr.next++
+	ctr.dirty = true
+	return v, nil
+}
+
+// bump raises c's counter to at least next: bumpCounterTo's semantics,
+// with the write deferred to flush. An absent counter loads as 1, so a
+// bump to 1 or below leaves it absent, as bumpCounterTo does.
+func (ic *idCounters) bump(tx *btypedb.Tx[string, []byte], desc *TableDesc, c *Column, next uint64) error {
+	ctr, err := ic.load(tx, desc, c)
+	if err != nil {
+		return err
+	}
+	if ctr.next >= next {
+		return nil
+	}
+	// Writable is checked only when the bump would write, matching
+	// bumpCounterTo, whose no-op path never reaches tx.Set.
+	if !tx.Writable() {
+		return btypedb.ErrTxNotWritable
+	}
+	ctr.next, ctr.dirty = next, true
+	return nil
+}
+
+// flush writes every counter that moved since its load or the last
+// flush back to tx. Entries stay cached and clean, so draws after a
+// savepoint keep reading from memory.
+func (ic *idCounters) flush(tx *btypedb.Tx[string, []byte]) error {
+	for _, ctr := range ic.m {
+		if !ctr.dirty {
+			continue
+		}
+		if err := tx.Set(ctr.key, binary.BigEndian.AppendUint64(nil, ctr.next)); err != nil {
+			return serr.Wrap(err, "op", "write identity counter")
+		}
+		ctr.dirty = false
+	}
+	return nil
+}
+
+// reset drops every cached counter, flushed or not. For use after the
+// kv state was rewound (RollbackTo): what the cache holds belongs to
+// the discarded branch.
+func (ic *idCounters) reset() { clear(ic.m) }
+
+// forget drops one counter without flushing it, for a caller about to
+// overwrite its record (RestartIdentity).
+func (ic *idCounters) forget(tableID uint64, colID uint32) {
+	delete(ic.m, idCounterKey{tableID, colID})
+}
+
+// forgetTable drops every counter of one table without flushing, for a
+// caller about to delete their records (TRUNCATE ... RESTART IDENTITY).
+func (ic *idCounters) forgetTable(tableID uint64) {
+	for k := range ic.m {
+		if k.table == tableID {
+			delete(ic.m, k)
+		}
+	}
+}
+
+// peek reports c's cached next value when the cache holds an unflushed
+// one; a clean or absent entry means the stored record is current.
+func (ic *idCounters) peek(tableID uint64, colID uint32) (uint64, bool) {
+	if ctr, ok := ic.m[idCounterKey{tableID, colID}]; ok && ctr.dirty {
+		return ctr.next, true
+	}
+	return 0, false
 }
 
 // identityOwner returns the reservation guard for desc's identity
@@ -125,10 +308,11 @@ func identityOwner(e *Engine, desc *TableDesc) func(kvView) error {
 // bumpIdentityOnUpdate raises the counter of every identity column an
 // update sets, so later draws land past the new value. Bumps follow the
 // same mode split as fillIdentity: transactional in serialized mode
-// (rolled back with the update), through the non-transactional
-// allocator under concurrent writes (they stand, at worst a gap).
-// Negative values never collide with draws, which start at 1.
-func bumpIdentityOnUpdate(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, set map[string]any, newVals []any) error {
+// (rolled back with the update; through ids when the caller is a Txn),
+// through the non-transactional allocator under concurrent writes
+// (they stand, at worst a gap). Negative values never collide with
+// draws, which start at 1.
+func bumpIdentityOnUpdate(e *Engine, tx *btypedb.Tx[string, []byte], ids *idCounters, desc *TableDesc, set map[string]any, newVals []any) error {
 	if !desc.hasIdentity() {
 		return nil
 	}
@@ -141,16 +325,7 @@ func bumpIdentityOnUpdate(e *Engine, tx *btypedb.Tx[string, []byte], desc *Table
 		if !ok || n < 0 {
 			continue
 		}
-		c := &desc.Columns[ord]
-		key := identitySeqKey(desc.ID, c.ID)
-		what := desc.Name + "." + c.Name
-		var err error
-		if e.occ {
-			err = e.bumpCounterAllocTo(key, uint64(n)+1, what, identityOwner(e, desc))
-		} else {
-			err = bumpCounterTo(tx, key, uint64(n)+1, what)
-		}
-		if err != nil {
+		if err := bumpIdentity(e, tx, ids, desc, &desc.Columns[ord], uint64(n)+1); err != nil {
 			return err
 		}
 	}
@@ -239,6 +414,9 @@ func (t *Txn) RestartIdentity(table, column string, next int64) error {
 			"table", table, "column", column)
 	}
 	key := identitySeqKey(desc.ID, c.ID)
+	// The record is overwritten below; a cached entry flushed after it
+	// would put the old position back (see idCounters).
+	t.ids.forget(desc.ID, c.ID)
 	if err := t.tx.Set(key, binary.BigEndian.AppendUint64(nil, uint64(next))); err != nil {
 		return serr.Wrap(err, "op", "restart identity", "table", table, "column", column)
 	}
@@ -273,6 +451,11 @@ func (t *Txn) PeekIdentity(table, column string) (next uint64, ok bool, err erro
 	c, err := identityCol(desc, table, column)
 	if err != nil {
 		return 0, false, err
+	}
+	// Serialized mode: draws since the last flush live only in the
+	// transaction's counter cache, ahead of the stored record.
+	if v, ok := t.ids.peek(desc.ID, c.ID); ok {
+		return v, true, nil
 	}
 	key := identitySeqKey(desc.ID, c.ID)
 	if t.e.occ {

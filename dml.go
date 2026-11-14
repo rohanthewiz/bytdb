@@ -61,7 +61,7 @@ func (e *Engine) Insert(table string, vals ...any) error {
 		if err != nil {
 			return err
 		}
-		_, err = insertRow(e, tx, desc, vals)
+		_, err = insertRow(e, tx, nil, desc, vals)
 		return err
 	})
 	if err != nil {
@@ -84,7 +84,7 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 		if err != nil {
 			return err
 		}
-		stored, err := insertRow(e, tx, desc, vals)
+		stored, err := insertRow(e, tx, nil, desc, vals)
 		if err != nil {
 			return err
 		}
@@ -105,7 +105,9 @@ func (e *Engine) InsertReturning(table string, vals ...any) (Row, error) {
 // and bumps, which stay: they are harmless (at worst a gap) and, in
 // serialized mode, roll back with the transaction anyway if it aborts
 // (in concurrent-writes mode they are engine-level and always stand).
-func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals []any) ([]any, error) {
+// ids is the calling Txn's identity-counter cache, nil for a one-shot
+// write (see fillIdentity).
+func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], ids *idCounters, desc *TableDesc, vals []any) ([]any, error) {
 	// Every insert path (one-shot, Txn, SQL single and multi-row,
 	// INSERT ... SELECT, ON CONFLICT's insert arm) funnels through
 	// here, so this one check refuses growth for all of them — and,
@@ -122,7 +124,7 @@ func insertRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, vals 
 	if !tx.Writable() {
 		return nil, btypedb.ErrTxNotWritable
 	}
-	vals, drawn, err := fillIdentity(e, tx, desc, vals)
+	vals, drawn, err := fillIdentity(e, tx, ids, desc, vals)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +218,7 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 		if err != nil {
 			return err
 		}
-		_, updated, err = updateRow(e, tx, desc, pkVals, set)
+		_, updated, err = updateRow(e, tx, nil, desc, pkVals, set)
 		return err
 	})
 	if err != nil {
@@ -230,8 +232,8 @@ func (e *Engine) Update(table string, pkVals []any, set map[string]any) (bool, e
 // row — so callers reporting the final values (RETURNING) get engine
 // truth. Phase 1 computes and validates everything; phase 2 writes —
 // so any error leaves the transaction unmutated. A missing row is
-// (nil, false, nil), not an error.
-func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVals []any, set map[string]any) ([]any, bool, error) {
+// (nil, false, nil), not an error. ids is as for insertRow.
+func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], ids *idCounters, desc *TableDesc, pkVals []any, set map[string]any) ([]any, bool, error) {
 	oldKey, err := fullPKKey(desc, pkVals)
 	if err != nil {
 		return nil, false, err
@@ -345,7 +347,7 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], desc *TableDesc, pkVal
 	// UPDATE t SET id = 3 left the counter at 2 and the next two draws
 	// collided (deep-look D-19). Postgres does not bump here; bytdb's
 	// identity contract is the stricter one and update now honors it.
-	if err := bumpIdentityOnUpdate(e, tx, desc, set, newVals); err != nil {
+	if err := bumpIdentityOnUpdate(e, tx, ids, desc, set, newVals); err != nil {
 		return nil, false, err
 	}
 
