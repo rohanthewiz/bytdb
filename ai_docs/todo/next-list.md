@@ -173,7 +173,8 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   **License file in `bench/`.** It is an internal harness module and nothing
   imports it.
 - **N-045** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` ·
-  declined 2026-11-13 by the user after measuring (no session doc yet):
+  declined `2026-1113-2328-n045-measured-declined-typer-copy-trim` by the
+  user after measuring (trim in `0e02458`):
   **Cache the typed tree on prepared statements (D-40 step 3).** Measured
   on `BenchmarkDLPointSelectPrepared` (Apple M-series): the prepared point
   read is now 2.27 µs and 75 allocations (the plan's 3.9–4.9 µs and
