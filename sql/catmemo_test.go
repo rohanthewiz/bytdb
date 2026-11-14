@@ -214,9 +214,7 @@ func TestVirtualStaticPrefilter(t *testing.T) {
 	const ctes = `with l as (select id from users where id <= 3),
 		r as (select id, city as tag from users where id <= 3) `
 	var rows [][]any
-	for _, r := range exec(t, d, ctes+`select id, tag from r order by id`).Rows {
-		rows = append(rows, r)
-	}
+	rows = append(rows, exec(t, d, ctes+`select id, tag from r order by id`).Rows...)
 	if len(rows) != 3 {
 		t.Fatalf("fixture: want 3 rows, got %v", rows)
 	}
