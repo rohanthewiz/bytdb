@@ -41,15 +41,8 @@ are that plan's item IDs. The user asked for the plan to be implemented as
 written, so its six decisions (Q1–Q6) are taken at the plan's
 recommendations. Every phase of it (0–9) is on main and released in
 `v0.23.0` (N-044, closed); what remains is the pieces deliberately deferred
-(N-047, N-049; N-045 was declined after measuring, see Non-goals; N-046 is
-closed).
-
-- **N-047** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` · value low
-  **Remaining Phase 7 pieces.** D-47 second half (memoize catalog rows per
-  catalog version, excluding live tables such as `pg_stat_activity` and
-  sequence state, or push `table_name = 'x'` into the builders); D-45's
-  identity-counter batching (keep default-mode counters in the `Txn` until
-  commit) and lazy counter names.
+(N-049; N-045 was declined after measuring, see Non-goals; N-046 and N-047
+are closed).
 
 - **N-049** · raised `2026-1110-0757-deep-look-phase8-close` · value low
   **Capture GORM v2, golang-migrate and atlas statements verbatim.**
@@ -186,6 +179,48 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   typing well above this share of a hot statement.
 
 ## Closed
+
+- **N-047** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` ·
+  closed 2026-11-14, `2026-1114-0901-n047-catalog-memo-identity-batching`.
+  **Remaining Phase 7 pieces (D-47 second half, D-45 identity
+  batching).** Catalog:
+  system-table rows are memoized per `Engine.CatalogVersion`
+  (`sql/catmemo.go`), opt-in per table via `sysTableDef.byVersion`. The 17
+  catalog-derived tables are marked. `pg_stat_activity`, `pg_settings`
+  (per session) and `pg_sequences` (`last_value`) stay live, and the
+  constant tables are left unmarked because they are cheap. The version is
+  read before the build, so a racing DDL can only store newer rows, never
+  older. Memoizing alone gave 194 -> 88 µs, after which 98% of what was
+  left was the executor copying every virtual row before the WHERE. Two
+  executor changes followed in `sql/join.go`. A first-step virtual row now
+  passes through uncopied, and a lone virtual step's surviving rows are
+  cloned at `yield` (`joinRun.borrowed`). That clone is what keeps
+  `execSelect`'s `append` of expression columns from writing into a shared
+  row with spare capacity. Also, `joinRun.virtualRows` filters a virtual
+  step's rows by its static conjuncts once per join run. Those statics were
+  always computed but ignored for virtual tables. That replaces the
+  "push `table_name` into the builders" option and also covers CTEs, views
+  and derived tables. Identity: in serialized mode, `Txn.ids` (`idCounters`
+  in `identity.go`) holds counters in memory and writes them back at
+  commit (both `Txn.Commit` and `WriteTxn`) and at `Savepoint`.
+  `RollbackTo` drops the cache. `RestartIdentity` and `TRUNCATE ... RESTART
+  IDENTITY` drop entries before their direct writes, and `PeekIdentity`
+  reads dirty entries. One-shot writes keep the direct path (`ids` nil),
+  and OCC is unchanged. The counter name is built only on error. Measured
+  on an M3, median of 6: `DLCatalogColumns200` 200 -> 21 µs (723 KB -> 5 KB),
+  `DLCatalogAttributes200` 674 -> 133 µs (1.9 MB -> 85 KB), new
+  `DLInsertIdentity` (100 rows/txn) 1248 -> 871 ns/row (20 -> 12 allocs),
+  and WAL per identity row -57 bytes (`TestIdentityBatchLogsCounterOnce`).
+  `DLWriteTxnOneInsert` is unchanged. Tests: `sql/catmemo_test.go` (memo
+  reuse and invalidation, live tables, caller mutation, the yield clone,
+  prefilter semantics incl. LEFT JOIN ON vs WHERE, concurrent DDL under
+  -race) and `identity_batch_test.go`. Every lifecycle rule and the clone
+  were mutation-checked: removing each fails a test. Also passed: difftest
+  (16 corpus files vs Postgres 16) and `/verify` over pgwire, including a
+  restart. Left as is: OCC identity draws still build the key and name per
+  draw (the allocator threads the name into its errors), and hash-join
+  probes still allocate a key per row (`hashJoinKey`), now most of what the
+  attributes query costs.
 
 - **N-046** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` ·
   closed 2026-11-14,
