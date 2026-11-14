@@ -2142,22 +2142,17 @@ func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 	notFound := &Result{Notice: `index "` + s.Name + `" does not exist, skipping`}
 	table := s.Table
 	if table == "" {
-		var found []string
-		for _, tn := range d.e.Tables() {
-			if d.e.TableShared(tn).Index(s.Name) != nil {
-				found = append(found, tn)
-			}
+		var err error
+		if table, err = d.indexTable(s.Name, "DROP INDEX"); err != nil {
+			return nil, err
 		}
-		switch len(found) {
-		case 0:
+		if table == "" {
 			if s.IfExists {
 				return notFound, nil
 			}
-			return nil, serr.New("no such index", "index", s.Name)
-		case 1:
-			table = found[0]
-		default:
-			return nil, serr.New("index name is ambiguous; use DROP INDEX name ON table", "index", s.Name)
+			// Postgres's wording and class (42704 undefined_object), so a
+			// client that branches on the code sees what it would there.
+			return nil, serr.New(`index "`+s.Name+`" does not exist`, "index", s.Name)
 		}
 	} else if s.IfExists {
 		if t := d.e.TableShared(table); t == nil || t.Index(s.Name) == nil {
@@ -2165,6 +2160,63 @@ func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 		}
 	}
 	if err := d.e.DropIndex(table, s.Name); err != nil {
+		return nil, err
+	}
+	return &Result{}, nil
+}
+
+// indexTable finds the one table holding a secondary index called name,
+// for DROP INDEX and ALTER INDEX without an ON clause. It returns "" when
+// no table has one. A name on several tables is an error, because bytdb
+// names indexes per table and has no basis for picking one. stmt names
+// the statement for the hint.
+func (d *DB) indexTable(name, stmt string) (string, error) {
+	var found []string
+	for _, tn := range d.e.Tables() {
+		if d.e.TableShared(tn).Index(name) != nil {
+			found = append(found, tn)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return "", nil
+	case 1:
+		return found[0], nil
+	}
+	return "", serr.New("index name is ambiguous; use "+stmt+" name ON table", "index", name)
+}
+
+// execRenameIndex runs ALTER INDEX ... RENAME TO. A missing index is
+// Postgres's `relation "x" does not exist` (42P01), not DROP INDEX's
+// 42704, because ALTER INDEX resolves its target as a relation. With IF
+// EXISTS it becomes the matching "skipping" notice.
+//
+// A table's primary-key index (t_pkey) is listed in pg_indexes but has
+// no IndexDesc. Its name is derived from the table's name
+// (bytdb.PKConstraintName), so it can't be renamed. Saying so is clearer
+// than the "does not exist" that the lookup alone would report for an
+// index the catalog shows.
+func (d *DB) execRenameIndex(s *RenameIndex) (*Result, error) {
+	table := s.Table
+	if table == "" {
+		var err error
+		if table, err = d.indexTable(s.Name, "ALTER INDEX"); err != nil {
+			return nil, err
+		}
+	}
+	if table == "" || d.e.TableShared(table) == nil || d.e.TableShared(table).Index(s.Name) == nil {
+		for _, tn := range d.e.Tables() {
+			if (table == "" || tn == table) && s.Name == bytdb.PKConstraintName(tn) {
+				return nil, serr.New("a primary key index cannot be renamed; its name follows the table's",
+					"index", s.Name, "table", tn)
+			}
+		}
+		if s.IfExists {
+			return &Result{Notice: `relation "` + s.Name + `" does not exist, skipping`}, nil
+		}
+		return nil, serr.New(`relation "`+s.Name+`" does not exist`, "index", s.Name)
+	}
+	if err := d.e.RenameIndex(table, s.Name, s.To); err != nil {
 		return nil, err
 	}
 	return &Result{}, nil

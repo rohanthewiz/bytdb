@@ -362,7 +362,7 @@ func command(st Statement) string {
 	case *DropView:
 		return "DROP VIEW"
 	case *AddColumn, *DropColumn, *RenameTable, *RenameColumn,
-		*AddConstraint, *AddFK, *DropConstraint, *AlterOwner,
+		*AddConstraint, *AddFK, *AddUnique, *DropConstraint, *AlterOwner,
 		*AlterColumnDefault, *AlterColumnNotNull, *AlterColumnType,
 		*AlterColumnNoop, *AlterColumnRestart, *ReplacePrimaryKey:
 		return "ALTER TABLE"
@@ -370,6 +370,8 @@ func command(st Statement) string {
 		return "CREATE INDEX"
 	case *DropIndex:
 		return "DROP INDEX"
+	case *RenameIndex:
+		return "ALTER INDEX"
 	case *CreateSequence:
 		return "CREATE SEQUENCE"
 	case *DropSequence:

@@ -6,17 +6,31 @@ package pgwire_test
 // which statement. Each runs through pgx over the wire, the way the tool
 // would issue it (parameters as the tool binds them).
 //
-// Not covered here because their sources were not available to copy
-// from: GORM v2 beyond HasTable (TestClientProbes), golang-migrate and
-// atlas. goose's table locker (lock.NewPostgresTableLocker) needs
-// `now() + $3::interval`, and bytdb has no interval type (N-048), so only
-// its default migrator and session locker are listed.
+// GORM, golang-migrate and atlas (N-049) were captured, not hand-copied.
+// Each tool ran against a bytdbd with a pgx QueryTracer recording every
+// statement and its arguments: GORM through AutoMigrate (create, re-run,
+// model change, re-run), CRUD and the Migrator API; golang-migrate
+// through Up, Steps(-1), Force, Down and Drop on both its postgres
+// (lib/pq) and pgx/v5 drivers; atlas through Open, Inspect and Lock. The
+// text below is what they sent.
+//
+// goose's table locker (lock.NewPostgresTableLocker) needs `now() +
+// $3::interval`, and bytdb has no interval type (N-048), so only its
+// default migrator and session locker are listed. atlas's schema
+// inspection is not listed either. Every inspect query it sends needs
+// catalog surface bytdb lacks (N-055), so only its connect and lock
+// statements are here.
 
 import (
 	"context"
+	"errors"
+	"regexp"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // TestGooseVerbatim drives goose v3.27.2's Postgres dialect
@@ -140,5 +154,477 @@ func TestPgxVerbatim(t *testing.T) {
 	}
 	if err := c.QueryRow(ctx, `select $1::int8 + 1`, int64(2)).Scan(&n); err != nil || n != 3 {
 		t.Fatalf("after DeallocateAll: %d %v", n, err)
+	}
+}
+
+// gormQ holds GORM's statements, copied from what gorm.io/gorm v1.31.2
+// with gorm.io/driver/postgres v1.6.3 sent (see the file comment).
+// Parameters are $n because the driver's BindVarTo writes them that way.
+var gormQ = struct {
+	hasTable, columnTypes, uniqueNames, uniqueCols, formatType, colComment,
+	hasConstraint, hasIndex, hasColumn, getTables, getIndexes string
+}{
+	hasTable: `SELECT count(*) FROM information_schema.tables WHERE table_schema = CURRENT_SCHEMA() AND table_name = $1 AND table_type = $2`,
+	// Migrator.ColumnTypes, run by every AutoMigrate of an existing table.
+	columnTypes:   `SELECT c.column_name, c.is_nullable = 'YES', c.udt_name, c.character_maximum_length, c.numeric_precision, c.numeric_precision_radix, c.numeric_scale, c.datetime_precision, 8 * typlen, c.column_default, pd.description, c.identity_increment FROM information_schema.columns AS c JOIN pg_type AS pgt ON c.udt_name = pgt.typname LEFT JOIN pg_catalog.pg_description as pd ON pd.objsubid = c.ordinal_position AND pd.objoid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = c.table_name AND relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = c.table_schema)) where table_catalog = $1 AND table_schema = CURRENT_SCHEMA() AND table_name = $2`,
+	uniqueNames:   `SELECT constraint_name FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = $1 AND c.table_schema = CURRENT_SCHEMA() AND c.table_name = $2 AND constraint_type = $3`,
+	uniqueCols:    `SELECT c.column_name, constraint_name, constraint_type FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = $1 AND c.table_schema = CURRENT_SCHEMA() AND c.table_name = $2`,
+	formatType:    "SELECT a.attname as column_name, format_type(a.atttypid, a.atttypmod) AS data_type\tFROM pg_attribute a JOIN pg_class b ON a.attrelid = b.oid AND relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = CURRENT_SCHEMA())\tWHERE a.attnum > 0\tAND NOT a.attisdropped\tAND b.relname = $1",
+	colComment:    `SELECT description FROM pg_catalog.pg_description WHERE objsubid = (SELECT ordinal_position FROM information_schema.columns WHERE table_schema = CURRENT_SCHEMA() AND table_name = $1 AND column_name = $2) AND objoid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = $3 AND relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = CURRENT_SCHEMA()))`,
+	hasConstraint: `SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE table_schema = CURRENT_SCHEMA() AND table_name = $1 AND constraint_name = $2`,
+	hasIndex:      `SELECT count(*) FROM pg_indexes WHERE tablename = $1 AND indexname = $2 AND schemaname = CURRENT_SCHEMA()`,
+	hasColumn:     `SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE table_schema = CURRENT_SCHEMA() AND table_name = $1 AND column_name = $2`,
+	getTables:     `SELECT table_name FROM information_schema.tables WHERE table_schema = CURRENT_SCHEMA() AND table_type = $1`,
+	// Migrator.GetIndexes: the indexes that back no constraint.
+	getIndexes: "\nSELECT\n\tct.relname AS table_name,\n\tci.relname AS index_name,\n\ti.indisunique AS non_unique,\n\ti.indisprimary AS primary,\n\ta.attname AS column_name\nFROM\n\tpg_index i\n\tLEFT JOIN pg_class ct ON ct.oid = i.indrelid\n\tLEFT JOIN pg_class ci ON ci.oid = i.indexrelid\n\tLEFT JOIN pg_attribute a ON a.attrelid = ct.oid\n\tLEFT JOIN pg_constraint con ON con.conindid = i.indexrelid\nWHERE\n\ta.attnum = ANY(i.indkey)\n\tAND con.oid IS NULL\n\tAND ct.relkind = 'r'\n\tAND ct.relname = $1\n AND ct.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = CURRENT_SCHEMA())",
+}
+
+// gormInsertUser is Create's statement for the model the test uses; the
+// multi-row form and the upserts extend it.
+const gormInsertUser = `INSERT INTO "users" ("created_at","updated_at","deleted_at","name","email","age","balance","active","bio","company_id") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING "id"`
+
+// TestGormVerbatim drives GORM's statements (gorm.io/gorm v1.31.2,
+// gorm.io/driver/postgres v1.6.3) through a model's life: AutoMigrate
+// creates the tables, AutoMigrate runs again on the existing tables (the
+// introspection every application start repeats), the model changes, and
+// then CRUD and the Migrator API run. Before N-049 the second
+// AutoMigrate failed outright. information_schema.columns had no
+// identity_increment, the simple-protocol `LIMIT '1'` probe did not
+// parse, and a `uniqueIndex` field's index read as a UNIQUE constraint,
+// which AutoMigrate then dropped by a name that did not exist.
+func TestGormVerbatim(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+
+	var dbName string
+	if err := c.QueryRow(ctx, `SELECT CURRENT_DATABASE()`).Scan(&dbName); err != nil {
+		t.Fatal(err)
+	}
+	count := func(q string, args ...any) int64 {
+		t.Helper()
+		var n int64
+		if err := c.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return n
+	}
+
+	// --- AutoMigrate, first run: HasTable, then CreateTable and its
+	// indexes and comments.
+	if n := count(gormQ.hasTable, "companies", "BASE TABLE"); n != 0 {
+		t.Fatalf("HasTable before create: %d", n)
+	}
+	for _, q := range []string{
+		`CREATE TABLE "companies" ("id" bigserial,"name" varchar(100) NOT NULL,PRIMARY KEY ("id"))`,
+		`CREATE TABLE "users" ("id" bigserial,"created_at" timestamptz,"updated_at" timestamptz,"deleted_at" timestamptz,"name" varchar(64),"email" text NOT NULL,"age" smallint DEFAULT 18,"balance" numeric(10,2),"active" boolean DEFAULT true,"bio" text,"company_id" bigint,PRIMARY KEY ("id"),CONSTRAINT "fk_users_company" FOREIGN KEY ("company_id") REFERENCES "companies"("id"))`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS "idx_users_email" ON "users" ("email")`,
+		`CREATE INDEX IF NOT EXISTS "idx_users_name" ON "users" ("name")`,
+		`CREATE INDEX IF NOT EXISTS "idx_users_deleted_at" ON "users" ("deleted_at")`,
+		`COMMENT ON COLUMN "users"."bio" IS 'free text'`,
+	} {
+		mustExec(t, c, q)
+	}
+	if n := count(gormQ.hasTable, "users", "BASE TABLE"); n != 1 {
+		t.Fatalf("HasTable after create: %d", n)
+	}
+
+	// --- AutoMigrate, second run: ColumnTypes, whose scan GORM does
+	// column by column. A missing identity_increment failed the whole
+	// statement (42703).
+	type colType struct {
+		nullable           bool
+		udt                string
+		dflt, identityIncr *string
+	}
+	columnTypes := func(table string) map[string]colType {
+		t.Helper()
+		rows, err := c.Query(ctx, gormQ.columnTypes, dbName, table)
+		if err != nil {
+			t.Fatalf("ColumnTypes: %v", err)
+		}
+		defer rows.Close()
+		out := map[string]colType{}
+		for rows.Next() {
+			var (
+				name                       string
+				ct                         colType
+				maxLen, prec, radix, scale *int64
+				dtPrec, typLen             *int64
+				comment                    *string
+			)
+			if err := rows.Scan(&name, &ct.nullable, &ct.udt, &maxLen, &prec, &radix, &scale,
+				&dtPrec, &typLen, &ct.dflt, &comment, &ct.identityIncr); err != nil {
+				t.Fatalf("ColumnTypes scan: %v", err)
+			}
+			out[name] = ct
+		}
+		if rows.Err() != nil {
+			t.Fatalf("ColumnTypes: %v", rows.Err())
+		}
+		return out
+	}
+	cols := columnTypes("users")
+	if len(cols) != 11 {
+		t.Fatalf("ColumnTypes: %d columns, want 11: %v", len(cols), cols)
+	}
+	// GORM's autoIncrementValuePattern (driver migrator.go) is how it
+	// recognizes the bigserial key; identity_increment stays NULL for a
+	// serial-style column, as in Postgres.
+	autoInc := regexp.MustCompile(`^nextval\('"?[^']+seq"?'::regclass\)$`)
+	if id := cols["id"]; id.dflt == nil || !autoInc.MatchString(*id.dflt) || id.identityIncr != nil {
+		t.Errorf("id: default %v, identity_increment %v", id.dflt, id.identityIncr)
+	}
+	if email := cols["email"]; email.nullable || email.udt != "text" {
+		t.Errorf("email: %+v", email)
+	}
+
+	// GetRows: a LIMIT $1 probe in pgx's simple protocol, which inlines
+	// the bound 1 as the literal '1'.
+	rows, err := c.Query(ctx, `SELECT * FROM "users" LIMIT $1`, pgx.QueryExecModeSimpleProtocol, 1)
+	if err != nil {
+		t.Fatalf("GetRows: %v", err)
+	}
+	if n := len(rows.FieldDescriptions()); n != 11 {
+		t.Errorf("GetRows: %d fields", n)
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		t.Fatalf("GetRows: %v", rows.Err())
+	}
+
+	// The unique probes. idx_users_email came from CREATE UNIQUE INDEX
+	// (`uniqueIndex`), so it is no constraint: listing it made
+	// MigrateColumnUnique issue DROP CONSTRAINT "uni_users_email".
+	uniqueCols := func() map[string]string {
+		t.Helper()
+		rows, err := c.Query(ctx, gormQ.uniqueCols, dbName, "users")
+		if err != nil {
+			t.Fatalf("unique columns: %v", err)
+		}
+		defer rows.Close()
+		out := map[string]string{}
+		for rows.Next() {
+			var col, name, kind string
+			if err := rows.Scan(&col, &name, &kind); err != nil {
+				t.Fatal(err)
+			}
+			out[col] = kind + " " + name
+		}
+		return out
+	}
+	if got := uniqueCols(); len(got) != 1 || got["id"] != "PRIMARY KEY users_pkey" {
+		t.Errorf("unique columns after create: %v", got)
+	}
+	if n := count(`SELECT count(*) FROM (`+gormQ.uniqueNames+`) u`, dbName, "users", "UNIQUE"); n != 0 {
+		t.Errorf("UNIQUE constraints after create: %d", n)
+	}
+
+	// format_type per column, and the column comment (bytdb ignores
+	// COMMENT, so GORM re-sends it on each run, which is harmless).
+	ftypes := map[string]string{}
+	rows, err = c.Query(ctx, gormQ.formatType, "users")
+	if err != nil {
+		t.Fatalf("format_type: %v", err)
+	}
+	for rows.Next() {
+		var name, typ string
+		if err := rows.Scan(&name, &typ); err != nil {
+			t.Fatal(err)
+		}
+		ftypes[name] = typ
+	}
+	rows.Close()
+	if ftypes["name"] != "character varying(64)" || ftypes["balance"] != "numeric(10,2)" {
+		t.Errorf("format_type: %v", ftypes)
+	}
+	var desc string
+	if err := c.QueryRow(ctx, gormQ.colComment, "users", "bio", "users").Scan(&desc); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("column comment: %q %v", desc, err)
+	}
+	if n := count(gormQ.hasConstraint, "users", "fk_users_company"); n != 1 {
+		t.Errorf("HasConstraint fk: %d", n)
+	}
+	if n := count(gormQ.hasIndex, "users", "idx_users_email"); n != 1 {
+		t.Errorf("HasIndex: %d", n)
+	}
+
+	// --- The model changes: a wider name (and the smallint GORM re-asserts
+	// on every run, since bytdb stores it as int8; its identity USING is
+	// a no-op, not a table rewrite), three new columns, a composite index,
+	// and a field that gains `unique`.
+	for _, q := range []string{
+		`ALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(128) USING "name"::varchar(128)`,
+		`ALTER TABLE "users" ALTER COLUMN "age" TYPE smallint USING "age"::smallint`,
+		`ALTER TABLE "users" ADD "nickname" text`,
+		`ALTER TABLE "users" ADD "score" bigint`,
+		`ALTER TABLE "users" ADD "handle" text`,
+		`CREATE INDEX IF NOT EXISTS "idx_nick_age" ON "users" ("nickname","score")`,
+		`ALTER TABLE "users" ADD CONSTRAINT "uni_users_handle" UNIQUE ("handle")`,
+	} {
+		mustExec(t, c, q)
+	}
+	if got := uniqueCols(); len(got) != 2 || got["handle"] != "UNIQUE uni_users_handle" {
+		t.Errorf("unique columns after ADD CONSTRAINT: %v", got)
+	}
+	if n := count(gormQ.hasConstraint, "users", "uni_users_handle"); n != 1 {
+		t.Errorf("HasConstraint unique: %d", n)
+	}
+
+	// --- CRUD, with the argument types GORM binds.
+	var companyID int64
+	if err := c.QueryRow(ctx, `INSERT INTO "companies" ("name") VALUES ($1) RETURNING "id"`, "Acme").Scan(&companyID); err != nil {
+		t.Fatalf("Create company: %v", err)
+	}
+	now := time.Now()
+	var annID, id2 int64
+	if err := c.QueryRow(ctx, gormInsertUser, now, now, nil, "ann", "ann@x", uint64(18), 12.5, true, "", &companyID).Scan(&annID); err != nil {
+		t.Fatalf("Create user: %v", err)
+	}
+	rows, err = c.Query(ctx, `INSERT INTO "users" ("created_at","updated_at","deleted_at","name","email","age","balance","active","bio","company_id") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10),($11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING "id"`,
+		now, now, nil, "bob", "bob@x", uint64(18), 0.0, true, "", nil,
+		now, now, nil, "cy", "cy@x", uint64(18), 0.0, true, "", nil)
+	if err != nil {
+		t.Fatalf("Create batch: %v", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("Create batch: %v %v", ids, err)
+	}
+	id2 = ids[0]
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`SELECT * FROM "users" WHERE "users"."id" = $1 AND "users"."deleted_at" IS NULL ORDER BY "users"."id" LIMIT $2`, []any{uint(annID), 1}},
+		{`SELECT * FROM "users" WHERE email = $1 AND "users"."deleted_at" IS NULL ORDER BY "users"."id" LIMIT $2`, []any{"bob@x", 1}},
+		{`SELECT * FROM "users" WHERE "users"."deleted_at" IS NULL ORDER BY id`, nil},
+		{`SELECT * FROM "companies" WHERE "companies"."id" = $1`, []any{&companyID}},
+		{`SELECT "users"."id","users"."created_at","users"."updated_at","users"."deleted_at","users"."name","users"."email","users"."age","users"."balance","users"."active","users"."bio","users"."company_id","Company"."id" AS "Company__id","Company"."name" AS "Company__name" FROM "users" LEFT JOIN "companies" "Company" ON "users"."company_id" = "Company"."id" WHERE "users"."deleted_at" IS NULL`, nil},
+		{`SELECT count(*) FROM "users" WHERE age > $1 AND "users"."deleted_at" IS NULL`, []any{10}},
+		{`SELECT "name" FROM "users" WHERE "users"."deleted_at" IS NULL LIMIT $1 OFFSET $2`, []any{2, 1}},
+	} {
+		rows, err := c.Query(ctx, q.sql, q.args...)
+		if err == nil {
+			for rows.Next() {
+			}
+			rows.Close()
+			err = rows.Err()
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", q.sql, err)
+		}
+	}
+	mustExec(t, c, `UPDATE "users" SET "name"=$1,"updated_at"=$2 WHERE "users"."deleted_at" IS NULL AND "id" = $3`, "bobby", now, uint(id2))
+	mustExec(t, c, `UPDATE "users" SET "active"=$1,"age"=$2,"updated_at"=$3 WHERE "users"."deleted_at" IS NULL AND "id" = $4`, false, 40, now, uint(id2))
+	// OnConflict{Columns: email, DoUpdates: name}: the conflict target is
+	// the bare unique index, which Postgres accepts as an arbiter too.
+	var upID int64
+	if err := c.QueryRow(ctx, `INSERT INTO "users" ("created_at","updated_at","deleted_at","name","email","age","balance","active","bio","company_id") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT ("email") DO UPDATE SET "name"="excluded"."name" RETURNING "id"`,
+		now, now, nil, "ann2", "ann@x", uint64(18), 0.0, true, "", nil).Scan(&upID); err != nil || upID != annID {
+		t.Fatalf("upsert on email: %d %v", upID, err)
+	}
+	// A nested Transaction is a savepoint.
+	tx, err := c.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, gormInsertUser, now, now, nil, "dee", "dee@x", uint64(18), 0.0, true, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SAVEPOINT sp16082005902882369444`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, gormInsertUser, now, now, nil, "eve", "eve@x", uint64(18), 0.0, true, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT sp16082005902882369444`); err != nil {
+		t.Fatal(err)
+	}
+	tx.Rollback(ctx)
+	// Delete (soft), Unscoped().Delete, then Save of the gone row: its
+	// UPDATE matches nothing, so GORM falls back to an id upsert.
+	mustExec(t, c, `UPDATE "users" SET "deleted_at"=$1 WHERE "users"."id" = $2 AND "users"."deleted_at" IS NULL`, now, uint(id2))
+	mustExec(t, c, `DELETE FROM "users" WHERE "users"."id" = $1`, uint(id2))
+	if tag := mustExec(t, c, `UPDATE "users" SET "created_at"=$1,"updated_at"=$2,"deleted_at"=$3,"name"=$4,"email"=$5,"age"=$6,"balance"=$7,"active"=$8,"bio"=$9,"company_id"=$10 WHERE "users"."deleted_at" IS NULL AND "id" = $11`,
+		now, now, nil, "bobby", "bob@x", uint8(40), 0.0, true, "", nil, uint(id2)); tag.RowsAffected() != 0 {
+		t.Fatalf("Save of a deleted row updated %d", tag.RowsAffected())
+	}
+	var saved int64
+	if err := c.QueryRow(ctx, `INSERT INTO "users" ("created_at","updated_at","deleted_at","name","email","age","balance","active","bio","company_id","id") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT ("id") DO UPDATE SET "updated_at"=$12,"deleted_at"="excluded"."deleted_at","name"="excluded"."name","email"="excluded"."email","age"="excluded"."age","balance"="excluded"."balance","active"="excluded"."active","bio"="excluded"."bio","company_id"="excluded"."company_id" RETURNING "id"`,
+		now, now, now, "bobby", "bob@x", uint8(40), 0.0, true, "", nil, uint(id2), now).Scan(&saved); err != nil || saved != id2 {
+		t.Fatalf("Save upsert: %d %v", saved, err)
+	}
+
+	// --- The Migrator API.
+	if n := count(gormQ.hasColumn, "users", "name"); n != 1 {
+		t.Errorf("HasColumn: %d", n)
+	}
+	mustExec(t, c, `ALTER TABLE "users" RENAME COLUMN "nickname" TO "nick"`)
+	mustExec(t, c, `ALTER TABLE "users" RENAME COLUMN "nick" TO "nickname"`)
+	// GORM's DropColumn sends DROP COLUMN alone. bytdb refuses an indexed
+	// column where Postgres drops the index along with it (N-056), so the
+	// index goes first here.
+	mustExec(t, c, `DROP INDEX "idx_nick_age"`)
+	mustExec(t, c, `ALTER TABLE "users" DROP COLUMN "score"`)
+	mustExec(t, c, `ALTER INDEX "idx_users_name" RENAME TO "idx_users_name2"`)
+	if n := count(gormQ.hasIndex, "users", "idx_users_name2"); n != 1 {
+		t.Errorf("HasIndex after rename: %d", n)
+	}
+	mustExec(t, c, `DROP INDEX "idx_users_name2"`)
+	_, err = c.Exec(ctx, `DROP INDEX "idx_users_name2"`)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "42704" || pgErr.Message != `index "idx_users_name2" does not exist` {
+		t.Errorf("DROP INDEX of a missing index: %v", err)
+	}
+	mustExec(t, c, `ALTER TABLE "users" DROP CONSTRAINT "fk_users_company"`)
+	mustExec(t, c, `ALTER TABLE "users" ADD CONSTRAINT "fk_users_company" FOREIGN KEY ("company_id") REFERENCES "companies"("id")`)
+	rows, err = c.Query(ctx, gormQ.getTables, "BASE TABLE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if slices.Sort(tables); err != nil || !slices.Equal(tables, []string{"companies", "users"}) {
+		t.Errorf("GetTables: %v %v", tables, err)
+	}
+	// GetIndexes lists the indexes that back no constraint, joined to
+	// their columns through attnum = ANY(indkey), an int2vector.
+	rows, err = c.Query(ctx, gormQ.getIndexes, "users")
+	if err != nil {
+		t.Fatalf("GetIndexes: %v", err)
+	}
+	var idx []string
+	for rows.Next() {
+		var table, name, col string
+		var unique, primary bool
+		if err := rows.Scan(&table, &name, &unique, &primary, &col); err != nil {
+			t.Fatal(err)
+		}
+		idx = append(idx, name+"."+col)
+	}
+	rows.Close()
+	slices.Sort(idx)
+	if want := []string{"idx_users_deleted_at.deleted_at", "idx_users_email.email"}; !slices.Equal(idx, want) {
+		t.Errorf("GetIndexes: %v, want %v", idx, want)
+	}
+	// DropTable, child first. GORM may also send the parent first and
+	// rely on CASCADE dropping the child's foreign key, which bytdb
+	// refuses (N-056).
+	mustExec(t, c, `DROP TABLE IF EXISTS "users" CASCADE`)
+	mustExec(t, c, `DROP TABLE IF EXISTS "companies" CASCADE`)
+}
+
+// TestGolangMigrateVerbatim covers golang-migrate v4.20.1's postgres
+// driver (database/postgres/postgres.go, on lib/pq) and its pgx/v5
+// driver (database/pgx/v5/pgx.go), which send the same statements:
+// WithConnection's probes, ensureVersionTable under the advisory lock,
+// SetVersion's TRUNCATE and INSERT transaction, Version, and Drop. The lock
+// id is a decimal string (GenerateAdvisoryLockId) bound to a bigint
+// parameter. lib/pq's BeginTx opens the transaction with BEGIN READ
+// WRITE.
+func TestGolangMigrateVerbatim(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	var dbName, schema string
+	if err := c.QueryRow(ctx, `SELECT CURRENT_DATABASE()`).Scan(&dbName); err != nil || dbName == "" {
+		t.Fatalf("CURRENT_DATABASE: %q %v", dbName, err)
+	}
+	if err := c.QueryRow(ctx, `SELECT CURRENT_SCHEMA()`).Scan(&schema); err != nil || schema != "public" {
+		t.Fatalf("CURRENT_SCHEMA: %q %v", schema, err)
+	}
+	const lockID = "2467963925" // as captured: GenerateAdvisoryLockId("bytdb", "public", "schema_migrations")
+	mustExec(t, c, `SELECT pg_advisory_lock($1)`, lockID)
+	var n int
+	if err := c.QueryRow(ctx, `SELECT COUNT(1) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2 LIMIT 1`, schema, "schema_migrations").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("version table probe: %d %v", n, err)
+	}
+	mustExec(t, c, `CREATE TABLE IF NOT EXISTS "public"."schema_migrations" (version bigint not null primary key, dirty boolean not null)`)
+	mustExec(t, c, `SELECT pg_advisory_unlock($1)`, lockID)
+
+	setVersion := func(version int, dirty bool) {
+		t.Helper()
+		mustExec(t, c, `BEGIN READ WRITE`)
+		mustExec(t, c, `TRUNCATE "public"."schema_migrations"`)
+		if version >= 0 || dirty {
+			mustExec(t, c, `INSERT INTO "public"."schema_migrations" (version, dirty) VALUES ($1, $2)`, version, dirty)
+		}
+		mustExec(t, c, `COMMIT`)
+	}
+	version := func() (int, bool) {
+		t.Helper()
+		var v int
+		var dirty bool
+		err := c.QueryRow(ctx, `SELECT version, dirty FROM "public"."schema_migrations" LIMIT 1`).Scan(&v, &dirty)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return -1, false
+		}
+		if err != nil {
+			t.Fatalf("Version: %v", err)
+		}
+		return v, dirty
+	}
+	mustExec(t, c, `SELECT pg_advisory_lock($1)`, lockID)
+	setVersion(1, true)
+	// A migration file goes through in one Exec, statements and all.
+	mustExec(t, c, "CREATE TABLE users (\n  id bigserial PRIMARY KEY,\n  email text NOT NULL UNIQUE,\n  created_at timestamptz NOT NULL DEFAULT now()\n);\n")
+	setVersion(1, false)
+	setVersion(2, true)
+	mustExec(t, c, "ALTER TABLE users ADD COLUMN name text;\nCREATE INDEX users_name_idx ON users (name);\n")
+	setVersion(2, false)
+	mustExec(t, c, `SELECT pg_advisory_unlock($1)`, lockID)
+	if v, dirty := version(); v != 2 || dirty {
+		t.Fatalf("Version: %d %v", v, dirty)
+	}
+	// Down to nil: SetVersion(-1, true) writes the marker row, and the
+	// final SetVersion(-1, false) leaves the table empty.
+	setVersion(-1, true)
+	mustExec(t, c, "DROP TABLE users;\n")
+	setVersion(-1, false)
+	if v, _ := version(); v != -1 {
+		t.Fatalf("Version after down: %d", v)
+	}
+	// Drop: every base table in the schema.
+	rows, err := c.Query(ctx, `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema()) AND table_type='BASE TABLE'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || !slices.Equal(tables, []string{"schema_migrations"}) {
+		t.Fatalf("Drop's table list: %v %v", tables, err)
+	}
+	mustExec(t, c, `DROP TABLE IF EXISTS "schema_migrations" CASCADE`)
+}
+
+// TestAtlasVerbatim covers what atlas v1.3.0 (ariga.io/atlas/sql/postgres)
+// sends before inspecting: Open's parameter probe, InspectRealm's
+// search_path swap, and Lock's advisory lock (an fnv32 id bound as
+// uint32). The inspection that follows needs catalog surface bytdb lacks
+// (N-055).
+func TestAtlasVerbatim(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	var ver string
+	var am, crdb *string
+	if err := c.QueryRow(ctx, `SELECT current_setting('server_version_num'), current_setting('default_table_access_method', true), current_setting('crdb_version', true)`).Scan(&ver, &am, &crdb); err != nil {
+		t.Fatalf("paramsQuery: %v", err)
+	}
+	// atlas refuses below 10_00_00 and treats a non-NULL crdb_version as
+	// CockroachDB.
+	if len(ver) != 6 || ver < "100000" || crdb != nil {
+		t.Errorf("paramsQuery: version %q, crdb %v", ver, crdb)
+	}
+	var path, cleared string
+	if err := c.QueryRow(ctx, `SELECT current_setting('search_path'), set_config('search_path', '', false)`).Scan(&path, &cleared); err != nil || cleared != "" {
+		t.Fatalf("search_path swap: %q %q %v", path, cleared, err)
+	}
+	if err := c.QueryRow(ctx, `SELECT set_config('search_path', $1, false)`, path).Scan(&cleared); err != nil || cleared != path {
+		t.Fatalf("search_path restore: %q %v", cleared, err)
+	}
+	const lockID = uint32(2686470616) // fnv32("atlas_migrate_execute")
+	var got bool
+	if err := c.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, lockID).Scan(&got); err != nil || !got {
+		t.Fatalf("pg_try_advisory_lock: %v %v", got, err)
+	}
+	if err := c.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, lockID).Scan(&got); err != nil || !got {
+		t.Fatalf("pg_advisory_unlock: %v %v", got, err)
 	}
 }

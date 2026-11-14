@@ -54,10 +54,15 @@ CREATE TABLE items (
 - Composite primary keys: `PRIMARY KEY (a, b)`.
 - `NOT NULL` columns; NULL rejected with Postgres-worded errors (SQLSTATE 23502).
 - `UNIQUE` column and table constraints are sugar for a unique index named
-  `table_cols_key`, as in Postgres. Either `DROP INDEX` or
-  `ALTER TABLE t DROP CONSTRAINT table_cols_key` removes it. `DROP CONSTRAINT`
-  accepts any unique index's name, because the catalogs list every unique
-  index as a UNIQUE constraint. A plain index's name is refused.
+  `table_cols_key`, as in Postgres, or the `CONSTRAINT name` given. `ALTER
+  TABLE t ADD [CONSTRAINT n] UNIQUE (cols)` adds one to an existing table
+  (existing duplicates refuse it). Either `DROP INDEX` or `ALTER TABLE t DROP
+  CONSTRAINT name` removes it. The catalogs (`pg_constraint`,
+  `table_constraints`, `key_column_usage`, `constraint_column_usage`) list
+  UNIQUE constraints but not a bare `CREATE UNIQUE INDEX`, as Postgres does.
+  GORM's AutoMigrate relies on that difference. `DROP CONSTRAINT` still
+  accepts a bare unique index's name, as it always did, and refuses a plain
+  index's. *(verified in `sql/orm_ddl_test.go`)*
 - `CHECK` constraints, column-level or table-level, named or auto-named,
   enforced on INSERT and UPDATE with Postgres wording:
   `new row for relation "items" violates check constraint "items_price_check"`
@@ -153,8 +158,12 @@ CREATE TABLE items (
   (23505), and a column `DEFAULT` is cast along with the column — if it cannot
   be, the statement fails (drop the default first). Refused: a column on
   either side of a foreign key (drop the constraint first) and an identity
-  column to a non-int type. `SET STORAGE`, `SET COMPRESSION`, and `SET
-  STATISTICS` are accepted as no-ops (bytdb has no TOAST and no planner
+  column to a non-int type. A `TYPE` that names the column's current type
+  is a no-op with no rewrite, as in Postgres. So is a `USING c` or `USING
+  c::type` that restates it. GORM's AutoMigrate sends that form on every run
+  for a `smallint` field, because bytdb stores smallint as int8. Postgres
+  would rewrite the table for any `USING`, with the same result. `SET
+  STORAGE`, `SET COMPRESSION`, and `SET STATISTICS` are accepted as no-ops (bytdb has no TOAST and no planner
   statistics), so pg_dump output runs unmodified.
 - **Replacing the primary key** uses Postgres's two-action spelling:
   `ALTER TABLE t DROP CONSTRAINT t_pkey, ADD [CONSTRAINT n] PRIMARY KEY (a, b)`.
@@ -380,10 +389,19 @@ INSERT INTO t VALUES (1, 'x')
 ```sql
 CREATE UNIQUE INDEX users_email ON users (email);
 CREATE INDEX orders_by_age ON orders (age DESC, id);
-DROP INDEX orders_by_age ON orders;
+ALTER INDEX orders_by_age RENAME TO orders_age;
+DROP INDEX orders_age ON orders;
 ```
 
 - Unique and non-unique, multi-column, per-column `ASC`/`DESC`.
+- `ALTER INDEX [IF EXISTS] name [ON t] RENAME TO new` renames without
+  rebuilding: entries are keyed by the index's ID, not its name. It is the
+  only `ALTER INDEX` form. A table's `t_pkey` cannot be renamed, because its
+  name follows the table's. Index names in `DROP INDEX` and `ALTER INDEX` may
+  be qualified with `public.`. `ON t` (bytdb's addition) picks the table
+  when two tables have an index of that name. A missing index is
+  Postgres's `index "x" does not exist` (42704) for `DROP INDEX` and
+  `relation "x" does not exist` (42P01) for `ALTER INDEX`.
 - NULL never conflicts in a unique index (SQL semantics).
 - Backfill is atomic with the descriptor write: the index exists complete, or
   not at all.
@@ -999,10 +1017,21 @@ Tested against real clients, not just protocol specs:
   ActiveRecord/SQLAlchemy column introspection over
   `pg_attribute`/`pg_class`/`pg_type` (`pgwire/orm_test.go`)
 - **Migration tools and drivers**, statements copied verbatim from their
-  sources (`pgwire/orm_verbatim_test.go`): goose v3's version table,
-  `pg_tables` probe and advisory session lock; lib/pq's startup parameters
-  and `target_session_attrs` probes; pgx's `DeallocateAll`. goose's newer
-  table locker needs `interval`, which bytdb does not have.
+  sources or captured from the running tool (`pgwire/orm_verbatim_test.go`):
+  goose v3's version table, `pg_tables` probe and advisory session lock;
+  lib/pq's startup parameters and `target_session_attrs` probes; pgx's
+  `DeallocateAll`. GORM v1.31 (driver/postgres v1.6) runs AutoMigrate on new
+  and existing tables, CRUD, upserts, savepoints and the Migrator API.
+  golang-migrate v4.20, on both its lib/pq and pgx/v5 drivers, runs Up,
+  Down, Steps, Force and Drop. For atlas v1.3, only the connect probe and
+  advisory lock work: its schema inspection needs catalog tables bytdb lacks
+  (`pg_depend`, `pg_enum`, set-returning functions in the select list, …).
+  goose's newer table locker needs `interval`, which bytdb does not have.
+  Two GORM Migrator calls need a step first, because bytdb refuses to drop
+  something another object depends on, where Postgres drops the dependent
+  too. `DropColumn` of an indexed column needs the index dropped first.
+  `DropTable` of a parent before its child needs the child's foreign key
+  dropped first, or the child dropped first.
 - **Protocol 3.2 clients** (libpq 18, lib/pq with `max_protocol_version`):
   answered with NegotiateProtocolVersion and served as 3.0; `_pq_.` protocol
   options are reported as unrecognized
@@ -1011,12 +1040,17 @@ Tested against real clients, not just protocol specs:
 
 Constraints introspect through `information_schema.table_constraints`
 joined to `key_column_usage`: primary keys in key order, foreign keys with
-`position_in_unique_constraint`. Every unique index reports as a `UNIQUE`
-constraint, since `UNIQUE (cols)` is an index in bytdb, and NOT NULL
-columns do not appear as synthetic CHECK rows.
+`position_in_unique_constraint`. A UNIQUE constraint reports as `UNIQUE`,
+and a bare `CREATE UNIQUE INDEX` does not, as in Postgres. Unique indexes
+created before bytdb told the two apart still report as constraints. NOT
+NULL columns do not appear as synthetic CHECK rows.
+`information_schema.columns` carries Postgres's identity family
+(`identity_start` … `identity_cycle`, `generation_expression`). For bytdb's
+serial-style key columns these read NULL, with `identity_cycle` `NO`, as a
+Postgres serial does.
 
 `pg_constraint` lists the same keys. Each table has one `p` row, and each
-unique index has one `u` row, next to the `c` (CHECK) and `f` (FOREIGN KEY)
+UNIQUE constraint has one `u` row, next to the `c` (CHECK) and `f` (FOREIGN KEY)
 rows. `conkey` holds the constrained columns' attnums as an array literal
 (`{1,2}`), so `attnum = ANY(conkey)` joins to `pg_attribute`. FK rows also
 carry `confkey`, the parent's attnums. A key row's `conindid` names its

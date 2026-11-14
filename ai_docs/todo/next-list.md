@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-055
+**Next ID:** N-057
 
 ## Open
 
@@ -40,19 +40,9 @@ N-045 to N-047 and N-049 come from one audit and share one plan,
 are that plan's item IDs. The user asked for the plan to be implemented as
 written, so its six decisions (Q1–Q6) are taken at the plan's
 recommendations. Every phase of it (0–9) is on main and released in
-`v0.23.0` (N-044, closed); what remains is the pieces deliberately deferred
-(N-049; N-045 was declined after measuring, see Non-goals; N-046 and N-047
-are closed).
-
-- **N-049** · raised `2026-1110-0757-deep-look-phase8-close` · value low
-  **Capture GORM v2, golang-migrate and atlas statements verbatim.**
-  `pgwire/orm_verbatim_test.go` holds goose, lib/pq and pgx statements copied
-  from their sources; the other three tools were not in the module cache, and
-  the plan asked for captured statements, not remembered ones. With network
-  access, read each tool's Postgres driver/dialect source (golang-migrate's
-  `database/postgres`, GORM's `gorm.io/driver/postgres` migrator, atlas's
-  inspect queries), copy the connect- and migration-time SQL into the same
-  test file, and fix whatever fails.
+`v0.23.0` (N-044, closed). The pieces deliberately deferred are settled
+too: N-045 was declined after measuring (see Non-goals), and N-046, N-047
+and N-049 are closed.
 
 - **N-050** · raised `2026-1111-1759-numeric-type-n048` · value low
   **Small-coefficient fast path for numeric (plan Q2).** `decimal.Decimal`
@@ -84,6 +74,37 @@ are closed).
   comparison; `interval` is the largest (a new value kind with calendar
   arithmetic). No consumer has asked.
 
+- **N-055** · raised `2026-1114-1610-n033-linux-pty-n049-orm-capture` · value low
+  **atlas schema inspection.** atlas v1.3.0 (`ariga.io/atlas/sql/postgres`)
+  connects and locks against bytdb (`TestAtlasVerbatim`), but every inspect
+  query it sends fails, each on different catalog surface (probed
+  2026-11-14). `schemasQuery` and `tablesQuery` need `pg_depend` and
+  `pg_partitioned_table`. `columnsQuery` needs `information_schema.columns`
+  `interval_type`/`character_set_name`/`collation_name`, plus
+  `col_description`, `pg_get_serial_sequence` and `quote_ident`. `fksQuery`
+  needs set-returning functions in the select list (`generate_series`,
+  `unnest` over `conkey`). `checksQuery` needs `array_position` over the
+  int2[] text form. The indexes query needs row-value comparison
+  `(a, b) = (c, d)`, `jsonb_object_agg`, `pg_get_expr`, three-argument
+  `pg_get_indexdef`, `pg_index_column_has_property`, `pg_opclass`,
+  `regnamespace` casts and `indclass[...]` subscripts. `enumsQuery` needs
+  `pg_enum`. The queries are in atlas's `sql/postgres/inspect.go` and
+  `driver.go`. No consumer has asked.
+- **N-056** · raised `2026-1114-1610-n033-linux-pty-n049-orm-capture` · value medium
+  **Should drops cascade to dependent indexes and FKs the way Postgres's
+  do?** bytdb runs every drop as RESTRICT (deep-look D-54: "remove the
+  dependent object first"), and two GORM Migrator calls hit that.
+  `DropColumn` of an indexed column fails with `cannot drop an indexed
+  column` (2BP01), where Postgres drops the index along with the column,
+  even without CASCADE. `DropTable` sends `DROP TABLE IF EXISTS parent
+  CASCADE` before the child when its model order puts the parent first, and
+  that fails with 2BP01, where Postgres drops the child's foreign-key
+  constraint. Changing either reverses D-54, so it's **the user's call**:
+  keep RESTRICT, or cascade to indexes on DROP COLUMN and to referencing
+  FK constraints (not tables) on DROP TABLE ... CASCADE, with Postgres's
+  `drop cascades to ...` notices. `TestGormVerbatim` drops the index and the
+  child first to work around it.
+
 ## Validate
 
 - **N-033** · raised `2026-1104-1337-bytdb-cli-shell` · value low
@@ -91,7 +112,7 @@ are closed).
   Interactive mode (liner line editing, raw/cooked terminal handoff
   around `.shell` / `.edit`, Ctrl-C cancelling a running query, Tab
   completion, history, width fitting) was exercised through a pty on
-  macOS in `2026-1104-1337`. **Linux done 2026-11-14:**
+  macOS in `2026-1104-1337`. **Linux done 2026-11-14** (`2026-1114-1610-n033-linux-pty-n049-orm-capture`):
   `pgwire/cmd/bytdb/testdata/ptydrive.py` drove the shell through a pty
   in docker (`golang:1.26.1` on arm64 natively, `python:3.13-slim` on
   amd64 under emulation), and all 23 checks passed on both. The checks
@@ -162,9 +183,6 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 - **N-012** · declined `2026-0916-1511-next-list-rebuild-and-drain`:
   **pgwire `v0.10.0` / `v0.11.0` tags stay unbackfilled.** The lockstep tag
   line resumes at `v0.12.0`.
-- **N-013** · declined `2026-0916-1557-sqlstate-gaps-constraint-catalog`:
-  **Unique indexes vs UNIQUE constraints in `table_constraints`.** bytdb can't
-  tell them apart, so every unique index reports as UNIQUE.
 - **N-014** · declined `2026-0916-1557-sqlstate-gaps-constraint-catalog`:
   **Synthetic NOT NULL CHECK rows in `table_constraints`.** Nullability is
   already in `information_schema.columns`.
@@ -191,6 +209,50 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-049** · raised `2026-1110-0757-deep-look-phase8-close` · closed
+  2026-11-14, `2026-1114-1610-n033-linux-pty-n049-orm-capture`.
+  **GORM v2, golang-migrate and atlas statements, captured.** Rather than
+  copying from source, each tool ran against a scratch bytdbd with a pgx
+  QueryTracer recording every statement and its arguments. GORM v1.31.2
+  (driver/postgres v1.6.3) ran AutoMigrate four times (create, re-run, model
+  change, re-run), then CRUD and the Migrator API. golang-migrate v4.20.1
+  ran on both its lib/pq and pgx/v5 drivers. atlas v1.3.0 ran Open,
+  Inspect and Lock. golang-migrate passed untouched. GORM's AutoMigrate on
+  an **existing table** had always failed, and these fixes make it work:
+  `information_schema.columns` gains Postgres's identity family
+  (`identity_increment` is what GORM selects); a quoted `LIMIT '1'` /
+  `OFFSET` count (pgx simple protocol) coerces as in Postgres, with 22P02 /
+  2201W/X errors; `attnum = ANY(indkey)` expands the int2vector text form;
+  `IndexDesc.IndexOnly` (JSON `omitempty`, so older indexes keep reading as
+  constraints) marks `CREATE UNIQUE INDEX` as a bare index, and
+  `pg_constraint`, `table_constraints`, `key_column_usage` and
+  `constraint_column_usage` leave it out. Before that, a `uniqueIndex` field
+  made AutoMigrate drop a constraint that didn't exist. This reverses N-013.
+  Also new: `ALTER TABLE ADD [CONSTRAINT n] UNIQUE (cols)`; CREATE TABLE
+  keeps a UNIQUE's `CONSTRAINT name`; `ALTER INDEX [IF EXISTS] name [ON t]
+  RENAME TO` (`Engine.RenameIndex`, descriptor-only); `public.`-qualified
+  index names; and DROP INDEX's `index "x" does not exist` (42704). An
+  identity `USING c::T` is no longer a table rewrite, and GORM re-sends it
+  for every smallint field on every run. The CLI `.dump` writes UNIQUE
+  constraints as `ADD CONSTRAINT … UNIQUE`. atlas inspection is left as
+  N-055, and the RESTRICT-only drops GORM hits as N-056. Tests:
+  `TestGormVerbatim`, `TestGolangMigrateVerbatim`, `TestAtlasVerbatim`,
+  `sql/orm_ddl_test.go` (each catalog view, names, ALTER INDEX, quoted
+  counts, int2vector, identity family, no-rewrite USING),
+  `TestRenameIndexAndIndexOnly` (reopen), the dump round trip and SQLSTATE
+  rows. Mutation-checked: each catalog filter, the vector parse, the
+  quoted count and the identity USING each fail a test when removed. PG16
+  (docker) confirmed every Postgres behavior claimed. Also fixed in passing
+  (`3514eae`): staticcheck S1011 in `sql/catmemo_test.go`, which had kept CI
+  red since `5c0eca5`.
+- **N-013** · declined `2026-0916-1557-sqlstate-gaps-constraint-catalog` ·
+  reversed and closed 2026-11-14, `2026-1114-1610-n033-linux-pty-n049-orm-capture`.
+  **Unique indexes vs UNIQUE constraints in `table_constraints`.** It was
+  declined because bytdb couldn't tell the two apart. N-049 found a consumer:
+  GORM's AutoMigrate drops a listed UNIQUE constraint that the model
+  declares as `uniqueIndex`, then fails. `IndexDesc.IndexOnly` now records
+  the difference and the four constraint views honor it. Indexes from
+  before the flag existed still read as constraints.
 - **N-047** · raised `2026-1110-0555-deep-look-phase7-part2-phase8-start` ·
   closed 2026-11-14, `2026-1114-0901-n047-catalog-memo-identity-batching`.
   **Remaining Phase 7 pieces (D-47 second half, D-45 identity

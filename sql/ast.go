@@ -699,10 +699,10 @@ type FKDef struct {
 // CreateTable is CREATE TABLE [IF NOT EXISTS] t (col type
 // [constraints], ..., [PRIMARY KEY (col, ...)],
 // [[CONSTRAINT name] CHECK (expr)], ...).
-// Uniques collects UNIQUE constraints — column-level and table-level
-// alike — as column lists; the executor lowers each to a unique index
-// (UNIQUE here is sugar over CREATE UNIQUE INDEX, as the pg_constraint
-// synthesis assumes). FKs collects FOREIGN KEY constraints, column-
+// Uniques collects UNIQUE constraints, column-level and table-level
+// alike. The executor lowers each to a unique index that the catalog
+// lists as a constraint (bytdb.IndexDesc.IndexOnly false), unlike CREATE
+// UNIQUE INDEX's. FKs collects FOREIGN KEY constraints, column-
 // level REFERENCES included. IfNotExists makes the statement a no-op
 // when a table of that name exists — a name check only; as in
 // Postgres, the existing table's schema is not compared to this one.
@@ -711,7 +711,7 @@ type CreateTable struct {
 	Cols        []ColDef
 	PK          []string
 	Checks      []CheckDef
-	Uniques     [][]string
+	Uniques     []UniqueDef
 	FKs         []FKDef
 	IfNotExists bool
 }
@@ -828,6 +828,23 @@ type AddConstraint struct {
 	Check CheckDef
 }
 
+// UniqueDef is one UNIQUE constraint: its columns and its CONSTRAINT
+// name. Name is "" when none was given, and the executor then uses
+// Postgres's table_cols_key.
+type UniqueDef struct {
+	Name string
+	Cols []string
+}
+
+// AddUnique is ALTER TABLE t ADD [CONSTRAINT name] UNIQUE (cols). Like
+// a CREATE TABLE UNIQUE, it lowers to a unique index listed as a
+// constraint. Existing rows are checked by the index backfill, which
+// fails on the first duplicate.
+type AddUnique struct {
+	Table  string
+	Unique UniqueDef
+}
+
 // AddFK is ALTER TABLE t ADD [CONSTRAINT name] FOREIGN KEY (cols)
 // REFERENCES parent [(cols)]. Existing rows are validated in the
 // transaction that publishes the constraint.
@@ -936,6 +953,16 @@ type CreateIndex struct {
 type DropIndex struct {
 	Name, Table string
 	IfExists    bool
+}
+
+// RenameIndex is ALTER INDEX [IF EXISTS] name [ON t] RENAME TO new.
+// As with DropIndex, no ON clause resolves the index by name across
+// tables; ON is bytdb's extension for when that is ambiguous, since
+// bytdb names indexes per table. IfExists turns a missing index into a
+// notice.
+type RenameIndex struct {
+	Name, Table, To string
+	IfExists        bool
 }
 
 // SeqOptions is the option list of CREATE or ALTER SEQUENCE. Pointer
@@ -1320,6 +1347,8 @@ func (*AlterColumnRestart) stmt() {}
 func (*ReplacePrimaryKey) stmt()  {}
 func (*CreateIndex) stmt()        {}
 func (*DropIndex) stmt()          {}
+func (*RenameIndex) stmt()        {}
+func (*AddUnique) stmt()          {}
 func (*CreateSequence) stmt()     {}
 func (*DropSequence) stmt()       {}
 func (*AlterSequence) stmt()      {}

@@ -250,6 +250,17 @@ type IndexDesc struct {
 	Cols   []int  `json:"cols"`
 	Unique bool   `json:"unique"`
 	Desc   []bool `json:"desc,omitempty"`
+	// IndexOnly marks a unique index made by CREATE UNIQUE INDEX, as
+	// opposed to one that implements a UNIQUE constraint. Both enforce
+	// uniqueness the same way. Only the catalog tells them apart:
+	// Postgres lists constraints in pg_constraint, table_constraints,
+	// key_column_usage and constraint_column_usage, and a bare unique
+	// index in none of them. Clients act on the difference. GORM's
+	// AutoMigrate reads a listed UNIQUE constraint on a `uniqueIndex`
+	// field as an undeclared constraint and drops it. It is false on every
+	// index written before the field existed, so those keep reading as
+	// constraints, as they did when created.
+	IndexOnly bool `json:"index_only,omitempty"`
 }
 
 // DescAt reports whether the i-th key column orders descending.

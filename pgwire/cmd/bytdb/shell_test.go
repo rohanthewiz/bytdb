@@ -146,6 +146,7 @@ CREATE TABLE "Customer" ("Id" int PRIMARY KEY, "full name" text NOT NULL, email 
 CREATE TABLE orders (id serial PRIMARY KEY, cust int REFERENCES "Customer" ("Id") ON DELETE CASCADE,
   total double precision, items text[], meta jsonb, ts timestamp, d date, u uuid, raw bytea, paid boolean);
 CREATE INDEX by_total ON orders (total DESC, id);
+CREATE UNIQUE INDEX orders_u ON orders (u);
 CREATE TABLE tree (id int PRIMARY KEY, parent int REFERENCES tree (id));
 INSERT INTO "Customer" VALUES (1, 'Ada O''Neil', 'ada@x.io', '2024-01-01 00:00:00'),
   (2, 'back\slash
@@ -169,6 +170,11 @@ CREATE VIEW a_view AS SELECT id FROM big_orders;
 	if code != 0 {
 		t.Fatalf("dump: code %d stderr %s", code, errOut)
 	}
+	// A UNIQUE constraint dumps as one and a bare unique index as an
+	// index, so the restore lists them in the catalog as before (N-049).
+	// The dump-equality check below confirms the kind survives.
+	mustContain(t, dump, `ALTER TABLE "Customer" ADD CONSTRAINT "Customer_email_key" UNIQUE (email);`,
+		"CREATE UNIQUE INDEX orders_u ON orders (u);")
 	// Foreign keys come after the data, views after their dependencies.
 	if i, j := strings.Index(dump, "INSERT INTO tree"), strings.Index(dump, "ADD CONSTRAINT tree_parent_fkey"); i < 0 || j < i {
 		t.Errorf("foreign key should follow the rows it validates:\n%s", dump)

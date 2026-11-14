@@ -117,11 +117,19 @@ func createTableDDL(desc *bytdb.TableDesc, inlineFKs bool) string {
 		strings.Join(parts, ",\n    ") + "\n);"
 }
 
-// indexDDL renders a CREATE INDEX statement. A UNIQUE constraint is
-// stored as a unique index, so it comes back as one: the same
-// enforcement, spelled as the index it always was.
+// indexDDL renders an index as the statement that recreates it. A
+// UNIQUE constraint is stored as a unique index that the catalog lists
+// as a constraint (IndexOnly false), so it comes back as ALTER TABLE ...
+// ADD CONSTRAINT ... UNIQUE. A restore then lists it in
+// table_constraints again, and a client that diffs constraints (GORM's
+// AutoMigrate) sees the same schema it left. A bare CREATE UNIQUE INDEX
+// comes back as one. A key column ordered DESC can only be written as
+// an index, so such a unique index is dumped as CREATE UNIQUE INDEX
+// whichever kind it is. Only an index from before IndexOnly existed can
+// be both.
 func indexDDL(desc *bytdb.TableDesc, ix *bytdb.IndexDesc) string {
 	cols := make([]string, len(ix.Cols))
+	anyDesc := false
 	for i, o := range ix.Cols {
 		name := "?"
 		if o >= 0 && o < len(desc.Columns) {
@@ -129,8 +137,13 @@ func indexDDL(desc *bytdb.TableDesc, ix *bytdb.IndexDesc) string {
 		}
 		if ix.DescAt(i) {
 			name += " DESC"
+			anyDesc = true
 		}
 		cols[i] = name
+	}
+	if ix.Unique && !ix.IndexOnly && !anyDesc {
+		return "ALTER TABLE " + quoteIdent(desc.Name) + " ADD CONSTRAINT " + quoteIdent(ix.Name) +
+			" UNIQUE (" + strings.Join(cols, ", ") + ");"
 	}
 	kw := "CREATE INDEX "
 	if ix.Unique {

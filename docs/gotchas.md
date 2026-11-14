@@ -135,7 +135,8 @@ Parse-time rejections with pointed errors:
 
 | Not supported | Use instead / note |
 |---|---|
-| `ALTER TABLE ... ADD UNIQUE` | `CREATE UNIQUE INDEX`, or the `UNIQUE` constraint sugar at create |
+| `ALTER INDEX` other than `RENAME TO` (`SET TABLESPACE`, storage parameters, `ATTACH PARTITION`) | bytdb has no physical storage settings to tune |
+| `ADD UNIQUE USING INDEX`, `UNIQUE NULLS NOT DISTINCT` | `ADD [CONSTRAINT n] UNIQUE (cols)` |
 | A lone `ALTER TABLE ... ADD PRIMARY KEY` (every table already has one) | Replace it: `DROP CONSTRAINT t_pkey, ADD PRIMARY KEY (...)` — the only multi-action `ALTER TABLE` accepted |
 | `ALTER COLUMN TYPE` on a foreign-key column (either side) | Drop the constraint, change the type on both sides, re-add it |
 | `RIGHT` / `FULL` / `NATURAL` joins | Rewrite as `LEFT`/`INNER` |

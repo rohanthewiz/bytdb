@@ -176,6 +176,9 @@ func TestInfoSchemaConstraints(t *testing.T) {
 		`create table orgs (id int, region text, code text, primary key (region, id))`,
 		`create unique index orgs_code on orgs (code)`,
 		`create index orgs_plain on orgs (code)`,
+		// A UNIQUE constraint lists; the bare unique index above does not
+		// (N-049: GORM's AutoMigrate drops a listed one it didn't declare).
+		`alter table orgs add constraint orgs_region_code unique (region, code)`,
 		`create table users (id int primary key, org_region text, org_id int,
 			age int constraint users_age_chk check (age >= 0),
 			constraint users_org_fk foreign key (org_region, org_id) references orgs (region, id))`,
@@ -187,8 +190,8 @@ func TestInfoSchemaConstraints(t *testing.T) {
 		from information_schema.table_constraints
 		where table_schema = 'public' order by table_name, constraint_name`)
 	want := [][]any{
-		{"orgs", "orgs_code", "UNIQUE", "YES"},
 		{"orgs", "orgs_pkey", "PRIMARY KEY", nil},
+		{"orgs", "orgs_region_code", "UNIQUE", "YES"},
 		{"users", "users_age_chk", "CHECK", nil},
 		{"users", "users_org_fk", "FOREIGN KEY", nil},
 		{"users", "users_pkey", "PRIMARY KEY", nil},

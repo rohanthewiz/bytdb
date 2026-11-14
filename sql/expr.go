@@ -472,10 +472,46 @@ func anyElems(env *exEnv, r Expr) (vals []any, isNull bool, err error) {
 	case []any:
 		return v, false, nil
 	case string:
+		if vals, ok := parseVectorText(v); ok {
+			return vals, false, nil
+		}
 		vals, err = parseArrayLiteral(v)
 		return vals, false, err
 	}
 	return nil, false, serr.New("ANY/ALL requires an array on the right-hand side")
+}
+
+// parseVectorText splits the text form of Postgres's int2vector and
+// oidvector ("1 3", space-separated, no braces) into its element
+// strings, which then coerce during comparison like an array literal's.
+// pg_index.indkey carries that form here, as it does in Postgres, and
+// catalog queries test it with `a.attnum = ANY(i.indkey)` (GORM's
+// Migrator.GetIndexes, among others). Postgres allows that because
+// int2vector is binary-coercible to int2[].
+//
+// bytdb has no vector type to key off, so the text itself decides: only
+// a string made entirely of space-separated unsigned integers qualifies.
+// That can't be mistaken for an array literal, which always starts with
+// '{'. The cost is that a bare literal such as ANY('1 2') is also
+// accepted, where Postgres would reject it as a malformed int[] literal.
+// That only turns an error into an answer. An empty string stays
+// malformed, as before: an empty int2vector is only possible for an
+// index with no columns, and bytdb never has one.
+func parseVectorText(s string) ([]any, bool) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return nil, false
+	}
+	vals := make([]any, len(fields))
+	for i, f := range fields {
+		for j := 0; j < len(f); j++ {
+			if f[j] < '0' || f[j] > '9' {
+				return nil, false
+			}
+		}
+		vals[i] = f
+	}
+	return vals, true
 }
 
 func arrayElems(env *exEnv, n *ExArray) ([]any, error) {
@@ -1534,7 +1570,7 @@ func constraintdef(d *DB, oid int64) any {
 			return "PRIMARY KEY (" + colList(desc, desc.PKCols) + ")"
 		}
 		for _, ix := range desc.Indexes {
-			if ix.Unique && oid == indexOID(desc.ID, ix.ID) {
+			if ix.Unique && !ix.IndexOnly && oid == indexOID(desc.ID, ix.ID) {
 				return "UNIQUE (" + colList(desc, ix.Cols) + ")"
 			}
 		}

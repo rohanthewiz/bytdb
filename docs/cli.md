@@ -188,7 +188,9 @@ during replay:
 1. sequences, with `setval` to restore each one's position
 2. `CREATE TABLE`, including the primary key, NOT NULL, DEFAULT, and CHECK
 3. the rows, as `INSERT`s wrapped in `BEGIN`/`COMMIT` every 10,000 rows
-4. indexes, including the unique indexes behind UNIQUE constraints
+4. indexes. A UNIQUE constraint is written as `ALTER TABLE … ADD CONSTRAINT …
+   UNIQUE` and a bare unique index as `CREATE UNIQUE INDEX`, so a restore lists
+   each in the catalog as before.
 5. foreign keys, as `ALTER TABLE … ADD CONSTRAINT`. They come after the
    data, so self-references and mutual references load cleanly.
 6. views, ordered so that each view comes after the views it reads

@@ -542,7 +542,7 @@ func moreSysTables() map[string]*sysTableDef {
 						add(desc.Name, desc.Columns[o].Name, bytdb.PKConstraintName(desc.Name))
 					}
 					for _, ix := range desc.Indexes {
-						if ix.Unique {
+						if ix.Unique && !ix.IndexOnly { // constraints only, as table_constraints
 							for _, o := range ix.Cols {
 								add(desc.Name, desc.Columns[o].Name, ix.Name)
 							}

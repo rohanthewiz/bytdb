@@ -238,14 +238,19 @@ func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 			return nil, err
 		}
 	}
-	// A unique constraint is a unique index in bytdb: UNIQUE (cols) is
-	// sugar for one, and pg_constraint / table_constraints list every
-	// unique index as a UNIQUE constraint (N-013). The name those
-	// catalogs show must therefore be droppable here, or a migration
-	// tool diffing pg_constraint would emit a DROP CONSTRAINT that
-	// fails. A plain index is not a constraint (the catalogs give it no
-	// row), so it still falls through to "does not exist", as in
-	// Postgres. Engine.DropIndex refuses when a foreign key depends on
+	// A unique constraint is a unique index in bytdb: UNIQUE (cols)
+	// lowers to one, which pg_constraint and table_constraints list as a
+	// UNIQUE constraint. The name those catalogs show must therefore be
+	// droppable here, or a migration tool diffing pg_constraint would
+	// emit a DROP CONSTRAINT that fails.
+	//
+	// A unique index made by CREATE UNIQUE INDEX (IndexOnly) is no
+	// constraint, and the catalogs no longer list it. Postgres would
+	// refuse to drop it as one. bytdb still accepts it, as it did when
+	// the catalog listed every unique index as a constraint. Accepting
+	// keeps those statements working and only turns Postgres's error into
+	// success. A plain index still falls through to "does not exist", as
+	// in Postgres. Engine.DropIndex refuses when a foreign key depends on
 	// the index's uniqueness, the same guard DROP INDEX gets.
 	if !existed {
 		if ix := desc.Index(s.Name); ix != nil && ix.Unique {

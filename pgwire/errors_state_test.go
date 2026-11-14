@@ -38,6 +38,18 @@ func TestSQLStateMapping(t *testing.T) {
 		{"numeric NaN and Infinity are not supported", false, "0A000"},
 		{"bad binary numeric parameter", false, "22P03"},
 
+		// N-049: a missing index, by DROP INDEX's Postgres wording and
+		// the engine's own text (42704); ALTER INDEX's relation wording
+		// (42P01); the primary-key index rename refusal; and a quoted
+		// LIMIT/OFFSET count's coercion errors.
+		{`index "idx_users_name2" does not exist`, false, "42704"},
+		{"no such index", false, "42704"},
+		{`relation "nope" does not exist`, false, "42P01"},
+		{"a primary key index cannot be renamed; its name follows the table's", false, "0A000"},
+		{"invalid input syntax for type bigint", false, "22P02"},
+		{"LIMIT must not be negative", false, "2201W"},
+		{"OFFSET must not be negative", false, "2201X"},
+
 		// A position always means the parser rejected the text,
 		// regardless of the message wording.
 		{"unexpected token", true, "42601"},

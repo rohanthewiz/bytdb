@@ -886,12 +886,16 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// the table. Engine DDL is one transaction per change, so a failed
 		// index (a bad column name, a duplicate) un-creates the table to
 		// keep CREATE TABLE all-or-nothing from the caller's view.
-		for _, ucols := range s.Uniques {
-			keys := make([]bytdb.IndexCol, len(ucols))
-			for i, c := range ucols {
+		for _, u := range s.Uniques {
+			keys := make([]bytdb.IndexCol, len(u.Cols))
+			for i, c := range u.Cols {
 				keys[i] = bytdb.IndexCol{Name: c}
 			}
-			idxName := s.Table + "_" + strings.Join(ucols, "_") + "_key"
+			idxName := u.Name
+			if idxName == "" {
+				idxName = s.Table + "_" + strings.Join(u.Cols, "_") + "_key"
+			}
+			// CreateIndexCols leaves IndexOnly false: a constraint.
 			if _, err := d.e.CreateIndexCols(s.Table, idxName, true, keys); err != nil {
 				d.e.DropTable(s.Table) // best-effort unwind; the create error matters more
 				return nil, err
@@ -1095,12 +1099,32 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		if name == "" {
 			name = d.generatedIndexName(s.Table, s.Cols)
 		}
-		if _, err := d.e.CreateIndexCols(s.Table, name, s.Unique, keys); err != nil {
+		// CREATE UNIQUE INDEX makes a bare index, not a constraint, so the
+		// catalog's constraint views leave it out, as Postgres's do.
+		spec := bytdb.IndexSpec{Name: name, Cols: keys, Unique: s.Unique, IndexOnly: s.Unique}
+		if _, err := d.e.CreateIndexSpec(s.Table, spec); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
+	case *AddUnique:
+		keys := make([]bytdb.IndexCol, len(s.Unique.Cols))
+		for i, c := range s.Unique.Cols {
+			keys[i] = bytdb.IndexCol{Name: c}
+		}
+		name := s.Unique.Name
+		if name == "" {
+			// Postgres's table_cols_key, numbered past a taken name as
+			// its generated names are.
+			name = d.freeIndexName(s.Table, s.Unique.Cols, "_key")
+		}
+		if _, err := d.e.CreateIndexCols(s.Table, name, true, keys); err != nil {
 			return nil, err
 		}
 		return &Result{}, nil
 	case *DropIndex:
 		return d.execDropIndex(s)
+	case *RenameIndex:
+		return d.execRenameIndex(s)
 	case *Truncate:
 		return d.execTruncate(s)
 	case *Vacuum:
@@ -1270,7 +1294,13 @@ func (d *DB) execDropTables(s *DropTable) (*Result, error) {
 // (table_col_idx1, ...) when that name is taken by another relation or
 // by one of the table's indexes.
 func (d *DB) generatedIndexName(table string, cols []string) string {
-	base := table + "_" + strings.Join(cols, "_") + "_idx"
+	return d.freeIndexName(table, cols, "_idx")
+}
+
+// freeIndexName is generatedIndexName with the suffix given: "_idx" for
+// an index, "_key" for a UNIQUE constraint's, as Postgres names them.
+func (d *DB) freeIndexName(table string, cols []string, suffix string) string {
+	base := table + "_" + strings.Join(cols, "_") + suffix
 	taken := func(name string) bool {
 		if desc := d.e.TableShared(table); desc != nil && desc.Index(name) != nil {
 			return true

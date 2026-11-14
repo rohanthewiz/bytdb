@@ -148,7 +148,8 @@ func sqlstate(msg string, hasPos bool) string {
 	case strings.HasPrefix(msg, "cannot cast type "):
 		return "42846" // cannot_coerce
 	case strings.Contains(msg, "subquery is not supported"),
-		strings.Contains(msg, "cached plan must not change result type"):
+		strings.Contains(msg, "cached plan must not change result type"),
+		strings.HasPrefix(msg, "a primary key index cannot be renamed"):
 		return "0A000" // feature_not_supported
 	// Schema changes refused because another object depends on the
 	// target: a foreign key, a CHECK, or an index. Postgres reports its
@@ -180,6 +181,13 @@ func sqlstate(msg string, hasPos bool) string {
 	case strings.Contains(msg, "constraint") && strings.Contains(msg, "already exists"):
 		return "42710" // duplicate_object
 	case strings.Contains(msg, "constraint") && strings.Contains(msg, "does not exist"):
+		return "42704" // undefined_object
+	// DROP INDEX of a missing index: the SQL layer's Postgres wording, and
+	// the engine's own text for a table-qualified DROP INDEX ... ON t.
+	// Both used to fall through to XX000, and a migration tool that
+	// tolerates 42704 then saw an internal error.
+	case strings.HasPrefix(msg, `index "`) && strings.HasSuffix(msg, `" does not exist`),
+		strings.Contains(msg, "no such index"):
 		return "42704" // undefined_object
 	case strings.Contains(msg, "prepared statement already exists"):
 		return "42P05" // duplicate_prepared_statement

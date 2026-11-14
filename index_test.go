@@ -427,3 +427,72 @@ func TestCompositeIndex(t *testing.T) {
 		t.Fatalf("partial bound = %v; want %v", got, want)
 	}
 }
+
+// TestRenameIndexAndIndexOnly covers N-049's engine pieces. RenameIndex
+// is descriptor-only, so entries keyed by the index ID still serve scans
+// under the new name. IndexOnly survives a reopen through the
+// JSON-encoded descriptor, and the positional CreateIndex forms leave it
+// false.
+func TestRenameIndexAndIndexOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ri.db")
+	e := openEngine(t, path)
+	peopleTable(t, e)
+	for i, name := range []string{"ann", "bob", "cy"} {
+		if err := e.Insert("people", int64(i+1), name, int64(30+i), name+"@x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.CreateIndexSpec("people", IndexSpec{Name: "people_email", Unique: true, IndexOnly: true,
+		Cols: []IndexCol{{Name: "email"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateIndex("people", "people_age", true, "age"); err != nil {
+		t.Fatal(err)
+	}
+	// IndexOnly is meaningless without Unique and is kept off.
+	if ix, err := e.CreateIndexSpec("people", IndexSpec{Name: "people_name", IndexOnly: true,
+		Cols: []IndexCol{{Name: "name"}}}); err != nil || ix.IndexOnly {
+		t.Fatalf("non-unique IndexOnly: %+v %v", ix, err)
+	}
+
+	if err := e.RenameIndex("people", "people_email", "people_mail"); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []struct{ from, to, want string }{
+		{"nope", "x", "no such index"},
+		{"people_mail", "people_age", `relation "people_age" already exists`},
+		{"people_mail", "people_pkey", `relation "people_pkey" already exists`},
+		{"people_mail", "", "new index name is required"},
+	} {
+		if err := e.RenameIndex("people", bad.from, bad.to); err == nil || !strings.Contains(err.Error(), bad.want) {
+			t.Errorf("RenameIndex(%q, %q): %v, want %q", bad.from, bad.to, err, bad.want)
+		}
+	}
+	e.Close()
+
+	e = openEngine(t, path)
+	defer e.Close()
+	desc := e.Table("people")
+	mail, age := desc.Index("people_mail"), desc.Index("people_age")
+	if desc.Index("people_email") != nil || mail == nil || !mail.IndexOnly || !mail.Unique {
+		t.Fatalf("after reopen: %+v", desc.Indexes)
+	}
+	if age == nil || age.IndexOnly {
+		t.Fatalf("CreateIndex's unique index: %+v", age)
+	}
+	// The entries moved with the name: a scan under it finds the row,
+	// and uniqueness still holds.
+	var names []string
+	for r, err := range e.ScanIndex("people", "people_mail", []any{"bob@x"}, []any{"bob@y"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, r.Vals[1].(string))
+	}
+	if !slices.Equal(names, []string{"bob"}) {
+		t.Fatalf("scan by renamed index: %v", names)
+	}
+	if err := e.Insert("people", int64(9), "dup", int64(99), "ann@x"); err == nil {
+		t.Fatal("renamed unique index stopped enforcing")
+	}
+}

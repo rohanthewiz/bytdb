@@ -315,7 +315,6 @@ func TestSQLAddDropConstraint(t *testing.T) {
 	}
 	for q, want := range map[string]string{
 		`alter table items add primary key (id)`:                    `multiple primary keys for table "items" are not allowed`,
-		`alter table items add constraint u unique (price)`:         "ADD UNIQUE is not supported",
 		`alter table items add foreign key (id) references o (id)`:  "does not exist",
 		`alter table nosuch add check (a > 0)`:                      "does not exist",
 		`alter table nosuch drop constraint c`:                      "does not exist",
@@ -327,10 +326,11 @@ func TestSQLAddDropConstraint(t *testing.T) {
 	}
 }
 
-// TestDropConstraintUnique: every unique index is listed as a UNIQUE
-// constraint in pg_constraint, so DROP CONSTRAINT must accept the
-// name the catalog shows — whichever way the index was created —
-// while a plain index, which the catalog omits, stays refused.
+// TestDropConstraintUnique: a UNIQUE constraint is listed in
+// pg_constraint, so DROP CONSTRAINT must accept the name the catalog
+// shows. A bare CREATE UNIQUE INDEX is not listed (N-049, as in
+// Postgres) but still drops by name, as it did before. A plain index,
+// which the catalog omits, stays refused.
 func TestDropConstraintUnique(t *testing.T) {
 	d := openDB(t)
 	exec(t, d, `create table acct (id int primary key, email text unique, a int, b int, tag text,
@@ -344,7 +344,7 @@ func TestDropConstraintUnique(t *testing.T) {
 		return exec(t, d, `select conname from pg_constraint
 			where conrelid = 'acct'::regclass and contype = 'u' order by 1`).Rows
 	}
-	if want := [][]any{{"acct_a_b_key"}, {"acct_email_key"}, {"acct_tag_u"}}; !reflect.DeepEqual(uniques(), want) {
+	if want := [][]any{{"acct_a_b_key"}, {"acct_email_key"}}; !reflect.DeepEqual(uniques(), want) {
 		t.Fatalf("before: got %v", uniques())
 	}
 

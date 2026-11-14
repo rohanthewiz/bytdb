@@ -41,6 +41,28 @@ func (e *Engine) CreateIndex(table, name string, unique bool, cols ...string) (*
 // CreateIndexCols is CreateIndex with per-column directions: a Desc
 // key column orders descending in the index's key space.
 func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCol) (*IndexDesc, error) {
+	return e.CreateIndexSpec(table, IndexSpec{Name: name, Unique: unique, Cols: cols})
+}
+
+// IndexSpec is the full shape of an index for CreateIndexSpec,
+// including the settings the positional CreateIndex forms leave at their
+// defaults.
+type IndexSpec struct {
+	Name   string
+	Cols   []IndexCol
+	Unique bool
+	// IndexOnly records that a unique index is a bare index, not a
+	// UNIQUE constraint (see IndexDesc.IndexOnly). The positional forms
+	// leave it false, so their unique indexes read as constraints, which
+	// is what they always did. The SQL layer sets it for CREATE UNIQUE
+	// INDEX.
+	IndexOnly bool
+}
+
+// CreateIndexSpec registers the index spec describes and backfills it
+// from existing rows, atomically, as CreateIndex does.
+func (e *Engine) CreateIndexSpec(table string, spec IndexSpec) (*IndexDesc, error) {
+	name, unique, cols := spec.Name, spec.Unique, spec.Cols
 	if name == "" {
 		return nil, serr.New("index name is required", "table", table)
 	}
@@ -57,7 +79,9 @@ func (e *Engine) CreateIndexCols(table, name string, unique bool, cols []IndexCo
 		if old.Index(name) != nil {
 			return nil, errRelationExists(name)
 		}
-		idx := IndexDesc{Name: name, Unique: unique, ID: primaryIndexID + 1}
+		// IndexOnly means nothing without Unique: a non-unique index is
+		// never a constraint, so the flag is kept off it.
+		idx := IndexDesc{Name: name, Unique: unique, IndexOnly: unique && spec.IndexOnly, ID: primaryIndexID + 1}
 		for _, x := range old.Indexes {
 			if x.ID >= idx.ID {
 				idx.ID = x.ID + 1
@@ -165,6 +189,46 @@ func (e *Engine) DropIndex(table, name string) error {
 	})
 	if err != nil {
 		return serr.Wrap(err, "op", "drop index", "table", table, "index", name)
+	}
+	return nil
+}
+
+// RenameIndex renames a secondary index on table. It only rewrites the
+// descriptor: index entries are keyed by the index's numeric ID
+// (indexPrefix(tableID, indexID)), never by its name, so nothing in the
+// key space moves and the rename costs the same on any table size.
+//
+// The new name must be free among table's indexes, the same per-table
+// scope CreateIndex checks (bytdb names indexes per table, unlike
+// Postgres's schema-wide relation namespace), and must not be the
+// table's primary-key name, which pg_indexes and table_constraints
+// already list. The primary key's own index has no IndexDesc, so it
+// cannot be renamed here and reads as "no such index".
+//
+// Renaming a unique index also renames the UNIQUE constraint it backs,
+// because the catalog lists every unique index as a constraint under the
+// index's name. That matches Postgres, where ALTER INDEX on a
+// constraint's index renames the constraint too.
+func (e *Engine) RenameIndex(table, oldName, newName string) error {
+	if newName == "" {
+		return serr.New("new index name is required", "table", table, "index", oldName)
+	}
+	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
+		if old.Index(oldName) == nil {
+			return nil, serr.New("no such index", "table", table, "index", oldName)
+		}
+		if newName == oldName {
+			return nil, nil // nothing to change; Postgres accepts it too
+		}
+		if old.Index(newName) != nil || newName == PKConstraintName(table) {
+			return nil, errRelationExists(newName)
+		}
+		desc := old.clone() // clone() copies Indexes, so the write below is private
+		desc.Index(oldName).Name = newName
+		return desc, nil
+	})
+	if err != nil {
+		return serr.Wrap(err, "op", "rename index", "table", table, "index", oldName, "to", newName)
 	}
 	return nil
 }

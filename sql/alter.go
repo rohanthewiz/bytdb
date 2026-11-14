@@ -8,6 +8,8 @@ package sql
 // rows, since the engine treats both expression languages as opaque.
 
 import (
+	"fmt"
+
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
 )
@@ -32,7 +34,10 @@ func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 	}
 	ch := bytdb.ColumnTypeChange{Type: s.Type, MaxLen: s.MaxLen, Precision: s.Precision, Scale: s.Scale}
 
-	if s.Using != nil {
+	// An identity USING is left off, so the engine sees that nothing
+	// changes and skips the table rewrite. Its no-op shortcut needs Using
+	// nil. See usingIsIdentity.
+	if s.Using != nil && !usingIsIdentity(s, desc.Columns[desc.ColIndex(s.Col)]) {
 		sc := tableScope(s.Table, desc)
 		if err := validateRowExpr(sc, s.Using, "transform expressions", "transform expression"); err != nil {
 			return nil, err
@@ -136,4 +141,60 @@ func rowEnvFor(d *DB, table string) func(bytdb.Row) *exEnv {
 		env.row = r.Vals
 		return env
 	}
+}
+
+// usingIsIdentity reports whether s's USING expression just restates the
+// column's current value: `USING c` or `USING c::T`, where T and the
+// TYPE clause both name the type col already has, modifiers included.
+//
+// GORM's AutoMigrate sends exactly this, on every run, for any column
+// whose reported type it doesn't recognize as its own spelling.
+// bytdb stores smallint as int8, so a `smallint` field gets
+// `ALTER COLUMN "age" TYPE smallint USING "age"::smallint` each time the
+// application starts. With USING present, the engine would rewrite every
+// row and rebuild every index to store the same values.
+//
+// It's an identity because col already has the target type: a cast to
+// a value's own type returns the value. Integer casts don't range-check
+// (smallint is int8 here), type modifiers on casts other than numeric's
+// are not applied, and a numeric(p,s) cast to the column's own (p,s)
+// only rounds what is already rounded. Postgres rewrites the table for
+// any USING, but the rows come out the same, so skipping the rewrite
+// changes nothing a reader can see.
+//
+// The column is the one read before the engine's DDL transaction. If a
+// concurrent ALTER changes its type in between, the engine sees a real
+// change with no USING, applies the automatic cast, and refuses when
+// there is none.
+func usingIsIdentity(s *AlterColumnType, col bytdb.Column) bool {
+	if col.Type != s.Type || col.MaxLen != s.MaxLen || col.Precision != s.Precision || col.Scale != s.Scale {
+		return false
+	}
+	isCol := func(e Expr) bool {
+		c, ok := e.(*ExCol)
+		return ok && c.Col.Name == s.Col && (c.Col.Table == "" || c.Col.Table == s.Table)
+	}
+	if isCol(s.Using) {
+		return true
+	}
+	cast, ok := s.Using.(*ExCast)
+	if !ok || !isCol(cast.E) || castColType(cast.Type) != s.Type {
+		return false
+	}
+	// castColType falls back to text for names it doesn't know, so a
+	// text column must be cast to a text spelling, not an unknown name
+	// that only defaulted to text.
+	if s.Type == bytdb.TString {
+		switch cast.Type {
+		case "text", "varchar", "string", "name":
+		default:
+			return false
+		}
+	}
+	// numeric(p,s) is the one cast that applies its modifier, so it
+	// must match the column's own. A bare numeric cast changes nothing.
+	if isNumericCast(cast.Type) && cast.Type != "numeric" && cast.Type != "decimal" {
+		return cast.Type == fmt.Sprintf("numeric(%d,%d)", s.Precision, s.Scale)
+	}
+	return true
 }

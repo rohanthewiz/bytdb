@@ -127,6 +127,8 @@ func writeTarget(st Statement) string {
 		return s.Table
 	case *AddFK:
 		return s.Table
+	case *AddUnique:
+		return s.Table
 	case *RenameTable:
 		return s.Table
 	case *RenameColumn:
@@ -148,6 +150,8 @@ func writeTarget(st Statement) string {
 	case *CreateIndex:
 		return s.Table
 	case *DropIndex:
+		return s.Table
+	case *RenameIndex:
 		return s.Table
 	case *CreateSequence:
 		return s.Name
@@ -747,7 +751,11 @@ var sysTables = map[string]*sysTableDef{
 					attnumArray(desc.PKCols), nil,
 				})
 				for _, ix := range desc.Indexes {
-					if !ix.Unique {
+					// A bare CREATE UNIQUE INDEX is no constraint: Postgres
+					// gives it no pg_constraint row, and clients key off
+					// that (GORM's GetIndexes lists exactly the indexes with
+					// no row here).
+					if !ix.Unique || ix.IndexOnly {
 						continue
 					}
 					ixOID := indexOID(desc.ID, ix.ID)
@@ -969,7 +977,7 @@ var sysTables = map[string]*sysTableDef{
 			for _, desc := range d.userDescs() {
 				add(desc, bytdb.PKConstraintName(desc.Name), "PRIMARY KEY", nil)
 				for _, ix := range desc.Indexes {
-					if ix.Unique {
+					if ix.Unique && !ix.IndexOnly { // a bare unique index is not a constraint
 						add(desc, ix.Name, "UNIQUE", "YES")
 					}
 				}
@@ -1014,7 +1022,7 @@ var sysTables = map[string]*sysTableDef{
 			for _, desc := range d.userDescs() {
 				add(desc, bytdb.PKConstraintName(desc.Name), desc.PKCols, false)
 				for _, ix := range desc.Indexes {
-					if ix.Unique {
+					if ix.Unique && !ix.IndexOnly { // constraints only, as table_constraints
 						add(desc, ix.Name, ix.Cols, false)
 					}
 				}
@@ -1037,7 +1045,17 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("numeric_precision", bytdb.TInt), sysCol("numeric_precision_radix", bytdb.TInt),
 			sysCol("numeric_scale", bytdb.TInt), sysCol("datetime_precision", bytdb.TInt),
 			sysCol("is_identity", bytdb.TString), sysCol("identity_generation", bytdb.TString),
-			sysCol("is_generated", bytdb.TString), sysCol("is_updatable", bytdb.TString)),
+			// The rest of Postgres's identity family, in its order. GORM's
+			// Migrator.ColumnTypes (gorm.io/driver/postgres) selects
+			// identity_increment by name on every AutoMigrate of an
+			// existing table, and atlas reads identity_start and
+			// generation_expression the same way, so a missing column
+			// fails the whole statement (42703) rather than reading NULL.
+			sysCol("identity_start", bytdb.TString), sysCol("identity_increment", bytdb.TString),
+			sysCol("identity_maximum", bytdb.TString), sysCol("identity_minimum", bytdb.TString),
+			sysCol("identity_cycle", bytdb.TString),
+			sysCol("is_generated", bytdb.TString), sysCol("generation_expression", bytdb.TString),
+			sysCol("is_updatable", bytdb.TString)),
 		rows: func(d *DB) [][]any {
 			// One row per column of every table: rows come from a slab
 			// sized up front rather than one allocation each. A
@@ -1049,7 +1067,7 @@ var sysTables = map[string]*sysTableDef{
 			for _, desc := range descs {
 				n += len(desc.Columns)
 			}
-			const width = 18
+			const width = 24
 			slab := make([]any, 0, n*width)
 			rows := make([][]any, 0, n)
 			for _, desc := range descs {
@@ -1079,6 +1097,12 @@ var sysTables = map[string]*sysTableDef{
 					}
 					// A serial-style column reports is_identity NO, as a
 					// Postgres serial does: its default is the nextval above.
+					// The identity_* sequence parameters are then NULL and
+					// identity_cycle is NO, which is what Postgres's view
+					// computes when no identity sequence is attached (its
+					// CASE over a NULL seqcycle). GORM keys auto-increment
+					// off either a nextval default or a non-empty
+					// identity_increment, so the default alone suffices.
 					// The numeric and datetime precisions describe the binary
 					// types (int8: 64 bits, float8: 53; timestamps: 6).
 					prec, radix, scale := colNumericPrecision(c)
@@ -1087,7 +1111,7 @@ var sysTables = map[string]*sysTableDef{
 						sysDatabase, "public", desc.Name, c.Name,
 						int64(i+1), dflt, nullable, colDataType(c), colUdtName(c),
 						maxLen, prec, radix, scale, datetimePrecision(c.Type),
-						"NO", nil, "NEVER", "YES",
+						"NO", nil, nil, nil, nil, nil, "NO", "NEVER", nil, "YES",
 					)
 					rows = append(rows, slab[start:len(slab):len(slab)])
 				}
@@ -1103,7 +1127,7 @@ var sysTables = map[string]*sysTableDef{
 						sysDatabase, "public", v.name, c.Name,
 						int64(j + 1), nil, "YES", sqlTypeName(c.Type), udtName(c.Type),
 						nil, prec, radix, scale, datetimePrecision(c.Type),
-						"NO", nil, "NEVER", "NO",
+						"NO", nil, nil, nil, nil, nil, "NO", "NEVER", nil, "NO",
 					})
 				}
 			}

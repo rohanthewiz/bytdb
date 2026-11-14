@@ -900,7 +900,7 @@ func isDDL(st Statement) bool {
 	case *CreateTable, *DropTable, *AddColumn, *DropColumn,
 		*RenameTable, *RenameColumn, *AlterColumnDefault, *AlterColumnNotNull,
 		*AlterColumnType, *ReplacePrimaryKey,
-		*AddConstraint, *AddFK, *DropConstraint, *CreateIndex, *DropIndex,
+		*AddConstraint, *AddFK, *AddUnique, *DropConstraint, *CreateIndex, *DropIndex, *RenameIndex,
 		*CreateSequence, *DropSequence, *AlterSequence,
 		*CreateView, *DropView:
 		return true

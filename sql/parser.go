@@ -344,6 +344,9 @@ func (p *parser) statement() (Statement, error) {
 		if p.acceptKw("sequence") {
 			return p.alterSequence()
 		}
+		if p.acceptKw("index") {
+			return p.alterIndex()
+		}
 		return p.alterTable()
 	case p.acceptKw("truncate"):
 		return p.truncateStmt()
@@ -1013,14 +1016,16 @@ func (p *parser) createTable() (Statement, error) {
 				return nil, err
 			}
 		case p.acceptKw("unique"):
-			// UNIQUE (a, b): sugar for a unique index over the columns.
-			// A CONSTRAINT name, like the primary key's, is accepted and
-			// dropped — the index gets the conventional table_cols_key name.
+			// [CONSTRAINT name] UNIQUE (a, b): a unique index over the
+			// columns, listed as a constraint. The CONSTRAINT name is kept,
+			// as Postgres keeps it, and becomes the index's name. GORM
+			// writes CONSTRAINT "uni_t_c" UNIQUE ("c") and later drops
+			// it by that name. Unnamed, it gets table_cols_key.
 			cols, err := p.identList("a unique column")
 			if err != nil {
 				return nil, err
 			}
-			ct.Uniques = append(ct.Uniques, cols)
+			ct.Uniques = append(ct.Uniques, UniqueDef{Name: cname, Cols: cols})
 		case p.acceptKw("foreign"):
 			if err := p.expectKw("key"); err != nil {
 				return nil, err
@@ -1058,7 +1063,7 @@ func (p *parser) createTable() (Statement, error) {
 				ct.PK = []string{col.Name}
 			}
 			if col.Unique {
-				ct.Uniques = append(ct.Uniques, []string{col.Name})
+				ct.Uniques = append(ct.Uniques, UniqueDef{Cols: []string{col.Name}})
 			}
 			if col.Ref != nil {
 				ct.FKs = append(ct.FKs, *col.Ref)
@@ -1723,7 +1728,7 @@ func (p *parser) dropIndex() (Statement, error) {
 		}
 		ifExists = true
 	}
-	name, err := p.ident("an index name")
+	name, err := p.indexName()
 	if err != nil {
 		return nil, err
 	}
@@ -1735,6 +1740,65 @@ func (p *parser) dropIndex() (Statement, error) {
 	}
 	p.dropBehavior()
 	return di, nil
+}
+
+// alterIndex parses the rest of ALTER INDEX; "alter index" is
+// consumed. Only RENAME TO is supported. It is the form ORMs emit (GORM's
+// Migrator.RenameIndex), and the other forms (SET TABLESPACE, storage
+// parameters, ATTACH PARTITION, column statistics) tune physical storage
+// bytdb doesn't have.
+//
+//	ALTER INDEX [IF EXISTS] name [ON t] RENAME TO new_name
+func (p *parser) alterIndex() (Statement, error) {
+	ri := &RenameIndex{}
+	if p.acceptKw("if") {
+		if err := p.expectKw("exists"); err != nil {
+			return nil, err
+		}
+		ri.IfExists = true
+	}
+	var err error
+	if ri.Name, err = p.indexName(); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("on") {
+		if ri.Table, err = p.tableName(); err != nil {
+			return nil, err
+		}
+	}
+	if !p.acceptKw("rename") {
+		return nil, p.unexpected("RENAME TO (the only ALTER INDEX form bytdb supports)")
+	}
+	if err := p.expectKw("to"); err != nil {
+		return nil, err
+	}
+	// The new name is never schema-qualified, in Postgres too: an index
+	// always stays in its table's schema.
+	if ri.To, err = p.ident("the new index name"); err != nil {
+		return nil, err
+	}
+	return ri, nil
+}
+
+// indexName parses an index name, optionally qualified by the public
+// schema ("public"."idx", which GORM and pg_dump both write). Indexes
+// live with their tables, so no other schema can hold one.
+func (p *parser) indexName() (string, error) {
+	first, err := p.ident("an index name")
+	if err != nil {
+		return "", err
+	}
+	if !p.acceptOp(".") {
+		return first, nil
+	}
+	name, err := p.ident("an index name")
+	if err != nil {
+		return "", err
+	}
+	if first != "public" {
+		return "", serr.New("no such schema", "schema", first)
+	}
+	return name, nil
 }
 
 // dropBehavior accepts a DROP's trailing CASCADE or RESTRICT. bytdb
@@ -1816,8 +1880,15 @@ func (p *parser) alterTableAction(table string) (Statement, error) {
 				"hint", "replace the key with ALTER TABLE "+table+" DROP CONSTRAINT "+
 					bytdb.PKConstraintName(table)+", ADD PRIMARY KEY (...)")
 		case p.acceptKw("unique"):
-			return nil, serr.New("ADD UNIQUE is not supported; use CREATE UNIQUE INDEX",
-				"table", table)
+			// ADD [CONSTRAINT name] UNIQUE (cols). GORM's
+			// Migrator.CreateConstraint emits it when a field gains a
+			// `unique` tag. Postgres's UNIQUE USING INDEX and NULLS [NOT]
+			// DISTINCT forms are not accepted.
+			cols, err := p.identList("a unique column")
+			if err != nil {
+				return nil, err
+			}
+			return &AddUnique{Table: table, Unique: UniqueDef{Name: cname, Cols: cols}}, nil
 		case p.acceptKw("foreign"):
 			if err := p.expectKw("key"); err != nil {
 				return nil, err
@@ -2785,6 +2856,27 @@ func (p *parser) nonNegInt(clause string) (int64, Param, error) {
 			def = -1
 		}
 		return def, v.(Param), nil
+	}
+	if t.kind == tString {
+		// A quoted count: Postgres types the literal as unknown, then
+		// coerces it to bigint, so LIMIT '10' works there and 'ten' fails
+		// as bigint input. pgx's simple protocol (QueryExecModeSimpleProtocol)
+		// sends every bound argument this way: GORM's Migrator.ColumnTypes
+		// probes `SELECT * FROM t LIMIT $1` with 1 bound and gets
+		// LIMIT '1' on the wire. int8in allows surrounding whitespace, so
+		// that is trimmed too.
+		n, err := strconv.ParseInt(strings.TrimSpace(t.text), 10, 64)
+		if err != nil {
+			return 0, 0, serr.New("invalid input syntax for type bigint", "value", t.text)
+		}
+		if n < 0 {
+			// Postgres's wording and class (2201W / 2201X via pgwire). The
+			// coercion runs at execution there, so this is an execution
+			// error, not the syntax error a bare negative number gets.
+			return 0, 0, serr.New(clause+" must not be negative", "got", t.text)
+		}
+		p.advance()
+		return n, 0, nil
 	}
 	if t.kind != tNumber {
 		return 0, 0, p.unexpected("a count after " + clause)
