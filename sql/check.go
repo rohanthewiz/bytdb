@@ -8,6 +8,7 @@ package sql
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/serr"
@@ -251,10 +252,12 @@ func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 	// keeps those statements working and only turns Postgres's error into
 	// success. A plain index still falls through to "does not exist", as
 	// in Postgres. Engine.DropIndex refuses when a foreign key depends on
-	// the index's uniqueness, the same guard DROP INDEX gets.
+	// the index's uniqueness, the same guard DROP INDEX gets, and
+	// CASCADE drops those foreign keys as it does there.
+	var deps []bytdb.Dependent
 	if !existed {
 		if ix := desc.Index(s.Name); ix != nil && ix.Unique {
-			if err := d.e.DropIndex(s.Table, s.Name); err != nil {
+			if deps, err = d.e.DropIndexWith(s.Table, s.Name, dropOpts(s.Cascade)); err != nil {
 				return nil, err
 			}
 			existed = true
@@ -273,18 +276,15 @@ func (d *DB) execDropConstraint(s *DropConstraint) (*Result, error) {
 		return nil, serr.New(`constraint "` + s.Name + `" of relation "` +
 			s.Table + `" does not exist`)
 	}
-	return &Result{}, nil
+	return &Result{Notice: strings.Join(cascadeNotices(deps), "\n")}, nil
 }
 
-// checkDropColumn rejects dropping a column a check constraint
-// mentions, as Postgres does without CASCADE.
-func (d *DB) checkDropColumn(table, col string) error {
-	return d.checkColumnUnmentioned(table, col, "drop")
-}
-
-// checkColumnUnmentioned rejects dropping or renaming a column a
-// check constraint mentions: check expressions are stored as text, so
-// either change would silently orphan the constraint.
+// checkColumnUnmentioned rejects renaming a column a check constraint
+// mentions: check expressions are stored as text, so the rename would
+// silently orphan the constraint. Postgres allows it, since it stores
+// the expression by column number. Dropping such a column is no longer
+// refused here: the engine drops the CHECK with the column, as Postgres
+// does (N-056, drop.go). verb names the change in the message.
 func (d *DB) checkColumnUnmentioned(table, col, verb string) error {
 	desc := d.e.TableShared(table)
 	if desc == nil {

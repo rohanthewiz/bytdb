@@ -431,8 +431,11 @@ func (d *DB) execCreateView(s *CreateView) (*Result, error) {
 	return &Result{}, nil
 }
 
+// execDropView runs DROP VIEW [IF EXISTS] v [CASCADE]. Views that read
+// v, directly or through other views, refuse the drop unless CASCADE
+// drops them too (Engine.DropViewWith).
 func (d *DB) execDropView(s *DropView) (*Result, error) {
-	existed, err := d.e.DropView(s.Name)
+	existed, deps, err := d.e.DropViewWith(s.Name, dropOpts(s.Cascade))
 	if err != nil {
 		return nil, err
 	}
@@ -442,5 +445,5 @@ func (d *DB) execDropView(s *DropView) (*Result, error) {
 		}
 		return nil, serr.New(`view "` + s.Name + `" does not exist`)
 	}
-	return &Result{}, nil
+	return &Result{Notice: strings.Join(cascadeNotices(deps), "\n")}, nil
 }

@@ -196,6 +196,11 @@ func TestErrors(t *testing.T) {
 // (dependent_objects_still_exist), whichever object is in the way. The
 // message fragment pins which refusal each statement actually hit, so
 // a reordered check can't silently route one through another's text.
+//
+// The drops are RESTRICT drops with Postgres's wording (N-056). Dropping
+// an indexed, CHECKed or FK column is no longer among them: Postgres
+// drops those dependents with the column, and so does bytdb
+// (TestDropCascadeWire).
 func TestDependencyRefusals(t *testing.T) {
 	ctx := context.Background()
 	c := connect(t, startServer(t))
@@ -203,16 +208,17 @@ func TestDependencyRefusals(t *testing.T) {
 	mustExec(t, c, `create table c (id int primary key, pid int references p (id),
 		pcode text references p (code), n int check (n > 0), k int)`)
 	mustExec(t, c, `create index c_k on c (k)`)
+	mustExec(t, c, `create view pv as select id, code from p`)
+	mustExec(t, c, `create view pv2 as select id from pv`)
 
 	for _, tc := range []struct{ q, frag string }{
-		{`drop table p`, "because other objects depend on it"},
-		{`alter table c drop column n`, "because other objects depend on it"},
+		{`drop table p`, "cannot drop table p because other objects depend on it"},
+		{`drop view pv`, "cannot drop view pv because other objects depend on it"},
+		{`alter table p drop column code`, "cannot drop column code of table p because other objects depend on it"},
 		{`alter table c rename column n to m`, "because other objects depend on it"},
-		{`alter table p drop constraint p_code_key`, "a foreign key depends on"},
-		{`drop index p_code_key`, "a foreign key depends on"},
+		{`alter table p drop constraint p_code_key`, "cannot drop index p_code_key because other objects depend on it"},
+		{`drop index p_code_key`, "cannot drop index p_code_key because other objects depend on it"},
 		{`alter table p drop constraint p_pkey, add primary key (id, note)`, "a foreign key depends on"},
-		{`alter table c drop column k`, "an indexed column"},
-		{`alter table c drop column pid`, "a foreign key column"},
 		{`alter table p rename to p2`, "referenced by a foreign key"},
 		{`alter table p rename column code to code2`, "referenced by a foreign key"},
 		{`alter table c alter column pid type text`, "a foreign key column"},
@@ -223,6 +229,25 @@ func TestDependencyRefusals(t *testing.T) {
 		if !errors.As(err, &pgErr) || pgErr.Code != "2BP01" || !strings.Contains(pgErr.Message, tc.frag) {
 			t.Errorf("%s\n  got: %+v\n  want: 2BP01 containing %q", tc.q, err, tc.frag)
 		}
+	}
+
+	// A RESTRICT drop's refusal carries Postgres's DETAIL (one line per
+	// dependent, transitive views included) and HINT, as PG16 sends them
+	// for the same schema. Before N-056 the HINT went out inside DETAIL,
+	// or not at all beside an explicit DETAIL.
+	var pgErr *pgconn.PgError
+	if _, err := c.Exec(ctx, `drop table p`); !errors.As(err, &pgErr) {
+		t.Fatalf("drop table p: %v", err)
+	}
+	wantDetail := "constraint c_pcode_fkey on table c depends on table p\n" +
+		"constraint c_pid_fkey on table c depends on table p\n" +
+		"view pv depends on table p\n" +
+		"view pv2 depends on view pv"
+	if pgErr.Detail != wantDetail {
+		t.Errorf("detail = %q\nwant %q", pgErr.Detail, wantDetail)
+	}
+	if pgErr.Hint != "Use DROP ... CASCADE to drop the dependent objects too." {
+		t.Errorf("hint = %q", pgErr.Hint)
 	}
 }
 

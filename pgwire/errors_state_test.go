@@ -123,15 +123,16 @@ func TestSQLStateMapping(t *testing.T) {
 		{"savepoint sp1 does not exist", false, "3B001"},
 
 		// Every dependency refusal shares one code, whichever object
-		// (FK, CHECK, index) is in the way.
-		{`cannot drop table "p" because other objects depend on it`, false, "2BP01"},
-		{`cannot drop column "a" of table "t" because other objects depend on it`, false, "2BP01"},
+		// (FK, CHECK, index, view) is in the way. The RESTRICT drops
+		// (N-056) carry bytdb.ErrDependentObjects too; their text maps
+		// the same without it.
+		{`cannot drop table p because other objects depend on it`, false, "2BP01"},
+		{`cannot drop column code of table p because other objects depend on it`, false, "2BP01"},
+		{`cannot drop index p_code_key because other objects depend on it`, false, "2BP01"},
+		{`cannot drop view v because other objects depend on it`, false, "2BP01"},
+		{`cannot drop desired object(s) because other objects depend on them`, false, "2BP01"},
 		{`cannot rename column "a" of table "t" because other objects depend on it`, false, "2BP01"},
-		{"cannot drop the unique index a foreign key depends on", false, "2BP01"},
 		{"cannot drop the primary key a foreign key depends on", false, "2BP01"},
-		{"cannot drop an indexed column; drop the index first", false, "2BP01"},
-		{"cannot drop a foreign key column; drop the constraint first", false, "2BP01"},
-		{"cannot drop a column referenced by a foreign key", false, "2BP01"},
 		{"cannot rename a table referenced by a foreign key", false, "2BP01"},
 		{"cannot rename a column referenced by a foreign key", false, "2BP01"},
 		{"cannot change the type of a foreign key column; drop the constraint first", false, "2BP01"},

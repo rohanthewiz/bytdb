@@ -42,6 +42,11 @@ func TestNoticeSeverities(t *testing.T) {
 	mustExec(t, c, `create sequence s`)
 	mustExec(t, c, `insert into t values (1, 1), (2, 2)`)
 	mustExec(t, c, `delete from t where id = 2`)
+	// For DROP ... CASCADE's notices (N-056).
+	mustExec(t, c, `create table p (id int primary key)`)
+	mustExec(t, c, `create table ch (id int primary key, pid int references p (id), k int)`)
+	mustExec(t, c, `create index ch_k on ch (k)`)
+	mustExec(t, c, `create view pv as select id from p`)
 
 	for _, tc := range []struct {
 		sql  string
@@ -65,6 +70,17 @@ func TestNoticeSeverities(t *testing.T) {
 			[]string{`NOTICE 00000 index "ghost" does not exist, skipping`}},
 		{`drop view if exists ghost`,
 			[]string{`NOTICE 00000 view "ghost" does not exist, skipping`}},
+		// DROP ... CASCADE reports each dropped dependent as Postgres's
+		// NOTICE 00000, after the IF EXISTS skips. Postgres folds two or
+		// more into one "drop cascades to 2 other objects" notice with a
+		// DETAIL. bytdb sends one each (sql/drop.go cascadeNotices).
+		{`drop table if exists ghost, p cascade`, []string{
+			`NOTICE 00000 table "ghost" does not exist, skipping`,
+			`NOTICE 00000 drop cascades to constraint ch_pid_fkey on table ch`,
+			`NOTICE 00000 drop cascades to view pv`,
+		}},
+		// An indexed column's index goes with it silently.
+		{`alter table ch drop column k`, nil},
 		{`vacuum v`,
 			[]string{`WARNING 01000 skipping "v" --- cannot vacuum non-tables or special system tables`}},
 		{`vacuum verbose v, t`, []string{

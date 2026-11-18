@@ -83,7 +83,9 @@ CREATE TABLE items (
   the same backfill limit as a `DEFAULT` backfill. *(verified in
   `alter_rebuild_test.go`, `sql/alter_test.go`)*
 - `ALTER TABLE t DROP COLUMN c` — also O(1); data stays under a retired column
-  ID and is skipped on decode.
+  ID and is skipped on decode. The column's indexes (multi-column ones
+  included), the CHECKs that mention it, and the table's own foreign keys
+  over it go with it, as in Postgres. See **Drops and dependencies** below.
 - `ALTER TABLE t ADD CONSTRAINT n CHECK (...)` validates existing rows;
   `DROP CONSTRAINT [IF EXISTS] n` drops a CHECK, a FOREIGN KEY, or a UNIQUE
   constraint (unique index) by name.
@@ -100,10 +102,35 @@ CREATE TABLE items (
   `t_col_idx`, numbered on collision as Postgres does), `CONCURRENTLY`,
   `ON ONLY`, `USING btree` (other access methods are refused), `ALTER TABLE
   [IF EXISTS] [ONLY]`, `DROP COLUMN IF EXISTS`, `DROP TABLE a, b` (all
-  checked before any is dropped), a trailing `CASCADE`/`RESTRICT` on drops
-  (both run as RESTRICT: a drop something depends on is refused), and `NOT
-  VALID` on `ADD CONSTRAINT` (existing rows are still checked). `CREATE TABLE
-  ... AS` is refused: the table would have no primary key.
+  checked before any is dropped, then dropped in one transaction), a
+  trailing `CASCADE`/`RESTRICT` on drops (they do what Postgres's do; see
+  **Drops and dependencies** below), and `NOT VALID` on `ADD CONSTRAINT`
+  (existing rows are still checked). `CREATE TABLE ... AS` is refused: the
+  table would have no primary key.
+- **Drops and dependencies** (N-056, which replaced D-54's RESTRICT-only
+  rule). A drop takes the target's own parts with it, CASCADE or not, and
+  treats separate objects that depend on it the way Postgres 16 does:
+  RESTRICT (the default) refuses with 2BP01, Postgres's message, a DETAIL
+  line per dependent and its HINT, while CASCADE drops them too, with a
+  `drop cascades to …` NOTICE each. Each drop is one DDL transaction, so it
+  happens whole or not at all.
+
+  | Statement | Goes with it, always | Needs CASCADE |
+  |---|---|---|
+  | `DROP TABLE t [, …]` | its rows, indexes, constraints, identity counters | foreign keys on other tables that reference it (the constraint, not the table); views reading it, and views reading those |
+  | `ALTER TABLE t DROP COLUMN c` | indexes including `c`; CHECKs mentioning `c`; `t`'s foreign keys over `c` | foreign keys (any table, `t` included) that reference `c` |
+  | `DROP INDEX i` / `DROP CONSTRAINT` of a UNIQUE | — | foreign keys whose referenced columns only `i` made unique |
+  | `DROP VIEW v` | — | views reading `v`, transitively |
+
+  `DROP TABLE parent, child` needs no CASCADE: references inside the list
+  don't count. Three differences remain. A primary-key column cannot be
+  dropped (a bytdb table always has a primary key). Views are not tracked
+  per column, because bytdb resolves a view's columns when it runs, where
+  Postgres binds them at `CREATE VIEW`, so a view that reads a dropped column
+  fails when queried instead of blocking the drop. And where Postgres folds
+  several cascaded objects into one "drop cascades to N other objects"
+  notice, bytdb sends one notice per object. *(verified in
+  `sql/drop_cascade_test.go`, `drop_test.go`)*
 - **`DEFAULT` values** are constant literals *plus exactly the clock markers*:
   `DEFAULT now()` (all `CURRENT_TIMESTAMP`-family spellings normalize to it)
   and `DEFAULT current_date`, evaluated once per INSERT statement so a
@@ -229,12 +256,13 @@ ALTER TABLE child DROP CONSTRAINT IF EXISTS child_p_fkey;
 - `ALTER TABLE ADD FOREIGN KEY` validates every existing row in the
   transaction that publishes the constraint — as two scans (parent keys
   materialize into a set), not a probe per row.
-- Schema guards: you cannot drop a referenced table, drop an FK column, drop
-  the unique index an FK depends on (by `DROP INDEX` or `DROP CONSTRAINT`), or
-  rename a referenced table out from under its children. Over the wire, every
-  such refusal is SQLSTATE 2BP01 (dependent_objects_still_exist), as are the
-  CHECK and index guards on dropping or renaming a column: drop the dependent
-  object first, then retry.
+- Schema guards: without CASCADE you cannot drop a referenced table, a
+  referenced column, or the unique index an FK depends on (by `DROP INDEX` or
+  `DROP CONSTRAINT`). With CASCADE the referencing constraint goes instead,
+  as in Postgres (see **Drops and dependencies** above). Dropping an FK's own
+  column drops the FK. Renaming a referenced table or column out from under
+  its children, or a column a CHECK mentions, is refused. Over the wire,
+  every such refusal is SQLSTATE 2BP01 (dependent_objects_still_exist).
 
 How a parent DELETE resolves:
 
@@ -1036,11 +1064,9 @@ Tested against real clients, not just protocol specs:
   advisory lock work: its schema inspection needs catalog tables bytdb lacks
   (`pg_depend`, `pg_enum`, set-returning functions in the select list, …).
   goose's newer table locker needs `interval`, which bytdb does not have.
-  Two GORM Migrator calls need a step first, because bytdb refuses to drop
-  something another object depends on, where Postgres drops the dependent
-  too. `DropColumn` of an indexed column needs the index dropped first.
-  `DropTable` of a parent before its child needs the child's foreign key
-  dropped first, or the child dropped first.
+  GORM's `DropColumn` of an indexed column drops the index with it, and its
+  `DropTable` of a parent before its child (`DROP TABLE … CASCADE`) drops
+  the child's foreign key, as in Postgres (N-056).
 - **Protocol 3.2 clients** (libpq 18, lib/pq with `max_protocol_version`):
   answered with NegotiateProtocolVersion and served as 3.0; `_pq_.` protocol
   options are reported as unrecognized

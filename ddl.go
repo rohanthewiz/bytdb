@@ -132,50 +132,14 @@ func validMaxLen(c Column) error {
 }
 
 // DropTable removes a table — descriptor, rows, and every index —
-// atomically. A table referenced by another table's foreign key
-// cannot be dropped (drop the referencing constraint or table first);
-// its own foreign keys go with it.
+// atomically, as DROP TABLE without CASCADE does. A table referenced by
+// another table's foreign key cannot be dropped (ErrDependentObjects);
+// its own foreign keys go with it. Views are not consulted: the engine
+// cannot read their SQL text. DropTables is the full form (several
+// tables, CASCADE, view dependencies).
 func (e *Engine) DropTable(name string) error {
-	// Captured for the post-commit allocator invalidation below; a
-	// retried closure just overwrites it with the same ID.
-	var droppedID uint64
-	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
-		desc, err := e.descFromView(tx, name)
-		if err != nil {
-			return err
-		}
-		droppedID = desc.ID
-		refs, err := e.referencingFKs(tx, name, true)
-		if err != nil {
-			return err
-		}
-		if len(refs) > 0 {
-			return serr.New(`cannot drop table "`+name+`" because other objects depend on it`,
-				"detail", `constraint "`+refs[0].FK.Name+`" on table "`+refs[0].Child.Name+
-					`" depends on table "`+name+`"`)
-		}
-		prefix := tableSpace(desc.ID)
-		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
-			return err
-		}
-		// The table's identity counters live in the system sequences
-		// table, outside its own key space.
-		idPrefix := identitySeqTablePrefix(desc.ID)
-		if _, err := tx.DeleteRange(string(idPrefix), string(tuple.PrefixEnd(idPrefix))); err != nil {
-			return err
-		}
-		_, err = tx.Delete(descKey(name))
-		return err
-	})
-	if err != nil {
-		return serr.Wrap(err, "op", "drop table", "table", name)
-	}
-	// In concurrent-writes mode the table's identity counters may have
-	// live in-memory allocators; drop them so no cached draw can write
-	// the deleted keys back.
-	e.invalidateCounterPrefix(string(identitySeqTablePrefix(droppedID)))
-	e.cacheEvict(name)
-	return nil
+	_, err := e.DropTables([]string{name}, DropOptions{})
+	return err
 }
 
 // AddColumn appends a column to a table. Without a DEFAULT no rows
@@ -419,101 +383,16 @@ func countRowsUpTo(tx *btypedb.Tx[string, []byte], tableID uint64, limit int64) 
 	return n
 }
 
-// DropColumn removes a column from a table. No rows are rewritten:
-// the column's data stays in old row values under its retired ID,
-// skipped on decode, and ages out as rows are updated. Key and indexed
-// columns cannot be dropped (drop the index first). A later AddColumn
-// with the same name gets a fresh ID, so the old data can never
-// resurface.
+// DropColumn removes a column from a table, as ALTER TABLE ... DROP
+// COLUMN without CASCADE does: indexes over the column and the table's
+// own foreign keys over it go with it, while a foreign key that
+// references the column refuses the drop (ErrDependentObjects). A
+// primary-key column cannot be dropped. CHECK constraints are left
+// alone, since the engine cannot read their SQL text. DropColumnWith
+// is the full form, documented there (CASCADE, CHECKs).
 func (e *Engine) DropColumn(table, name string) error {
-	// Captured for the post-commit allocator invalidation below ("" when
-	// the dropped column had no identity counter).
-	var droppedCounterKey string
-	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
-		ord := old.ColIndex(name)
-		if ord < 0 {
-			return nil, errNoSuchColumn(table, name)
-		}
-		if old.Columns[ord].Identity {
-			// The counter goes with the column; the column ID is never
-			// reused, so nothing can resurrect it.
-			droppedCounterKey = identitySeqKey(old.ID, old.Columns[ord].ID)
-			if _, err := tx.Delete(droppedCounterKey); err != nil {
-				return nil, err
-			}
-		}
-		if old.isPK(ord) {
-			return nil, serr.New("cannot drop a primary key column", "table", table, "column", name)
-		}
-		for i := range old.Indexes {
-			if slices.Contains(old.Indexes[i].Cols, ord) {
-				return nil, serr.New("cannot drop an indexed column; drop the index first",
-					"table", table, "column", name, "index", old.Indexes[i].Name)
-			}
-		}
-		// A column on either side of a foreign key cannot be dropped
-		// while the constraint stands (Postgres requires CASCADE).
-		for i := range old.ForeignKeys {
-			if slices.Contains(old.ForeignKeys[i].Cols, ord) {
-				return nil, serr.New("cannot drop a foreign key column; drop the constraint first",
-					"table", table, "column", name, "constraint", old.ForeignKeys[i].Name)
-			}
-		}
-		refs, err := e.referencingFKs(tx, table, false)
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range refs {
-			if slices.Contains(r.FK.RefCols, name) {
-				return nil, serr.New("cannot drop a column referenced by a foreign key",
-					"table", table, "column", name,
-					"constraint", r.FK.Name, "referencing_table", r.Child.Name)
-			}
-		}
-		desc := old.clone()
-		desc.Columns = slices.Delete(desc.Columns, ord, ord+1)
-		// Ordinal references above the removed column shift down by one.
-		for i, p := range desc.PKCols {
-			if p > ord {
-				desc.PKCols[i] = p - 1
-			}
-		}
-		for i := range desc.Indexes {
-			cols := slices.Clone(desc.Indexes[i].Cols)
-			for j, c := range cols {
-				if c > ord {
-					cols[j] = c - 1
-				}
-			}
-			desc.Indexes[i].Cols = cols
-		}
-		// Foreign-key child columns are stored as ordinals too, and must
-		// shift with the same rule. The guard above only refuses dropping a
-		// column that IS an FK child column; dropping an unrelated column
-		// with a LOWER ordinal is allowed, so without this the FK's Cols
-		// would keep pointing one slot too high — silently enforcing the
-		// constraint against the wrong column, or (when the child column
-		// was the last one) indexing past desc.Columns and panicking.
-		for i := range desc.ForeignKeys {
-			cols := slices.Clone(desc.ForeignKeys[i].Cols)
-			for j, c := range cols {
-				if c > ord {
-					cols[j] = c - 1
-				}
-			}
-			desc.ForeignKeys[i].Cols = cols
-		}
-		return desc, nil
-	})
-	if err != nil {
-		return serr.Wrap(err, "op", "drop column", "table", table, "column", name)
-	}
-	if droppedCounterKey != "" {
-		// Concurrent-writes mode: no cached draw may write the deleted
-		// counter key back.
-		e.invalidateCounter(droppedCounterKey)
-	}
-	return nil
+	_, err := e.DropColumnWith(table, name, DropOptions{})
+	return err
 }
 
 // SetColumnDefault sets or replaces a column's DEFAULT, given as the

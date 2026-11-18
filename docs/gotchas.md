@@ -262,8 +262,18 @@ Four semantic notes that surprise people (all Postgres-faithful):
   disable the cap with `Engine.SetBackfillLimit(n)` — `0` or less means no
   limit. The defaultless `ADD COLUMN` rewrites nothing and is never
   capped, however low the limit is set.
-- `DROP COLUMN` cannot drop a primary-key, indexed, or foreign-key column
-  (drop the index/constraint first).
+- `DROP COLUMN` cannot drop a primary-key column: a bytdb table always has a
+  primary key. Postgres drops the key with the column. Every other dependent
+  follows Postgres: the column's indexes, CHECKs and own foreign keys go
+  with it, and a foreign key referencing it needs CASCADE.
+- Views are not tracked per column. Postgres refuses `DROP COLUMN` (or, with
+  CASCADE, drops the view) when a view reads the column. bytdb resolves a
+  view's columns when the view runs, so the drop goes through and the view
+  fails when next queried. `DROP TABLE` and `DROP VIEW` do track the views
+  that read them.
+- A cascading drop sends one `drop cascades to …` NOTICE per dropped object.
+  Postgres sends one notice, "drop cascades to N other objects", with the
+  list in its DETAIL, when there is more than one.
 - Dropped-column data is not rewritten out of existing rows — it lingers under
   a retired column ID (invisible, but occupying space) until rows are updated
   or compaction-adjacent rewrites happen. Re-adding the same name gets a fresh

@@ -64,21 +64,12 @@ func (e *Engine) CreateView(name, query string, orReplace bool) error {
 // snapshot per referenced name (deep-look D-40 step 1).
 func (e *Engine) HasViews() bool { return e.viewCount.Load() > 0 }
 
-// DropView removes a view, reporting whether it existed.
+// DropView removes a view, reporting whether it existed. Views that
+// read it are not consulted: the engine cannot read their SQL text.
+// DropViewWith is the full form (view dependencies, CASCADE).
 func (e *Engine) DropView(name string) (bool, error) {
-	existed := false
-	err := e.updateDDL(func(tx *btypedb.Tx[string, []byte]) error {
-		var err error
-		existed, err = tx.Delete(viewKey(name))
-		return err
-	})
-	if err != nil {
-		return false, serr.Wrap(err, "op", "drop view", "view", name)
-	}
-	if existed {
-		e.viewCount.Add(-1)
-	}
-	return existed, nil
+	existed, _, err := e.DropViewWith(name, DropOptions{})
+	return existed, err
 }
 
 // View returns the named view, or nil — from the committed state at

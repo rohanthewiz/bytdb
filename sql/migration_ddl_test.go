@@ -129,9 +129,10 @@ func TestDropForms(t *testing.T) {
 	if d.e.TableShared("a") != nil || d.e.TableShared("b") != nil {
 		t.Fatal("tables survived DROP TABLE a, b")
 	}
-	// CASCADE does not cascade: a referenced table is refused, as RESTRICT.
-	if _, err := d.Exec(`drop table p cascade`); err == nil {
-		t.Fatal("DROP TABLE CASCADE of a referenced table succeeded")
+	// RESTRICT (the default) refuses a referenced table; CASCADE drops
+	// the referencing constraint, not the table (N-056).
+	if _, err := d.Exec(`drop table p restrict`); err == nil {
+		t.Fatal("DROP TABLE RESTRICT of a referenced table succeeded")
 	}
 	exec(t, d, `create index ch_pid on ch (pid)`)
 	exec(t, d, `drop index ch_pid restrict`)

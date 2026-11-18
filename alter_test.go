@@ -120,19 +120,17 @@ func TestDropColumnRestrictions(t *testing.T) {
 		!strings.Contains(err.Error(), "primary key") {
 		t.Fatalf("pk column drop: %v", err)
 	}
-	if err := e.DropColumn("people", "age"); err == nil ||
-		!strings.Contains(err.Error(), "drop the index first") {
-		t.Fatalf("indexed column drop: %v", err)
-	}
 	if err := e.DropColumn("people", "nope"); err == nil {
 		t.Fatal("unknown column drop accepted")
 	}
-	// After dropping the index, the column may go.
-	if err := e.DropIndex("people", "by-age"); err != nil {
-		t.Fatal(err)
-	}
+	// An indexed column drops with its index, as in Postgres, where
+	// the index depends on the column automatically (N-056). It used to
+	// be refused until the index was dropped first.
 	if err := e.DropColumn("people", "age"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("indexed column drop: %v", err)
+	}
+	if e.Table("people").Index("by-age") != nil {
+		t.Fatal("index over the dropped column survived")
 	}
 }
 

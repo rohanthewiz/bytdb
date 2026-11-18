@@ -724,6 +724,9 @@ type DropTable struct {
 	// is checked before any is dropped, so a missing one (without IF
 	// EXISTS) drops nothing, as in Postgres.
 	More []string
+	// Cascade is DROP ... CASCADE: dependents (other tables' foreign
+	// keys, views) are dropped too instead of refusing the drop.
+	Cascade bool
 }
 
 // Ignored is a statement bytdb accepts and does nothing for, because
@@ -794,10 +797,11 @@ type CreateView struct {
 	OrReplace bool
 }
 
-// DropView is DROP VIEW [IF EXISTS] name.
+// DropView is DROP VIEW [IF EXISTS] name [CASCADE | RESTRICT].
 type DropView struct {
 	Name     string
 	IfExists bool
+	Cascade  bool // views reading this one are dropped too
 }
 
 // AddColumn is ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] col type.
@@ -810,10 +814,11 @@ type AddColumn struct {
 	IfNotExists bool
 }
 
-// DropColumn is ALTER TABLE t DROP [COLUMN] col.
+// DropColumn is ALTER TABLE t DROP [COLUMN] col [CASCADE | RESTRICT].
 type DropColumn struct {
 	Table, Col string
 	IfExists   bool // DROP COLUMN IF EXISTS: a missing column is a notice
+	Cascade    bool // foreign keys referencing the column are dropped too
 }
 
 // RenameTable is ALTER TABLE t RENAME TO u.
@@ -853,11 +858,15 @@ type AddFK struct {
 	FK    FKDef
 }
 
-// DropConstraint is ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name.
+// DropConstraint is ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name
+// [CASCADE | RESTRICT].
 type DropConstraint struct {
 	Table    string
 	Name     string
 	IfExists bool
+	// Cascade drops the foreign keys that relied on a dropped UNIQUE
+	// constraint's uniqueness; the other kinds have no dependents.
+	Cascade bool
 }
 
 // AlterColumnDefault is ALTER TABLE t ALTER [COLUMN] c
@@ -953,6 +962,7 @@ type CreateIndex struct {
 type DropIndex struct {
 	Name, Table string
 	IfExists    bool
+	Cascade     bool // foreign keys that relied on the index's uniqueness are dropped too
 }
 
 // RenameIndex is ALTER INDEX [IF EXISTS] name [ON t] RENAME TO new.

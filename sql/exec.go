@@ -2159,10 +2159,11 @@ func (d *DB) execDropIndex(s *DropIndex) (*Result, error) {
 			return notFound, nil
 		}
 	}
-	if err := d.e.DropIndex(table, s.Name); err != nil {
+	deps, err := d.e.DropIndexWith(table, s.Name, dropOpts(s.Cascade))
+	if err != nil {
 		return nil, err
 	}
-	return &Result{}, nil
+	return &Result{Notice: strings.Join(cascadeNotices(deps), "\n")}, nil
 }
 
 // indexTable finds the one table holding a secondary index called name,

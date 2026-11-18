@@ -39,6 +39,8 @@ func sqlstateOf(err error, msg string, hasPos bool) string {
 		return "23514" // check_violation
 	case errors.Is(err, bytdb.ErrRelationExists):
 		return "42P07" // duplicate_table
+	case errors.Is(err, bytdb.ErrDependentObjects):
+		return "2BP01" // dependent_objects_still_exist: a RESTRICT drop
 	}
 	return sqlstate(msg, hasPos)
 }
@@ -160,28 +162,30 @@ func sqlstate(msg string, hasPos bool) string {
 		strings.HasPrefix(msg, "a primary key index cannot be renamed"):
 		return "0A000" // feature_not_supported
 	// Schema changes refused because another object depends on the
-	// target: a foreign key, a CHECK, or an index. Postgres reports its
-	// own such refusals (DROP without CASCADE) as 2BP01, and the remedy
-	// is the same for all of bytdb's: remove the dependent object first,
-	// then retry. That holds even where Postgres would have allowed the
-	// change (it tracks dependencies by oid, bytdb by name): renaming a
-	// referenced table or column, changing a FK column's type, renaming
-	// a column a CHECK mentions, or dropping an indexed or FK column,
-	// which Postgres would cascade. 0A000 would tell a client the change
-	// can never work, and it can once the dependent object is gone.
+	// target. The drops themselves follow Postgres (N-056, bytdb's
+	// drop.go): DROP TABLE / VIEW / INDEX / COLUMN without CASCADE
+	// refuse with Postgres's "cannot drop X because other objects depend
+	// on it". That error carries bytdb.ErrDependentObjects, mapped above,
+	// and the text case here keeps it 2BP01 when it reaches this switch
+	// without the sentinel. The rest are changes bytdb refuses where
+	// Postgres would allow them, because bytdb tracks dependencies by
+	// name and Postgres by oid: renaming a referenced table or column,
+	// changing a FK column's type, renaming a column a CHECK mentions,
+	// replacing the primary key a foreign key relies on. The remedy is
+	// to remove the dependent object first and retry. 0A000 would tell a
+	// client the change can never work, and it can once the dependent
+	// object is gone.
 	// The wordings covered, by origin:
-	//   "... because other objects depend on it"      DROP TABLE, DROP/RENAME COLUMN (CHECK)
-	//   "... a foreign key depends on"                 DROP INDEX / DROP CONSTRAINT, PK replace
-	//   "... referenced by a foreign key"             DROP/RENAME COLUMN, RENAME TABLE, ALTER TYPE
-	//   "cannot drop|change the type of a foreign key column"
-	//   "cannot drop an indexed column"
+	//   "... because other objects depend on it|them" DROP TABLE/VIEW/INDEX/COLUMN, RENAME COLUMN (CHECK)
+	//   "... a foreign key depends on"                 PK replace
+	//   "... referenced by a foreign key"             RENAME TABLE/COLUMN, ALTER TYPE
+	//   "cannot change the type of a foreign key column"
 	// The truncate case above says "referenced in", not "by", so it
 	// keeps Postgres's 0A000.
-	case strings.Contains(msg, "because other objects depend on it"),
+	case strings.Contains(msg, "because other objects depend on "),
 		strings.Contains(msg, "a foreign key depends on"),
 		strings.HasPrefix(msg, "cannot ") && (strings.Contains(msg, "referenced by a foreign key") ||
-			strings.Contains(msg, "a foreign key column") ||
-			strings.Contains(msg, "an indexed column")):
+			strings.Contains(msg, "a foreign key column")):
 		return "2BP01" // dependent_objects_still_exist
 	case strings.Contains(msg, "violates check constraint"),
 		strings.Contains(msg, "is violated by some row"):
@@ -332,6 +336,7 @@ func conflictBody() wbuf {
 //	column "c" of relation "t" already
 //	  exists, skipping                          NOTICE    42701 duplicate_column
 //	… does not exist, skipping                  NOTICE    00000
+//	drop cascades to … (DROP … CASCADE)         NOTICE    00000
 //	compacted the storage log: … (VERBOSE)      INFO      00000
 //	there is already a transaction in progress  WARNING   25001
 //	there is no transaction in progress,
@@ -351,9 +356,11 @@ func noticeBody(msg string) wbuf {
 		if strings.HasPrefix(msg, "column ") {
 			code = "42701" // duplicate_column
 		}
-	case strings.HasSuffix(msg, " does not exist, skipping"):
-		// Postgres's DROP ... IF EXISTS skips carry no errcode, so they
-		// get the NOTICE default, successful_completion.
+	case strings.HasSuffix(msg, " does not exist, skipping"),
+		strings.HasPrefix(msg, "drop cascades to "):
+		// Postgres's DROP ... IF EXISTS skips and DROP ... CASCADE's
+		// report carry no errcode, so they get the NOTICE default,
+		// successful_completion.
 		severity, code = "NOTICE", "00000"
 	case strings.HasPrefix(msg, "compacted the storage log: "):
 		// VACUUM VERBOSE's report (sql.vacuumReport). Postgres sends
@@ -402,13 +409,21 @@ func errorBody(err error, query string, base int) wbuf {
 	flds := serr.SErrFromErr(err).UserFields()
 	pos := -1
 	var detail []string
-	var explicit string
+	var explicit, hint string
 	for i := 0; i+1 < len(flds); i += 2 {
 		k, v := flds[i], flds[i+1]
 		if k == "pos" {
 			if p, perr := strconv.Atoi(v); perr == nil {
 				pos = p
 			}
+			continue
+		}
+		if k == "hint" {
+			// Postgres's HINT field. It used to ride in DETAIL as
+			// "hint: ...", or be dropped beside an explicit detail,
+			// which lost the "Use DROP ... CASCADE" advice a RESTRICT
+			// drop's refusal carries (N-056).
+			hint = v
 			continue
 		}
 		if k == "detail" {
@@ -437,6 +452,10 @@ func errorBody(err error, query string, base int) wbuf {
 	if len(detail) > 0 {
 		b.byte('D')
 		b.cstr(strings.Join(detail, ", "))
+	}
+	if hint != "" {
+		b.byte('H')
+		b.cstr(hint)
 	}
 	if pos >= 0 {
 		// Byte offset within the statement -> 1-based character

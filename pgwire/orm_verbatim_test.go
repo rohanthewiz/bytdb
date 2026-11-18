@@ -461,11 +461,14 @@ func TestGormVerbatim(t *testing.T) {
 	}
 	mustExec(t, c, `ALTER TABLE "users" RENAME COLUMN "nickname" TO "nick"`)
 	mustExec(t, c, `ALTER TABLE "users" RENAME COLUMN "nick" TO "nickname"`)
-	// GORM's DropColumn sends DROP COLUMN alone. bytdb refuses an indexed
-	// column where Postgres drops the index along with it (N-056), so the
-	// index goes first here.
-	mustExec(t, c, `DROP INDEX "idx_nick_age"`)
+	// GORM's DropColumn sends DROP COLUMN alone. score is the second
+	// column of idx_nick_age, and the index goes with the column, as in
+	// Postgres (N-056). Before that, bytdb refused the drop until the
+	// index was dropped first.
 	mustExec(t, c, `ALTER TABLE "users" DROP COLUMN "score"`)
+	if n := count(gormQ.hasIndex, "users", "idx_nick_age"); n != 0 {
+		t.Errorf("HasIndex after DropColumn: %d", n)
+	}
 	mustExec(t, c, `ALTER INDEX "idx_users_name" RENAME TO "idx_users_name2"`)
 	if n := count(gormQ.hasIndex, "users", "idx_users_name2"); n != 1 {
 		t.Errorf("HasIndex after rename: %d", n)
@@ -506,11 +509,18 @@ func TestGormVerbatim(t *testing.T) {
 	if want := []string{"idx_users_deleted_at.deleted_at", "idx_users_email.email"}; !slices.Equal(idx, want) {
 		t.Errorf("GetIndexes: %v, want %v", idx, want)
 	}
-	// DropTable, child first. GORM may also send the parent first and
-	// rely on CASCADE dropping the child's foreign key, which bytdb
-	// refuses (N-056).
-	mustExec(t, c, `DROP TABLE IF EXISTS "users" CASCADE`)
+	// DropTable in model order, which here puts the parent first. CASCADE
+	// drops the child's foreign key, not the child, with Postgres's
+	// notice (N-056). Before that, bytdb refused the parent, so this
+	// test dropped the child first.
 	mustExec(t, c, `DROP TABLE IF EXISTS "companies" CASCADE`)
+	if n := count(gormQ.hasConstraint, "users", "fk_users_company"); n != 0 {
+		t.Errorf("fk_users_company survived DROP TABLE companies CASCADE: %d", n)
+	}
+	mustExec(t, c, `DROP TABLE IF EXISTS "users" CASCADE`)
+	if n := count(gormQ.hasTable, "users", "BASE TABLE"); n != 0 {
+		t.Errorf("HasTable after DropTable: %d", n)
+	}
 }
 
 // TestGolangMigrateVerbatim covers golang-migrate v4.20.1's postgres

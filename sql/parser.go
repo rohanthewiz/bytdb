@@ -318,7 +318,7 @@ func (p *parser) statement() (Statement, error) {
 				}
 				dt.More = append(dt.More, name)
 			}
-			p.dropBehavior()
+			dt.Cascade = p.dropBehavior()
 			return dt, nil
 		case p.acceptKw("view"):
 			dv := &DropView{}
@@ -332,7 +332,7 @@ func (p *parser) statement() (Statement, error) {
 			if dv.Name, err = p.tableName(); err != nil {
 				return nil, err
 			}
-			p.dropBehavior()
+			dv.Cascade = p.dropBehavior()
 			return dv, nil
 		case p.acceptKw("sequence"):
 			return p.dropSequence()
@@ -1738,7 +1738,7 @@ func (p *parser) dropIndex() (Statement, error) {
 			return nil, err
 		}
 	}
-	p.dropBehavior()
+	di.Cascade = p.dropBehavior()
 	return di, nil
 }
 
@@ -1801,15 +1801,21 @@ func (p *parser) indexName() (string, error) {
 	return name, nil
 }
 
-// dropBehavior accepts a DROP's trailing CASCADE or RESTRICT. bytdb
-// does not cascade a drop into dependent objects; both run as RESTRICT,
-// which refuses a drop something depends on (a foreign key referencing
-// the table) and drops anything else — so a migration's DROP ... CASCADE
-// of an object nothing depends on runs unchanged (deep-look D-54).
-func (p *parser) dropBehavior() {
-	if !p.acceptKw("cascade") {
-		p.acceptKw("restrict")
+// dropBehavior accepts a DROP's trailing CASCADE or RESTRICT and
+// reports whether it was CASCADE. RESTRICT is the default, as in
+// Postgres. Either way a drop takes the target's own parts with it
+// (indexes and CHECKs over a dropped column, a dropped table's
+// constraints). RESTRICT refuses the drop when a separate object depends
+// on the target: another table's foreign key, or a view. CASCADE drops
+// those too, with a "drop cascades to ..." notice each (N-056, which
+// replaced deep-look D-54's RESTRICT-only rule; the engine side is
+// drop.go).
+func (p *parser) dropBehavior() bool {
+	if p.acceptKw("cascade") {
+		return true
 	}
+	p.acceptKw("restrict")
+	return false
 }
 
 // ignoreRest consumes the rest of the statement — up to its ';' or the
@@ -2074,6 +2080,7 @@ func (p *parser) alterTableAction(table string) (Statement, error) {
 				// run as one atomic re-key.
 				return p.replacePrimaryKey(table, dc)
 			}
+			dc.Cascade = p.dropBehavior()
 			return dc, nil
 		}
 		p.acceptKw("column")
@@ -2088,7 +2095,7 @@ func (p *parser) alterTableAction(table string) (Statement, error) {
 		if dc.Col, err = p.ident("a column name"); err != nil {
 			return nil, err
 		}
-		p.dropBehavior()
+		dc.Cascade = p.dropBehavior()
 		return dc, nil
 	case p.acceptKw("owner"):
 		// OWNER TO role — accepted for pg_dump/migration compatibility

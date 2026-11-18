@@ -256,45 +256,10 @@ func (d *DB) settingValue(name string) (string, bool) {
 
 // quoteIdent quotes an identifier when it would not survive unquoted:
 // anything but lowercase letters, digits, underscores and dollar signs
-// (not leading with a digit or dollar sign), or a reserved word.
-func quoteIdent(s string) string {
-	plain := s != "" && !reservedWords[s]
-	for i := 0; plain && i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z', c == '_':
-		case (c >= '0' && c <= '9') || c == '$':
-			plain = i > 0
-		default:
-			plain = false
-		}
-	}
-	if plain {
-		return s
-	}
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-}
-
-// reservedWords are Postgres's reserved keywords (the "reserved" and
-// "reserved (can be function or type)" classes): the words quote_ident
-// must quote even when they are otherwise plain.
-var reservedWords = func() map[string]bool {
-	m := map[string]bool{}
-	for _, w := range strings.Fields(`all analyse analyze and any array as asc
-		asymmetric authorization binary both case cast check collate collation
-		column concurrently constraint create cross current_catalog current_date
-		current_role current_schema current_time current_timestamp current_user
-		default deferrable desc distinct do else end except false fetch for
-		foreign freeze from full grant group having ilike in initially inner
-		intersect into is isnull join lateral leading left like limit localtime
-		localtimestamp natural not notnull null offset on only or order outer
-		overlaps placing primary references returning right select session_user
-		similar some symmetric system_user table tablesample then to trailing
-		true union unique user using variadic verbose when where window with`) {
-		m[w] = true
-	}
-	return m
-}()
+// (not leading with a digit or dollar sign), or a reserved word. The
+// rule and its reserved-word list live in the engine (bytdb.QuoteIdent),
+// which renders Postgres-worded drop refusals with it too.
+func quoteIdent(s string) string { return bytdb.QuoteIdent(s) }
 
 // serialSequence answers pg_get_serial_sequence(table, column): the
 // schema-qualified sequence a serial column's default draws from, or

@@ -132,8 +132,6 @@ func TestFKSchemaGuards(t *testing.T) {
 
 	wantErr(t, d, `drop table users`, "other objects depend on it")
 	wantErr(t, d, `alter table users drop column id`, "cannot drop a primary key column")
-	wantErr(t, d, `alter table orders drop column user_id`,
-		"cannot drop a foreign key column")
 	wantErr(t, d, `truncate users`, "cannot truncate a table referenced in a foreign key")
 	// Truncating parent and child together is fine.
 	exec(t, d, `truncate users, orders`)
@@ -142,7 +140,7 @@ func TestFKSchemaGuards(t *testing.T) {
 	exec(t, d, `create table emails (id int primary key, addr text unique)`)
 	exec(t, d, `create table subs (id int primary key, addr text references emails (addr))`)
 	wantErr(t, d, `drop index emails_addr_key`,
-		"cannot drop the unique index a foreign key depends on")
+		"cannot drop index emails_addr_key because other objects depend on it")
 	// ...until the constraint goes; then everything unwinds.
 	exec(t, d, `alter table subs drop constraint subs_addr_fkey`)
 	exec(t, d, `drop index emails_addr_key`)

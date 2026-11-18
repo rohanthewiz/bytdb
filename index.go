@@ -153,44 +153,14 @@ func (e *Engine) CreateIndexSpec(table string, spec IndexSpec) (*IndexDesc, erro
 	return created, nil
 }
 
-// DropIndex removes a secondary index and its entries atomically.
+// DropIndex removes a secondary index and its entries atomically, as
+// DROP INDEX without CASCADE does. A unique index whose uniqueness a
+// foreign key depends on cannot be dropped (ErrDependentObjects) unless
+// another unique key still covers the referenced columns.
+// DropIndexWith adds CASCADE.
 func (e *Engine) DropIndex(table, name string) error {
-	err := e.alterDesc(table, func(tx *btypedb.Tx[string, []byte], old *TableDesc) (*TableDesc, error) {
-		idx := old.Index(name)
-		if idx == nil {
-			return nil, serr.New("no such index", "table", table, "index", name)
-		}
-		// A unique index may be the uniqueness a foreign key depends on;
-		// dropping it would leave "the referenced row" undefined. Refuse
-		// unless another unique key still covers the referenced columns.
-		if idx.Unique {
-			refs, err := e.referencingFKs(tx, table, false)
-			if err != nil {
-				return nil, err
-			}
-			trimmed := old.clone() // clone() copies Indexes, so DeleteFunc is safe
-			trimmed.Indexes = slices.DeleteFunc(trimmed.Indexes,
-				func(x IndexDesc) bool { return x.Name == name })
-			for _, r := range refs {
-				if uniqueKeyCovers(old, r.FK.RefCols) && !uniqueKeyCovers(trimmed, r.FK.RefCols) {
-					return nil, serr.New("cannot drop the unique index a foreign key depends on",
-						"table", table, "index", name,
-						"constraint", r.FK.Name, "referencing_table", r.Child.Name)
-				}
-			}
-		}
-		desc := old.clone()
-		desc.Indexes = slices.DeleteFunc(desc.Indexes, func(x IndexDesc) bool { return x.Name == name })
-		prefix := indexPrefix(desc.ID, idx.ID)
-		if _, err := tx.DeleteRange(string(prefix), string(tuple.PrefixEnd(prefix))); err != nil {
-			return nil, err
-		}
-		return desc, nil
-	})
-	if err != nil {
-		return serr.Wrap(err, "op", "drop index", "table", table, "index", name)
-	}
-	return nil
+	_, err := e.DropIndexWith(table, name, DropOptions{})
+	return err
 }
 
 // RenameIndex renames a secondary index on table. It only rewrites the

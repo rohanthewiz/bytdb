@@ -187,11 +187,9 @@ func TestSQLCheckConstraints(t *testing.T) {
 	}
 	exec(t, d, `update items set qty = 7 where id = 3`)
 
-	// Dropping a checked column is blocked, as without CASCADE.
-	if _, err := d.Exec(`alter table items drop column qty`); err == nil ||
-		!strings.Contains(err.Error(), "because other objects depend on it") {
-		t.Fatalf("drop checked column: %v", err)
-	}
+	// Dropping a column a CHECK mentions is not refused here: the
+	// CHECK goes with it, as in Postgres (N-056). TestDropColumnTakesChecks
+	// covers that; this table keeps its checks for the catalog below.
 	exec(t, d, `alter table items drop column tag`) // unreferenced: fine
 
 	// The catalog serves psql's check-constraint query.
@@ -277,11 +275,8 @@ func TestSQLAddDropConstraint(t *testing.T) {
 		t.Fatalf("after dedup add: got %v", res.Rows)
 	}
 
-	// DROP CONSTRAINT lifts enforcement and unblocks DROP COLUMN.
+	// DROP CONSTRAINT lifts enforcement.
 	exec(t, d, `alter table items drop constraint items_check1`)
-	if _, err := d.Exec(`alter table items drop column qty`); err == nil {
-		t.Fatal("drop of checked column allowed")
-	}
 	exec(t, d, `alter table items drop constraint qty_sane`)
 	exec(t, d, `alter table items drop column qty`)
 	exec(t, d, `alter table items drop constraint items_check`)
@@ -378,9 +373,17 @@ func TestDropConstraintUnique(t *testing.T) {
 	exec(t, d, `create table parent (id int primary key, code text unique)`)
 	exec(t, d, `create table child (id int primary key, pc text references parent (code))`)
 	wantErr(t, d, `alter table parent drop constraint parent_code_key`,
-		"cannot drop the unique index a foreign key depends on")
+		"cannot drop index parent_code_key because other objects depend on it")
 	if d.e.Table("parent").Index("parent_code_key") == nil {
 		t.Fatal("FK-backing index dropped")
+	}
+	// CASCADE drops the foreign key with it, as in Postgres (N-056).
+	res := exec(t, d, `alter table parent drop constraint parent_code_key cascade`)
+	if res.Notice != "drop cascades to constraint child_pc_fkey on table child" {
+		t.Fatalf("notice = %q", res.Notice)
+	}
+	if d.e.Table("parent").Index("parent_code_key") != nil || len(d.e.Table("child").ForeignKeys) != 0 {
+		t.Fatal("DROP CONSTRAINT CASCADE left the index or the foreign key")
 	}
 }
 
