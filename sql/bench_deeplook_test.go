@@ -37,6 +37,9 @@ func TestMain(m *testing.M) {
 	if benchDir != "" {
 		os.RemoveAll(benchDir)
 	}
+	if liDir != "" {
+		os.RemoveAll(liDir)
+	}
 	os.Exit(code)
 }
 

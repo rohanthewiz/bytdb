@@ -22,13 +22,39 @@
 // across rows, goroutines and cached plans. The zero value is 0 with
 // scale 0.
 //
-// Design note: the coefficient is a *big.Int even for small values. A
-// fast path holding an int64 coefficient would save allocations in
-// money-sized arithmetic, and is left for when a benchmark asks for it:
-// correctness and Postgres parity come first.
+// # Two coefficient forms (N-050)
+//
+// The coefficient lives inline as an int64 while it fits, and in a
+// *big.Int only beyond that:
+//
+//	small   wide == nil, coefficient = small,  |small| ≤ MaxInt64
+//	wide    wide != nil, coefficient = *wide,  |*wide| > MaxInt64
+//
+// Money-sized values (anything with at most 18 significant digits) are
+// therefore one machine word: decoding a row, comparing, adding or
+// multiplying two of them allocates nothing. A TPC-H Q1-shaped query
+// (products of numeric(15,2) columns summed per group,
+// sql/numeric_workload_bench_test.go) allocated ~50 objects a row with
+// every coefficient a *big.Int, against ~17 for the same table in
+// float8; the inline form is what closes most of that gap.
+//
+// Every operation tries the small form first, with explicit overflow
+// checks (128-bit products from math/bits), and falls back to the
+// *big.Int code, which is the original implementation and still handles
+// any value. The forms are canonical: mk demotes a *big.Int that fits,
+// so a value has exactly one representation and Decimals compare equal
+// structurally (reflect.DeepEqual) exactly when they are equal digit
+// for digit and scale for scale. MinInt64 is kept wide so that negation
+// and |x| never overflow in the small paths.
+//
+// The wide path accepts non-canonical input (a wide value that would
+// fit), which the tests use as an oracle: each operation run on the
+// forced-wide form of its operands must give the same result as the
+// small path (TestSmallMatchesWide, FuzzSmallMatchesWide).
 package decimal
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"math/big"
@@ -71,8 +97,14 @@ var (
 )
 
 // Decimal is an exact decimal number; see the package doc.
+//
+// 24 bytes: the int64 coefficient sits beside the pointer rather than
+// sharing storage with it (an unsafe union would save 8 bytes but make
+// the GC's view of the pointer word depend on a tag), so boxing a
+// Decimal in an interface is still a single small allocation.
 type Decimal struct {
-	coef  *big.Int // nil means 0; never mutated once the value exists
+	wide  *big.Int // the coefficient when it does not fit small; never mutated once the value exists
+	small int64    // the coefficient when wide is nil; never MinInt64
 	scale int32    // digits after the point; 0 ≤ scale ≤ MaxScale
 }
 
@@ -114,37 +146,61 @@ var pow10Table = func() []*big.Int {
 	return t
 }()
 
-// mk builds a Decimal from a coefficient it takes ownership of. Every
-// constructor goes through it, which keeps one invariant: the
-// coefficient is nil exactly when the value is zero. Equality never
-// depended on it (Cmp and both encodings read the value), but a single
-// representation of zero makes Decimals compare equal structurally too
-// (reflect.DeepEqual in tests, %#v in logs).
+// mk builds a Decimal from a *big.Int coefficient it takes ownership of
+// (nil means 0). Every wide-path result goes through it, which keeps
+// the representation canonical (see the package doc): a coefficient
+// that fits the small form is demoted to it, so zero is always the
+// all-zero struct plus its scale, and equal (digits, scale) pairs are
+// equal structs (reflect.DeepEqual in tests, %#v in logs).
 func mk(coef *big.Int, scale int32) Decimal {
-	if coef != nil && coef.Sign() == 0 {
-		coef = nil
+	if coef == nil {
+		return Decimal{scale: scale}
 	}
-	return Decimal{coef: coef, scale: scale}
+	if coef.IsInt64() {
+		if n := coef.Int64(); n != math.MinInt64 {
+			return Decimal{small: n, scale: scale}
+		}
+	}
+	return Decimal{wide: coef, scale: scale}
 }
 
-// c returns the coefficient, materializing zero for the zero value. The
-// result must not be mutated.
-func (d Decimal) c() *big.Int {
-	if d.coef == nil {
-		return new(big.Int)
+// mkSmall builds a Decimal from an int64 coefficient. MinInt64 is the
+// one int64 the small form excludes (its magnitude has no int64), so it
+// goes wide; the small-path arithmetic below can produce it only at
+// the very edge (e.g. -MaxInt64 - 1).
+func mkSmall(n int64, scale int32) Decimal {
+	if n == math.MinInt64 {
+		return Decimal{wide: big.NewInt(n), scale: scale}
 	}
-	return d.coef
+	return Decimal{small: n, scale: scale}
+}
+
+// isSmall reports whether the coefficient is held inline.
+func (d Decimal) isSmall() bool { return d.wide == nil }
+
+// c returns the coefficient as a *big.Int for the wide paths,
+// materializing the small form (an allocation; the small paths never
+// call it). The result must not be mutated.
+func (d Decimal) c() *big.Int {
+	if d.wide != nil {
+		return d.wide
+	}
+	return big.NewInt(d.small)
 }
 
 // New returns coef × 10^-scale. scale must be in [0, MaxScale]; New
-// copies coef, so the caller may reuse it.
+// copies coef (or reads it into the small form), so the caller may
+// reuse it.
 func New(coef *big.Int, scale int32) Decimal {
+	if coef.IsInt64() {
+		return mkSmall(coef.Int64(), scale)
+	}
 	return mk(new(big.Int).Set(coef), scale)
 }
 
 // FromInt64 returns n with scale 0.
 func FromInt64(n int64) Decimal {
-	return mk(big.NewInt(n), 0)
+	return mkSmall(n, 0)
 }
 
 // FromFloat64 converts a float64. digits is the number of significant
@@ -185,7 +241,12 @@ func Parse(s string) (Decimal, error) {
 	case "nan", "infinity", "inf":
 		return Decimal{}, ErrSpecial
 	}
-	var digits strings.Builder
+	// The digits accumulate into acc while the number stays within an
+	// int64 (the small form); only longer input pays for a digit string
+	// and big.Int.SetString, rebuilt from s after the scan. Parse runs
+	// on every numeric literal and every text-format wire parameter.
+	var acc uint64
+	accFits := true
 	frac, sawDigit, sawPoint := 0, false, false
 	i := 0
 scan:
@@ -193,7 +254,11 @@ scan:
 		ch := s[i]
 		switch {
 		case ch >= '0' && ch <= '9':
-			digits.WriteByte(ch)
+			if acc <= (math.MaxInt64-9)/10 {
+				acc = acc*10 + uint64(ch-'0')
+			} else {
+				accFits = false
+			}
 			sawDigit = true
 			if sawPoint {
 				frac++
@@ -226,13 +291,28 @@ scan:
 		}
 		exp = e
 	}
+	// value = coef × 10^(exp - frac). A positive net exponent folds into
+	// the coefficient (scale 0); a negative one is the scale.
+	net := exp - int64(frac)
+	if accFits && net <= 0 && -net <= MaxScale {
+		// Small form: at most 18 significant digits, so no integer-digit
+		// limit can be in play either.
+		n := int64(acc)
+		if neg {
+			n = -n
+		}
+		return Decimal{small: n, scale: int32(-net)}, nil
+	}
+	var digits strings.Builder
+	for j := 0; j < i; j++ {
+		if isDigit(s[j]) {
+			digits.WriteByte(s[j])
+		}
+	}
 	coef, ok := new(big.Int).SetString(digits.String(), 10)
 	if !ok {
 		return Decimal{}, ErrSyntax
 	}
-	// value = coef × 10^(exp - frac). A positive net exponent folds into
-	// the coefficient (scale 0); a negative one is the scale.
-	net := exp - int64(frac)
 	if net > 0 {
 		if net > MaxIntDigits {
 			return Decimal{}, ErrOverflow
@@ -273,12 +353,28 @@ func (d Decimal) String() string {
 
 // AppendText appends String's form to buf.
 func (d Decimal) AppendText(buf []byte) []byte {
-	c := d.c()
+	if d.isSmall() {
+		// The magnitude's digits go to a stack array: no allocation
+		// beyond buf's own growth. This is every numeric a text-format
+		// wire response renders.
+		if d.small < 0 {
+			buf = append(buf, '-')
+		}
+		var a [20]byte
+		return appendPointed(buf, strconv.AppendUint(a[:0], absU64(d.small), 10), int(d.scale))
+	}
+	c := d.wide
 	if c.Sign() < 0 {
 		buf = append(buf, '-')
 	}
-	digits := new(big.Int).Abs(c).Text(10)
-	sc := int(d.scale)
+	return appendPointed(buf, new(big.Int).Abs(c).Text(10), int(d.scale))
+}
+
+// appendPointed appends a magnitude's decimal digits with the point
+// placed sc digits from the right, zero-padded on the left as needed
+// ("5" at scale 3 is "0.005"). Generic over the two digit sources: the
+// small form's stack bytes and the wide form's Text string.
+func appendPointed[D []byte | string](buf []byte, digits D, sc int) []byte {
 	if sc == 0 {
 		return append(buf, digits...)
 	}
@@ -298,23 +394,58 @@ func (d Decimal) AppendText(buf []byte) []byte {
 func (d Decimal) Scale() int32 { return d.scale }
 
 // Coef returns a copy of the coefficient: the value is Coef × 10^-Scale.
-func (d Decimal) Coef() *big.Int { return new(big.Int).Set(d.c()) }
+func (d Decimal) Coef() *big.Int {
+	if d.isSmall() {
+		return big.NewInt(d.small)
+	}
+	return new(big.Int).Set(d.wide)
+}
 
 // Sign is -1, 0 or +1.
 func (d Decimal) Sign() int {
-	if d.coef == nil {
-		return 0
+	if d.wide != nil {
+		return d.wide.Sign()
 	}
-	return d.coef.Sign()
+	switch {
+	case d.small < 0:
+		return -1
+	case d.small > 0:
+		return 1
+	}
+	return 0
 }
 
 // IsZero reports whether the value is 0 (at any scale).
-func (d Decimal) IsZero() bool { return d.Sign() == 0 }
+func (d Decimal) IsZero() bool { return d.wide == nil && d.small == 0 }
+
+// coefDigits is the number of decimal digits in |coefficient| ("0" has
+// one), without rendering it in the small form.
+func (d Decimal) coefDigits() int {
+	if d.isSmall() {
+		return digitsU64(absU64(d.small))
+	}
+	return len(new(big.Int).Abs(d.wide).Text(10))
+}
+
+// digitsU64 is the number of decimal digits in x (1 for 0). The bit
+// length gives log10 to within one: ⌊bits·log10(2)⌋ (1233/4096 ≈
+// 0.30103) is either the digit count or one short, and one comparison
+// against the table settles which.
+func digitsU64(x uint64) int {
+	if x == 0 {
+		return 1
+	}
+	t := bits.Len64(x) * 1233 >> 12
+	if t < len(pow10u64) && x >= pow10u64[t] {
+		t++
+	}
+	return t
+}
 
 // IntDigits is the number of digits before the decimal point, 0 for a
 // value whose magnitude is below 1.
 func (d Decimal) IntDigits() int {
-	n := len(new(big.Int).Abs(d.c()).Text(10)) - int(d.scale)
+	n := d.coefDigits() - int(d.scale)
 	if n < 0 || d.IsZero() {
 		return 0
 	}
@@ -348,18 +479,31 @@ func (d Decimal) Cmp(o Decimal) int {
 	if ds == 0 {
 		return 0
 	}
-	// Fast path, no allocation: both magnitudes fit a uint64 and the
-	// rescaled one still does (checked with a 128-bit product). This is
-	// every money-sized comparison — a numeric(10,2) column against a
-	// literal of another scale on every row of a scan — which otherwise
-	// allocated twice per row in align.
-	if d.coef.IsInt64() && o.coef.IsInt64() {
-		if c, ok := cmpSmall(absU64(d.coef.Int64()), d.scale, absU64(o.coef.Int64()), o.scale); ok {
+	// Fast path, no allocation: both coefficients are small and the
+	// rescaled one still fits a uint64 (checked with a 128-bit
+	// product). This is every money-sized comparison — a numeric(10,2)
+	// column against a literal of another scale on every row of a scan —
+	// which otherwise allocated twice per row in align.
+	if d.isSmall() && o.isSmall() {
+		if d.scale == o.scale {
+			return cmpInt64(d.small, o.small)
+		}
+		if c, ok := cmpSmall(absU64(d.small), d.scale, absU64(o.small), o.scale); ok {
 			return c * ds // both have sign ds: a larger magnitude is smaller when negative
 		}
 	}
 	ac, bc, _ := align(d, o)
 	return ac.Cmp(bc)
+}
+
+func cmpInt64(a, b int64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
 }
 
 // absU64 is |n| as a uint64 (exact for MinInt64 too).
@@ -416,7 +560,15 @@ func (d Decimal) Normalize() Decimal {
 	if d.IsZero() {
 		return Decimal{}
 	}
-	c := new(big.Int).Set(d.coef)
+	if d.isSmall() {
+		x, s := d.small, d.scale
+		for s > 0 && x%10 == 0 {
+			x /= 10
+			s--
+		}
+		return Decimal{small: x, scale: s}
+	}
+	c := new(big.Int).Set(d.wide)
 	s := d.scale
 	r := new(big.Int)
 	q := new(big.Int)
@@ -433,7 +585,10 @@ func (d Decimal) Normalize() Decimal {
 
 // Neg is -d, same scale.
 func (d Decimal) Neg() Decimal {
-	return mk(new(big.Int).Neg(d.c()), d.scale)
+	if d.isSmall() {
+		return Decimal{small: -d.small, scale: d.scale} // never MinInt64, so never overflows
+	}
+	return mk(new(big.Int).Neg(d.wide), d.scale)
 }
 
 // Abs is |d|, same scale.
@@ -444,14 +599,65 @@ func (d Decimal) Abs() Decimal {
 	return d.Neg()
 }
 
+// alignSmall is align for two small values: both coefficients at the
+// larger scale, as int64s. ok is false when rescaling would leave the
+// int64 range; the caller then takes the wide path.
+func alignSmall(a, b Decimal) (x, y int64, scale int32, ok bool) {
+	x, y = a.small, b.small
+	switch {
+	case a.scale < b.scale:
+		x, ok = scaleUp(x, b.scale-a.scale)
+		return x, y, b.scale, ok
+	case b.scale < a.scale:
+		y, ok = scaleUp(y, a.scale-b.scale)
+		return x, y, a.scale, ok
+	}
+	return x, y, a.scale, true
+}
+
+// scaleUp is n×10^k when the result is a small coefficient.
+func scaleUp(n int64, k int32) (int64, bool) {
+	if n == 0 {
+		return 0, true
+	}
+	if k >= int32(len(pow10u64)) {
+		return 0, false // |n| ≥ 1, so the product exceeds 10^19 > MaxInt64
+	}
+	u, ok := mulPow10(absU64(n), int(k))
+	if !ok || u > math.MaxInt64 {
+		return 0, false
+	}
+	if n < 0 {
+		return -int64(u), true
+	}
+	return int64(u), true
+}
+
 // Add is d + o at scale max(sd, so).
 func (d Decimal) Add(o Decimal) (Decimal, error) {
+	if d.isSmall() && o.isSmall() {
+		if x, y, s, ok := alignSmall(d, o); ok {
+			// Signed overflow: the sum's sign differs from both operands'.
+			if sum := x + y; (x^sum)&(y^sum) >= 0 {
+				return checked(mkSmall(sum, s))
+			}
+		}
+	}
 	ac, bc, s := align(d, o)
 	return checked(mk(new(big.Int).Add(ac, bc), s))
 }
 
 // Sub is d - o at scale max(sd, so).
 func (d Decimal) Sub(o Decimal) (Decimal, error) {
+	if d.isSmall() && o.isSmall() {
+		if x, y, s, ok := alignSmall(d, o); ok {
+			// Signed overflow: the operands' signs differ and the
+			// difference's sign differs from the minuend's.
+			if diff := x - y; (x^y)&(x^diff) >= 0 {
+				return checked(mkSmall(diff, s))
+			}
+		}
+	}
 	ac, bc, s := align(d, o)
 	return checked(mk(new(big.Int).Sub(ac, bc), s))
 }
@@ -459,6 +665,17 @@ func (d Decimal) Sub(o Decimal) (Decimal, error) {
 // Mul is d × o at scale sd + so. Postgres caps the product's scale at
 // NUMERIC_DSCALE_MAX by rounding; the same happens here.
 func (d Decimal) Mul(o Decimal) (Decimal, error) {
+	if d.isSmall() && o.isSmall() && d.scale+o.scale <= MaxScale {
+		// The magnitudes' full 128-bit product; small when the high
+		// word is empty and the low one fits an int64.
+		if hi, lo := bits.Mul64(absU64(d.small), absU64(o.small)); hi == 0 && lo <= math.MaxInt64 {
+			n := int64(lo)
+			if (d.small < 0) != (o.small < 0) {
+				n = -n
+			}
+			return mkSmall(n, d.scale+o.scale), nil
+		}
+	}
 	p := mk(new(big.Int).Mul(d.c(), o.c()), d.scale+o.scale)
 	if p.scale > MaxScale {
 		p = p.Round(MaxScale)
@@ -474,6 +691,9 @@ func (d Decimal) Mul(o Decimal) (Decimal, error) {
 func checked(d Decimal) (Decimal, error) {
 	if d.scale > MaxScale {
 		return Decimal{}, ErrOverflow
+	}
+	if d.isSmall() {
+		return d, nil // at most 19 digits: far inside MaxIntDigits
 	}
 	if bound := d.c().BitLen()*30103/100000 + 1 - int(d.scale); bound > MaxIntDigits &&
 		d.IntDigits() > MaxIntDigits {
@@ -492,7 +712,20 @@ func (d Decimal) weightAndFirst() (weight, first int) {
 	if d.IsZero() {
 		return 0, 0
 	}
-	digits := new(big.Int).Abs(d.coef).Text(10)
+	if d.isSmall() {
+		// Same arithmetic on the magnitude itself: the leading n digits
+		// are |coef| / 10^(len-n), padded with zeros when len < n.
+		u := absU64(d.small)
+		nd := digitsU64(u)
+		e := nd - 1 - int(d.scale)
+		weight = floorDiv(e, 4)
+		n := e - 4*weight + 1 // 1..4
+		if n <= nd {
+			return weight, int(u / pow10u64[nd-n])
+		}
+		return weight, int(u * pow10u64[n-nd])
+	}
+	digits := new(big.Int).Abs(d.wide).Text(10)
 	// e is the decimal exponent of the leading digit: |d| ∈ [10^e, 10^(e+1)).
 	e := len(digits) - 1 - int(d.scale)
 	weight = floorDiv(e, 4)
@@ -544,6 +777,12 @@ func (d Decimal) DivRound(o Decimal, scale int32) (Decimal, error) {
 	}
 	// d/o = (cd·10^-sd)/(co·10^-so). Scaled to the target:
 	// q = cd·10^(scale - sd + so) / co.
+	shift := int(scale) - int(d.scale) + int(o.scale)
+	if d.isSmall() && o.isSmall() && scale <= MaxScale {
+		if q, ok := divRoundSmall(d.small, o.small, shift); ok {
+			return mkSmall(q, scale), nil
+		}
+	}
 	num := new(big.Int).Set(d.c())
 	den := new(big.Int).Set(o.c())
 	if shift := int(scale) - int(d.scale) + int(o.scale); shift >= 0 {
@@ -552,6 +791,48 @@ func (d Decimal) DivRound(o Decimal, scale int32) (Decimal, error) {
 		den.Mul(den, pow10(-shift))
 	}
 	return checked(mk(quoRoundHalfAway(num, den), scale))
+}
+
+// divRoundSmall is n·10^shift / m rounded half away from zero (shift
+// may be negative: the power then multiplies m), for small n and
+// nonzero m. The scaled dividend is built as a 128-bit product so that
+// avg-style quotients — a sum of cents divided by a count at ~12
+// digits of scale — stay on this path. ok is false when a scaled
+// operand or the quotient leaves the 64-bit range.
+//
+//	shift ≥ 0:  (hi:lo) = |n|·10^shift,  q = (hi:lo) / |m|   needs hi < |m|
+//	shift < 0:  q = |n| / (|m|·10^-shift)                     needs the product in 64 bits
+func divRoundSmall(n, m int64, shift int) (int64, bool) {
+	un, den := absU64(n), absU64(m)
+	var q, r uint64
+	if shift >= 0 {
+		if shift >= len(pow10u64) {
+			return 0, false
+		}
+		hi, lo := bits.Mul64(un, pow10u64[shift])
+		if hi >= den {
+			return 0, false // the quotient would not fit 64 bits (Div64 panics)
+		}
+		q, r = bits.Div64(hi, lo, den)
+	} else {
+		var ok bool
+		if den, ok = mulPow10(den, -shift); !ok {
+			return 0, false
+		}
+		q, r = un/den, un%den
+	}
+	// Half away from zero on magnitudes: round up when 2r ≥ den,
+	// written r ≥ den-r so that 2r cannot overflow.
+	if r >= den-r {
+		q++
+	}
+	if q > math.MaxInt64 {
+		return 0, false
+	}
+	if (n < 0) != (m < 0) {
+		return -int64(q), true
+	}
+	return int64(q), true
 }
 
 // quoRoundHalfAway is num/den rounded half away from zero.
@@ -579,6 +860,11 @@ func (d Decimal) Mod(o Decimal) (Decimal, error) {
 	if o.IsZero() {
 		return Decimal{}, ErrDivByZero
 	}
+	if d.isSmall() && o.isSmall() {
+		if x, y, s, ok := alignSmall(d, o); ok {
+			return checked(mkSmall(x%y, s)) // Go's % truncates, like big.Int.Rem: the dividend's sign
+		}
+	}
 	ac, bc, s := align(d, o)
 	return checked(mk(new(big.Int).Rem(ac, bc), s))
 }
@@ -597,6 +883,11 @@ func (d Decimal) Trunc(scale int32) Decimal {
 
 func (d Decimal) rescale(scale int32, round bool) Decimal {
 	target := max(scale, 0)
+	if d.isSmall() {
+		if r, ok := d.rescaleSmall(scale, target, round); ok {
+			return r
+		}
+	}
 	if scale >= d.scale {
 		// Widening: pad with zeros, exact.
 		if target == d.scale {
@@ -619,10 +910,53 @@ func (d Decimal) rescale(scale int32, round bool) Decimal {
 	return mk(q, target)
 }
 
+// rescaleSmall is rescale for a small coefficient; ok is false when an
+// intermediate leaves the int64 range (only widening, or rounding to
+// the left of the point, can).
+func (d Decimal) rescaleSmall(scale, target int32, round bool) (Decimal, bool) {
+	if scale >= d.scale {
+		if target == d.scale {
+			return d, true
+		}
+		x, ok := scaleUp(d.small, target-d.scale)
+		return Decimal{small: x, scale: target}, ok
+	}
+	// Narrowing by k digits. With |coef| < 2^63 < 10^19, k ≥ 20 leaves
+	// a quotient of 0 and a remainder below half of 10^k, so the result
+	// is 0 whether rounding or truncating. k = 19 still divides (the
+	// remainder can reach half of 10^19).
+	k := int(d.scale - scale)
+	if k >= len(pow10u64) {
+		return Decimal{scale: target}, true
+	}
+	u := absU64(d.small)
+	p := pow10u64[k]
+	q, r := u/p, u%p
+	if round && r >= p-r { // 2r ≥ p without overflowing
+		q++
+	}
+	// q ≤ |coef|/10 + 1 here, so it fits an int64.
+	x := int64(q)
+	if d.small < 0 {
+		x = -x
+	}
+	if scale < 0 {
+		// Rounded to tens, hundreds, ...: scale back up to an integer.
+		var ok bool
+		if x, ok = scaleUp(x, -scale); !ok {
+			return Decimal{}, false
+		}
+	}
+	return Decimal{small: x, scale: target}, true
+}
+
 // Floor is the largest integer ≤ d, scale 0.
 func (d Decimal) Floor() Decimal {
 	t := d.Trunc(0)
 	if d.Sign() < 0 && t.Cmp(d) != 0 {
+		if t.isSmall() {
+			return mkSmall(t.small-1, 0) // t.small ≥ -MaxInt64: no wraparound
+		}
 		return mk(new(big.Int).Sub(t.c(), bigOne), 0)
 	}
 	return t
@@ -632,6 +966,9 @@ func (d Decimal) Floor() Decimal {
 func (d Decimal) Ceil() Decimal {
 	t := d.Trunc(0)
 	if d.Sign() > 0 && t.Cmp(d) != 0 {
+		if t.isSmall() && t.small < math.MaxInt64 {
+			return mkSmall(t.small+1, 0)
+		}
 		return mk(new(big.Int).Add(t.c(), bigOne), 0)
 	}
 	return t
@@ -661,7 +998,7 @@ func (d Decimal) FitTypmod(precision, scale int32) (Decimal, error) {
 // below that (0.05 → -1). Postgres calls this ddigits in apply_typmod.
 // Meaningless for zero.
 func (d Decimal) lead() int {
-	return len(new(big.Int).Abs(d.c()).Text(10)) - int(d.scale)
+	return d.coefDigits() - int(d.scale)
 }
 
 // TypmodError is "numeric field overflow" (SQLSTATE 22003).
@@ -692,6 +1029,14 @@ func (d Decimal) IsInteger() bool {
 	if d.scale == 0 {
 		return true
 	}
+	if d.isSmall() {
+		// |coef| < 10^19, so a scale of 19 or more leaves a fraction
+		// unless the value is 0.
+		if int(d.scale) >= len(pow10u64) {
+			return d.small == 0
+		}
+		return absU64(d.small)%pow10u64[d.scale] == 0
+	}
 	return new(big.Int).Rem(d.c(), pow10(int(d.scale))).Sign() == 0
 }
 
@@ -699,7 +1044,11 @@ func (d Decimal) IsInteger() bool {
 // does: round half away from zero, then range-check. ok is false when
 // the rounded value does not fit.
 func (d Decimal) Int64() (n int64, ok bool) {
-	r := d.Round(0).c()
+	rd := d.Round(0)
+	if rd.isSmall() {
+		return rd.small, true
+	}
+	r := rd.wide
 	if !r.IsInt64() {
 		return 0, false
 	}
@@ -709,8 +1058,21 @@ func (d Decimal) Int64() (n int64, ok bool) {
 // Float64 is the nearest float64 (correctly rounded from the exact
 // decimal text), as Postgres's numeric → float8 cast.
 func (d Decimal) Float64() float64 {
+	// Exact fast path (the one strconv's own parser takes): a
+	// coefficient below 2^53 and a power of ten up to 10^22 are both
+	// exact float64s, and IEEE division rounds its exact quotient
+	// correctly, so coef / 10^scale is the nearest float64.
+	if d.isSmall() && d.scale <= 22 && absU64(d.small) <= 1<<53 {
+		return float64(d.small) / float64pow10[d.scale]
+	}
 	f, _ := strconv.ParseFloat(d.String(), 64)
 	return f
+}
+
+// float64pow10 holds 10^0..10^22, the powers of ten a float64 holds exactly.
+var float64pow10 = [...]float64{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+	1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
 }
 
 // Mantissa returns the value in scientific form for order-preserving
@@ -721,9 +1083,17 @@ func (d Decimal) Mantissa() (neg bool, digits string, exp int) {
 	if d.IsZero() {
 		return false, "", 0
 	}
-	full := new(big.Int).Abs(d.coef).Text(10)
+	if d.isSmall() {
+		// The digits come from the stack; only the trimmed string the
+		// caller keeps is allocated.
+		var a [20]byte
+		full := strconv.AppendUint(a[:0], absU64(d.small), 10)
+		exp = len(full) - int(d.scale)
+		return d.small < 0, string(bytes.TrimRight(full, "0")), exp
+	}
+	full := new(big.Int).Abs(d.wide).Text(10)
 	exp = len(full) - int(d.scale)
-	return d.coef.Sign() < 0, strings.TrimRight(full, "0"), exp
+	return d.wide.Sign() < 0, strings.TrimRight(full, "0"), exp
 }
 
 // FromMantissaU64 is FromMantissa for a mantissa already parsed into
@@ -735,6 +1105,9 @@ func FromMantissaU64(neg bool, mant uint64, nDigits, exp int, scale int32) (Deci
 		return Decimal{scale: scale}, nil
 	}
 	own := nDigits - exp
+	if d, ok := mantissaSmall(neg, mant, own, exp, scale); ok {
+		return d, nil
+	}
 	coef := new(big.Int).SetUint64(mant)
 	if own < 0 {
 		coef.Mul(coef, pow10(-own))
@@ -751,6 +1124,48 @@ func FromMantissaU64(neg bool, mant uint64, nDigits, exp int, scale int32) (Deci
 		coef.Neg(coef)
 	}
 	return mk(coef, int32(own)), nil
+}
+
+// mantissaSmall is the small-form body of FromMantissaU64: mant ×
+// 10^-own, raised to scale, when every step stays in int64. own is the
+// value's minimal scale (negative: that many trailing zeros). ok is
+// false — the caller takes the wide path, which also reports the
+// limits — for anything else. This is the per-row, per-column decode
+// of every stored numeric up to 18 digits, so it must not allocate.
+func mantissaSmall(neg bool, mant uint64, own, exp int, scale int32) (Decimal, bool) {
+	if exp > MaxIntDigits || own > MaxScale {
+		return Decimal{}, false
+	}
+	if own < 0 {
+		// Trailing zeros fold into the coefficient (scale 0).
+		if -own >= len(pow10u64) {
+			return Decimal{}, false
+		}
+		var ok bool
+		if mant, ok = mulPow10(mant, -own); !ok {
+			return Decimal{}, false
+		}
+		own = 0
+	}
+	if int(scale) > own {
+		// Displayed at a wider scale than the digits need: pad.
+		if int(scale)-own >= len(pow10u64) {
+			return Decimal{}, false
+		}
+		var ok bool
+		if mant, ok = mulPow10(mant, int(scale)-own); !ok {
+			return Decimal{}, false
+		}
+		own = int(scale)
+	}
+	if mant > math.MaxInt64 {
+		return Decimal{}, false
+	}
+	n := int64(mant)
+	if neg {
+		n = -n
+	}
+	return Decimal{small: n, scale: int32(own)}, true
 }
 
 // FromMantissa is Mantissa's inverse: ±0.digits × 10^exp, displayed at
@@ -772,6 +1187,11 @@ func FromMantissa(neg bool, digits string, exp int, scale int32) (Decimal, error
 				return Decimal{}, ErrSyntax
 			}
 			n = n*10 + uint64(c-'0')
+		}
+		if n != 0 {
+			if d, ok := mantissaSmall(neg, n, len(digits)-exp, exp, scale); ok {
+				return d, nil
+			}
 		}
 		coef = new(big.Int).SetUint64(n)
 	} else {
@@ -805,15 +1225,55 @@ func FromMantissa(neg bool, digits string, exp int, scale int32) (Decimal, error
 // one scale (any numeric(p, s) column) reuses the same words row after
 // row. The zero value is 0. Not safe for concurrent use; Value returns
 // an independent Decimal.
+//
+// Like Decimal, the total starts in an inline int64 (small) and moves
+// to the big.Int (coef) the first time an addition would leave the
+// int64 range, and stays there: a sum of 100k money values is ~10^12
+// cents, so most totals never move.
 type Sum struct {
+	small int64 // the total while wide is false; never MinInt64
+	wide  bool  // the total lives in coef
 	coef  big.Int
 	scale int32
 	tmp   big.Int // rescaled operand, reused
 }
 
+// promote moves the total into the big.Int form.
+func (s *Sum) promote() {
+	s.coef.SetInt64(s.small)
+	s.small, s.wide = 0, true
+}
+
+// addSmall adds x×10^-xs to a small total, reporting false (total
+// unchanged) when the result would leave the int64 range.
+func (s *Sum) addSmall(x int64, xs int32) bool {
+	a, b, sc, ok := alignSmall(Decimal{small: s.small, scale: s.scale}, Decimal{small: x, scale: xs})
+	if !ok {
+		return false
+	}
+	sum := a + b
+	if (a^sum)&(b^sum) < 0 || sum == math.MinInt64 {
+		return false
+	}
+	s.small, s.scale = sum, sc
+	return true
+}
+
 // Add adds d to the total at scale max(total's, d's), as Decimal.Add.
 func (s *Sum) Add(d Decimal) error {
-	c := d.c()
+	if !s.wide {
+		if d.isSmall() && s.addSmall(d.small, d.scale) {
+			return nil
+		}
+		s.promote()
+	}
+	// The operand as a big.Int without allocating: a small d is read
+	// into tmp, which the rescale below may then overwrite in place
+	// (math/big allows the receiver to alias an operand).
+	c := d.wide
+	if c == nil {
+		c = s.tmp.SetInt64(d.small)
+	}
 	switch {
 	case d.scale > s.scale:
 		// Widen the total to d's scale first, in place.
@@ -836,6 +1296,15 @@ func (s *Sum) Add(d Decimal) error {
 
 // AddInt64 adds an integer (scale 0).
 func (s *Sum) AddInt64(n int64) error {
+	if !s.wide {
+		// n may be MinInt64, which the small form refuses (alignSmall
+		// passes an unscaled operand through unchecked), so it goes
+		// straight to the big.Int total.
+		if n != math.MinInt64 && s.addSmall(n, 0) {
+			return nil
+		}
+		s.promote()
+	}
 	s.tmp.SetInt64(n)
 	if s.scale > 0 {
 		s.tmp.Mul(&s.tmp, pow10(int(s.scale)))
@@ -846,5 +1315,8 @@ func (s *Sum) AddInt64(n int64) error {
 
 // Value is the total as an independent Decimal.
 func (s *Sum) Value() Decimal {
+	if !s.wide {
+		return Decimal{small: s.small, scale: s.scale}
+	}
 	return mk(new(big.Int).Set(&s.coef), s.scale)
 }

@@ -5,6 +5,12 @@ package sql
 // scale. Measured 2026-11-11 (M-series, -benchtime 10x): sum+avg 18 ms
 // numeric vs 11.7 ms float8; a cross-scale filter 18 ms. The next lever
 // is a small-coefficient fast path in package decimal (plan Q2).
+//
+// 2026-11-15, after that fast path (N-050: an inline int64 coefficient,
+// see the decimal package doc): sum+avg 16.5 → 13.5 ms (float8 11.4),
+// with allocations down from 5.1 to 3.0 per row, the same as float8;
+// the filter 17 → 14.6 ms. The decimal-heavy workload behind the change
+// is in numeric_workload_bench_test.go.
 
 import (
 	"fmt"
