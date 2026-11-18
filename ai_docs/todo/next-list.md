@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-060
+**Next ID:** N-061
 
 ## Open
 
@@ -73,32 +73,6 @@ and N-049 are closed.
   `regnamespace` casts and `indclass[...]` subscripts. `enumsQuery` needs
   `pg_enum`. The queries are in atlas's `sql/postgres/inspect.go` and
   `driver.go`. No consumer has asked.
-- **N-056** · raised `2026-1114-1610-n033-linux-pty-n049-orm-capture` · value medium
-  **Should drops cascade to dependent indexes and FKs the way Postgres's
-  do?** bytdb runs every drop as RESTRICT (deep-look D-54: "remove the
-  dependent object first"), and two GORM Migrator calls hit that.
-  `DropColumn` of an indexed column fails with `cannot drop an indexed
-  column` (2BP01), where Postgres drops the index along with the column,
-  even without CASCADE. `DropTable` sends `DROP TABLE IF EXISTS parent
-  CASCADE` before the child when its model order puts the parent first, and
-  that fails with 2BP01, where Postgres drops the child's foreign-key
-  constraint. **Decided 2026-11-14 (user): do what Postgres does, where
-  it works for bytdb.** That reverses D-54's RESTRICT-only rule for these
-  cases. To build, checking each against PG16 first:
-  - `DROP COLUMN` drops every index that includes the column, with no
-    CASCADE needed. Postgres does it silently, multi-column indexes
-    included. A FK constraint on the column goes too, with CASCADE.
-  - `DROP TABLE … CASCADE` drops the foreign-key constraints of other
-    tables that reference it (not the tables), with Postgres's `drop
-    cascades to constraint x on table y` notice. Dependent views go too,
-    if bytdb can tell which views depend on the table. Without CASCADE
-    it stays refused (2BP01).
-  - Do each inside one DDL transaction, so a failure leaves nothing
-    half-dropped.
-  - Afterwards, update the RESTRICT wording in `docs/features.md` (D-54
-    paragraph), `docs/gotchas.md`, `pgwire/errors.go`'s 2BP01 comment and
-    the parser's `dropBehavior` comment. Remove the work-around in
-    `TestGormVerbatim` (it drops the index and the child first).
 - **N-057** · raised `2026-1117-2221-n050-numeric-small-coefficient` · value low
   **The `^` exponent operator.** `SELECT 2.5::numeric ^ 2` fails in the
   lexer here ("unexpected character", 42601), while Postgres returns `6.25`.
@@ -124,6 +98,16 @@ and N-049 are closed.
   stack buffer, which uses only API already released, so a GOWORK=off
   pgwire build is unaffected. Measure a GROUP BY numeric query and a pgx
   fetch first.
+
+- **N-060** · raised `2026-1118-1459-n056-drops-cascade-like-postgres` · value low
+  **A multi-column foreign key's default name.** bytdb names
+  `FOREIGN KEY (x, y) REFERENCES p (a, b)` on table `ch` as `ch_x_fkey`,
+  from the first column only (`sql/fk.go`, `resolveFK`). PG16 names it
+  `ch_x_y_fkey`, joining every column the way it already does for
+  `UNIQUE (a, b)` (`t_a_b_key`). A migration tool that drops the
+  constraint by the name Postgres would give it gets 42704. Found while
+  writing N-056's tests (`TestDropColumnTakesDependents` skips the name
+  for that reason).
 
 ## Validate
 
@@ -237,6 +221,48 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   `2026-1114-1640-n052-exact-numeric-math` (`94be4da`).
 
 ## Closed
+
+- **N-056** · raised `2026-1114-1610-n033-linux-pty-n049-orm-capture` · closed
+  2026-11-18, `2026-1118-1459-n056-drops-cascade-like-postgres`. **Drops cascade to dependents the way Postgres's do.** This
+  reverses D-54's RESTRICT-only rule, as decided 2026-11-14. Every case was
+  run on PG16 (docker) first. The engine's new `drop.go` sorts dependents
+  into Postgres's two kinds. Auto dependents always go: a dropped column's
+  indexes (multi-column and unique ones too), the CHECKs that mention it
+  (PG16 drops those silently as well, which the item didn't list), and the
+  table's own FKs over it, including a column whose FK references itself.
+  Normal dependents need CASCADE: FKs referencing a dropped table, column
+  or unique index (on other tables or the same one), and views reading a
+  dropped table or view, transitively. RESTRICT refuses with Postgres's
+  message, a DETAIL line per dependent and its HINT, under the new
+  `bytdb.ErrDependentObjects` (2BP01). A refused multi-table drop uses
+  Postgres's "cannot drop desired object(s) because other objects depend
+  on them". CASCADE sends `drop cascades to …` NOTICE/00000 lines. New
+  engine API: `DropTables`, `DropColumnWith`, `DropIndexWith` and
+  `DropViewWith` take `DropOptions{Cascade, ViewReads, CheckReads}`. The
+  old `DropTable`, `DropColumn`, `DropIndex` and `DropView` wrap them.
+  Each drop is one DDL transaction, so `DROP TABLE a, b` is now all or
+  nothing (it used to drop table by table), and `DROP TABLE parent, child`
+  needs no CASCADE. CASCADE is also parsed on `DROP CONSTRAINT`, for a
+  UNIQUE an FK relies on. The SQL layer supplies `viewReads` (FROM names
+  minus the query's CTE names) and `checkReads`. `QuoteIdent` moved to the
+  root package so messages quote relations as Postgres does (constraint
+  and column names bare). pgwire now sends a `hint` field as HINT instead
+  of folding it into DETAIL. Kept apart from Postgres, and documented: a
+  PK column stays undroppable; views aren't tracked per column (bytdb
+  binds view columns at run time); and several cascaded objects get one
+  notice each, not Postgres's "drop cascades to N other objects" plus
+  DETAIL. Docs: `docs/features.md` (new "Drops and dependencies"
+  section), `docs/gotchas.md`, the README and package grammar,
+  `pgwire/errors.go`'s 2BP01 comment, the parser's `dropBehavior`
+  comment. `TestGormVerbatim` lost both work-arounds: GORM's `DropColumn`
+  of an indexed column and its parent-first `DROP TABLE … CASCADE` now run
+  as sent. Tests: `drop_test.go` (key ranges, sentinel, commit-failure
+  atomicity, view count, reopen), `sql/drop_cascade_test.go` (PG16's
+  scenarios and notices), `TestDependencyRefusals` (exact DETAIL/HINT on
+  the wire) and `TestNoticeSeverities` rows. Nine mutations, one per rule,
+  are each caught by a test. Also checked end to end with the `verify`
+  skill: a pgx client against a scratch `bytdbd`, then a restart. Raised
+  N-060.
 
 - **N-050** · raised `2026-1111-1759-numeric-type-n048` · closed
   2026-11-17, `2026-1117-2221-n050-numeric-small-coefficient`. **Small-coefficient fast path for numeric.** Measured first,
