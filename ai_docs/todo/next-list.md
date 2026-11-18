@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-057
+**Next ID:** N-060
 
 ## Open
 
@@ -44,15 +44,6 @@ recommendations. Every phase of it (0–9) is on main and released in
 too: N-045 was declined after measuring (see Non-goals), and N-046, N-047
 and N-049 are closed.
 
-- **N-050** · raised `2026-1111-1759-numeric-type-n048` · value low
-  **Small-coefficient fast path for numeric (plan Q2).** `decimal.Decimal`
-  holds a `*big.Int` even for money-sized values. After this session's
-  cheap wins (shared powers of ten, allocation-free `Cmp`, numeric
-  mantissa decode, in-place `decimal.Sum`), `sum`+`avg` over 100k
-  `numeric(10,2)` rows is 18 ms against 11.7 ms for float8, and a
-  cross-scale filter 18 ms (`sql/numeric_bench_test.go`). An `int64`
-  coefficient for values that fit would remove most remaining
-  allocations. Measure a real workload before starting.
 - **N-051** · raised `2026-1111-1759-numeric-type-n048` · value low
   **numeric `NaN` and `±Infinity`.** Refused today (0A000 over the wire,
   plan Q7). Postgres has them; adding them means special cases in every
@@ -108,6 +99,31 @@ and N-049 are closed.
     paragraph), `docs/gotchas.md`, `pgwire/errors.go`'s 2BP01 comment and
     the parser's `dropBehavior` comment. Remove the work-around in
     `TestGormVerbatim` (it drops the index and the child first).
+- **N-057** · raised `2026-1117-2221-n050-numeric-small-coefficient` · value low
+  **The `^` exponent operator.** `SELECT 2.5::numeric ^ 2` fails in the
+  lexer here ("unexpected character", 42601), while Postgres returns `6.25`.
+  `power(x, y)` works (N-052), but the lexer has no `^` token. Postgres defines `^` for numeric and
+  float8. It is left-associative and binds tighter than `*` and `/`. Found
+  by N-050's three-way wire check (all 42 `X ^ 2` cases).
+- **N-058** · raised `2026-1117-2221-n050-numeric-small-coefficient` · value low
+  **`::int4` / `::int2` casts don't range-check.** All of bytdb's integers
+  are int64, so `SELECT 3000000000::int4` returns the value where Postgres
+  raises 22003 "integer out of range". The fix is a range check on the
+  narrowing casts, keeping the int64 storage. Also, binary-format integer
+  results are 8 bytes even when the column is described as int4. Clients
+  read them by the described OID, which the wire check didn't exercise.
+  Found by N-050's wire check.
+- **N-059** · raised `2026-1117-2221-n050-numeric-small-coefficient` · value low
+  **Numeric digit strings left on two paths.** After N-050, GROUP BY,
+  DISTINCT and hash joins on a numeric column (`sql/hashkey.go` →
+  `tuple.Encode` → `Decimal.Mantissa`) still allocate a digit string per
+  value, and pgwire's `appendNumericBinary` (`Coef` + `Text` + string
+  padding) allocates several per value. pgx asks for binary numeric results,
+  so it takes the second path. An `AppendMantissa(buf)` in package decimal
+  would serve the first. The second can render through `AppendText` into a
+  stack buffer, which uses only API already released, so a GOWORK=off
+  pgwire build is unaffected. Measure a GROUP BY numeric query and a pgx
+  fetch first.
 
 ## Validate
 
@@ -221,6 +237,43 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   `2026-1114-1640-n052-exact-numeric-math` (`94be4da`).
 
 ## Closed
+
+- **N-050** · raised `2026-1111-1759-numeric-type-n048` · closed
+  2026-11-17, `2026-1117-2221-n050-numeric-small-coefficient`. **Small-coefficient fast path for numeric.** Measured first,
+  as the item asked, on a TPC-H-shaped workload
+  (`sql/numeric_workload_bench_test.go`: lineitem with numeric(15,2)
+  columns, Q1, Q6 and a 10k-row fetch rendered as wire text, each beside
+  the same table in float8). Before the change Q1 took 120 ms against
+  52 ms for float8, with 50 allocations per row against 17. That gap
+  was much larger than the item's sum+avg micro-benchmark showed, so the
+  change went ahead. `decimal.Decimal` is now `{wide *big.Int; small
+  int64; scale int32}`. The coefficient stays inline while it fits an
+  int64 (MinInt64 excluded, so negation and |x| cannot overflow) and
+  moves to a `*big.Int` only beyond that. The forms are canonical: `mk`
+  demotes, so `reflect.DeepEqual` still means equal digits and scale.
+  The small form is used by Parse, AppendText, Cmp, Add, Sub, Mul,
+  DivRound (a 128-bit dividend through `bits.Div64`, so avg stays
+  small), Mod, Round/Trunc/Floor/Ceil, Normalize, IsInteger, Int64,
+  Float64 (Clinger's exact fast path), Mantissa, FromMantissa[U64],
+  DivScale and `decimal.Sum`, each with explicit overflow checks that
+  fall back to the original `*big.Int` code. Results, means of 6 runs:
+  Q1 120 → 69 ms, at 17 allocations per row, the same as float8; Q6
+  37 → 27 ms; fetch 7.1 → 3.7 ms, now faster than float8's 4.2;
+  sum+avg 16.5 → 13.5 ms; the cross-scale filter 17 → 14.6 ms. Tests:
+  `decimal/small_test.go` runs every operation on small operands
+  against the same operation on their forced-wide form, which is the
+  original code path. It covers boundary values at 10^18, 10^19,
+  √MaxInt64 and ±MaxInt64, scales 0–25, and Sum sequences that cross
+  the int64 edge. Two deliberate mutations were both caught, and
+  `FuzzSmallMatchesWide` ran 120 s clean. `go test ./...`, pgwire, the
+  difftest corpus against PG16 and staticcheck v0.8.2 all pass. In a
+  three-way wire check (new bytdbd, pre-change bytdbd, PG16; simple and
+  extended protocol; text and binary numeric; 9,102 checks) new and old
+  were identical on every check. The 117 differences from PG were all
+  pre-existing: `^` is not parsed, `::int4` does not range-check, and
+  binary integers are 8 bytes wide. Not changed: GROUP BY and DISTINCT
+  on numeric (`hashKey` → `Mantissa`) and pgwire's binary numeric
+  encoder (`Coef` + `Text`) still allocate a digit string per value.
 
 - **N-049** · raised `2026-1110-0757-deep-look-phase8-close` · closed
   2026-11-14, `2026-1114-1610-n033-linux-pty-n049-orm-capture`.
