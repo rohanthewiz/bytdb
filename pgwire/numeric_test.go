@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -100,12 +101,15 @@ func TestNumericOverWire(t *testing.T) {
 	}
 
 	// Errors: typmod overflow with Postgres's DETAIL, division by zero,
-	// bad input, NaN.
+	// bad input, NaN cast to an integer (N-051; NaN itself is a value
+	// now), an infinity into a constrained column.
 	for q, code := range map[string]string{
 		`insert into acct (id, bal) values (9, 123456789.5)`: "22003",
+		`insert into acct (id, bal) values (9, 'Infinity')`:  "22003",
 		`select 1 / 0.0`:                  "22012",
 		`select 'abc'::numeric`:           "22P02",
-		`select 'NaN'::numeric`:           "0A000",
+		`select 'NaN'::numeric::int8`:     "0A000",
+		`select '-inf'::numeric::int4`:    "0A000",
 		`create table bad (x numeric(0))`: "22023",
 	} {
 		_, err := c.Exec(ctx, q)
@@ -114,8 +118,13 @@ func TestNumericOverWire(t *testing.T) {
 			t.Errorf("%s: %v, want SQLSTATE %s", q, err, code)
 			continue
 		}
-		if code == "22003" && pe.Detail != "A field with precision 10, scale 2 must round to an absolute value less than 10^8." {
+		if code == "22003" && strings.Contains(q, "123456789.5") &&
+			pe.Detail != "A field with precision 10, scale 2 must round to an absolute value less than 10^8." {
 			t.Errorf("overflow DETAIL = %q", pe.Detail)
+		}
+		if code == "22003" && strings.Contains(q, "Infinity") &&
+			pe.Detail != "A field with precision 10, scale 2 cannot hold an infinite value." {
+			t.Errorf("infinite DETAIL = %q", pe.Detail)
 		}
 	}
 

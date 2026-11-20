@@ -142,13 +142,35 @@ func castToNumeric(v any, typ string) (any, error) {
 }
 
 // floatToNumeric is Postgres's float8 → numeric: the float printed with
-// 15 significant digits first, so 0.1::float8::numeric is 0.1.
+// 15 significant digits first, so 0.1::float8::numeric is 0.1. NaN and
+// ±Infinity become numeric's own (N-051), so the error below is only a
+// guard: FromFloat64 has no failing input left.
 func floatToNumeric(f float64) (bytdb.Decimal, error) {
 	d, err := decimal.FromFloat64(f, 15)
 	if err != nil {
 		return bytdb.Decimal{}, serr.New("cannot convert " + bytdb.FormatFloat(f) + " to numeric")
 	}
 	return d, nil
+}
+
+// specialToIntErr is Postgres's error for casting numeric NaN or an
+// infinity to an integer type (numeric_int8 and friends, SQLSTATE
+// 0A000): "cannot convert NaN to bigint", "cannot convert infinity to
+// integer". castType is the cast's spelling; Postgres names the target
+// by its canonical type name.
+func specialToIntErr(d bytdb.Decimal, castType string) error {
+	what := "infinity"
+	if d.IsNaN() {
+		what = "NaN"
+	}
+	target := "bigint"
+	switch castType {
+	case "int", "integer", "int4":
+		target = "integer"
+	case "smallint", "int2":
+		target = "smallint"
+	}
+	return serr.New("cannot convert " + what + " to " + target)
 }
 
 // numericCastMods reads the modifier out of a cast type string

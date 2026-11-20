@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -1357,10 +1358,24 @@ func renderLit(v any) string {
 	case int64:
 		return strconv.FormatInt(n, 10)
 	case float64:
+		// NaN and the infinities have no literal: strconv's "NaN" and
+		// "+Inf" lexed as an identifier and an operator, so a float
+		// column with DEFAULT 'NaN' refused every INSERT that used the
+		// default (found alongside N-051). Quoted, in Postgres's
+		// spelling, the string coerces back into the float column.
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return "'" + bytdb.FormatFloat(n) + "'"
+		}
 		return strconv.FormatFloat(n, 'g', -1, 64)
 	case bytdb.Decimal:
 		// Unquoted, so it reads back as a numeric literal, scale and all
-		// (DEFAULT 0.00 stays 0.00).
+		// (DEFAULT 0.00 stays 0.00). NaN and the infinities are not
+		// literals (unquoted they would lex as identifiers), so they are
+		// stored quoted: the string coerces back into the numeric column
+		// as numeric_in reads it (N-051).
+		if !n.IsFinite() {
+			return "'" + n.String() + "'"
+		}
 		return n.String()
 	case bool:
 		return strconv.FormatBool(n)

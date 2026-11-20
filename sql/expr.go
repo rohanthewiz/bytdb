@@ -1073,7 +1073,11 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			return floatToInt(x)
 		case bytdb.Decimal:
 			// numeric -> bigint rounds half away from zero (2.5 is 3),
-			// unlike float8 -> bigint's half to even.
+			// unlike float8 -> bigint's half to even. NaN and the
+			// infinities have no integer and their own error (N-051).
+			if !x.IsFinite() {
+				return nil, specialToIntErr(x, typ)
+			}
 			n, ok := x.Int64()
 			if !ok {
 				return nil, errIntRange()

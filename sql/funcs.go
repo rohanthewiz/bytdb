@@ -505,6 +505,9 @@ func init() {
 		"floor":   {min: 1, max: 1, typ: numericResult, eval: keepIntDec(math.Floor, bytdb.Decimal.Floor)},
 		"sign": {min: 1, max: 1, typ: numericResult, eval: func(a []any) (any, error) {
 			if d, ok := a[0].(bytdb.Decimal); ok {
+				if d.IsNaN() {
+					return d, nil // sign(NaN) is NaN (N-051); the infinities are ±1
+				}
 				return decimal.FromInt64(int64(d.Sign())), nil // numeric -1, 0 or 1
 			}
 			if n, ok := a[0].(int64); ok {
@@ -619,13 +622,21 @@ func init() {
 			})},
 		// The scale functions (Postgres 13+): scale is the display
 		// scale; min_scale the smallest that shows the value exactly;
-		// trim_scale the value at that scale.
+		// trim_scale the value at that scale. NaN and the infinities
+		// have no digits, so scale and min_scale are NULL for them, and
+		// trim_scale returns them unchanged (N-051).
 		"scale": {min: 1, max: 1, typ: numericArg(bytdb.TInt), eval: func(a []any) (any, error) {
 			d, _ := asDecimal(a[0])
+			if !d.IsFinite() {
+				return nil, nil
+			}
 			return int64(d.Scale()), nil
 		}},
 		"min_scale": {min: 1, max: 1, typ: numericArg(bytdb.TInt), eval: func(a []any) (any, error) {
 			d, _ := asDecimal(a[0])
+			if !d.IsFinite() {
+				return nil, nil
+			}
 			return int64(d.Normalize().Scale()), nil
 		}},
 		"trim_scale": {min: 1, max: 1, typ: numericArg(bytdb.TNumeric), eval: func(a []any) (any, error) {
@@ -876,6 +887,12 @@ func init() {
 			x, ok := num(a[0])
 			if !ok {
 				return nil, serr.New("to_timestamp takes seconds since the epoch")
+			}
+			// NaN has no instant (float8_timestamptz's 22008); it
+			// reaches here from a float8 NaN, and since N-051 from
+			// numeric's. int64(NaN) would be an arbitrary instant.
+			if math.IsNaN(x) {
+				return nil, serr.New("timestamp cannot be NaN")
 			}
 			if math.IsInf(x, 1) {
 				return int64(bytdb.TimestampInfinity), nil

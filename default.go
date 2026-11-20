@@ -111,8 +111,11 @@ func decodeDefaultLiteral(text string, now time.Time) (any, error) {
 	// A decimal literal is numeric (N-048): read it exactly, scale
 	// included, so DEFAULT 0.00 backfills 0.00. coerce takes a Decimal
 	// into a float column too, so a float default stored as "1.5" still
-	// lands as 1.5. NaN and Infinity are not decimals and fall through
-	// to ParseFloat.
+	// lands as 1.5. NaN and the infinities ("NaN", "+Inf", "-Inf" as
+	// strconv writes a float default) parse as numeric's special values
+	// since N-051, and coerce turns those back into the float ones, so a
+	// float column's NaN default is still NaN; ParseFloat now only sees
+	// what neither reads.
 	if d, err := decimal.Parse(s); err == nil {
 		return d, nil
 	}

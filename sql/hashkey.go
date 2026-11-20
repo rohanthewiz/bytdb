@@ -17,13 +17,18 @@ package sql
 //	float64 with an integral value in int64 range → that int64
 //	NaN                                            → nanKey (one group, sorts after every number)
 //	Decimal with an integral value in int64 range  → that int64 (N-048)
+//	Decimal NaN                                    → nanKey, as a float NaN (N-051)
+//	Decimal ±Infinity                              → the float64 infinity (N-051)
 //	any other Decimal                              → unchanged (its key encoding ignores scale)
 //	anything else                                  → unchanged
 //
 // A Decimal needs no normalization of its own for 1.0 = 1.00: the tuple
 // key form already drops the display scale. Folding integral values to
 // int64 is what lets an integer and a numeric holding the same number
-// meet in one group, as they do under SQL equality.
+// meet in one group, as they do under SQL equality. Numeric's special
+// values fold onto float8's for the same reason: 'NaN'::numeric =
+// 'NaN'::float8 and the infinities are equal across the two types, so
+// SELECT x UNION SELECT 'NaN'::float8 keeps one NaN, as in Postgres.
 //
 // The tuple encoding is kept (rather than a plain hash) because group
 // keys' byte order is also used as the groups' order.
@@ -43,6 +48,12 @@ var nanKey = []byte("\xff\xffNaN")
 // hashNorm is one value's canonical key form.
 func hashNorm(v any) any {
 	if d, ok := v.(bytdb.Decimal); ok {
+		if !d.IsFinite() {
+			if d.IsNaN() {
+				return nanKey
+			}
+			return d.Float64() // ±Inf
+		}
 		if d.IsInteger() {
 			if n, ok := d.Int64(); ok {
 				return n

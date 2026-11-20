@@ -12,7 +12,6 @@ package bytdb
 import (
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"strconv"
 
@@ -23,17 +22,15 @@ import (
 // parseDecimalErr parses numeric text with Postgres's error wording:
 // `invalid input syntax for type numeric: "abc"` (22P02), and
 // "value overflows numeric format" (22003) for out-of-range input.
+// 'NaN', 'Infinity' and '-Infinity' are values since N-051 (decimal.Parse
+// reads every spelling numeric_in does), so there is no refusal here.
 func parseDecimalErr(s string) (Decimal, error) {
 	d, err := decimal.Parse(s)
 	if err == nil {
 		return d, nil
 	}
-	switch {
-	case errors.Is(err, decimal.ErrSyntax):
+	if errors.Is(err, decimal.ErrSyntax) {
 		return Decimal{}, serr.New(`invalid input syntax for type numeric: "` + s + `"`)
-	case errors.Is(err, decimal.ErrSpecial):
-		return Decimal{}, serr.New("numeric NaN and Infinity are not supported",
-			"value", s, "hint", "store them in a double precision column, or use NULL")
 	}
 	return Decimal{}, serr.New(err.Error(), "value", s)
 }
@@ -41,12 +38,11 @@ func parseDecimalErr(s string) (Decimal, error) {
 // DecimalFromFloat converts a float64 as a Go caller handing one to a
 // numeric column means it: the shortest decimal text that round-trips
 // to the same float (0.1, not 0.1000000000000000055...). NaN and ±Inf
-// are refused.
+// become numeric NaN and ±Infinity (N-051).
 func DecimalFromFloat(f float64) (Decimal, error) {
 	d, err := decimal.FromFloat64(f, -1)
 	if err != nil {
-		return Decimal{}, serr.New("numeric NaN and Infinity are not supported",
-			"value", strconv.FormatFloat(f, 'g', -1, 64))
+		return Decimal{}, serr.Wrap(err, "value", strconv.FormatFloat(f, 'g', -1, 64))
 	}
 	return d, nil
 }
@@ -93,12 +89,11 @@ func coerceNumeric(v any) (d Decimal, ok bool, err error) {
 		return d, true, err
 	case float32:
 		// Through float32's own shortest text: float32(0.1) is 0.1, not
-		// the float64 widening's 0.10000000149011612.
-		d, err := decimal.Parse(strconv.FormatFloat(float64(x), 'g', -1, 32))
-		if err != nil {
-			return Decimal{}, true, serr.New("numeric NaN and Infinity are not supported")
-		}
-		return d, true, nil
+		// the float64 widening's 0.10000000149011612. NaN and ±Inf print
+		// as "NaN" / "+Inf" / "-Inf", which Parse reads as numeric's
+		// special values, so they convert as float8's do.
+		d, err := parseDecimalErr(strconv.FormatFloat(float64(x), 'g', -1, 32))
+		return d, true, err
 	case string:
 		d, err := parseDecimalErr(x)
 		return d, true, err
@@ -188,8 +183,12 @@ func NumericTypmod(c Column) int64 {
 }
 
 // numericToInt is the numeric → integer conversion Postgres's casts use:
-// round half away from zero, range-checked.
+// round half away from zero, range-checked. NaN and the infinities fail
+// with their own messages (specialToIntErr).
 func numericToInt(d Decimal) (int64, error) {
+	if !d.IsFinite() {
+		return 0, specialToIntErr(d, "bigint")
+	}
 	n, ok := d.Int64()
 	if !ok {
 		return 0, serr.New("bigint out of range")
@@ -197,17 +196,27 @@ func numericToInt(d Decimal) (int64, error) {
 	return n, nil
 }
 
-// numericToFloat is the numeric → float8 conversion: the nearest float.
+// specialToIntErr is Postgres's error for casting numeric NaN or an
+// infinity to an integer type: "cannot convert NaN to bigint", "cannot
+// convert infinity to integer" (SQLSTATE 0A000, feature_not_supported,
+// as numeric_int8 raises it). typeName is the target as Postgres names
+// it: bigint, integer or smallint.
+func specialToIntErr(d Decimal, typeName string) error {
+	what := "infinity"
+	if d.IsNaN() {
+		what = "NaN"
+	}
+	return serr.New("cannot convert " + what + " to " + typeName)
+}
+
+// numericToFloat is the numeric → float8 conversion: the nearest float,
+// and NaN / ±Infinity to the float ones.
 func numericToFloat(d Decimal) float64 { return d.Float64() }
 
 // floatToNumeric is Postgres's float8 → numeric cast: the float printed
 // with 15 significant digits first (DBL_DIG), so 0.1::float8::numeric
 // is 0.1 and 1/3.0::float8::numeric is 0.333333333333333. NaN and
-// ±Infinity are refused (bytdb's numeric has neither).
+// ±Infinity map to numeric's own (Postgres 14+; N-051).
 func floatToNumeric(f float64) (Decimal, error) {
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return Decimal{}, serr.New("numeric NaN and Infinity are not supported",
-			"value", FormatFloat(f))
-	}
 	return decimal.FromFloat64(f, 15)
 }

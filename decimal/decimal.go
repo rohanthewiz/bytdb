@@ -13,9 +13,36 @@
 //	a % b          scale max(sa, sb)
 //	round(a, n)    scale max(n, 0), half away from zero
 //
-// There is no NaN or ±Infinity: Postgres has them, but every operation
-// would need a special case, and bytdb refuses them on input instead
-// (ErrSpecial). The tuple encoding leaves room to add them later.
+// # Special values (N-051)
+//
+// Besides finite numbers a Decimal can be NaN, +Infinity or -Infinity,
+// as Postgres 14+'s numeric can. They read and print as Postgres spells
+// them ("NaN", "Infinity", "-Infinity"; Parse also takes "inf" and any
+// case, and a sign on the infinities but not on NaN), and every
+// operation follows numeric.c's rules for them:
+//
+//	order        -Infinity < every finite value < +Infinity < NaN, NaN = NaN
+//	x ± y        NaN in, NaN out; Inf + -Inf and Inf - Inf are NaN;
+//	             otherwise an infinite operand wins
+//	x × y        NaN in, NaN out; Inf × 0 is NaN; otherwise ±Inf by signs
+//	x / y        NaN in, NaN out (even NaN / 0); Inf / Inf is NaN;
+//	             Inf / 0 is division by zero; finite / Inf is 0
+//	x % y        NaN in, NaN out; Inf % 0 is division by zero;
+//	             Inf % finite is NaN; finite % Inf is the finite one
+//	round etc.   a special value is returned unchanged
+//	typmod       NaN fits any numeric(p, s); ±Infinity fits none
+//
+// They live in the kind field, which is zero (finite) for every value
+// that existed before, so the zero value is still 0 and nothing about
+// the finite representation below changed. A special value has its
+// other fields zeroed, so the representation stays canonical: all NaNs
+// are one struct, as are each infinity's.
+//
+// Each operation checks kind first and hands any special operand to a
+// small function that applies the rules above; the finite fast paths
+// behind that check are untouched. The check is one byte compare (both
+// operands' kinds OR-ed), so the money-sized paths N-050 tuned pay
+// nothing measurable for it.
 //
 // A Decimal is immutable. Every operation returns a new value and never
 // writes through the *big.Int it holds, so values can be shared freely
@@ -86,8 +113,12 @@ var (
 	// ErrSyntax is the input-syntax failure; callers wrap it with the
 	// offending text in Postgres's wording.
 	ErrSyntax = errors.New("invalid input syntax for type numeric")
-	// ErrSpecial refuses NaN and ±Infinity, which bytdb's numeric does
-	// not represent.
+	// ErrSpecial refused NaN and ±Infinity before bytdb's numeric could
+	// represent them.
+	//
+	// Deprecated: since N-051 they are values (see NaN and Inf), and
+	// nothing in this package returns ErrSpecial. It stays exported so
+	// code that matches it still compiles.
 	ErrSpecial = errors.New("numeric NaN and Infinity are not supported")
 	// ErrOverflow is Postgres's "value overflows numeric format": more
 	// integer digits or a larger scale than the type can hold.
@@ -96,17 +127,82 @@ var (
 	ErrDivByZero = errors.New("division by zero")
 )
 
-// Decimal is an exact decimal number; see the package doc.
+// Decimal is an exact decimal number, or NaN or ±Infinity; see the
+// package doc.
 //
 // 24 bytes: the int64 coefficient sits beside the pointer rather than
 // sharing storage with it (an unsafe union would save 8 bytes but make
 // the GC's view of the pointer word depend on a tag), so boxing a
-// Decimal in an interface is still a single small allocation.
+// Decimal in an interface is still a single small allocation. kind
+// fits in the padding after scale, so N-051 did not grow the struct.
 type Decimal struct {
 	wide  *big.Int // the coefficient when it does not fit small; never mutated once the value exists
 	small int64    // the coefficient when wide is nil; never MinInt64
 	scale int32    // digits after the point; 0 ≤ scale ≤ MaxScale
+	kind  kind     // finite, or one of the special values (then the fields above are all zero)
 }
+
+// kind tells a finite value from Postgres's three special numerics.
+// finite is the zero value, so Decimal{} is 0 and every finite value
+// built before N-051 keeps its meaning.
+type kind uint8
+
+const (
+	finite kind = iota
+	kindNaN
+	kindPosInf
+	kindNegInf
+)
+
+// rank orders the kinds as Postgres orders the values (cmp_numerics):
+// -Infinity below every finite value, +Infinity above, and NaN above
+// everything, equal only to itself.
+func (k kind) rank() int {
+	switch k {
+	case kindNegInf:
+		return 0
+	case finite:
+		return 1
+	case kindPosInf:
+		return 2
+	}
+	return 3 // kindNaN
+}
+
+// NaN returns numeric NaN: not a number, but in Postgres's numeric
+// equal to itself and greater than every other value, so it sorts,
+// groups and indexes like an ordinary value.
+func NaN() Decimal { return Decimal{kind: kindNaN} }
+
+// Inf returns +Infinity when sign ≥ 0 and -Infinity when sign < 0, as
+// math.Inf does.
+func Inf(sign int) Decimal {
+	if sign < 0 {
+		return Decimal{kind: kindNegInf}
+	}
+	return Decimal{kind: kindPosInf}
+}
+
+// IsNaN reports whether d is NaN.
+func (d Decimal) IsNaN() bool { return d.kind == kindNaN }
+
+// IsInf reports whether d is an infinity, as math.IsInf does: +Infinity
+// when sign > 0, -Infinity when sign < 0, either when sign is 0.
+func (d Decimal) IsInf(sign int) bool {
+	switch {
+	case sign > 0:
+		return d.kind == kindPosInf
+	case sign < 0:
+		return d.kind == kindNegInf
+	}
+	return d.kind == kindPosInf || d.kind == kindNegInf
+}
+
+// IsFinite reports whether d is a number: not NaN and not infinite.
+// The accessors that only make sense for a number (Coef, Scale,
+// Mantissa, IntDigits) treat a special value as 0; callers that
+// serialize a value check IsFinite first.
+func (d Decimal) IsFinite() bool { return d.kind == finite }
 
 var (
 	bigOne = big.NewInt(1)
@@ -207,11 +303,17 @@ func FromInt64(n int64) Decimal {
 // digits kept: 15 reproduces Postgres's float8 → numeric cast (it prints
 // the float with DBL_DIG digits first, so 0.1::float8::numeric is 0.1),
 // and -1 keeps the shortest text that round-trips to the same float,
-// which is what a Go caller handing over a float64 means. NaN and
-// ±Inf are ErrSpecial.
+// which is what a Go caller handing over a float64 means. NaN and ±Inf
+// become numeric NaN and ±Infinity, as Postgres 14+'s float8 → numeric
+// cast does.
 func FromFloat64(f float64, digits int) (Decimal, error) {
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return Decimal{}, ErrSpecial
+	switch {
+	case math.IsNaN(f):
+		return NaN(), nil
+	case math.IsInf(f, 1):
+		return Inf(1), nil
+	case math.IsInf(f, -1):
+		return Inf(-1), nil
 	}
 	// 'g' trims trailing zeros, as C's %.15g does in Postgres's
 	// float8_numeric: 0.1 becomes "0.1", not "1.00000000000000e-01"
@@ -224,22 +326,30 @@ func FromFloat64(f float64, digits int) (Decimal, error) {
 // count), an optional exponent, and Postgres 16's underscores between
 // digits ("1_000.5"). The scale is the digits written after the point,
 // less the exponent, floored at 0: "1.50e1" is 15.0, "1e3" is 1000.
+//
+// The special values are spelled as numeric_in reads them, in any case:
+// "NaN" (unsigned only: "-NaN" is a syntax error), and "Infinity" or
+// "inf" with an optional sign.
 func Parse(s string) (Decimal, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return Decimal{}, ErrSyntax
 	}
-	neg := false
+	neg, signed := false, false
 	switch s[0] {
 	case '-':
-		neg = true
+		neg, signed = true, true
 		s = s[1:]
 	case '+':
+		signed = true
 		s = s[1:]
 	}
-	switch strings.ToLower(s) {
-	case "nan", "infinity", "inf":
-		return Decimal{}, ErrSpecial
+	// Every number has a digit or a point right after the sign, so
+	// anything else is a special value or a syntax error (numeric_in
+	// makes the same split). Testing the first byte keeps the special
+	// words off the per-literal path entirely.
+	if s != "" && !isDigit(s[0]) && s[0] != '.' {
+		return parseSpecial(s, neg, signed)
 	}
 	// The digits accumulate into acc while the number stays within an
 	// int64 (the small form); only longer input pays for a digit string
@@ -333,6 +443,23 @@ scan:
 	return d, nil
 }
 
+// parseSpecial reads the text after an optional sign as one of the
+// special values. NaN takes no sign; the infinities take either.
+// Anything else is ErrSyntax, including internal whitespace ("- inf"),
+// which numeric_in refuses too.
+func parseSpecial(s string, neg, signed bool) (Decimal, error) {
+	switch {
+	case !signed && strings.EqualFold(s, "nan"):
+		return NaN(), nil
+	case strings.EqualFold(s, "infinity"), strings.EqualFold(s, "inf"):
+		if neg {
+			return Inf(-1), nil
+		}
+		return Inf(1), nil
+	}
+	return Decimal{}, ErrSyntax
+}
+
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 // MustParse is Parse that panics; for tests and constants.
@@ -346,13 +473,22 @@ func MustParse(s string) Decimal {
 
 // String renders the value in Postgres's output form: plain notation,
 // never an exponent, exactly Scale digits after the point, "-" for a
-// negative value and no sign for zero.
+// negative value and no sign for zero. The special values are "NaN",
+// "Infinity" and "-Infinity".
 func (d Decimal) String() string {
 	return string(d.AppendText(nil))
 }
 
 // AppendText appends String's form to buf.
 func (d Decimal) AppendText(buf []byte) []byte {
+	switch d.kind {
+	case kindNaN:
+		return append(buf, "NaN"...)
+	case kindPosInf:
+		return append(buf, "Infinity"...)
+	case kindNegInf:
+		return append(buf, "-Infinity"...)
+	}
 	if d.isSmall() {
 		// The magnitude's digits go to a stack array: no allocation
 		// beyond buf's own growth. This is every numeric a text-format
@@ -390,10 +526,13 @@ func appendPointed[D []byte | string](buf []byte, digits D, sc int) []byte {
 	return append(buf, digits[len(digits)-sc:]...)
 }
 
-// Scale is the display scale: digits after the point.
+// Scale is the display scale: digits after the point. It is 0 for the
+// special values, which is the dscale Postgres stores for them (its
+// SQL scale() returns NULL for them instead; the SQL layer does that).
 func (d Decimal) Scale() int32 { return d.scale }
 
 // Coef returns a copy of the coefficient: the value is Coef × 10^-Scale.
+// A special value has none and returns 0; check IsFinite first.
 func (d Decimal) Coef() *big.Int {
 	if d.isSmall() {
 		return big.NewInt(d.small)
@@ -401,22 +540,25 @@ func (d Decimal) Coef() *big.Int {
 	return new(big.Int).Set(d.wide)
 }
 
-// Sign is -1, 0 or +1.
+// Sign is -1, 0 or +1: +1 for +Infinity and -1 for -Infinity. NaN has
+// no sign and reports 0 (numeric.c never asks; check IsNaN first where
+// it matters, since 0 here does not mean IsZero).
 func (d Decimal) Sign() int {
 	if d.wide != nil {
 		return d.wide.Sign()
 	}
 	switch {
-	case d.small < 0:
+	case d.small < 0, d.kind == kindNegInf:
 		return -1
-	case d.small > 0:
+	case d.small > 0, d.kind == kindPosInf:
 		return 1
 	}
 	return 0
 }
 
-// IsZero reports whether the value is 0 (at any scale).
-func (d Decimal) IsZero() bool { return d.wide == nil && d.small == 0 }
+// IsZero reports whether the value is 0 (at any scale). The special
+// values are not zero, although their coefficient fields are.
+func (d Decimal) IsZero() bool { return d.wide == nil && d.small == 0 && d.kind == finite }
 
 // coefDigits is the number of decimal digits in |coefficient| ("0" has
 // one), without rendering it in the small form.
@@ -443,10 +585,10 @@ func digitsU64(x uint64) int {
 }
 
 // IntDigits is the number of digits before the decimal point, 0 for a
-// value whose magnitude is below 1.
+// value whose magnitude is below 1 and for the special values.
 func (d Decimal) IntDigits() int {
 	n := d.coefDigits() - int(d.scale)
-	if n < 0 || d.IsZero() {
+	if n < 0 || d.IsZero() || d.kind != finite {
 		return 0
 	}
 	return n
@@ -466,8 +608,16 @@ func align(a, b Decimal) (ac, bc *big.Int, scale int32) {
 	return ac, bc, a.scale
 }
 
-// Cmp compares by value, ignoring scale: 1.0 and 1.00 are equal.
+// Cmp compares by value, ignoring scale: 1.0 and 1.00 are equal. The
+// special values order as Postgres orders them: -Infinity below every
+// number, +Infinity above, NaN above everything and equal to itself
+// (so NaN groups, sorts and indexes like an ordinary value).
 func (d Decimal) Cmp(o Decimal) int {
+	if d.kind|o.kind != finite {
+		// At least one is special: the kinds' ranks decide, and equal
+		// ranks can only be the same special value twice.
+		return cmpInt64(int64(d.kind.rank()), int64(o.kind.rank()))
+	}
 	// Signs settle most comparisons without aligning.
 	ds, os := d.Sign(), o.Sign()
 	if ds != os {
@@ -552,10 +702,10 @@ func (d Decimal) Equal(o Decimal) bool { return d.Cmp(o) == 0 }
 // Normalize strips trailing fractional zeros: the scale drops to the
 // smallest that still shows the value exactly (never below 0). Equal
 // values normalize to identical (coefficient, scale) pairs, which is
-// what hash and index keys need.
+// what hash and index keys need. A special value is returned as is.
 func (d Decimal) Normalize() Decimal {
 	if d.scale == 0 {
-		return d
+		return d // also every special value, whose scale is 0
 	}
 	if d.IsZero() {
 		return Decimal{}
@@ -583,15 +733,25 @@ func (d Decimal) Normalize() Decimal {
 	return mk(c, s)
 }
 
-// Neg is -d, same scale.
+// Neg is -d, same scale. -NaN is NaN; the infinities swap.
 func (d Decimal) Neg() Decimal {
+	switch d.kind {
+	case kindNaN:
+		return d
+	case kindPosInf:
+		return Inf(-1)
+	case kindNegInf:
+		return Inf(1)
+	}
 	if d.isSmall() {
 		return Decimal{small: -d.small, scale: d.scale} // never MinInt64, so never overflows
 	}
 	return mk(new(big.Int).Neg(d.wide), d.scale)
 }
 
-// Abs is |d|, same scale.
+// Abs is |d|, same scale. |NaN| is NaN and |±Infinity| is +Infinity
+// (NaN's Sign is 0 and Neg turns -Infinity around, so the general
+// rule covers both).
 func (d Decimal) Abs() Decimal {
 	if d.Sign() >= 0 {
 		return d
@@ -635,6 +795,9 @@ func scaleUp(n int64, k int32) (int64, bool) {
 
 // Add is d + o at scale max(sd, so).
 func (d Decimal) Add(o Decimal) (Decimal, error) {
+	if d.kind|o.kind != finite {
+		return addSpecial(d, o), nil
+	}
 	if d.isSmall() && o.isSmall() {
 		if x, y, s, ok := alignSmall(d, o); ok {
 			// Signed overflow: the sum's sign differs from both operands'.
@@ -649,6 +812,12 @@ func (d Decimal) Add(o Decimal) (Decimal, error) {
 
 // Sub is d - o at scale max(sd, so).
 func (d Decimal) Sub(o Decimal) (Decimal, error) {
+	if d.kind|o.kind != finite {
+		// d - o = d + (-o) holds for every special case numeric_sub
+		// lists: Inf - Inf = Inf + -Inf = NaN, finite - Inf = -Inf, and
+		// so on.
+		return addSpecial(d, o.Neg()), nil
+	}
 	if d.isSmall() && o.isSmall() {
 		if x, y, s, ok := alignSmall(d, o); ok {
 			// Signed overflow: the operands' signs differ and the
@@ -662,9 +831,32 @@ func (d Decimal) Sub(o Decimal) (Decimal, error) {
 	return checked(mk(new(big.Int).Sub(ac, bc), s))
 }
 
+// addSpecial is numeric_add's special-value branch: at least one of d
+// and o is NaN or infinite.
+//
+//	        | -Inf   finite  +Inf   NaN
+//	  -Inf  | -Inf   -Inf    NaN    NaN
+//	finite  | -Inf     —     +Inf   NaN
+//	  +Inf  |  NaN   +Inf    +Inf   NaN
+//	   NaN  |  NaN   NaN     NaN    NaN
+func addSpecial(d, o Decimal) Decimal {
+	switch {
+	case d.kind == kindNaN || o.kind == kindNaN:
+		return NaN()
+	case d.kind == finite:
+		return o
+	case o.kind == finite || o.kind == d.kind:
+		return d
+	}
+	return NaN() // opposite infinities
+}
+
 // Mul is d × o at scale sd + so. Postgres caps the product's scale at
 // NUMERIC_DSCALE_MAX by rounding; the same happens here.
 func (d Decimal) Mul(o Decimal) (Decimal, error) {
+	if d.kind|o.kind != finite {
+		return mulSpecial(d, o), nil
+	}
 	if d.isSmall() && o.isSmall() && d.scale+o.scale <= MaxScale {
 		// The magnitudes' full 128-bit product; small when the high
 		// word is empty and the low one fits an int64.
@@ -681,6 +873,22 @@ func (d Decimal) Mul(o Decimal) (Decimal, error) {
 		p = p.Round(MaxScale)
 	}
 	return checked(p)
+}
+
+// mulSpecial is numeric_mul's special-value branch: NaN in, NaN out;
+// otherwise at least one operand is infinite, and the product is the
+// infinity with the product of the signs, except that ∞ × 0 is NaN.
+// (An infinity's Sign is ±1, so one multiplication covers all four
+// sign pairs numeric.c spells out.)
+func mulSpecial(d, o Decimal) Decimal {
+	if d.kind == kindNaN || o.kind == kindNaN {
+		return NaN()
+	}
+	s := d.Sign() * o.Sign()
+	if s == 0 {
+		return NaN()
+	}
+	return Inf(s)
 }
 
 // checked enforces the type's limits on a computed value. It runs on
@@ -749,8 +957,12 @@ func floorDiv(a, b int) int {
 
 // DivScale is the result scale Postgres gives d / o (select_div_scale):
 // enough digits that the quotient has at least 16 significant ones,
-// never fewer than either operand's scale, at most 1000.
+// never fewer than either operand's scale, at most 1000. It is 0 when
+// either operand is special: Div's result is then special or a plain 0.
 func DivScale(d, o Decimal) int32 {
+	if d.kind|o.kind != finite {
+		return 0
+	}
 	w1, f1 := d.weightAndFirst()
 	w2, f2 := o.weightAndFirst()
 	qweight := w1 - w2
@@ -764,6 +976,10 @@ func DivScale(d, o Decimal) int32 {
 
 // Div is d / o at DivScale(d, o), rounded half away from zero.
 func (d Decimal) Div(o Decimal) (Decimal, error) {
+	if d.kind|o.kind != finite {
+		// Before the zero check: NaN / 0 is NaN, not an error.
+		return divSpecial(d, o, 0)
+	}
 	if o.IsZero() {
 		return Decimal{}, ErrDivByZero
 	}
@@ -771,7 +987,12 @@ func (d Decimal) Div(o Decimal) (Decimal, error) {
 }
 
 // DivRound is d / o rounded half away from zero to scale (≥ 0).
+// Special operands follow Div's rules; a finite d over an infinite o
+// is 0 at scale.
 func (d Decimal) DivRound(o Decimal, scale int32) (Decimal, error) {
+	if d.kind|o.kind != finite {
+		return divSpecial(d, o, scale)
+	}
 	if o.IsZero() {
 		return Decimal{}, ErrDivByZero
 	}
@@ -835,6 +1056,31 @@ func divRoundSmall(n, m int64, shift int) (int64, bool) {
 	return int64(q), true
 }
 
+// divSpecial is numeric_div's special-value branch: at least one of d
+// and o is NaN or infinite.
+//
+//	NaN / anything, anything / NaN   NaN (NaN / 0 included: no error)
+//	±Inf / ±Inf                      NaN
+//	±Inf / 0                         division by zero
+//	±Inf / nonzero finite            the infinity with the signs' product
+//	finite / ±Inf                    0, at zeroScale
+//
+// Postgres returns a scale-0 zero for the last case (its const_zero);
+// Div passes 0 for that, and DivRound its own target scale.
+func divSpecial(d, o Decimal, zeroScale int32) (Decimal, error) {
+	switch {
+	case d.kind == kindNaN || o.kind == kindNaN:
+		return NaN(), nil
+	case d.kind == finite:
+		return Decimal{scale: zeroScale}, nil // o is infinite
+	case o.kind != finite:
+		return NaN(), nil // Inf / Inf
+	case o.IsZero():
+		return Decimal{}, ErrDivByZero
+	}
+	return Inf(d.Sign() * o.Sign()), nil
+}
+
 // quoRoundHalfAway is num/den rounded half away from zero.
 func quoRoundHalfAway(num, den *big.Int) *big.Int {
 	q, r := new(big.Int).QuoRem(num, den, new(big.Int))
@@ -856,7 +1102,22 @@ func quoRoundHalfAway(num, den *big.Int) *big.Int {
 
 // Mod is Postgres's numeric modulo: d - o·trunc(d/o), at scale
 // max(sd, so). The result has d's sign.
+//
+// Special operands (numeric_mod): NaN in, NaN out, even NaN % 0;
+// ±Inf % 0 is division by zero and ±Inf % anything else is NaN; a
+// finite d % ±Inf is d itself.
 func (d Decimal) Mod(o Decimal) (Decimal, error) {
+	if d.kind|o.kind != finite {
+		switch {
+		case d.kind == kindNaN || o.kind == kindNaN:
+			return NaN(), nil
+		case d.kind == finite:
+			return d, nil // o is infinite
+		case o.IsZero():
+			return Decimal{}, ErrDivByZero
+		}
+		return NaN(), nil
+	}
 	if o.IsZero() {
 		return Decimal{}, ErrDivByZero
 	}
@@ -881,7 +1142,13 @@ func (d Decimal) Trunc(scale int32) Decimal {
 	return d.rescale(scale, false)
 }
 
+// rescale is Round and Trunc; through them also Floor, Ceil, Int64 and
+// FitTypmod. A special value has no digits to round and comes back
+// unchanged, as from Postgres's numeric_round / numeric_trunc.
 func (d Decimal) rescale(scale int32, round bool) Decimal {
+	if d.kind != finite {
+		return d
+	}
 	target := max(scale, 0)
 	if d.isSmall() {
 		if r, ok := d.rescaleSmall(scale, target, round); ok {
@@ -950,8 +1217,12 @@ func (d Decimal) rescaleSmall(scale, target int32, round bool) (Decimal, bool) {
 	return Decimal{small: x, scale: target}, true
 }
 
-// Floor is the largest integer ≤ d, scale 0.
+// Floor is the largest integer ≤ d, scale 0. A special value comes
+// back unchanged.
 func (d Decimal) Floor() Decimal {
+	if d.kind != finite {
+		return d
+	}
 	t := d.Trunc(0)
 	if d.Sign() < 0 && t.Cmp(d) != 0 {
 		if t.isSmall() {
@@ -962,8 +1233,12 @@ func (d Decimal) Floor() Decimal {
 	return t
 }
 
-// Ceil is the smallest integer ≥ d, scale 0.
+// Ceil is the smallest integer ≥ d, scale 0. A special value comes
+// back unchanged.
 func (d Decimal) Ceil() Decimal {
+	if d.kind != finite {
+		return d
+	}
 	t := d.Trunc(0)
 	if d.Sign() > 0 && t.Cmp(d) != 0 {
 		if t.isSmall() && t.small < math.MaxInt64 {
@@ -985,7 +1260,17 @@ func (d Decimal) Ceil() Decimal {
 // so "-2 digits before the point", within 3 - 5 = -2) but not 0.0123.
 // A negative scale (numeric(2,-3)) rounds to thousands and allows
 // 2 - (-3) = 5 integer digits.
+//
+// The special values follow apply_typmod_special: NaN fits every
+// numeric(p, s), and ±Infinity fits none (TypmodError with Infinite
+// set, which changes the DETAIL).
 func (d Decimal) FitTypmod(precision, scale int32) (Decimal, error) {
+	switch d.kind {
+	case kindNaN:
+		return d, nil
+	case kindPosInf, kindNegInf:
+		return Decimal{}, &TypmodError{Precision: precision, Scale: scale, Infinite: true}
+	}
 	r := d.Round(scale)
 	if !r.IsZero() && r.lead() > int(precision-scale) {
 		return Decimal{}, &TypmodError{Precision: precision, Scale: scale}
@@ -1001,13 +1286,22 @@ func (d Decimal) lead() int {
 	return d.coefDigits() - int(d.scale)
 }
 
-// TypmodError is "numeric field overflow" (SQLSTATE 22003).
-type TypmodError struct{ Precision, Scale int32 }
+// TypmodError is "numeric field overflow" (SQLSTATE 22003). Infinite
+// marks an infinity offered to a constrained column, which Postgres
+// refuses with its own DETAIL.
+type TypmodError struct {
+	Precision, Scale int32
+	Infinite         bool
+}
 
 func (e *TypmodError) Error() string { return "numeric field overflow" }
 
 // Detail is Postgres's DETAIL line for the error.
 func (e *TypmodError) Detail() string {
+	if e.Infinite {
+		return "A field with precision " + itoa(e.Precision) + ", scale " + itoa(e.Scale) +
+			" cannot hold an infinite value."
+	}
 	return "A field with precision " + itoa(e.Precision) + ", scale " + itoa(e.Scale) +
 		" must round to an absolute value less than " + pow10Text(e.Precision-e.Scale) + "."
 }
@@ -1024,8 +1318,13 @@ func pow10Text(n int32) string {
 func itoa(n int32) string { return strconv.Itoa(int(n)) }
 
 // IsInteger reports whether the value has no fractional part (at any
-// scale: 2.00 is an integer).
+// scale: 2.00 is an integer). NaN and the infinities are not integers.
+// (numeric.c's numeric_is_integral counts the infinities as integral,
+// but only power uses it, and Pow decides its special cases itself.)
 func (d Decimal) IsInteger() bool {
+	if d.kind != finite {
+		return false
+	}
 	if d.scale == 0 {
 		return true
 	}
@@ -1042,8 +1341,13 @@ func (d Decimal) IsInteger() bool {
 
 // Int64 converts to int64 the way Postgres's numeric → bigint cast
 // does: round half away from zero, then range-check. ok is false when
-// the rounded value does not fit.
+// the rounded value does not fit, and for NaN and the infinities
+// (whose SQL casts fail with their own messages; the caller words
+// them).
 func (d Decimal) Int64() (n int64, ok bool) {
+	if d.kind != finite {
+		return 0, false
+	}
 	rd := d.Round(0)
 	if rd.isSmall() {
 		return rd.small, true
@@ -1056,8 +1360,17 @@ func (d Decimal) Int64() (n int64, ok bool) {
 }
 
 // Float64 is the nearest float64 (correctly rounded from the exact
-// decimal text), as Postgres's numeric → float8 cast.
+// decimal text), as Postgres's numeric → float8 cast. The special
+// values become the float NaN and infinities.
 func (d Decimal) Float64() float64 {
+	switch d.kind {
+	case kindNaN:
+		return pgNaN
+	case kindPosInf:
+		return math.Inf(1)
+	case kindNegInf:
+		return math.Inf(-1)
+	}
 	// Exact fast path (the one strconv's own parser takes): a
 	// coefficient below 2^53 and a power of ten up to 10^22 are both
 	// exact float64s, and IEEE division rounds its exact quotient
@@ -1069,6 +1382,12 @@ func (d Decimal) Float64() float64 {
 	return f
 }
 
+// pgNaN is the NaN Postgres produces (C's NAN: quiet, positive, empty
+// payload), so numeric → float8 sends the same eight bytes in binary
+// format as Postgres does and as a stored float8 NaN (package tuple's
+// canonicalNaN). Go's math.NaN() sets the low payload bit instead.
+var pgNaN = math.Float64frombits(0x7FF8000000000000)
+
 // float64pow10 holds 10^0..10^22, the powers of ten a float64 holds exactly.
 var float64pow10 = [...]float64{
 	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
@@ -1078,9 +1397,11 @@ var float64pow10 = [...]float64{
 // Mantissa returns the value in scientific form for order-preserving
 // encodings: |d| = 0.digits × 10^exp, digits without leading or
 // trailing zeros (so equal values give identical parts whatever their
-// scale). Zero returns ("", 0).
+// scale). Zero returns ("", 0), and so does a special value, which has
+// no digits: an encoder checks IsFinite first and writes its own
+// marker (package tuple has a class byte for each).
 func (d Decimal) Mantissa() (neg bool, digits string, exp int) {
-	if d.IsZero() {
+	if d.IsZero() || d.kind != finite {
 		return false, "", 0
 	}
 	if d.isSmall() {
@@ -1230,12 +1551,21 @@ func FromMantissa(neg bool, digits string, exp int, scale int32) (Decimal, error
 // to the big.Int (coef) the first time an addition would leave the
 // int64 range, and stays there: a sum of 100k money values is ~10^12
 // cents, so most totals never move.
+//
+// Special inputs (N-051) are not added in; they are only noted, the way
+// Postgres's NumericAggState counts them beside its finite total. Value
+// then applies the rules addition would: any NaN, or both infinities,
+// make the total NaN, and otherwise a single kind of infinity wins.
+// Counting rather than folding keeps the finite total free of special
+// cases (and the per-row path free of anything but one kind test).
 type Sum struct {
 	small int64 // the total while wide is false; never MinInt64
 	wide  bool  // the total lives in coef
 	coef  big.Int
 	scale int32
 	tmp   big.Int // rescaled operand, reused
+
+	sawNaN, sawPosInf, sawNegInf bool // special inputs seen; see Value
 }
 
 // promote moves the total into the big.Int form.
@@ -1260,7 +1590,19 @@ func (s *Sum) addSmall(x int64, xs int32) bool {
 }
 
 // Add adds d to the total at scale max(total's, d's), as Decimal.Add.
+// A special d is noted rather than added (see Sum).
 func (s *Sum) Add(d Decimal) error {
+	switch d.kind {
+	case kindNaN:
+		s.sawNaN = true
+		return nil
+	case kindPosInf:
+		s.sawPosInf = true
+		return nil
+	case kindNegInf:
+		s.sawNegInf = true
+		return nil
+	}
 	if !s.wide {
 		if d.isSmall() && s.addSmall(d.small, d.scale) {
 			return nil
@@ -1287,7 +1629,9 @@ func (s *Sum) Add(d Decimal) error {
 		s.coef.Add(&s.coef, c)
 	}
 	if bound := s.coef.BitLen()*30103/100000 + 1 - int(s.scale); bound > MaxIntDigits {
-		if _, err := checked(s.Value()); err != nil {
+		// The finite part, not Value: a special input seen earlier must
+		// not hide an overflow of the digits themselves.
+		if _, err := checked(s.finiteValue()); err != nil {
 			return err
 		}
 	}
@@ -1313,8 +1657,24 @@ func (s *Sum) AddInt64(n int64) error {
 	return nil
 }
 
-// Value is the total as an independent Decimal.
+// Value is the total as an independent Decimal: NaN when a NaN or both
+// infinities were added, the infinity when one kind of infinity was,
+// and the finite total otherwise (numeric_sum / numeric_avg's order of
+// tests).
 func (s *Sum) Value() Decimal {
+	switch {
+	case s.sawNaN, s.sawPosInf && s.sawNegInf:
+		return NaN()
+	case s.sawPosInf:
+		return Inf(1)
+	case s.sawNegInf:
+		return Inf(-1)
+	}
+	return s.finiteValue()
+}
+
+// finiteValue is the total of the finite inputs alone.
+func (s *Sum) finiteValue() Decimal {
 	if !s.wide {
 		return Decimal{small: s.small, scale: s.scale}
 	}

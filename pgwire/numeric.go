@@ -18,8 +18,15 @@ package pgwire
 // and zero is ndigits 0 with its dscale. dscale is what keeps 1.50
 // from reading back as 1.5: the digits alone do not carry it.
 //
-// bytdb's numeric has no NaN or Infinity, so a parameter carrying one
-// is refused with the engine's message.
+// NaN and ±Infinity (N-051) are a bare header: ndigits 0, weight 0 and
+// the special sign word, which is what numeric_send writes for them.
+// Its dscale is 0 for NaN but 32 for both infinities: numeric_send reads
+// a special value's header as if it were a short numeric's, and the
+// infinities' sign bits (0xD000, 0xF000) overlap the short header's
+// dscale field (0x1F80, shifted right by 7) as 0x1000 → 32. Clients
+// ignore dscale on a special value; it is matched so the bytes equal
+// Postgres's, as TestNumericBinaryMatchesPostgres pins for numbers. On receipt numeric_recv reads (and range-checks) any digits
+// sent along, then ignores everything but the sign; so does this.
 
 import (
 	"encoding/binary"
@@ -41,10 +48,22 @@ const (
 	numericNInf = 0xF000
 
 	nbaseDigits = 4 // decimal digits per base-10000 digit
+
+	// infDscale is the dscale numeric_send writes for ±Infinity (see
+	// the file comment): (0xD000 & 0x1F80) >> 7, the same for 0xF000.
+	infDscale = 32
 )
 
 // appendNumericBinary appends d in numeric's binary format.
 func appendNumericBinary(dst []byte, d bytdb.Decimal) []byte {
+	switch {
+	case d.IsNaN():
+		return appendNumericHeader(dst, 0, 0, numericNaN, 0)
+	case d.IsInf(1):
+		return appendNumericHeader(dst, 0, 0, numericPInf, infDscale)
+	case d.IsInf(-1):
+		return appendNumericHeader(dst, 0, 0, numericNInf, infDscale)
+	}
 	sign := uint16(numericPos)
 	if d.Sign() < 0 {
 		sign = numericNeg
@@ -118,14 +137,30 @@ func decodeNumericBinary(raw []byte) (bytdb.Decimal, error) {
 	sign := binary.BigEndian.Uint16(raw[4:6])
 	dscale := int(binary.BigEndian.Uint16(raw[6:8]))
 	switch sign {
-	case numericPos, numericNeg:
-	case numericNaN, numericPInf, numericNInf:
-		return bytdb.Decimal{}, serr.New("numeric NaN and Infinity are not supported")
+	case numericPos, numericNeg, numericNaN, numericPInf, numericNInf:
 	default:
 		return bad("unknown sign")
 	}
 	if ndigits < 0 || len(raw) != 8+2*ndigits {
 		return bad("digit count does not match the body")
+	}
+	switch sign {
+	case numericNaN, numericPInf, numericNInf:
+		// The sign word alone is the value. numeric_recv still rejects
+		// a digit ≥ NBASE in the ignored digits, so check them too:
+		// the same bytes fail here exactly when they fail there.
+		for i := range ndigits {
+			if binary.BigEndian.Uint16(raw[8+2*i:]) > 9999 {
+				return bad("digit out of range")
+			}
+		}
+		switch sign {
+		case numericNaN:
+			return decimal.NaN(), nil
+		case numericPInf:
+			return decimal.Inf(1), nil
+		}
+		return decimal.Inf(-1), nil
 	}
 	if dscale > decimal.MaxScale {
 		return bad("display scale out of range")

@@ -37,6 +37,8 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{nil, false, int64(-7), 2.5, "k\x00ey", []byte{0}, true},
 		{decimal.MustParse("0")}, {decimal.MustParse("-12.50")}, {decimal.MustParse("1e30")},
 		{decimal.MustParse("0.000123"), int64(1), decimal.MustParse("-7")},
+		{decimal.NaN()}, {decimal.Inf(1)}, {decimal.Inf(-1)}, // N-051
+		{decimal.Inf(-1), decimal.MustParse("-7"), decimal.NaN()},
 	}
 	for _, vals := range seeds {
 		enc, err := Encode(vals...)
@@ -67,6 +69,9 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{tagDecimal, decNeg, 0x7F, 0xFF, 0xFF, 0xFE, 0xFE},
 		{tagDecimal, 0x09},
 		{tagDecimalScaled, decZero, 0x00},
+		{tagDecimalScaled, decNaN, 0x00},    // N-051: special value, truncated scale
+		{tagDecimalScaled, decNegInf, 0, 7}, // a crafted nonzero scale on a special value
+		{tagDecimal, decNaN + 1},            // first class past NaN
 	} {
 		f.Add(corrupt)
 	}
@@ -196,6 +201,7 @@ var boundaryVals = []any{
 	decimal.MustParse("-0.05"), decimal.MustParse("0.00"), decimal.MustParse("0.05"), decimal.MustParse("0.5"),
 	decimal.MustParse("1"), decimal.MustParse("1.000"), decimal.MustParse("1.1"), decimal.MustParse("10"),
 	decimal.MustParse("99.99"), decimal.MustParse("100"), decimal.MustParse("1e40"),
+	decimal.Inf(-1), decimal.Inf(1), decimal.NaN(), // N-051
 }
 
 // genTuple deterministically maps raw fuzz bytes onto a tuple of

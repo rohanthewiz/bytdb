@@ -492,3 +492,69 @@ func TestDecimalForms(t *testing.T) {
 		}
 	}
 }
+
+// TestDecimalSpecials (N-051): NaN and ±Infinity encode as their class
+// byte alone, in Postgres's order (-Infinity < numbers < +Infinity <
+// NaN) ascending and descending, one key per value, and both the key
+// and the stored form read back as the same value.
+func TestDecimalSpecials(t *testing.T) {
+	m := decimal.MustParse
+	nan, pinf, ninf := decimal.NaN(), decimal.Inf(1), decimal.Inf(-1)
+	sorted := []decimal.Decimal{ninf, m("-1e40"), m("-1"), m("0"), m("0.5"), m("1e40"), pinf, nan}
+	for i := 1; i < len(sorted); i++ {
+		a, _ := Encode(sorted[i-1])
+		b, _ := Encode(sorted[i])
+		if bytes.Compare(a, b) >= 0 {
+			t.Errorf("key(%s) should sort below key(%s)", sorted[i-1], sorted[i])
+		}
+		if Compare([]any{sorted[i-1]}, []any{sorted[i]}) >= 0 {
+			t.Errorf("Compare(%s, %s) should be < 0", sorted[i-1], sorted[i])
+		}
+		da, _ := AppendDesc(nil, sorted[i-1])
+		db, _ := AppendDesc(nil, sorted[i])
+		if bytes.Compare(da, db) <= 0 {
+			t.Errorf("desc key(%s) should sort above desc key(%s)", sorted[i-1], sorted[i])
+		}
+	}
+	for _, d := range []decimal.Decimal{nan, pinf, ninf} {
+		key, err := Encode(d)
+		if err != nil || len(key) != 2 {
+			t.Fatalf("key of %s = % x, %v (want tag + class)", d, key, err)
+		}
+		// Every special value is one key: a unique index holds one NaN.
+		again, _ := Encode(m(d.String()))
+		if !bytes.Equal(key, again) {
+			t.Errorf("%s encodes two ways: % x / % x", d, key, again)
+		}
+		for _, enc := range [][]byte{key, mustAppendValue(t, d)} {
+			vals, err := Decode(append(enc, 0x01)) // a NULL after it: the element must end where it should
+			if err != nil || len(vals) != 2 || vals[0].(decimal.Decimal) != d || vals[1] != nil {
+				t.Errorf("decode of %s (% x): %v, %v", d, enc, vals, err)
+			}
+			if rest, err := Skip(enc); err != nil || len(rest) != 0 {
+				t.Errorf("Skip over %s: rest %d, err %v", d, len(rest), err)
+			}
+		}
+		desc, _ := AppendDesc(nil, d)
+		if v, rest, err := DecodeOne(desc, true); err != nil || len(rest) != 0 || v.(decimal.Decimal) != d {
+			t.Errorf("desc round trip of %s: %v, %v", d, v, err)
+		}
+	}
+	// A special value's stored form carries scale 0, like any value's.
+	if enc := mustAppendValue(t, nan); !bytes.Equal(enc, []byte{tagDecimalScaled, decNaN, 0, 0}) {
+		t.Errorf("stored NaN = % x", enc)
+	}
+	// Class bytes past NaN are still refused.
+	if _, err := Decode([]byte{tagDecimal, decNaN + 1}); err == nil {
+		t.Error("class 0x06 must be refused")
+	}
+}
+
+func mustAppendValue(t *testing.T, v any) []byte {
+	t.Helper()
+	enc, err := AppendValue(nil, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return enc
+}

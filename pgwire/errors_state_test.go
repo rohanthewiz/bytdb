@@ -41,6 +41,11 @@ func TestSQLStateMapping(t *testing.T) {
 		{"NUMERIC precision 0 must be between 1 and 1000", false, "22023"},
 		{"NUMERIC scale 1001 must be between -1000 and 1000", false, "22023"},
 		{"numeric NaN and Infinity are not supported", false, "0A000"},
+		// N-051: numeric's special values cast to an integer, and
+		// to_timestamp of a NaN.
+		{"cannot convert NaN to bigint", false, "0A000"},
+		{"cannot convert infinity to integer", false, "0A000"},
+		{"timestamp cannot be NaN", false, "22008"},
 		{"bad binary numeric parameter", false, "22P03"},
 
 		// N-049: a missing index, by DROP INDEX's Postgres wording and

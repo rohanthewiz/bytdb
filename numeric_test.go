@@ -7,6 +7,7 @@ package bytdb_test
 
 import (
 	"errors"
+	"math"
 	"math/big"
 	"path/filepath"
 	"strings"
@@ -89,7 +90,7 @@ func TestNumericColumnCoercionAndTypmod(t *testing.T) {
 	if !strings.Contains(bytdb.ErrText(err), "must round to an absolute value less than 10^5") {
 		t.Errorf("overflow detail missing: %s", bytdb.ErrText(err))
 	}
-	for _, bad := range []any{"abc", "NaN", 1.5i} {
+	for _, bad := range []any{"abc", "-NaN", 1.5i} { // NaN takes no sign (N-051)
 		if err := e.Insert("acct", int64(101), nil, bad); err == nil {
 			t.Errorf("insert of %#v into numeric succeeded", bad)
 		}
@@ -278,5 +279,132 @@ func TestNumericAlterAndDefault(t *testing.T) {
 	r, _, _ = e.Get("m", int64(1))
 	if s, _ := r.String("fee"); s != "0.50" {
 		t.Errorf("numeric → text = %v", r.Col("fee"))
+	}
+}
+
+// TestNumericSpecialValues (N-051): NaN and ±Infinity at the engine
+// level. Every input shape that can spell them coerces; NaN fits a
+// numeric(p, s) column and an infinity does not; as keys they sort in
+// Postgres's order (-Infinity first, NaN last) and NaN is one key, so a
+// unique index refuses a second; ALTER COLUMN TYPE carries them to and
+// from float8 and refuses them into an integer column; and all of it
+// survives a reopen.
+func TestNumericSpecialValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sp.db")
+	e, err := bytdb.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateTable("sp", []bytdb.Column{
+		{Name: "k", Type: bytdb.TNumeric},
+		{Name: "bal", Type: bytdb.TNumeric, Precision: 7, Scale: 2},
+		{Name: "u", Type: bytdb.TNumeric},
+		{Name: "f", Type: bytdb.TFloat},
+	}, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateIndex("sp", "sp_u", true, "u"); err != nil {
+		t.Fatal(err)
+	}
+	nan, pinf, ninf := dec("NaN"), dec("Infinity"), dec("-Infinity")
+	// The key column takes each spelling: Decimal, text, bytes, float64
+	// and float32 (whose shortest text is "+Inf").
+	for _, row := range [][]any{
+		{"NaN", "NaN", float32(1), math.NaN()},
+		{float32(math.Inf(1)), nil, "inf", math.Inf(1)},
+		{[]byte("-infinity"), dec("1.5"), math.Inf(-1), 2.5},
+		{int64(0), nil, nil, nil},
+		{dec("2.5"), nil, nan, nil},
+	} {
+		if err := e.Insert("sp", row...); err != nil {
+			t.Fatalf("insert %v: %v", row, err)
+		}
+	}
+	// An infinity into numeric(7,2) is Postgres's overflow with its own
+	// DETAIL; NaN went in above.
+	err = e.Insert("sp", int64(9), "Infinity", nil, nil)
+	if err == nil || !strings.Contains(bytdb.ErrText(err), "cannot hold an infinite value") {
+		t.Fatalf("infinity into numeric(7,2): %v", err)
+	}
+	// NaN is one key, in the primary key and in a unique index.
+	if err := e.Insert("sp", math.NaN(), nil, nil, nil); !errors.Is(err, bytdb.ErrDuplicateKey) {
+		t.Fatalf("second NaN key: %v", err)
+	}
+	if err := e.Insert("sp", int64(7), nil, "NaN", nil); !errors.Is(err, bytdb.ErrUniqueViolation) {
+		t.Fatalf("second NaN in a unique index: %v", err)
+	}
+	check := func(e *bytdb.Engine) {
+		t.Helper()
+		var got []string
+		for r, err := range e.Scan("sp") {
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, numStr(t, r, "k"))
+		}
+		if want := "-Infinity 0 2.5 Infinity NaN"; strings.Join(got, " ") != want {
+			t.Errorf("key order = %v, want %s", got, want)
+		}
+		// Point lookups by each special value; the stored bal reads back.
+		for _, k := range []bytdb.Decimal{nan, pinf, ninf} {
+			if _, ok, err := e.Get("sp", k); !ok || err != nil {
+				t.Errorf("Get(%s): %v %v", k, ok, err)
+			}
+		}
+		if r, _, _ := e.Get("sp", nan); numStr(t, r, "bal") != "NaN" || numStr(t, r, "u") != "1" {
+			t.Errorf("NaN row = %v", r.Vals)
+		}
+		// A key range from 1 up: 2.5, Infinity and NaN, as Postgres's
+		// NaN > 1 is true.
+		var hi []string
+		for r, err := range e.ScanRange("sp", []any{dec("1")}, nil) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			hi = append(hi, numStr(t, r, "k"))
+		}
+		if want := "2.5 Infinity NaN"; strings.Join(hi, " ") != want {
+			t.Errorf("range k >= 1 = %v, want %s", hi, want)
+		}
+	}
+	check(e)
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if e, err = bytdb.Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	check(e)
+
+	// ALTER COLUMN TYPE: float8 → numeric keeps NaN and the infinities,
+	// numeric → float8 gives them back, numeric → int refuses them with
+	// Postgres's message, and the refused ALTER changes nothing.
+	if err := e.AlterColumnType("sp", "f", bytdb.ColumnTypeChange{Type: bytdb.TNumeric}); err != nil {
+		t.Fatal(err)
+	}
+	r, _, _ := e.Get("sp", nan)
+	if got := numStr(t, r, "f"); got != "NaN" {
+		t.Errorf("float NaN → numeric = %s", got)
+	}
+	r, _, _ = e.Get("sp", pinf)
+	if got := numStr(t, r, "f"); got != "Infinity" {
+		t.Errorf("float +Inf → numeric = %s", got)
+	}
+	err = e.AlterColumnType("sp", "u", bytdb.ColumnTypeChange{Type: bytdb.TInt})
+	if err == nil || !strings.Contains(err.Error(), "cannot convert") {
+		t.Fatalf("numeric with NaN/Inf → int: %v", err)
+	}
+	if err := e.AlterColumnType("sp", "u", bytdb.ColumnTypeChange{Type: bytdb.TFloat}); err != nil {
+		t.Fatal(err)
+	}
+	r, _, _ = e.Get("sp", ninf)
+	if f, _ := r.Float("u"); !math.IsInf(f, -1) {
+		t.Errorf("numeric -Infinity → float = %v", r.Col("u"))
+	}
+	// A numeric(p, s) typmod applied by ALTER refuses a stored infinity.
+	if err := e.AlterColumnType("sp", "f", bytdb.ColumnTypeChange{Type: bytdb.TNumeric, Precision: 5, Scale: 1}); err == nil ||
+		!strings.Contains(err.Error(), "numeric field overflow") {
+		t.Errorf("infinity under a new typmod: %v", err)
 	}
 }

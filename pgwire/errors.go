@@ -128,8 +128,19 @@ func sqlstate(msg string, hasPos bool) string {
 		return "2201F" // invalid_argument_for_power_function
 	case strings.HasPrefix(msg, "NUMERIC precision "), strings.HasPrefix(msg, "NUMERIC scale "):
 		return "22023" // invalid_parameter_value
+	// numeric NaN / ±Infinity cast to an integer type (N-051): Postgres
+	// raises these as feature_not_supported.
+	case strings.HasPrefix(msg, "cannot convert NaN to "),
+		strings.HasPrefix(msg, "cannot convert infinity to "):
+		return "0A000" // feature_not_supported
+	// decimal.ErrSpecial's text, from before numeric had NaN and
+	// Infinity (N-051); nothing in bytdb raises it now, but a caller
+	// holding the deprecated error still maps to the code it had.
 	case msg == "numeric NaN and Infinity are not supported":
-		return "0A000" // feature_not_supported: Postgres has them, bytdb's numeric does not
+		return "0A000" // feature_not_supported
+	// to_timestamp of a NaN, float8's or (since N-051) numeric's.
+	case msg == "timestamp cannot be NaN":
+		return "22008" // datetime_field_overflow
 	// Bind-time parameter decoding (values.go). A malformed binary value
 	// is Postgres's 22P03; a malformed text value is the same 22P02 as a
 	// bad literal. The space count pins the text form to "bad <type>

@@ -48,8 +48,8 @@ func TestParseRefusals(t *testing.T) {
 		"_1":            ErrSyntax,
 		"1__0":          ErrSyntax,
 		"1 2":           ErrSyntax,
-		"NaN":           ErrSpecial,
-		"-Infinity":     ErrSpecial,
+		"-NaN":          ErrSyntax, // N-051: NaN takes no sign
+		"infx":          ErrSyntax,
 		"1e-20000":      ErrOverflow,
 		"1e200000":      ErrOverflow,
 		"1e99999999999": ErrOverflow,
@@ -213,8 +213,8 @@ func TestCmpNormalizeAndConversions(t *testing.T) {
 	if d, _ := FromFloat64(1e20, 15); d.String() != "100000000000000000000" {
 		t.Errorf("FromFloat64(1e20, 15) = %s", d)
 	}
-	if _, err := FromFloat64(math.NaN(), -1); !errors.Is(err, ErrSpecial) {
-		t.Error("NaN must be refused")
+	if d, err := FromFloat64(math.NaN(), -1); err != nil || !d.IsNaN() {
+		t.Error("NaN must convert to numeric NaN (N-051)")
 	}
 	if !m("2.00").IsInteger() || m("2.01").IsInteger() {
 		t.Error("IsInteger")

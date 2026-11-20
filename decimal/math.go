@@ -162,9 +162,15 @@ func estimateLnDweight(d Decimal) int {
 // sqrt(16.0) is 4.000000000000000. The root is exact: an integer square
 // root with one extra digit, then that digit rounded half away from
 // zero. That is the correctly rounded result.
+//
+// numeric_sqrt's special cases: NaN and +Infinity are their own roots,
+// and -Infinity is a negative number like any other.
 func Sqrt(d Decimal) (Decimal, error) {
-	if d.Sign() < 0 {
+	if d.Sign() < 0 { // -Infinity too
 		return Decimal{}, ErrSqrtNegative
+	}
+	if d.kind != finite {
+		return d, nil
 	}
 	// numeric_sqrt: the result's weight is about half the input's.
 	// (weight+1)·4 is even, so Go's and C's division agree here.
@@ -372,7 +378,17 @@ func lnVar(arg Decimal, rscale int) (Decimal, error) {
 // decimal weight as d·log10(e) in float64. |d| ≥ 6000 overflows
 // (positive) or underflows to zero at that scale (negative), as in
 // exp_var.
+//
+// numeric_exp's special cases: exp(NaN) is NaN, exp(+Infinity) is
+// +Infinity, and exp(-Infinity) is 0 (POSIX's rule, with no underflow
+// error).
 func Exp(d Decimal) (Decimal, error) {
+	switch d.kind {
+	case kindNaN, kindPosInf:
+		return d, nil
+	case kindNegInf:
+		return Decimal{}, nil
+	}
 	val := d.Float64()
 	w := val * log10e
 	w = max(min(w, maxResultScale), -maxResultScale)
@@ -389,7 +405,13 @@ func expAt(y Decimal, rscale int) (Decimal, error) {
 
 // ---- ln and log ----
 
+// checkLog is the logarithms' domain check. NaN passes (its logarithm
+// is NaN, not an error; its Sign of 0 must not read as zero), and
+// -Infinity fails as a negative number.
 func checkLog(d Decimal) error {
+	if d.kind == kindNaN {
+		return nil
+	}
 	switch d.Sign() {
 	case 0:
 		return ErrLogZero
@@ -402,9 +424,15 @@ func checkLog(d Decimal) error {
 // Ln is Postgres's numeric ln(d): about 16 significant digits by
 // estimate_ln_dweight, so a d near 1 gets the extra places its small
 // logarithm needs (ln(1.00001) has 21).
+//
+// numeric_ln's special cases: ln(NaN) is NaN, ln(+Infinity) is
+// +Infinity, and -Infinity is a negative number (checkLog's error).
 func Ln(d Decimal) (Decimal, error) {
 	if err := checkLog(d); err != nil {
 		return Decimal{}, err
+	}
+	if d.kind != finite {
+		return d, nil // NaN or +Infinity
 	}
 	dw := estimateLnDweight(d)
 	return lnAt(d, clampScale(minSigDigits-dw, d.scale))
@@ -421,7 +449,34 @@ func lnAt(d Decimal, rscale int) (Decimal, error) {
 // result's, then divides and rounds. Those two roundings are reproduced,
 // because near a rounding boundary they decide the last digit. A base of
 // 1 has ln 0 and is Postgres's division by zero.
+//
+// Special arguments follow numeric_log: NaN anywhere is NaN (before any
+// domain check), then the domain errors as for numbers, then
+// log(+Inf, +Inf) is NaN (∞/∞), log(+Inf, x) is 0 and log(b, +Inf) is
+// +Infinity, even for b = 1.
 func Log(base, d Decimal) (Decimal, error) {
+	if base.kind|d.kind != finite {
+		if base.kind == kindNaN || d.kind == kindNaN {
+			return NaN(), nil
+		}
+		// Both signs before either zero, as numeric_log orders them
+		// here (log(0, -Inf) is "negative"; the finite path below
+		// checks base fully first, as ln_var does).
+		s1, s2 := base.Sign(), d.Sign()
+		if s1 < 0 || s2 < 0 {
+			return Decimal{}, ErrLogNegative
+		}
+		if s1 == 0 || s2 == 0 {
+			return Decimal{}, ErrLogZero
+		}
+		switch {
+		case base.kind == kindPosInf && d.kind == kindPosInf:
+			return NaN(), nil
+		case base.kind == kindPosInf:
+			return Decimal{}, nil
+		}
+		return Inf(1), nil // d is +Infinity
+	}
 	if err := checkLog(base); err != nil {
 		return Decimal{}, err
 	}
@@ -460,7 +515,12 @@ func Log(base, d Decimal) (Decimal, error) {
 //  2. ln(base) again, rounded to the places the result needs plus 8;
 //     times exp, rounded to the same places.
 //  3. exp of that, rounded to rscale.
+//
+// NaN and infinite arguments take powSpecial, before anything here.
 func Pow(base, exp Decimal) (Decimal, error) {
+	if base.kind|exp.kind != finite {
+		return powSpecial(base, exp)
+	}
 	if base.IsZero() && exp.Sign() < 0 {
 		return Decimal{}, ErrPowZeroNeg
 	}
@@ -523,6 +583,98 @@ func Pow(base, exp Decimal) (Decimal, error) {
 		r = r.Neg()
 	}
 	return r, nil
+}
+
+// decMinusOne is -1, for powSpecial's x = -1 rule.
+var decMinusOne = FromInt64(-1)
+
+// powSpecial is numeric_power's handling of NaN and infinite arguments,
+// which follows POSIX pow(3). x is the base, y the exponent; at least
+// one is special. The tests run in numeric_power's order, since several
+// overlap (1 ^ NaN is 1, but NaN ^ 1 is NaN):
+//
+//	NaN ^ 0 = 1, 1 ^ NaN = 1, any other NaN argument → NaN
+//	0 ^ negative (y = -Inf included)        → error, as for numbers
+//	negative ^ non-integer finite y         → error (x = -Inf included)
+//	1 ^ y = 1, x ^ 0 = 1, 0 ^ positive = 0
+//	y = ±Inf:   x = -1 → 1; else +Inf when (|x| > 1) == (y > 0), else 0
+//	            (an infinite x counts as |x| > 1)
+//	x = +Inf:   y > 0 → +Inf, y < 0 → 0
+//	x = -Inf:   y < 0 → 0; y an odd integer → -Inf; other y > 0 → +Inf
+//
+// Every finite result is a scale-0 1 or 0 (Postgres's const_one and
+// const_zero), whatever the inputs' scales.
+func powSpecial(x, y Decimal) (Decimal, error) {
+	one, zero := FromInt64(1), Decimal{}
+	if x.kind == kindNaN {
+		if y.kind == finite && y.IsZero() {
+			return one, nil
+		}
+		return NaN(), nil
+	}
+	if y.kind == kindNaN {
+		if x.kind == finite && x.Cmp(decOne) == 0 {
+			return one, nil
+		}
+		return NaN(), nil
+	}
+	// At least one infinity, and no NaN: Sign is meaningful for both.
+	s1, s2 := x.Sign(), y.Sign()
+	if s1 == 0 && s2 < 0 {
+		return Decimal{}, ErrPowZeroNeg
+	}
+	// An infinite exponent counts as integral here (numeric_is_integral),
+	// so only a finite fractional one is refused.
+	if s1 < 0 && y.kind == finite && !y.IsInteger() {
+		return Decimal{}, ErrPowNegNonInt
+	}
+	if x.kind == finite && x.Cmp(decOne) == 0 {
+		return one, nil
+	}
+	if s2 == 0 {
+		return one, nil
+	}
+	if s1 == 0 && s2 > 0 {
+		return zero, nil
+	}
+	if y.kind != finite {
+		absXGtOne := true // x = ±Inf
+		if x.kind == finite {
+			if x.Cmp(decMinusOne) == 0 {
+				return one, nil
+			}
+			absXGtOne = x.Abs().Cmp(decOne) > 0
+		}
+		if absXGtOne == (s2 > 0) {
+			return Inf(1), nil
+		}
+		return zero, nil
+	}
+	// x is infinite, y finite and nonzero.
+	if x.kind == kindPosInf {
+		if s2 > 0 {
+			return Inf(1), nil
+		}
+		return zero, nil
+	}
+	if s2 < 0 {
+		return zero, nil
+	}
+	if y.IsInteger() && isOdd(y) {
+		return Inf(-1), nil
+	}
+	return Inf(1), nil
+}
+
+// isOdd reports whether an integral finite d is odd. Bit 0 of the
+// integer part gives the parity; math/big's Bit reads a negative value
+// in two's complement, which keeps the parity of its magnitude.
+func isOdd(d Decimal) bool {
+	t := d.Trunc(0)
+	if t.isSmall() {
+		return t.small&1 != 0
+	}
+	return t.wide.Bit(0) == 1
 }
 
 func abs(n int) int {

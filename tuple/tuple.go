@@ -58,10 +58,21 @@ const (
 
 // Decimal body, after the tag:
 //
-//	class     1 byte   0x01 negative, 0x02 zero, 0x03 positive
-//	exponent  4 bytes  int32 E, sign bit flipped        (absent for zero)
-//	digits    n bytes  1 + each base-100 digit pair     (absent for zero)
-//	end       1 byte   0x00                             (absent for zero)
+//	class     1 byte   0x00 -Infinity, 0x01 negative, 0x02 zero,
+//	                   0x03 positive, 0x04 +Infinity, 0x05 NaN
+//	exponent  4 bytes  int32 E, sign bit flipped        (negative and positive only)
+//	digits    n bytes  1 + each base-100 digit pair     (negative and positive only)
+//	end       1 byte   0x00                             (negative and positive only)
+//
+// The special values (N-051) are their class byte alone, like zero, and
+// the classes are numbered in Postgres's order for numeric: -Infinity
+// below every number, +Infinity above, NaN above everything. So byte
+// order is still value order, an index range scan for x > 5 returns
+// +Infinity and NaN (Postgres's NaN > 5 is true), and every NaN is one
+// key, which is what makes a unique index refuse a second NaN as
+// Postgres's does. The three classes were unused before N-051, so no
+// byte an earlier version wrote changes meaning; an earlier version
+// reading a special value fails with "unknown decimal class".
 //
 // where |v| = 0.d1d2...dk × 10^E with no leading or trailing zero
 // digits (decimal.Mantissa); an odd final digit is padded with 0 in its
@@ -71,12 +82,15 @@ const (
 // mantissa (smaller magnitude) higher. Every part is fixed-width or
 // terminated, so whole-element inversion (AppendDesc) still reverses the
 // order. tagDecimalScaled then adds the display scale as a big-endian
-// uint16.
+// uint16 (0 for a special value, whose Scale is 0).
 const (
-	decNeg  byte = 0x01
-	decZero byte = 0x02
-	decPos  byte = 0x03
-	decEnd  byte = 0x00
+	decNegInf byte = 0x00
+	decNeg    byte = 0x01
+	decZero   byte = 0x02
+	decPos    byte = 0x03
+	decPosInf byte = 0x04
+	decNaN    byte = 0x05
+	decEnd    byte = 0x00
 )
 
 // Byte-string escaping: 0x00 inside the data becomes 0x00 0xFF, and
@@ -189,6 +203,12 @@ func appendDecimal(buf []byte, mask byte, d decimal.Decimal, withScale bool) []b
 	buf = append(buf, tag^mask)
 	neg, digits, exp := d.Mantissa()
 	switch {
+	case d.IsNaN():
+		buf = append(buf, decNaN^mask)
+	case d.IsInf(1):
+		buf = append(buf, decPosInf^mask)
+	case d.IsInf(-1):
+		buf = append(buf, decNegInf^mask)
 	case digits == "":
 		buf = append(buf, decZero^mask)
 	default:
@@ -225,6 +245,7 @@ func appendDecimal(buf []byte, mask byte, d decimal.Decimal, withScale bool) []b
 
 // decScan is one decimal element's parts as scanDecimal validated them.
 type decScan struct {
+	cls   byte // the class, unmasked: decodeDecimal builds a special value from it
 	neg   bool
 	pairs []byte // the stored digit-pair bytes (still XOR inv); nil for zero
 	inv   byte   // what the pair bytes are XORed with
@@ -243,8 +264,10 @@ func scanDecimal(data []byte, mask byte, withScale bool) (sc decScan, rest []byt
 		return sc, nil, serr.New("tuple: truncated decimal element")
 	}
 	cls, data := data[0]^mask, data[1:]
+	sc.cls = cls
 	switch cls {
-	case decZero:
+	case decZero, decNegInf, decPosInf, decNaN:
+		// The class byte is the whole value (then the scale, if any).
 	case decPos, decNeg:
 		sc.neg = cls == decNeg
 		sc.inv = mask
@@ -302,6 +325,14 @@ func decodeDecimal(data []byte, mask byte, withScale bool) (decimal.Decimal, []b
 	sc, rest, err := scanDecimal(data, mask, withScale)
 	if err != nil {
 		return decimal.Decimal{}, nil, err
+	}
+	switch sc.cls {
+	case decNaN:
+		return decimal.NaN(), rest, nil
+	case decPosInf:
+		return decimal.Inf(1), rest, nil
+	case decNegInf:
+		return decimal.Inf(-1), rest, nil
 	}
 	if len(sc.pairs) > 0 && len(sc.pairs) <= 9 {
 		// Up to 18 digits: accumulate the mantissa as a number, no digit

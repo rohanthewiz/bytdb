@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/decimal"
 )
 
 // TestNumericBinaryMatchesPostgres pins appendNumericBinary to Postgres
@@ -41,23 +42,53 @@ func TestNumericBinaryMatchesPostgres(t *testing.T) {
 }
 
 // TestNumericBinaryRefusals: forged headers fail the parameter instead
-// of allocating or panicking, and NaN/Infinity get the engine's refusal.
+// of allocating or panicking.
 func TestNumericBinaryRefusals(t *testing.T) {
 	for name, h := range map[string]string{
 		"short":           "000100",
 		"count mismatch":  "0002000000000000270f",
 		"digit too big":   "0001000000000000ffff",
-		"bad sign":        "000000001234000000",
+		"bad sign":        "0000000012340000",
 		"scale too big":   "0000000000007fff",
-		"NaN":             "000000000c00000000"[:16],
 		"negative ndigit": "ffff000000000000",
+		// N-051: a special value's digits are ignored but still
+		// checked, as numeric_recv checks them.
+		"NaN, count mismatch": "00010000c0000000",
+		"-Inf, digit too big": "00010000f0000000ffff",
+		"+Inf, short":         "00000000d000",
 	} {
 		raw, _ := hex.DecodeString(h)
-		if name == "NaN" {
-			raw = []byte{0, 0, 0, 0, 0xC0, 0, 0, 0}
-		}
 		if _, err := decodeNumericBinary(raw); err == nil {
 			t.Errorf("%s: accepted % x", name, raw)
+		}
+	}
+}
+
+// TestNumericBinarySpecials (N-051): NaN and ±Infinity travel as a bare
+// header with numeric_send's sign words, and read back from it, with or
+// without (ignored) digits.
+func TestNumericBinarySpecials(t *testing.T) {
+	for _, c := range []struct {
+		d    bytdb.Decimal
+		wire string
+	}{
+		// Postgres 16's numeric_send bytes, dscale 32 on the infinities
+		// included (encode(numeric_send('Infinity'::numeric), 'hex')).
+		{decimal.NaN(), "00000000c0000000"},
+		{decimal.Inf(1), "00000000d0000020"},
+		{decimal.Inf(-1), "00000000f0000020"},
+	} {
+		if got := hex.EncodeToString(appendNumericBinary(nil, c.d)); got != c.wire {
+			t.Errorf("%s encodes as %s, want %s", c.d, got, c.wire)
+		}
+		raw, _ := hex.DecodeString(c.wire)
+		if d, err := decodeNumericBinary(raw); err != nil || d != c.d {
+			t.Errorf("%s decodes as %s, %v", c.wire, d, err)
+		}
+		// Digits, weight and dscale are ignored for a special value.
+		raw, _ = hex.DecodeString("0001" + "0003" + c.wire[8:12] + "0005" + "0007")
+		if d, err := decodeNumericBinary(raw); err != nil || d != c.d {
+			t.Errorf("%s with digits decodes as %s, %v", c.d, d, err)
 		}
 	}
 }

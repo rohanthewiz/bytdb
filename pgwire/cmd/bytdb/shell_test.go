@@ -454,3 +454,36 @@ INSERT INTO price (sku) VALUES (7);
 		t.Errorf("restored values %q, want %q", out, want)
 	}
 }
+
+// TestDumpNumericSpecial (N-051): numeric NaN and ±Infinity dump as
+// quoted strings (unquoted they would read as identifiers), a numeric
+// key holding them restores in Postgres's order, a special DEFAULT
+// survives the round trip, and JSON output renders them as strings, as
+// Postgres's to_json does.
+func TestDumpNumericSpecial(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src.bytdb"), filepath.Join(dir, "dst.bytdb")
+	if _, errOut, code := runShell(t, `
+CREATE TABLE m (k numeric PRIMARY KEY, v numeric DEFAULT 'NaN');
+INSERT INTO m VALUES ('NaN', '-inf'), ('Infinity', 1.50), ('-Infinity', 'infinity'), (0, NULL);
+INSERT INTO m (k) VALUES (2.5);
+`, "-batch", src); code != 0 {
+		t.Fatalf("setup: code %d stderr %s", code, errOut)
+	}
+	dump, errOut, code := runShell(t, "", src, ".dump")
+	if code != 0 {
+		t.Fatalf("dump: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, dump, "'-Infinity', 'Infinity'", "0, NULL", "2.5, 'NaN'", "'Infinity', 1.50", "'NaN', '-Infinity'")
+	if _, errOut, code = runShell(t, dump, "-batch", dst); code != 0 {
+		t.Fatalf("restore: code %d stderr %s", code, errOut)
+	}
+	if again, _, _ := runShell(t, "", dst, ".dump"); again != dump {
+		t.Errorf("dump of the restored database differs.\nfirst:\n%s\nsecond:\n%s", dump, again)
+	}
+	out, errOut, code := runShell(t, "", dst, "-json", "-c", "SELECT k, v FROM m ORDER BY k")
+	if code != 0 {
+		t.Fatalf("json: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, out, `"k":"-Infinity"`, `"k":0`, `"k":2.5`, `"v":1.50`, `"k":"NaN"`, `"v":"-Infinity"`)
+}

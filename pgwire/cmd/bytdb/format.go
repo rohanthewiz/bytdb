@@ -187,8 +187,13 @@ func sqlLiteral(v any, t bytdb.ColType) string {
 		return strconv.FormatFloat(x, 'g', -1, 64)
 	case bytdb.Decimal:
 		// Unquoted, the exact digits and scale: it reads back as a
-		// numeric literal, so 19.90 reloads as 19.90.
-		return x.String()
+		// numeric literal, so 19.90 reloads as 19.90. NaN and the
+		// infinities (N-051) are not literals and go quoted, as float8's
+		// do, which the numeric column reads back the same way.
+		if x.IsFinite() {
+			return x.String()
+		}
+		return quoteString(x.String())
 	}
 	s, _ := displayValue(v, t)
 	return quoteString(s)
@@ -239,10 +244,14 @@ func jsonValue(v any, t bytdb.ColType) string {
 			return strconv.FormatFloat(x, 'g', -1, 64)
 		}
 	case bytdb.Decimal:
-		// numeric text is always a valid JSON number (no exponent, no
-		// NaN), and emitting it bare keeps every digit a float would
-		// round away.
-		return x.String()
+		// A finite numeric's text is always a valid JSON number (no
+		// exponent), and emitting it bare keeps every digit a float
+		// would round away. NaN and the infinities (N-051) are not JSON
+		// numbers and fall through to a string, as float8's do and as
+		// Postgres's to_json renders them ("NaN", "-Infinity").
+		if x.IsFinite() {
+			return x.String()
+		}
 	}
 	s, _ := displayValue(v, t)
 	b, _ := json.Marshal(s) // a string always marshals
