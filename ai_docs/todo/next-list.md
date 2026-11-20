@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-061
+**Next ID:** N-062
 
 ## Open
 
@@ -44,12 +44,6 @@ recommendations. Every phase of it (0–9) is on main and released in
 too: N-045 was declined after measuring (see Non-goals), and N-046, N-047
 and N-049 are closed.
 
-- **N-051** · raised `2026-1111-1759-numeric-type-n048` · value low
-  **numeric `NaN` and `±Infinity`.** Refused today (0A000 over the wire,
-  plan Q7). Postgres has them; adding them means special cases in every
-  arithmetic, comparison and aggregate path plus two tuple classes (the
-  encoding's class byte has room: 0x01/0x02/0x03 are used). Trigger: a
-  dump or a client that writes one.
 - **N-053** · raised `2026-1111-1759-numeric-type-n048` · value low
   **The rest of N-048's refused types: `interval`, `money`, `bit`,
   `citext`.** Still "unknown column type". `money` maps naturally onto
@@ -108,6 +102,20 @@ and N-049 are closed.
   constraint by the name Postgres would give it gets 42704. Found while
   writing N-056's tests (`TestDropColumnTakesDependents` skips the name
   for that reason).
+- **N-061** · raised `2026-1120-1558-n051-numeric-nan-infinity` · value low
+  **RANGE offset frames on numeric, and a quoted offset.** `RANGE BETWEEN
+  1 PRECEDING AND 1 FOLLOWING` over a numeric ORDER BY key fails with
+  "RANGE with offset PRECEDING/FOLLOWING is not supported for column type
+  numeric" (XX000), where Postgres runs it. On float8 the frame works,
+  but a quoted offset (`'Infinity' PRECEDING`) isn't converted to the
+  key's type ("frame starting offset must be numeric"). Postgres also
+  refuses a NaN or negative offset with 22013. For numeric the work is
+  `rangeThreshold` (`sql/window.go`) in exact Decimal arithmetic rather
+  than through float64, plus `in_range_numeric_numeric`'s special-value
+  rules: a NaN key is within any distance of NaN only, and an infinite
+  offset from the same-signed infinity takes in every value. Those rules
+  matter now that N-051 lets keys be NaN or infinite. PG16's answers for
+  a 7-row case are in the N-051 session doc. Found by N-051's corpus.
 
 ## Validate
 
@@ -222,6 +230,19 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
 
 ## Closed
 
+- **N-051** · raised `2026-1111-1759-numeric-type-n048` · closed
+  2026-11-20, `2026-1120-1558-n051-numeric-nan-infinity`. **numeric `NaN` and `±Infinity`.** They are
+  values now, with Postgres 14+'s rules. `decimal.Decimal` gained a `kind`
+  field in its padding (still 24 bytes, zero value still 0), checked ahead
+  of N-050's fast paths. The tuple encoding uses three class bytes, not
+  the two the item guessed: -Infinity 0x00, +Infinity 0x04, NaN 0x05, in
+  value order, so a unique index holds one NaN. Binary wire output is
+  byte-identical to `numeric_send` (dscale 32 on the infinities). Checked
+  against PG16 with 887 captured decimal cases, the corpus file
+  `80_numeric_special.sql` and a three-mode pgx check (0 differences).
+  Also fixed: float8 `DEFAULT 'NaN'` broke every INSERT using it, and
+  `to_timestamp(NaN)` returned an arbitrary instant. Numeric benchmarks
+  moved 0.5–2.7%, within run-to-run spread, with no added allocations.
 - **N-056** · raised `2026-1114-1610-n033-linux-pty-n049-orm-capture` · closed
   2026-11-18, `2026-1118-1459-n056-drops-cascade-like-postgres`. **Drops cascade to dependents the way Postgres's do.** This
   reverses D-54's RESTRICT-only rule, as decided 2026-11-14. Every case was
