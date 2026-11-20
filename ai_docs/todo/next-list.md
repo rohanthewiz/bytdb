@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-062
+**Next ID:** N-064
 
 ## Open
 
@@ -93,15 +93,6 @@ and N-049 are closed.
   pgwire build is unaffected. Measure a GROUP BY numeric query and a pgx
   fetch first.
 
-- **N-060** · raised `2026-1118-1459-n056-drops-cascade-like-postgres` · value low
-  **A multi-column foreign key's default name.** bytdb names
-  `FOREIGN KEY (x, y) REFERENCES p (a, b)` on table `ch` as `ch_x_fkey`,
-  from the first column only (`sql/fk.go`, `resolveFK`). PG16 names it
-  `ch_x_y_fkey`, joining every column the way it already does for
-  `UNIQUE (a, b)` (`t_a_b_key`). A migration tool that drops the
-  constraint by the name Postgres would give it gets 42704. Found while
-  writing N-056's tests (`TestDropColumnTakesDependents` skips the name
-  for that reason).
 - **N-061** · raised `2026-1120-1558-n051-numeric-nan-infinity` · value low
   **RANGE offset frames on numeric, and a quoted offset.** `RANGE BETWEEN
   1 PRECEDING AND 1 FOLLOWING` over a numeric ORDER BY key fails with
@@ -116,6 +107,26 @@ and N-049 are closed.
   offset from the same-signed infinity takes in every value. Those rules
   matter now that N-051 lets keys be NaN or infinite. PG16's answers for
   a 7-row case are in the N-051 session doc. Found by N-051's corpus.
+
+- **N-062** · raised `2026-1120-1609-n060-multi-column-fk-default-name` · value low
+  **ErrorResponse lacks the object fields.** pgwire's errors carry only
+  S, V, C, M, D, H and P (`pgwire/errors.go`). Postgres also sends `n`
+  (constraint name), `t` (table), `c` (column), `s` (schema) and `d`
+  (data type) where they apply, e.g. `n` on 23505/23503/23514 and `t`/`c`
+  on 23502. Clients and ORMs that map a violation to a constraint read
+  `n` (pgx's `PgError.ConstraintName`); against bytdb it is empty, so
+  they must parse the message text. Seen during N-060's wire check: the
+  FK violation named `ch_x_y_fkey` in its message, with an empty
+  `ConstraintName`.
+- **N-063** · raised `2026-1120-1609-n060-multi-column-fk-default-name` · value low
+  **Identifiers aren't truncated to 63 bytes.** Postgres truncates any
+  identifier longer than NAMEDATALEN-1 (63 bytes) with a NOTICE, and
+  `makeObjectName` shortens the parts of a generated name
+  (`table_cols_fkey`, `_key`, `_idx`, `_pkey`) so the whole fits in 63
+  bytes. bytdb keeps every name at full length (`resolveFK` in
+  `sql/fk.go`, `freeIndexName` in `sql/sql.go`), so with long table or
+  column names a migration tool computing Postgres's name misses
+  bytdb's. Noticed while fixing N-060.
 
 ## Validate
 
@@ -229,6 +240,17 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   `2026-1114-1640-n052-exact-numeric-math` (`94be4da`).
 
 ## Closed
+
+- **N-060** · raised `2026-1118-1459-n056-drops-cascade-like-postgres` · closed
+  2026-11-20, `2026-1120-1609-n060-multi-column-fk-default-name`. **A multi-column foreign key's default name.**
+  `resolveFK` (`sql/fk.go`) joins every FK column, so `FOREIGN KEY (x, y)`
+  on `ch` is `ch_x_y_fkey`, for CREATE TABLE and ALTER TABLE ADD FOREIGN
+  KEY alike, with the clash suffix unchanged (`ch_x_y_fkey1`). Stored names
+  keep their old form. `TestFKDefaultNameMultiColumn` is new;
+  `TestDropColumnTakesDependents` now compares the name it skipped, and
+  `TestSystemCatalogKeyConstraints` expects `members_org_id_org_code_fkey`.
+  Checked over the wire with pgx (pg_constraint, 23503 message, ADD again,
+  DROP CONSTRAINT by the Postgres name).
 
 - **N-051** · raised `2026-1111-1759-numeric-type-n048` · closed
   2026-11-20, `2026-1120-1558-n051-numeric-nan-infinity`. **numeric `NaN` and `±Infinity`.** They are
