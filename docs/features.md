@@ -241,6 +241,9 @@ ALTER TABLE child DROP CONSTRAINT IF EXISTS child_p_fkey;
   constraint. The referenced columns must be the parent's primary key or a
   unique index's columns (Postgres wording otherwise). Child and parent
   column types must match exactly.
+- An unnamed FK is named `table_cols_fkey` from **all** its columns, as in
+  Postgres: `FOREIGN KEY (x, y)` on `ch` is `ch_x_y_fkey`, with a numeric
+  suffix (`ch_x_y_fkey1`) when that name is taken.
 - `ON DELETE NO ACTION` / `RESTRICT` refuse a parent DELETE while children
   reference it. **`ON DELETE CASCADE`** removes referencing rows transitively
   instead. `ON UPDATE CASCADE` and `SET NULL/DEFAULT` are rejected at parse

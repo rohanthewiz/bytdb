@@ -335,7 +335,7 @@ func TestSystemCatalogKeyConstraints(t *testing.T) {
 		from pg_constraint where contype in ('p', 'u', 'f') order by 1`)
 	want := [][]any{
 		{"members_email_key", "u", "{4}", nil, "UNIQUE (email)"},
-		{"members_org_id_fkey", "f", "{2,3}", "{1,2}",
+		{"members_org_id_org_code_fkey", "f", "{2,3}", "{1,2}",
 			"FOREIGN KEY (org_id, org_code) REFERENCES orgs(id, code)"},
 		{"members_pkey", "p", "{1}", nil, "PRIMARY KEY (id)"},
 		{"orgs_name_key", "u", "{3}", nil, "UNIQUE (name)"},

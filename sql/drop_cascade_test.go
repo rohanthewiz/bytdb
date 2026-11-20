@@ -78,9 +78,9 @@ func TestDropColumnTakesDependents(t *testing.T) {
 	exec(t, d, `create table ch (id int primary key, pid int references p (id), x int, y int,
 		foreign key (x, y) references p (a, b))`)
 	exec(t, d, `alter table ch drop column pid`)
-	// One FK left: the (x, y) one. Its name is not compared, because
-	// bytdb names it ch_x_fkey where Postgres says ch_x_y_fkey (N-060).
-	if got := constraintNames(d, "ch"); len(got) != 1 || got[0] == "ch_pid_fkey" {
+	// One FK left: the (x, y) one, named from both its columns as
+	// Postgres names it (N-060).
+	if got := constraintNames(d, "ch"); !slices.Equal(got, []string{"ch_x_y_fkey"}) {
 		t.Errorf("ch after dropping pid: %v", got)
 	}
 	exec(t, d, `alter table ch drop column y`)

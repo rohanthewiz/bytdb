@@ -389,7 +389,9 @@ func fkRefColsChanged(desc *bytdb.TableDesc, refs []bytdb.FKRef, oldVals, newVal
 
 // resolveFKs maps a CREATE TABLE / ALTER TABLE foreign-key definition
 // onto the engine's descriptor form, naming unnamed constraints
-// table_col_fkey (numeric suffix on collision) per Postgres.
+// table_col1_col2_fkey (numeric suffix on collision) per Postgres:
+// every referencing column joins the name, as with a UNIQUE (a, b)
+// constraint's t_a_b_key, so FOREIGN KEY (x, y) on ch is ch_x_y_fkey.
 func resolveFK(desc *bytdb.TableDesc, def FKDef) (bytdb.FKDesc, error) {
 	fkd := bytdb.FKDesc{Name: def.Name, RefTable: def.RefTable, RefCols: def.RefCols, OnDelete: def.OnDelete}
 	for _, name := range def.Cols {
@@ -407,7 +409,13 @@ func resolveFK(desc *bytdb.TableDesc, def FKDef) (bytdb.FKDesc, error) {
 		for _, f := range desc.ForeignKeys {
 			taken[f.Name] = true
 		}
-		base := desc.Name + "_" + def.Cols[0] + "_fkey"
+		// Postgres's ChooseForeignKeyConstraintNameAddition joins all
+		// the FK's columns with "_". Naming from the first column alone
+		// (an earlier bytdb shape) gives a name a migration tool that
+		// computes Postgres's default can't find to drop. Names already
+		// stored in a descriptor are kept as they are; only new,
+		// unnamed constraints pick up this form.
+		base := desc.Name + "_" + strings.Join(def.Cols, "_") + "_fkey"
 		fkd.Name = base
 		for n := 1; taken[fkd.Name]; n++ {
 			fkd.Name = fmt.Sprintf("%s%d", base, n)

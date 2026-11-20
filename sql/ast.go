@@ -689,7 +689,7 @@ type CheckDef struct {
 // key). OnDelete is "" (NO ACTION/RESTRICT) or bytdb.FKCascade; ON
 // UPDATE parses NO ACTION/RESTRICT only.
 type FKDef struct {
-	Name     string // from CONSTRAINT name; "": named table_col_fkey
+	Name     string // from CONSTRAINT name; "": named table_col1_col2_fkey
 	Cols     []string
 	RefTable string
 	RefCols  []string

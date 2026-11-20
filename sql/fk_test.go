@@ -126,6 +126,39 @@ func TestFKCompositeAndUniqueTarget(t *testing.T) {
 	exec(t, d, `create table bad (id int primary key)`)
 }
 
+// An unnamed multi-column foreign key takes every column into its
+// default name, table_col1_col2_fkey, the way Postgres names it (and
+// the way bytdb already names UNIQUE (a, b) as t_a_b_key), so a
+// migration that drops it by Postgres's name finds it (N-060).
+func TestFKDefaultNameMultiColumn(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table p (id int primary key, a int, b int, unique (a, b))`)
+	exec(t, d, `create table ch (id int primary key, pid int references p (id), x int, y int,
+		foreign key (x, y) references p (a, b))`)
+	got := constraintNames(d, "ch")
+	if want := []string{"ch_pid_fkey", "ch_x_y_fkey"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("constraint names = %v, want %v", got, want)
+	}
+	// The violation message carries the full name too.
+	exec(t, d, `insert into p values (1, 1, 1)`)
+	wantErr(t, d, `insert into ch values (1, 1, 1, 2)`,
+		`violates foreign key constraint "ch_x_y_fkey"`)
+
+	// ALTER TABLE ... ADD FOREIGN KEY names the same way, and a second
+	// key over the same columns takes Postgres's numeric suffix.
+	exec(t, d, `alter table ch add foreign key (x, y) references p (a, b)`)
+	if got := constraintNames(d, "ch"); !strings.Contains(strings.Join(got, ","), "ch_x_y_fkey1") {
+		t.Fatalf("second (x, y) key: %v", got)
+	}
+
+	// The migration-tool case: drop by the name Postgres would give it.
+	exec(t, d, `alter table ch drop constraint ch_x_y_fkey`)
+	exec(t, d, `alter table ch drop constraint ch_x_y_fkey1`)
+	if got := constraintNames(d, "ch"); strings.Join(got, ",") != "ch_pid_fkey" {
+		t.Fatalf("after drops: %v", got)
+	}
+}
+
 func TestFKSchemaGuards(t *testing.T) {
 	d := openDB(t)
 	seedFK(t, d)
