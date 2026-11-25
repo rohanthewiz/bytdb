@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/rohanthewiz/bytdb v0.24.0
+	github.com/rohanthewiz/bytdb v0.25.0
 	github.com/rohanthewiz/bytdb/pgwire v0.0.0
 )
 
