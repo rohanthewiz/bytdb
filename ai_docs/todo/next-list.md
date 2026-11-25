@@ -31,7 +31,7 @@ through all 74 docs.
   `merged into N-xxx`. Moving an item between Open and Roadmap is fine.
 - Open and Roadmap stay in ID order.
 
-**Next ID:** N-064
+**Next ID:** N-070
 
 ## Open
 
@@ -44,20 +44,14 @@ recommendations. Every phase of it (0–9) is on main and released in
 too: N-045 was declined after measuring (see Non-goals), and N-046, N-047
 and N-049 are closed.
 
-- **N-053** · raised `2026-1111-1759-numeric-type-n048` · value low
-  **The rest of N-048's refused types: `interval`, `money`, `bit`,
-  `citext`.** Still "unknown column type". `money` maps naturally onto
-  `numeric(p,2)` now; `citext` onto text with case-insensitive
-  comparison; `interval` is the largest (a new value kind with calendar
-  arithmetic). No consumer has asked.
-
 - **N-055** · raised `2026-1114-1610-n033-linux-pty-n049-orm-capture` · value low
   **atlas schema inspection.** atlas v1.3.0 (`ariga.io/atlas/sql/postgres`)
   connects and locks against bytdb (`TestAtlasVerbatim`), but every inspect
   query it sends fails, each on different catalog surface (probed
   2026-11-14). `schemasQuery` and `tablesQuery` need `pg_depend` and
   `pg_partitioned_table`. `columnsQuery` needs `information_schema.columns`
-  `interval_type`/`character_set_name`/`collation_name`, plus
+  `character_set_name`/`collation_name` (`interval_type` exists since
+  N-053), plus
   `col_description`, `pg_get_serial_sequence` and `quote_ident`. `fksQuery`
   needs set-returning functions in the select list (`generate_series`,
   `unnest` over `conkey`). `checksQuery` needs `array_position` over the
@@ -127,6 +121,48 @@ and N-049 are closed.
   `sql/fk.go`, `freeIndexName` in `sql/sql.go`), so with long table or
   column names a migration tool computing Postgres's name misses
   bytdb's. Noticed while fixing N-060.
+- **N-064** · raised `2026-1125-1326-n053-interval-money-citext-bit` · value low
+  **RANGE offsets in intervals over a date key.** `RANGE BETWEEN
+  INTERVAL '7 days' PRECEDING AND CURRENT ROW` works over timestamp and
+  interval ORDER BY keys since N-053, but a date key is still "not
+  supported for column type date". Postgres's in_range_date_interval
+  adds the interval to the date's midnight and compares as timestamps;
+  date keys are day counts here, so the threshold has to round toward
+  the frame edge (floor on the end side, ceiling on the start side),
+  which is why it was left out. Workaround: order by `d::timestamptz`.
+- **N-065** · raised `2026-1125-1326-n053-interval-money-citext-bit` · value low
+  **EXTRACT returns float8, Postgres 14+ returns numeric.** EXTRACT
+  lowers to date_part, so `extract(epoch from ts)` and, since N-053,
+  `extract(... from interval)` are float8 (OID 701) where Postgres says
+  numeric (1700). The values agree; a client binding by OID sees a
+  different type, and numeric results like `extract(second ...)` keep
+  six decimals there. `interval.Interval.Extract` already returns
+  Postgres's numeric; timestamps would need the same.
+- **N-066** · raised `2026-1125-1326-n053-interval-money-citext-bit` · value low
+  **Bad date/timestamp text is 22P02, Postgres says 22007.** Postgres's
+  datetime input errors (date_in, timestamp_in) are
+  invalid_datetime_format; bytdb maps every "invalid input syntax for
+  type" to 22P02. Interval input already reports 22007 (N-053); date and
+  timestamp should follow (`pgwire/errors.go`). The difftest corpus
+  pins no date error codes today.
+- **N-067** · raised `2026-1125-1326-n053-interval-money-citext-bit` · value low
+  **bit_and / bit_or / bit_xor aggregates, and overlay() on bit
+  strings.** Postgres has the aggregates for integers and bit strings
+  (bit_xor since 14) and `overlay(b placing b from n [for n])`; bytdb
+  has neither. The bitwise operators themselves arrived with N-053.
+- **N-068** · raised `2026-1125-1326-n053-interval-money-citext-bit` · value low
+  **citext's case-insensitive function overloads.** The citext
+  extension redefines strpos, replace, split_part, translate and the
+  regexp_* functions to ignore case for citext arguments. bytdb hands
+  citext to functions as text (N-053), so those match case-sensitively;
+  `lower()` both sides is the workaround (docs/gotchas.md).
+- **N-069** · raised `2026-1125-1326-n053-interval-money-citext-bit` · value low
+  **Interval: Postgres 17's infinity, other IntervalStyles,
+  to_char(interval).** N-053 targeted Postgres 16, which has no
+  `'infinity'::interval`; Postgres 17 does (all fields at their
+  extremes, with its own arithmetic rules). `SET intervalstyle` other
+  than postgres is refused (22023) rather than printing the wrong style,
+  and `to_char` takes timestamps only.
 
 ## Validate
 
@@ -240,6 +276,28 @@ section. The entries below are the text as of `3b603e9`, unchanged.*
   `2026-1114-1640-n052-exact-numeric-math` (`94be4da`).
 
 ## Closed
+
+- **N-053** · raised `2026-1111-1759-numeric-type-n048` · closed
+  2026-11-25, `2026-1125-1326-n053-interval-money-citext-bit`. **`interval`, `money`, `citext` and `bit` /
+  `varbit`.** The user chose all four, phased, with a real money type
+  (plan `ai_docs/todo/2026-1125-interval-money-citext-bit-plan.md`,
+  Q1–Q10). interval: leaf package `interval` (Postgres 16's input forms,
+  postgres-style output, span comparison, arithmetic, justify_*,
+  make_interval with named arguments, age, extract, date_trunc, calendar
+  timestamp ± interval), tuple tags 0x0A/0x0B, typmods, RANGE frames with
+  interval offsets; 9,331 Postgres 16.9 goldens. money: int64 cents with
+  en_US text, cash_in/cash_out/cash_words, typed operators; 2,739
+  goldens. citext: leaf package `citext`, tags 0x0C/0x0D, fixed oid
+  2100000000. bit/varbit: '0'/'1' strings, B''/X'' constants, & | # ~
+  << >> (integers too). Corpus files 81–84 match Postgres 16; three-mode
+  pgx wire checks; race suite green; benchmarks within noise. Commits
+  a783702, a948f92, a7aa830, d31c99b, 1441548. goose's table locker runs
+  verbatim. **Release notes:** timestamp - timestamp is an interval (was
+  bigint µs); min/max return the later of equal values; `SET
+  intervalstyle` other than postgres is refused; `& | # ~ << >>` are
+  operators (`a & b` was a syntax error); `bit_length(text)` is new; a
+  later UNION/VALUES arm's untyped literal takes the first arm's type.
+  Follow-ups raised: N-064 to N-069.
 
 - **N-060** · raised `2026-1118-1459-n056-drops-cascade-like-postgres` · closed
   2026-11-20, `2026-1120-1609-n060-multi-column-fk-default-name`. **A multi-column foreign key's default name.**
