@@ -187,6 +187,19 @@ the corpus:
 - **pgwire's go.mod** pins a released bytdb; with this session's new API
   it builds only through the workspace until the lockstep release.
 
+## Release v0.25.0
+
+Cut after the session wrap, by the release skill. Minor: new types,
+operators, functions and SQLSTATE mappings since v0.24.0 (N-047, N-049,
+N-050, N-051, N-052, N-056, N-060, N-053). btypedb stays v0.11.0.
+
+- `v0.25.0` on `990380e` (CI on that commit green; `pgwire-released-pin`
+  failed as expected until the pin bump).
+- `pgwire/v0.25.0` on `77cd867` ("pgwire, bench, difftest: bump bytdb to
+  v0.25.0"); pgwire, bench and sql/difftest build with and without the
+  workspace.
+- Both resolve on proxy.golang.org.
+
 ## Next
 
 Closed: N-053. Declined: None. Raised: N-064, N-065, N-066, N-067,
