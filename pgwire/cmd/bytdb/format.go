@@ -58,6 +58,8 @@ func typeName(t bytdb.ColType) string {
 		return "interval"
 	case bytdb.TMoney:
 		return "money"
+	case bytdb.TCIText:
+		return "citext"
 	}
 	return string(t)
 }
@@ -131,6 +133,8 @@ func displayValue(v any, t bytdb.ColType) (s string, ok bool) {
 		return x.String(), true
 	case bytdb.Interval:
 		return x.String(), true
+	case bytdb.CIText:
+		return string(x), true
 	case string:
 		return x, true
 	case []byte:

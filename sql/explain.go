@@ -545,6 +545,12 @@ func typedLitText(v any, t bytdb.ColType) (string, bool) {
 			return "", false
 		}
 		txt = bytdb.FormatMoney(n)
+	case bytdb.TCIText:
+		c, ok := v.(bytdb.CIText)
+		if !ok {
+			return "", false
+		}
+		txt = strings.ReplaceAll(string(c), "'", "''")
 	default:
 		return "", false
 	}
@@ -569,6 +575,8 @@ func placeholderVal(t bytdb.ColType) any {
 		return make([]byte, 16)
 	case bytdb.TInterval:
 		return bytdb.Interval{}
+	case bytdb.TCIText:
+		return bytdb.CIText("")
 	}
 	return ""
 }

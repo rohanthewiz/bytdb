@@ -79,6 +79,8 @@ func oidForType(t bytdb.ColType) uint32 {
 		return oidInterval
 	case bytdb.TMoney:
 		return oidMoney
+	case bytdb.TCIText:
+		return bytdb.CITextOID
 	}
 	return oidText
 }
@@ -221,6 +223,12 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 			}
 			return appendIntervalBinary(dst, x), nil
 		}
+	case bytdb.TCIText:
+		// citext's text and binary forms are both the text's bytes
+		// (citext_send is textsend).
+		if x, ok := v.(bytdb.CIText); ok {
+			return append(dst, x...), nil
+		}
 	case bytdb.TMoney:
 		// Cents: cash_out's text, or cash_send's int8.
 		if x, ok := v.(int64); ok {
@@ -298,6 +306,9 @@ func kindFits(v any, t bytdb.ColType) bool {
 	case bytdb.TInterval:
 		_, ok := v.(bytdb.Interval)
 		return ok
+	case bytdb.TCIText:
+		_, ok := v.(bytdb.CIText)
+		return ok
 	}
 	return true
 }
@@ -322,6 +333,8 @@ func appendByKind(dst []byte, v any, format int) ([]byte, error) {
 			return x.AppendText(dst), nil
 		case bytdb.Interval:
 			return x.AppendText(dst), nil
+		case bytdb.CIText:
+			return append(dst, x...), nil
 		case string:
 			return append(dst, x...), nil
 		case []byte:
@@ -340,6 +353,8 @@ func appendByKind(dst []byte, v any, format int) ([]byte, error) {
 	case float64:
 		return binary.BigEndian.AppendUint64(dst, math.Float64bits(x)), nil
 	case string:
+		return append(dst, x...), nil
+	case bytdb.CIText:
 		return append(dst, x...), nil
 	case []byte:
 		return append(dst, x...), nil
@@ -398,6 +413,8 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			return bytdb.ParseDecimal(s)
 		case oidInterval:
 			return bytdb.ParseInterval(s)
+		case bytdb.CITextOID:
+			return bytdb.CIText(s), nil
 		case oidMoney:
 			// Kept as money text: the SQL layer reads an integer bound to
 			// money as whole units (Postgres's int-to-money cast), so cents
@@ -478,6 +495,8 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 		return decodeNumericBinary(raw)
 	case oidInterval:
 		return decodeIntervalBinary(raw)
+	case bytdb.CITextOID:
+		return bytdb.CIText(raw), nil // citext_recv is textrecv
 	case oidMoney:
 		// cash_recv: the cents as an int8, handed on as exact money text
 		// for the reason above.

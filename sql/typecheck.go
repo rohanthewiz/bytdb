@@ -107,6 +107,8 @@ func pgTypeName(t bytdb.ColType) string {
 		return "interval"
 	case bytdb.TMoney:
 		return "money"
+	case bytdb.TCIText:
+		return "citext"
 	case tyUnknown:
 		return "unknown"
 	}
@@ -1130,6 +1132,15 @@ func (t *typer) cmpPair(op PredOp, l Expr, lt bytdb.ColType, r Expr, rt bytdb.Co
 	if lt == bytdb.TDate && rt == bytdb.TTimestamp {
 		return dateToTimestamp(l), r, nil
 	}
+	// citext against text resolves to text = text in Postgres (the
+	// citext -> text cast is implicit; there is no citext = text), so the
+	// comparison is case-sensitive: cast the citext side to text.
+	if lt == bytdb.TCIText && rt == bytdb.TString {
+		return &ExCast{E: l, Type: "text", From: lt}, r, nil
+	}
+	if lt == bytdb.TString && rt == bytdb.TCIText {
+		return l, &ExCast{E: r, Type: "text", From: rt}, nil
+	}
 	if lt == bytdb.TTimestamp && rt == bytdb.TDate {
 		return l, dateToTimestamp(r), nil
 	}
@@ -1749,6 +1760,25 @@ func (t *typer) funcExpr(n *ExFunc, ts *tscope) (Expr, bytdb.ColType, error) {
 			args[i], changed = na, true
 		}
 	}
+	// citext arguments reach functions as text (N-053): Postgres's
+	// citext -> text cast is implicit, and every function here takes
+	// text, not citext — except the polymorphic forms, which keep the
+	// type (coalesce of citexts is citext). The cast is explicit in the
+	// tree so evaluation hands the function a plain string.
+	switch n.Name {
+	case "coalesce", "greatest", "least", "nullif", "pg_typeof":
+	default:
+		for i, at := range argTypes {
+			if at != bytdb.TCIText {
+				continue
+			}
+			if !changed {
+				args = append([]Expr(nil), n.Args...)
+			}
+			args[i] = &ExCast{E: args[i], Type: "text", From: at}
+			argTypes[i], changed = bytdb.TString, true
+		}
+	}
 	var typ bytdb.ColType
 	switch n.Name {
 	case "coalesce", "greatest", "least":
@@ -1895,7 +1925,9 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 		if lt == bytdb.TBytes && rt == bytdb.TBytes {
 			return rebuilt(bytdb.TBytes)
 		}
-		textish := func(t bytdb.ColType) bool { return !concrete(t) || t == bytdb.TString }
+		// citext concatenates as text, its implicit cast (N-053): the
+		// cast below makes its operand a plain string.
+		textish := func(t bytdb.ColType) bool { return !concrete(t) || t == bytdb.TString || t == bytdb.TCIText }
 		if !textish(lt) && !textish(rt) {
 			return nil, "", noOperator("||", lt, rt)
 		}

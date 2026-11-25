@@ -1010,7 +1010,8 @@ func (r *rows) ColumnTypeScanType(i int) reflect.Type {
 		return reflect.TypeFor[[]byte]()
 	case bytdb.TTimestamp, bytdb.TDate:
 		return reflect.TypeFor[time.Time]()
-	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric, bytdb.TInterval, bytdb.TMoney:
+	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric, bytdb.TInterval, bytdb.TMoney,
+		bytdb.TCIText:
 		// numeric, interval and money arrive as their text, see convert.
 		return reflect.TypeFor[string]()
 	}
@@ -1090,6 +1091,9 @@ func convert(v any, t bytdb.ColType) (driver.Value, error) {
 	// lengths of time. bytdb.ParseInterval reads the text back.
 	if iv, ok := v.(bytdb.Interval); ok {
 		return iv.String(), nil
+	}
+	if ct, ok := v.(bytdb.CIText); ok { // citext reaches database/sql as its text
+		return string(ct), nil
 	}
 	switch tv := v.(type) {
 	case nil:

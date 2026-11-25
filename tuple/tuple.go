@@ -5,7 +5,8 @@
 // key-value store and answer range queries with key scans.
 //
 // Supported element types (after normalization): nil (NULL), bool,
-// int64, float64, string, []byte, decimal.Decimal, interval.Interval.
+// int64, float64, string, []byte, decimal.Decimal, interval.Interval,
+// citext.Text.
 // Inputs of any Go integer width are
 // normalized to int64, float32 to float64. Every NaN normalizes to one
 // canonical NaN, which sorts above +Inf (Postgres's order: NaN is
@@ -19,7 +20,8 @@
 // byte an earlier version wrote.
 //
 // Elements of different types order by type tag: NULL < false < true <
-// ints < floats < bytes < strings < decimals < intervals. Within a typed
+// ints < floats < bytes < strings < decimals < intervals < citexts.
+// Within a typed
 // column only one tag
 // ever appears, so cross-type order only matters for NULL, which sorts
 // before everything. A tuple that is a prefix of another sorts first,
@@ -34,6 +36,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/rohanthewiz/bytdb/citext"
 	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
@@ -71,6 +74,17 @@ const (
 	// own fields come from the row value (it is written there too).
 	tagInterval       byte = 0x0A
 	tagIntervalFields byte = 0x0B
+	// citext (N-053) is case-insensitive text: 'ABC' = 'abc'. A key
+	// (tagCIText) holds the lowercase form (citext.Text.Fold), so equal
+	// values are one key and keys order as the values compare; a stored
+	// value (tagCITextAsIs) holds the text as written. Both bodies are
+	// escaped byte strings like tagString's, and both decode to
+	// citext.Text — a key to its lowercase form, which re-encodes to the
+	// same key (lowercasing is idempotent), and which is all an index
+	// entry's primary key needs; a primary-key column's own text comes
+	// from the row value, where it is written too.
+	tagCIText     byte = 0x0C
+	tagCITextAsIs byte = 0x0D
 )
 
 // intervalBodyLen is both interval forms' body length after the tag.
@@ -172,6 +186,15 @@ func appendVals(buf []byte, mask byte, vals []any, keepNegZero bool) ([]byte, er
 		if iv, ok := v.(interval.Interval); ok {
 			// Likewise: a stored value keeps the fields, a key the span.
 			buf = appendInterval(buf, mask, iv, keepNegZero)
+			continue
+		}
+		if ct, ok := v.(citext.Text); ok {
+			// And a stored value keeps the case, a key folds it.
+			if keepNegZero {
+				buf = appendEscaped(append(buf, tagCITextAsIs^mask), mask, []byte(ct))
+			} else {
+				buf = appendEscaped(append(buf, tagCIText^mask), mask, []byte(ct.Fold()))
+			}
 			continue
 		}
 		n, err := normalize(v)
@@ -557,6 +580,12 @@ func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
 			return nil, nil, err
 		}
 		return iv, rest, nil
+	case tagCIText, tagCITextAsIs:
+		str, rest, err := unescapeString(data, mask)
+		if err != nil {
+			return nil, nil, err
+		}
+		return citext.Text(str), rest, nil
 	}
 	return nil, nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
@@ -586,7 +615,7 @@ func Skip(data []byte) (rest []byte, err error) {
 			return nil, serr.New("tuple: truncated numeric element")
 		}
 		return data[8:], nil
-	case tagBytes, tagString:
+	case tagBytes, tagString, tagCIText, tagCITextAsIs:
 		_, _, end, err := scanEscaped(data, 0x00)
 		if err != nil {
 			return nil, err
@@ -746,6 +775,8 @@ func compareValues(av, bv any) int {
 		return t.Cmp(b.(decimal.Decimal))
 	case interval.Interval:
 		return t.Cmp(b.(interval.Interval)) // by span, as the key encodes
+	case citext.Text:
+		return t.Cmp(b.(citext.Text)) // by lowercase form, as the key encodes
 	}
 	return 0 // nil, false, true carry their value in the rank
 }
@@ -771,6 +802,8 @@ func rank(v any) int {
 		return int(tagDecimal)
 	case interval.Interval:
 		return int(tagInterval)
+	case citext.Text:
+		return int(tagCIText)
 	}
 	panic(fmt.Sprintf("tuple: unrankable type %T", v))
 }
@@ -778,7 +811,7 @@ func rank(v any) int {
 // normalize maps supported inputs onto the canonical element types.
 func normalize(v any) (any, error) {
 	switch t := v.(type) {
-	case nil, bool, int64, string, []byte, decimal.Decimal, interval.Interval:
+	case nil, bool, int64, string, []byte, decimal.Decimal, interval.Interval, citext.Text:
 		return t, nil
 	case int:
 		return int64(t), nil

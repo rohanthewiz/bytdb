@@ -1144,6 +1144,8 @@ func textOf(v any) string {
 	switch x := v.(type) {
 	case string:
 		return x
+	case bytdb.CIText:
+		return string(x)
 	case int64:
 		return strconv.FormatInt(x, 10)
 	case float64:

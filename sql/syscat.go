@@ -232,6 +232,8 @@ func typeOID(t bytdb.ColType) int64 {
 		return pgInterval
 	case bytdb.TMoney:
 		return 790
+	case bytdb.TCIText:
+		return bytdb.CITextOID
 	}
 	return 25 // text
 }
@@ -281,6 +283,8 @@ func sqlTypeName(t bytdb.ColType) string {
 		return "interval"
 	case bytdb.TMoney:
 		return "money"
+	case bytdb.TCIText:
+		return "USER-DEFINED" // an extension type, as information_schema reports it
 	}
 	return "text"
 }
@@ -313,6 +317,8 @@ func udtName(t bytdb.ColType) string {
 		return "interval"
 	case bytdb.TMoney:
 		return "money"
+	case bytdb.TCIText:
+		return "citext"
 	}
 	return "text"
 }
@@ -617,6 +623,7 @@ var sysTables = map[string]*sysTableDef{
 				{1184, "timestamptz", 8, "D"}, {2950, "uuid", 16, "U"},
 				{3802, "jsonb", -1, "U"}, {1700, "numeric", -1, "N"},
 				{pgInterval, "interval", 16, "T"}, {790, "money", 8, "N"},
+				{bytdb.CITextOID, "citext", -1, "S"},
 			} {
 				rows = append(rows, []any{t.oid, t.name, oidPGCatalog, t.len, "b", t.cat, int64(0)})
 			}

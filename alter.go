@@ -440,6 +440,8 @@ func sqlTypeName(t ColType) string {
 		return "interval"
 	case TMoney:
 		return "money"
+	case TCIText:
+		return "citext"
 	}
 	return string(t)
 }
@@ -490,6 +492,10 @@ func assignmentCast(from, to ColType) func(any) (any, error) {
 		return func(v any) (any, error) { return numericToFloat(v.(Decimal)), nil }
 	case from == TNumeric && to == TInt:
 		return func(v any) (any, error) { return numericToInt(v.(Decimal)) }
+	// citext and text cast both ways without USING (citext's casts are
+	// implicit to text and assignment from it), keeping the characters.
+	case from == TString && to == TCIText:
+		return func(v any) (any, error) { return CIText(v.(string)), nil }
 	// money's assignment casts (N-053): to and from numeric, and from
 	// an integer (whole units: 5 is $5.00).
 	case from == TMoney && to == TNumeric:
@@ -545,6 +551,8 @@ func castToText(v any, t ColType) (string, error) {
 		return v.(Interval).String(), nil
 	case TMoney:
 		return FormatMoney(v.(int64)), nil
+	case TCIText:
+		return string(v.(CIText)), nil
 	}
 	return "", serr.New("no text form for column type", "type", string(t))
 }
@@ -617,6 +625,8 @@ func castDefault(oldCol, newCol *Column) (string, error) {
 		out = x.String() // read back exactly by decodeDefaultLiteral
 	case Interval:
 		out = "'" + x.String() + "'" // interval text has no quotes to escape
+	case CIText:
+		out = "'" + strings.ReplaceAll(string(x), "'", "''") + "'"
 	default:
 		// []byte (bytea, uuid) has no literal form default.go reads.
 		return "", fail(nil)

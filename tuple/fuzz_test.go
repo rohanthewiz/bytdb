@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/rohanthewiz/bytdb/citext"
 	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/bytdb/interval"
 )
@@ -48,6 +49,9 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{interval.Interval{Months: math.MaxInt32, Days: math.MaxInt32, Micros: math.MaxInt64}},
 		{interval.Interval{Months: math.MinInt32, Days: math.MinInt32, Micros: math.MinInt64}},
 		{int64(1), interval.Interval{Micros: 1}, "x"},
+		// N-053: citext key (folded) and stored (as written) forms.
+		{citext.Text("ABC")}, {citext.Text("a\x00B")}, {citext.Text("")},
+		{citext.Text("Straße"), "x", citext.Text("ÄÖÜ")},
 	}
 	for _, vals := range seeds {
 		enc, err := Encode(vals...)
@@ -84,6 +88,8 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{tagInterval, 0x80, 0, 0},           // N-053: truncated span
 		{tagIntervalFields, 0, 0, 0, 0, 0},  // truncated fields
 		{tagInterval, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0}, // span beyond any interval
+		{tagCIText, 'A', 0x00},          // unterminated citext
+		{tagCITextAsIs, 'a', 0x00, 0x7}, // bad escape
 	} {
 		f.Add(corrupt)
 	}
@@ -221,6 +227,9 @@ var boundaryVals = []any{
 	interval.Interval{Months: 1}, interval.Interval{Days: 30}, interval.Interval{Days: 29, Micros: 86_400_000_000},
 	interval.Interval{Months: 1, Micros: -1}, interval.Interval{Months: math.MaxInt32},
 	interval.Interval{Months: math.MaxInt32, Days: math.MaxInt32, Micros: math.MaxInt64},
+	// N-053: citexts equal under case folding, and around the escape bytes.
+	citext.Text(""), citext.Text("\x00"), citext.Text("A"), citext.Text("a"), citext.Text("B"),
+	citext.Text("ab"), citext.Text("AB"), citext.Text("a\x00"), citext.Text("_"), citext.Text("ä"), citext.Text("Ä"),
 }
 
 // genTuple deterministically maps raw fuzz bytes onto a tuple of
@@ -231,7 +240,7 @@ var boundaryVals = []any{
 func genTuple(data []byte) []any {
 	var vals []any
 	for len(data) > 0 && len(vals) < 6 {
-		sel := data[0] % 9
+		sel := data[0] % 10
 		data = data[1:]
 		switch sel {
 		case 0:
@@ -327,6 +336,15 @@ func genTuple(data []byte) []any {
 				}
 			}
 			vals = append(vals, iv)
+		case 9: // citext: a length byte, then bytes; case varies with them
+			var n int
+			if len(data) > 0 {
+				n = int(data[0] % 9)
+				data = data[1:]
+			}
+			n = min(n, len(data))
+			vals = append(vals, citext.Text(data[:n]))
+			data = consume(data, n)
 		}
 	}
 	return vals

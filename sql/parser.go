@@ -1722,6 +1722,10 @@ func (p *parser) typeNameBase() (typ bytdb.ColType, maxLen int, err error) {
 		return bytdb.TUUID, 0, nil
 	case "money":
 		return bytdb.TMoney, 0, nil
+	case "citext":
+		// The citext extension's type. CREATE EXTENSION is accepted and
+		// ignored, so the type is simply always there.
+		return bytdb.TCIText, 0, nil
 	case "json", "jsonb":
 		// Both names land on TJSONB, with jsonb semantics: documents
 		// canonicalize on write (key order and whitespace vanish).
@@ -5525,7 +5529,7 @@ var typedLitTypes = map[string]bool{
 	"text": true, "varchar": true, "bool": true, "boolean": true,
 	"int": true, "integer": true, "bigint": true, "smallint": true,
 	"numeric": true, "decimal": true, "real": true, "float8": true, "float4": true,
-	"json": true, "jsonb": true, "bytea": true, "money": true,
+	"json": true, "jsonb": true, "bytea": true, "money": true, "citext": true,
 }
 
 // typedLiteral parses type 'string' (including timestamp WITH[OUT] TIME

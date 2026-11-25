@@ -44,7 +44,7 @@ var ErrUnsupportedValue = errors.New("unsupported value type")
 // common path pays nothing for the reflection.
 func NormalizeValue(v any) (any, error) {
 	switch x := v.(type) {
-	case nil, int64, float64, string, bool, []byte, time.Time, []string, Decimal, Interval:
+	case nil, int64, float64, string, bool, []byte, time.Time, []string, Decimal, Interval, CIText:
 		return v, nil
 	case driver.Valuer:
 		dv, err := x.Value()
@@ -134,8 +134,13 @@ func (r Row) Float(name string) (float64, bool) {
 // canonical text) column's value; ok is false for NULL, a missing
 // column, or another type.
 func (r Row) String(name string) (string, bool) {
-	v, ok := r.Col(name).(string)
-	return v, ok
+	switch v := r.Col(name).(type) {
+	case string:
+		return v, true
+	case CIText: // citext is text; its case-folding is for comparison only
+		return string(v), true
+	}
+	return "", false
 }
 
 // Decimal returns a numeric column's value; ok is false for NULL, a

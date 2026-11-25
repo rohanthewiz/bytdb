@@ -294,6 +294,9 @@ func (a *accum) collect(env *exEnv, v any) error {
 		spec = &emptySpec
 	}
 	if a.fn == AggStringAgg {
+		if c, ok := v.(bytdb.CIText); ok {
+			v, it.v = string(c), string(c) // citext aggregates as text (N-053)
+		}
 		if _, ok := v.(string); !ok {
 			return serr.New("string_agg requires a text argument", "got", fmt.Sprintf("%T", v))
 		}
@@ -971,7 +974,9 @@ func aggArgCheck(fn AggFunc, arg, sep bytdb.ColType) error {
 			return noFunc(fn.name(), []bytdb.ColType{arg}) // as in Postgres
 		}
 	case AggStringAgg:
-		if concrete(arg) && arg != bytdb.TString || concrete(sep) && sep != bytdb.TString {
+		// citext aggregates as text, its implicit cast (N-053).
+		textual := func(t bytdb.ColType) bool { return !concrete(t) || t == bytdb.TString || t == bytdb.TCIText }
+		if !textual(arg) || !textual(sep) {
 			return noFunc(fn.name(), []bytdb.ColType{arg, sep})
 		}
 	case AggBoolAnd, AggBoolOr:

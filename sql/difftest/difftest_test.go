@@ -96,6 +96,9 @@ func runFile(t *testing.T, path, pgURL string) {
 			if bres.err != nil || pres.err != nil {
 				t.Fatalf("%s setup %q\n  bytdb:    %v\n  postgres: %v", name, e.sql, bres.err, pres.err)
 			}
+			if strings.Contains(strings.ToLower(e.sql), "citext") {
+				noteCITextOID(ctx, t, pc)
+			}
 			continue
 		}
 		diff := compare(bres, pres, e)
@@ -145,7 +148,10 @@ func startPG(t *testing.T, url string) *pgx.Conn {
 	ctx := context.Background()
 	for _, q := range []string{
 		"CREATE SCHEMA " + schema,
-		"SET search_path TO " + schema,
+		// public stays on the path behind the file's schema: extension
+		// types (citext) are installed there, database-wide, and tables
+		// still land in the file's schema.
+		"SET search_path TO " + schema + ", public",
 		// bytdb renders timestamps in UTC; make Postgres agree so a
 		// timestamptz-typed expression (now()) compares by value.
 		"SET TIME ZONE 'UTC'",
@@ -315,7 +321,26 @@ const (
 	clsOther        typeClass = "other" // compared as exact text, class by OID
 )
 
+// pgCITextOID is citext's oid on the Postgres side. Postgres assigns it
+// when CREATE EXTENSION citext runs, so it is looked up (noteCITextOID)
+// rather than known; bytdb's is the fixed bytdb.CITextOID. Both map to
+// one class.
+var pgCITextOID uint32
+
+// noteCITextOID records Postgres's citext oid after a setup statement
+// that mentions citext (typically CREATE EXTENSION IF NOT EXISTS).
+func noteCITextOID(ctx context.Context, t *testing.T, c *pgx.Conn) {
+	var oid uint32
+	if err := c.QueryRow(ctx, "select coalesce((select oid from pg_type where typname = 'citext' limit 1), 0)").Scan(&oid); err != nil {
+		t.Fatalf("looking up citext's oid: %v", err)
+	}
+	pgCITextOID = oid
+}
+
 func classOf(oid uint32) typeClass {
+	if oid == bytdb.CITextOID || (oid != 0 && oid == pgCITextOID) {
+		return "citext"
+	}
 	switch oid {
 	case 20, 21, 23, 700, 701, 1700: // int8 int2 int4 float4 float8 numeric
 		return clsNumber

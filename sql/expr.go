@@ -1073,6 +1073,8 @@ func valText(v any) string {
 		return x.String()
 	case bytdb.Interval:
 		return x.String()
+	case bytdb.CIText:
+		return string(x)
 	case bool:
 		if x {
 			return "true"
@@ -1330,6 +1332,17 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 	}
 	if tm, ok := intervalCastTypmod(typ); ok {
 		return castToInterval(v, tm)
+	}
+	if typ == "citext" {
+		switch x := v.(type) {
+		case nil:
+			return nil, nil
+		case bytdb.CIText:
+			return x, nil
+		case string:
+			return bytdb.CIText(x), nil
+		}
+		return bytdb.CIText(valText(v)), nil // Postgres casts bool (and inet) to citext as their text
 	}
 	if typ == "money" {
 		// An untyped or numeric source: text is money text, a number is
@@ -1653,6 +1666,8 @@ func formatType(typid, typmod any) any {
 		name = "jsonb"
 	case 790:
 		name = "money"
+	case bytdb.CITextOID:
+		name = "citext"
 	case 1186:
 		// interval's typmod is Postgres's own packing of field range and
 		// precision (see interval.Typmod).
@@ -2425,6 +2440,8 @@ func castColType(typ string) bytdb.ColType {
 		return bytdb.TUUID
 	case "money":
 		return bytdb.TMoney
+	case "citext":
+		return bytdb.TCIText
 	case "json", "jsonb":
 		return bytdb.TJSONB
 	case "text[]", "varchar[]", "character varying[]":

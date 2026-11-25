@@ -1,7 +1,7 @@
 # Plan: `interval`, `money`, `citext` and `bit` / `varbit` (N-053)
 
-**Status (2026-11-25): phases 1 (interval) and 2 (money) done**;
-phases 3–5 to go.
+**Status (2026-11-25): phases 1–3 (interval, money, citext) done**;
+phases 4–5 to go.
 The user chose all four types, phased, with a real money type rather
 than a numeric(p,2) alias (2026-11-25).
 

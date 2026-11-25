@@ -149,7 +149,8 @@ Parse-time rejections with pointed errors:
 | FK `MATCH FULL/PARTIAL`, `ON UPDATE CASCADE`, `ON DELETE/UPDATE SET NULL/DEFAULT` | `MATCH SIMPLE` with `NO ACTION`/`RESTRICT`/`ON DELETE CASCADE` only — rejected rather than silently weakened |
 | `TRUNCATE ... CASCADE` | Name every referencing table: `TRUNCATE parent, child` (the error's HINT lists them) |
 | `ON CONFLICT ON CONSTRAINT name`, index predicates in the conflict target | Name the columns: `ON CONFLICT (col, ...)` |
-| Time-of-day, `CHAR(n)`, `bit`, `citext` | `TIME` → use `TIMESTAMP` |
+| Time-of-day, `CHAR(n)`, `bit` | `TIME` → use `TIMESTAMP` |
+| citext's own `strpos`, `replace`, `split_part`, `translate` and `regexp_*` versions, which ignore case | They take citext as text here, so they match case-sensitively; `lower()` both sides for a case-insensitive match. `citext[]` arrays are not supported |
 | `money` in another locale (`lc_monetary`), and `avg(money)` (Postgres has none either) | money prints as `$1,234.56` (en_US/C); cast to `numeric` for other formats or an average |
 | `'infinity'::interval` (Postgres 17+), `SET intervalstyle` other than `postgres` (refused, 22023), `to_char(interval, …)` | Intervals follow Postgres 16: finite, printed in the default `postgres` style |
 | `EXTRACT(… FROM interval)` as numeric | float8 here, as `EXTRACT` over a timestamp already is; the values agree |

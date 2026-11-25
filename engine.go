@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 
 	"github.com/rohanthewiz/btypedb"
+	"github.com/rohanthewiz/bytdb/citext"
 	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/bytdb/tuple"
@@ -104,7 +105,24 @@ const (
 	// (money × float8 rounds back to cents, money / money is float8) and
 	// its casts are the SQL layer's, through the helpers in money.go.
 	TMoney ColType = "money"
+	// TCIText is the citext extension's case-insensitive text (N-053),
+	// with its own runtime value, CIText, whose comparison folds case;
+	// its tuple encoding keys the lowercase form ('ABC' and 'abc' are
+	// one key) and stores the text as written.
+	TCIText ColType = "citext"
 )
+
+// CIText is the runtime value of a TCIText column (see package citext):
+// a string that compares case-insensitively. Insert accepts it, a string
+// or []byte; Row.String returns its text.
+type CIText = citext.Text
+
+// CITextOID is the pg_type oid bytdb gives citext. Postgres assigns the
+// extension type's oid when CREATE EXTENSION runs, so no fixed value
+// exists to copy; clients look citext up by name. This one sits below
+// 2^31 (some clients read oids as signed) and far above any oid bytdb
+// derives from a table ID.
+const CITextOID = 2_100_000_000
 
 // Interval is the runtime value of a TInterval column (see package
 // interval). Insert accepts it, a time.Duration (truncated to whole
@@ -116,10 +134,11 @@ type Interval = interval.Interval
 func ParseInterval(s string) (Interval, error) { return interval.Parse(s) }
 
 // keyLossy reports whether a type's key encoding drops part of the
-// value — numeric's display scale, interval's split into fields — so a
+// value — numeric's display scale, interval's split into fields,
+// citext's case — so a
 // primary-key column of the type is also written into the row value,
 // where decodeRow reads the value as written.
-func keyLossy(t ColType) bool { return t == TNumeric || t == TInterval }
+func keyLossy(t ColType) bool { return t == TNumeric || t == TInterval || t == TCIText }
 
 // Decimal is the runtime value of a TNumeric column: an exact decimal
 // with a display scale (see package decimal). Insert accepts it, any Go

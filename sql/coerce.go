@@ -126,6 +126,8 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 		return bytdb.ParseInterval(s)
 	case bytdb.TMoney:
 		return bytdb.ParseMoney(s)
+	case bytdb.TCIText:
+		return bytdb.CIText(s), nil
 	}
 	return s, nil
 }

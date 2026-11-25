@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rohanthewiz/bytdb/citext"
 	"github.com/rohanthewiz/bytdb/decimal"
 	"github.com/rohanthewiz/bytdb/interval"
 )
@@ -613,5 +614,37 @@ func TestIntervalForms(t *testing.T) {
 	}
 	if rest, err = Skip(rest); err != nil || len(rest) != 0 {
 		t.Fatalf("skip value form: %v", err)
+	}
+}
+
+// TestCITextForms pins N-053's citext forms: a key holds the lowercase
+// text, so values equal ignoring case are one key and keys order as the
+// values compare; a stored value keeps the case; both decode to
+// citext.Text.
+func TestCITextForms(t *testing.T) {
+	k1, _ := Encode(citext.Text("Hello"))
+	k2, _ := Encode(citext.Text("hELLO"))
+	if !bytes.Equal(k1, k2) {
+		t.Fatalf("equal citexts encode differently:\n% x\n% x", k1, k2)
+	}
+	v, _ := AppendValue(nil, citext.Text("Hello"))
+	got, err := Decode(v)
+	if err != nil || got[0] != citext.Text("Hello") {
+		t.Fatalf("stored form round trip: %v %v", got, err)
+	}
+	if got, err = Decode(k1); err != nil || got[0] != citext.Text("hello") {
+		t.Fatalf("key decode: %v %v", got, err)
+	}
+	ordered := []citext.Text{"", "a", "B", "c", "D\x00", "d\x01"}
+	for i := 1; i < len(ordered); i++ {
+		a, _ := Encode(ordered[i-1])
+		b, _ := Encode(ordered[i])
+		if bytes.Compare(a, b) >= 0 {
+			t.Errorf("%q does not sort before %q", ordered[i-1], ordered[i])
+		}
+	}
+	rest, err := Skip(append(k1, v...))
+	if err != nil || !bytes.Equal(rest, v) {
+		t.Fatalf("skip key form: %v", err)
 	}
 }

@@ -261,6 +261,16 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 		if v == nil || lit == nil {
 			return triUnknown, nil
 		}
+		// A citext operand matches without regard to case, as the citext
+		// extension's LIKE and regex operators do (N-053): citext LIKE
+		// 'a%' finds 'Abc'.
+		ci := false
+		if c, ok := v.(bytdb.CIText); ok {
+			v, ci = string(c), true
+		}
+		if c, ok := lit.(bytdb.CIText); ok {
+			lit, ci = string(c), true
+		}
 		s, okS := v.(string)
 		pat, okP := lit.(string)
 		if !okS || !okP {
@@ -269,7 +279,7 @@ func checkPred(v any, op PredOp, lit any) (tri, error) {
 		// LIKE patterns become regexes (once per distinct pattern, in
 		// the compile cache); both families then share one match path.
 		// Case-insensitivity is a compile flag, not a pattern rewrite.
-		insensitive := op == OpRegexI || op == OpNotRegexI || op == OpILike || op == OpNotILike
+		insensitive := ci || op == OpRegexI || op == OpNotRegexI || op == OpILike || op == OpNotILike
 		like := op == OpLike || op == OpNotLike || op == OpILike || op == OpNotILike
 		re, err := compilePattern(patKey{pat: pat, like: like, insensitive: insensitive})
 		if err != nil {
@@ -383,6 +393,8 @@ func kindOf(v any) bytdb.ColType {
 		return bytdb.TNumeric
 	case bytdb.Interval:
 		return bytdb.TInterval
+	case bytdb.CIText:
+		return bytdb.TCIText
 	case bool:
 		return bytdb.TBool
 	case []byte:
@@ -439,9 +451,24 @@ func compareVals(a, b any) (int, bool) {
 		if bv, ok := b.(bytdb.Interval); ok {
 			return av.Cmp(bv), true
 		}
+	case bytdb.CIText:
+		// Ignoring case, as citext compares: 'ABC' = 'abc' (N-053).
+		switch bv := b.(type) {
+		case bytdb.CIText:
+			return av.Cmp(bv), true
+		case string:
+			// citext against text is text = text in Postgres: case
+			// matters. Typing casts the citext side where it can see
+			// both types; this covers the shapes it cannot (an ANY over
+			// a text[]).
+			return cmp.Compare(string(av), bv), true
+		}
 	case string:
-		if bv, ok := b.(string); ok {
+		switch bv := b.(type) {
+		case string:
 			return cmp.Compare(av, bv), true
+		case bytdb.CIText:
+			return cmp.Compare(av, string(bv)), true // text = text, as above
 		}
 	case bool:
 		if bv, ok := b.(bool); ok {
@@ -830,6 +857,8 @@ func litType(v any) bytdb.ColType {
 		return bytdb.TNumeric
 	case bytdb.Interval:
 		return bytdb.TInterval
+	case bytdb.CIText:
+		return bytdb.TCIText
 	case bool:
 		return bytdb.TBool
 	case []byte:
@@ -1682,6 +1711,9 @@ func (d *DB) execUnion(s *Select) (*Result, error) {
 		if len(armRes.Cols) != len(res.Cols) {
 			return nil, serr.New("each " + arm.Op.String() + " query must have the same number of columns")
 		}
+		if err := unionCoerceArm(res.Types, armRes); err != nil {
+			return nil, err
+		}
 		switch arm.Op {
 		case SetIntersect, SetExcept:
 			// Set operations on whole rows, NULLs equal to NULLs as a
@@ -1713,6 +1745,32 @@ func (d *DB) execUnion(s *Select) (*Result, error) {
 	res.Rows = sortLimitRows(rows, keys, s.Offset, s.Limit)
 	res.RowsAffected = 0
 	return res, nil
+}
+
+// unionCoerceArm converts a later UNION arm's text values to the first
+// arm's column type where that type is a concrete non-text one, the way
+// Postgres resolves an unknown literal against its union partner:
+// VALUES ('a'::citext), ('A') is two citexts, so DISTINCT folds them;
+// SELECT date '2024-01-01' UNION ALL SELECT '2024-01-02' is two dates.
+// Only string values convert — a value already of another kind is left
+// for the executor, as before — so a real text column against a typed
+// one fails as invalid input rather than mixing kinds in one column.
+func unionCoerceArm(types []bytdb.ColType, arm *Result) error {
+	for c, t := range types {
+		if !concrete(t) || t == bytdb.TString || c >= len(arm.Types) || arm.Types[c] != bytdb.TString {
+			continue
+		}
+		for _, row := range arm.Rows {
+			if s, ok := row[c].(string); ok {
+				v, err := coerceLit(s, t)
+				if err != nil {
+					return err
+				}
+				row[c] = v
+			}
+		}
+	}
+	return nil
 }
 
 // execSelectDistinct runs a SELECT DISTINCT of any shape (plain,

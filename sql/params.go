@@ -540,7 +540,7 @@ func bindExpr(e Expr, b *binder) Expr {
 // engine's coerce); a [16]byte is a UUID's natural Go shape.
 func bindArg(a any) (any, error) {
 	switch v := a.(type) {
-	case nil, int64, float64, string, bool, []byte, time.Time, bytdb.Decimal, bytdb.Interval:
+	case nil, int64, float64, string, bool, []byte, time.Time, bytdb.Decimal, bytdb.Interval, bytdb.CIText:
 		return v, nil
 	case [16]byte:
 		return v[:], nil

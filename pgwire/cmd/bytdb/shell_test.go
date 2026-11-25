@@ -555,3 +555,31 @@ INSERT INTO acct (k) VALUES (12);
 	}
 	mustContain(t, out, `"k":"-$0.01"`, `"bal":"$2.50"`, `"k":"$1,234.56"`)
 }
+
+// TestDumpCIText (N-053): citext columns dump with their type and their
+// text as written, and a citext key restores, still refusing a value
+// equal ignoring case.
+func TestDumpCIText(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src.bytdb"), filepath.Join(dir, "dst.bytdb")
+	if _, errOut, code := runShell(t, `
+CREATE TABLE u (login citext PRIMARY KEY, email citext UNIQUE, bio text);
+INSERT INTO u VALUES ('Ada', 'ADA@x.org', 'x'), ('grace', 'Grace''s@x.org', NULL);
+`, "-batch", src); code != 0 {
+		t.Fatalf("setup: code %d stderr %s", code, errOut)
+	}
+	dump, errOut, code := runShell(t, "", src, ".dump")
+	if code != 0 {
+		t.Fatalf("dump: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, dump, "login citext", "email citext", "('Ada', 'ADA@x.org', 'x')", "('grace', 'Grace''s@x.org', NULL)")
+	if _, errOut, code = runShell(t, dump, "-batch", dst); code != 0 {
+		t.Fatalf("restore: code %d stderr %s", code, errOut)
+	}
+	if again, _, _ := runShell(t, "", dst, ".dump"); again != dump {
+		t.Errorf("dump of the restored database differs.\nfirst:\n%s\nsecond:\n%s", dump, again)
+	}
+	if _, errOut, code := runShell(t, "", "-batch", dst, "INSERT INTO u VALUES ('ADA', 'new@x.org', NULL)"); code == 0 {
+		t.Errorf("a login equal ignoring case was accepted after restore (%s)", errOut)
+	}
+}

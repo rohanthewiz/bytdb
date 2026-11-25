@@ -805,6 +805,15 @@ func coerce(v any, t ColType) (any, error) {
 		if ok {
 			return d, nil
 		}
+	case TCIText:
+		switch x := v.(type) {
+		case CIText:
+			return x, nil
+		case string:
+			return CIText(x), nil
+		case []byte:
+			return CIText(x), nil
+		}
 	case TMoney:
 		// The Go API's money value is cents (see money.go): a Go integer
 		// is cents, a Decimal is currency units, text is money text. A

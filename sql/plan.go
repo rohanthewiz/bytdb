@@ -400,6 +400,10 @@ func litFits(v any, t bytdb.ColType) bool {
 		// and the residual comparison rejects every row anyway.
 		b, ok := v.([]byte)
 		return ok && len(b) == 16
+	case bytdb.TCIText:
+		// Keys hold the lowercase form, as citext compares.
+		_, ok := v.(bytdb.CIText)
+		return ok
 	case bytdb.TMoney:
 		// Cents in an int64: key order is money order.
 		_, ok := v.(int64)
