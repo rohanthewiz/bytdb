@@ -19,8 +19,23 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
+
+// coerceLitCol is coerceLit for a value bound for column c. Interval
+// text is the one input a column reads differently from its bare type
+// (N-053): a type modifier decides a bare number's unit ('5' is five
+// minutes in an interval minute column), so it is parsed with the
+// modifier rather than converted by type alone.
+func coerceLitCol(v any, c *bytdb.Column) (any, error) {
+	if c.Type == bytdb.TInterval && c.IntervalTypmod != 0 {
+		if s, ok := v.(string); ok {
+			return interval.ParseTypmod(s, c.IntervalTypmod)
+		}
+	}
+	return coerceLit(v, c.Type)
+}
 
 // coerceLit converts a string value to a non-string column type's
 // value kind, per Postgres literal syntax. Non-strings and string
@@ -86,6 +101,8 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 		// Same as TTextArray: WHERE '{"a": 1}' = doc must compare in
 		// canonical spelling, not the query's.
 		return bytdb.CanonJSONB(s)
+	case bytdb.TInterval:
+		return bytdb.ParseInterval(s)
 	}
 	return s, nil
 }

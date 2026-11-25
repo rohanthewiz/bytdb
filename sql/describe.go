@@ -286,6 +286,11 @@ func describeSelect(lk tableLookup, st *Select, note func(any, bytdb.ColType), r
 					ft := bytdb.TInt
 					if w.Frame.Mode == FrameRange && len(w.OrderBy) == 1 {
 						ft = exprType(sc, w.OrderBy[0].Ex)
+						// A timestamp key's distance is an interval
+						// (N-053), as is an interval key's.
+						if ft == bytdb.TTimestamp {
+							ft = bytdb.TInterval
+						}
 					}
 					if l, ok := w.Frame.Start.Offset.(*ExLit); ok {
 						note(l.Val, ft)

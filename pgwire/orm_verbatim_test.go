@@ -14,10 +14,9 @@ package pgwire_test
 // (lib/pq) and pgx/v5 drivers; atlas through Open, Inspect and Lock. The
 // text below is what they sent.
 //
-// goose's table locker (lock.NewPostgresTableLocker) needs `now() +
-// $3::interval`, and bytdb has no interval type (N-048), so only its
-// default migrator and session locker are listed. atlas's schema
-// inspection is not listed either. Every inspect query it sends needs
+// goose's table locker (lock.NewPostgresTableLocker), which sends
+// `now() + $3::interval`, is listed since bytdb has an interval type
+// (N-053). atlas's schema inspection is not listed. Every inspect query it sends needs
 // catalog surface bytdb lacks (N-055), so only its connect and lock
 // statements are here.
 
@@ -112,6 +111,112 @@ func TestGooseVerbatim(t *testing.T) {
 // startup parameters it sends (client_encoding, datestyle) and the
 // probes target_session_attrs runs when the server did not report the
 // answers as ParameterStatus.
+// TestGooseTableLockerVerbatim drives goose v3.27.2's table locker
+// (lock/internal/store/postgres.go) through a lease's life: create the
+// lock table, acquire, fail to acquire while held, renew the lease,
+// check status, release, and clean up a stale lease. Each lease is
+// `now() + $n::interval` with goose's "<n> seconds" text (N-053; before
+// bytdb had interval the first statement failed).
+func TestGooseTableLockerVerbatim(t *testing.T) {
+	ctx := context.Background()
+	c := connect(t, startServer(t))
+	const table = "goose_lock"
+	mustExec(t, c, `CREATE TABLE goose_lock (
+		lock_id bigint NOT NULL PRIMARY KEY,
+		locked boolean NOT NULL DEFAULT false,
+		locked_at timestamptz NULL,
+		locked_by text NULL,
+		lease_expires_at timestamptz NULL,
+		updated_at timestamptz NULL
+	)`)
+	acquire := `INSERT INTO goose_lock (lock_id, locked, locked_at, locked_by, lease_expires_at, updated_at)
+	VALUES ($1, true, now(), $2, now() + $3::interval, now())
+	ON CONFLICT (lock_id) DO UPDATE SET
+		locked = true,
+		locked_at = now(),
+		locked_by = $2,
+		lease_expires_at = now() + $3::interval,
+		updated_at = now()
+	WHERE goose_lock.locked = false OR goose_lock.lease_expires_at < now()
+	RETURNING locked_by, lease_expires_at`
+	const lockID = int64(5887940537704921958)
+	before := time.Now()
+	var by string
+	var expires time.Time
+	if err := c.QueryRow(ctx, acquire, lockID, "instance-a", "60 seconds").Scan(&by, &expires); err != nil || by != "instance-a" {
+		t.Fatalf("AcquireLock: %q %v", by, err)
+	}
+	// The lease is now + 60 seconds (within the test's own clock skew).
+	if d := expires.Sub(before); d < 59*time.Second || d > 70*time.Second {
+		t.Errorf("lease expires %v after the call, want ~60s", d)
+	}
+	// Held and unexpired: a second instance's attempt updates nothing,
+	// so RETURNING yields no row (goose reports "already held").
+	err := c.QueryRow(ctx, acquire, lockID, "instance-b", "60 seconds").Scan(&by, &expires)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second AcquireLock while held: %q %v", by, err)
+	}
+	update := `UPDATE goose_lock SET
+		lease_expires_at = now() + $1::interval,
+		updated_at = now()
+	WHERE lock_id = $2 AND locked_by = $3 AND locked = true
+	RETURNING lease_expires_at`
+	var renewed time.Time
+	if err := c.QueryRow(ctx, update, "300 seconds", lockID, "instance-a").Scan(&renewed); err != nil {
+		t.Fatalf("UpdateLease: %v", err)
+	}
+	if d := renewed.Sub(before); d < 299*time.Second || d > 310*time.Second {
+		t.Errorf("renewed lease expires %v after the start, want ~300s", d)
+	}
+	var locked bool
+	var lockedBy *string
+	var leaseAt, updatedAt *time.Time
+	status := `SELECT locked, locked_by, lease_expires_at, updated_at FROM goose_lock WHERE lock_id = $1`
+	if err := c.QueryRow(ctx, status, lockID).Scan(&locked, &lockedBy, &leaseAt, &updatedAt); err != nil ||
+		!locked || lockedBy == nil || *lockedBy != "instance-a" || leaseAt == nil || !leaseAt.Equal(renewed) {
+		t.Fatalf("CheckLockStatus: %v %v %v %v", locked, lockedBy, leaseAt, err)
+	}
+	release := `UPDATE goose_lock SET
+		locked = false,
+		locked_at = NULL,
+		locked_by = NULL,
+		lease_expires_at = NULL,
+		updated_at = now()
+	WHERE lock_id = $1 AND locked_by = $2
+	RETURNING lock_id`
+	var released int64
+	if err := c.QueryRow(ctx, release, lockID, "instance-a").Scan(&released); err != nil || released != lockID {
+		t.Fatalf("ReleaseLock: %d %v", released, err)
+	}
+	// A lease that has already run out (a negative interval puts it in
+	// the past) is taken over by the next acquirer, and swept by the
+	// stale-lock cleanup.
+	if err := c.QueryRow(ctx, acquire, lockID, "instance-b", "-5 seconds").Scan(&by, &expires); err != nil || by != "instance-b" {
+		t.Fatalf("AcquireLock after release: %q %v", by, err)
+	}
+	if err := c.QueryRow(ctx, acquire, lockID, "instance-c", "60 seconds").Scan(&by, &expires); err != nil || by != "instance-c" {
+		t.Fatalf("AcquireLock over an expired lease: %q %v", by, err)
+	}
+	mustExec(t, c, `UPDATE goose_lock SET lease_expires_at = now() + $1::interval WHERE lock_id = $2`, "-1 seconds", lockID)
+	cleanup := `UPDATE goose_lock SET
+		locked = false,
+		locked_at = NULL,
+		locked_by = NULL,
+		lease_expires_at = NULL,
+		updated_at = now()
+	WHERE locked = true AND lease_expires_at < now()
+	RETURNING lock_id`
+	rows, err := c.Query(ctx, cleanup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil || len(cleaned) != 1 || cleaned[0] != lockID {
+		t.Fatalf("CleanupStaleLocks: %v %v", cleaned, err)
+	}
+	_ = table
+}
+
 func TestLibPQVerbatim(t *testing.T) {
 	ctx := context.Background()
 	cfg, err := pgx.ParseConfig(startServer(t))

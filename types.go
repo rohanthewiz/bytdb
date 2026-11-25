@@ -294,6 +294,35 @@ const (
 	DateNegInfinity = math.MinInt32
 )
 
+// DateToTimestamp is a date's midnight UTC as a timestamp, with date
+// 'infinity' and '-infinity' becoming the timestamp ones (a plain
+// days × micros-per-day turned date 'infinity' into a finite instant in
+// the year 36040; found by N-053's corpus). Every other date fits:
+// dates are int32-ranged, and 2^31 days of microseconds is far inside
+// int64.
+func DateToTimestamp(days int64) int64 {
+	switch days {
+	case DateInfinity:
+		return TimestampInfinity
+	case DateNegInfinity:
+		return TimestampNegInfinity
+	}
+	return days * 86_400_000_000
+}
+
+// TimestampToDate is a timestamp's UTC day (floored, so instants before
+// 1970 land on their own day), with the infinities mapped to the date
+// ones.
+func TimestampToDate(us int64) int64 {
+	switch us {
+	case TimestampInfinity:
+		return DateInfinity
+	case TimestampNegInfinity:
+		return DateNegInfinity
+	}
+	return floorDiv(us, 86_400_000_000)
+}
+
 // floorDiv is integer division rounding toward negative infinity.
 func floorDiv(a, b int64) int64 {
 	q := a / b

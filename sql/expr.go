@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -260,6 +261,10 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 			if n.Kind == arithJSONB || (n.Kind == arithUndecided && (staticJSONB(env, n.L) || staticJSONB(env, n.R))) {
 				return jsonbArith(n.Op, l, r)
 			}
+		}
+		switch n.Kind {
+		case arithTsMinusTs, arithTsInterval, arithIntervalNeg:
+			return timeArith(n.Kind, n.Op, l, r)
 		}
 		return arith(n.Op, l, r)
 	case *ExAgg:
@@ -794,6 +799,16 @@ func arith(op string, l, r any) (any, error) {
 	if l == nil || r == nil {
 		return nil, nil
 	}
+	// Intervals (N-053): interval ± interval, and interval scaled by a
+	// number (Postgres converts the number to float8). The operators
+	// that mix an interval with a timestamp are typed apart (timeArith),
+	// since a timestamp's runtime value is a bare int64.
+	if li, ok := l.(bytdb.Interval); ok {
+		return intervalArith(op, li, r)
+	}
+	if ri, ok := r.(bytdb.Interval); ok && op == "*" {
+		return intervalArith(op, ri, l)
+	}
 	li, lInt := l.(int64)
 	ri, rInt := r.(int64)
 	if lInt && rInt {
@@ -877,6 +892,67 @@ func arith(op string, l, r any) (any, error) {
 	return nil, serr.New("unhandled arithmetic operator", "op", op)
 }
 
+// intervalArith is iv op other for an interval left operand (or the
+// interval of number * interval, which commutes).
+func intervalArith(op string, iv bytdb.Interval, other any) (any, error) {
+	if o, ok := other.(bytdb.Interval); ok {
+		switch op {
+		case "+":
+			return iv.Add(o)
+		case "-":
+			return iv.Sub(o)
+		}
+		return nil, serr.New("operator does not exist: interval " + op + " interval")
+	}
+	f, ok := asFloat(other)
+	if !ok {
+		return nil, serr.New("arithmetic requires numeric operands", "op", op)
+	}
+	switch op {
+	case "*":
+		return iv.Mul(f)
+	case "/":
+		return iv.Div(f)
+	}
+	return nil, serr.New("operator does not exist: interval "+op+" number", "op", op)
+}
+
+// timeArith evaluates the operators typing marked as timestamp/interval
+// ones (see arithKind): timestamp values are int64 microseconds.
+func timeArith(kind arithKind, op string, l, r any) (any, error) {
+	switch kind {
+	case arithTsMinusTs:
+		a, aok := l.(int64)
+		b, bok := r.(int64)
+		if !aok || !bok {
+			return nil, serr.New("timestamp operands expected", "op", op)
+		}
+		return interval.Between(a, b)
+	case arithIntervalNeg:
+		iv, ok := r.(bytdb.Interval)
+		if !ok {
+			return nil, serr.New("interval operand expected", "op", "-")
+		}
+		return iv.Neg()
+	case arithTsInterval:
+		// timestamp ± interval, or interval + timestamp.
+		ts, tsOK := l.(int64)
+		iv, ivOK := r.(bytdb.Interval)
+		if !tsOK {
+			iv, ivOK = l.(bytdb.Interval)
+			ts, tsOK = r.(int64)
+		}
+		if !tsOK || !ivOK {
+			return nil, serr.New("timestamp and interval operands expected", "op", op)
+		}
+		if op == "-" {
+			return interval.SubFrom(ts, iv)
+		}
+		return interval.AddTo(ts, iv)
+	}
+	return nil, serr.New("unhandled time arithmetic")
+}
+
 // staticJSONB reports whether an expression is jsonb-typed by shape:
 // a jsonb column (resolved through the environment chain, so a
 // correlated outer column counts), a ::jsonb cast, a jsonb-producing
@@ -947,6 +1023,8 @@ func valText(v any) string {
 		return bytdb.FormatFloat(x)
 	case bytdb.Decimal:
 		return x.String()
+	case bytdb.Interval:
+		return x.String()
 	case bool:
 		if x {
 			return "true"
@@ -1006,15 +1084,11 @@ func castValFrom(env *exEnv, v any, from bytdb.ColType, typ string) (any, error)
 	switch {
 	case to == bytdb.TDate && from == bytdb.TTimestamp:
 		if micros, ok := v.(int64); ok {
-			days := micros / microsPerDay
-			if micros%microsPerDay < 0 {
-				days-- // floor, for instants before 1970
-			}
-			return days, nil
+			return bytdb.TimestampToDate(micros), nil // floored; infinities kept
 		}
 	case to == bytdb.TTimestamp && from == bytdb.TDate:
 		if days, ok := v.(int64); ok {
-			return days * microsPerDay, nil
+			return bytdb.DateToTimestamp(days), nil
 		}
 	case to == bytdb.TBool && from == bytdb.TInt:
 		if n, ok := v.(int64); ok {
@@ -1150,6 +1224,8 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			return x, nil
 		case string:
 			return bytdb.ParseTimestamp(x)
+		case time.Time: // a bound Go time under an explicit cast ($1::timestamptz)
+			return coerceLit(x, bytdb.TTimestamp)
 		}
 	case "date":
 		switch x := v.(type) {
@@ -1159,6 +1235,8 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 			return x, nil
 		case string:
 			return bytdb.ParseDate(x)
+		case time.Time:
+			return coerceLit(x, bytdb.TDate)
 		}
 	case "uuid":
 		switch x := v.(type) {
@@ -1185,7 +1263,25 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 	if isNumericCast(typ) {
 		return castToNumeric(v, typ)
 	}
+	if tm, ok := intervalCastTypmod(typ); ok {
+		return castToInterval(v, tm)
+	}
 	return nil, serr.New("unsupported cast", "type", typ)
+}
+
+// castToInterval is E::interval[modifier] (N-053): text parses (a bare
+// number in the modifier's last unit), an interval passes, and the
+// modifier then truncates and rounds as Postgres's interval_scale does.
+func castToInterval(v any, tm int32) (any, error) {
+	switch x := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return interval.ParseTypmod(x, tm)
+	case bytdb.Interval:
+		return interval.Adjust(x, tm)
+	}
+	return nil, serr.New("cannot cast to interval", "from", fmt.Sprintf("%T", v))
 }
 
 // --- functions with arguments ---
@@ -1481,6 +1577,13 @@ func formatType(typid, typmod any) any {
 		name = "uuid"
 	case 3802:
 		name = "jsonb"
+	case 1186:
+		// interval's typmod is Postgres's own packing of field range and
+		// precision (see interval.Typmod).
+		name = "interval"
+		if m, ok := typmod.(int64); ok && m > 0 && m <= math.MaxInt32 {
+			return name + interval.FormatTypmod(int32(m))
+		}
 	case 1700:
 		// numeric's typmod packs precision in the high 16 bits and an
 		// 11-bit two's-complement scale (Postgres 15+ allows negative
@@ -1642,7 +1745,7 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 				return nil, err
 			}
 			t := fp.sc.column(ord).Type
-			if (it.Agg == AggSum || it.Agg == AggAvg) && !numericType(t) {
+			if (it.Agg == AggSum || it.Agg == AggAvg) && !numericType(t) && t != bytdb.TInterval {
 				return nil, serr.New(it.Agg.name()+" requires a numeric column",
 					"column", it.Col.String())
 			}
@@ -2109,6 +2212,22 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 				return bytdb.TJSONB
 			}
 		}
+		// Intervals (N-053), as the typed bind pass resolves them: with
+		// a timestamp or date the result is a timestamp, otherwise an
+		// interval; timestamp - timestamp is an interval.
+		switch {
+		case n.Kind == arithIntervalNeg || n.Kind == arithTsMinusTs:
+			return bytdb.TInterval
+		case n.Kind == arithTsInterval:
+			return bytdb.TTimestamp
+		case lt == bytdb.TInterval || rt == bytdb.TInterval:
+			if temporalType(lt) || temporalType(rt) {
+				return bytdb.TTimestamp
+			}
+			return bytdb.TInterval
+		case lt == bytdb.TTimestamp && rt == bytdb.TTimestamp && n.Op == "-":
+			return bytdb.TInterval
+		}
 		if lt == bytdb.TFloat || rt == bytdb.TFloat {
 			return bytdb.TFloat
 		}
@@ -2126,6 +2245,9 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 // numeric), float otherwise. Other aggregates (MIN, MAX) keep the
 // argument's type.
 func sumAvgType(fn AggFunc, arg bytdb.ColType) bytdb.ColType {
+	if arg == bytdb.TInterval && (fn == AggSum || fn == AggAvg) {
+		return bytdb.TInterval // interval totals and averages (N-053)
+	}
 	switch fn {
 	case AggSum:
 		if arg == bytdb.TInt || arg == bytdb.TNumeric {
@@ -2219,6 +2341,9 @@ func castColType(typ string) bytdb.ColType {
 	}
 	if isNumericCast(typ) { // numeric(p,s)
 		return bytdb.TNumeric
+	}
+	if _, ok := intervalCastTypmod(typ); ok { // interval, interval day to second(3)
+		return bytdb.TInterval
 	}
 	return bytdb.TString
 }

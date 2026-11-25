@@ -16,6 +16,7 @@ import (
 	"strconv"
 
 	"github.com/rohanthewiz/bytdb/decimal"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -105,14 +106,43 @@ func coerceNumeric(v any) (d Decimal, ok bool, err error) {
 	return Decimal{}, false, nil
 }
 
+// coerceColumn is coerce for a value bound for column c, then the
+// column's declared limits (enforceTypmod). Every write path — insert,
+// update, a default — goes through it. Interval text is the one input
+// read differently per column: a bare number takes the modifier's last
+// field as its unit ('5' is 5 minutes in an interval minute column), so
+// it is parsed with the modifier rather than coerced and then adjusted.
+func coerceColumn(v any, c *Column) (any, error) {
+	if c.Type == TInterval && c.IntervalTypmod != 0 {
+		switch x := v.(type) {
+		case string:
+			return interval.ParseTypmod(x, c.IntervalTypmod)
+		case []byte:
+			return interval.ParseTypmod(string(x), c.IntervalTypmod)
+		}
+	}
+	cv, err := coerce(v, c.Type)
+	if err != nil {
+		return nil, err
+	}
+	return enforceTypmod(cv, c)
+}
+
 // enforceTypmod applies a column's declared limits to an already-coerced
-// value: VARCHAR(n)'s length (enforceMaxLen) and numeric(p, s)'s
-// rounding and range. Every write path calls this one function, so a
-// new kind of typmod has one place to go.
+// value: VARCHAR(n)'s length (enforceMaxLen), numeric(p, s)'s rounding
+// and range, and an interval modifier's truncation and rounding. Every
+// write path calls this one function, so a new kind of typmod has one
+// place to go.
 func enforceTypmod(v any, c *Column) (any, error) {
 	v, err := enforceMaxLen(v, c)
 	if err != nil {
 		return nil, err
+	}
+	if c.Type == TInterval && c.IntervalTypmod != 0 {
+		if iv, ok := v.(Interval); ok {
+			return interval.Adjust(iv, c.IntervalTypmod)
+		}
+		return v, nil
 	}
 	return enforceNumericTypmod(v, c)
 }
@@ -144,6 +174,16 @@ func enforceNumericTypmod(v any, c *Column) (any, error) {
 // allows precision 1..1000 and scale -1000..1000, and only numeric
 // columns carry one.
 func validTypmod(c Column) error {
+	if c.IntervalTypmod != 0 {
+		if c.Type != TInterval {
+			return serr.New("an interval type modifier is only valid on interval columns",
+				"column", c.Name, "type", string(c.Type))
+		}
+		// Adjust refuses a modifier it does not recognize.
+		if _, err := interval.Adjust(Interval{}, c.IntervalTypmod); err != nil {
+			return serr.Wrap(err, "column", c.Name)
+		}
+	}
 	if c.Precision == 0 && c.Scale == 0 {
 		return nil
 	}

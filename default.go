@@ -65,13 +65,10 @@ func columnDefaultValue(col *Column, now time.Time) (any, error) {
 	if err != nil {
 		return nil, serr.Wrap(err, "column", col.Name, "default", col.Default)
 	}
-	cv, err := coerce(v, col.Type)
+	cv, err := coerceColumn(v, col)
 	if err != nil {
 		return nil, serr.Wrap(err, "op", "coerce column default",
 			"column", col.Name, "default", col.Default)
-	}
-	if cv, err = enforceTypmod(cv, col); err != nil {
-		return nil, serr.Wrap(err, "column", col.Name, "default", col.Default)
 	}
 	return cv, nil
 }

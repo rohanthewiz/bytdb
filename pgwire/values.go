@@ -33,6 +33,7 @@ const (
 	oidTextArray   = 1009 // _text: one-dimensional text[]
 	oidJSON        = 114  // accepted on input; columns present as jsonb
 	oidJSONB       = 3802
+	oidInterval    = 1186
 )
 
 // Postgres's date/time binary formats count from 2000-01-01 rather
@@ -73,6 +74,8 @@ func oidForType(t bytdb.ColType) uint32 {
 		return oidJSONB
 	case bytdb.TNumeric:
 		return oidNumeric
+	case bytdb.TInterval:
+		return oidInterval
 	}
 	return oidText
 }
@@ -87,7 +90,7 @@ func typeSize(t bytdb.ColType) int {
 		return 8
 	case bytdb.TDate:
 		return 4
-	case bytdb.TUUID:
+	case bytdb.TUUID, bytdb.TInterval:
 		return 16
 	}
 	return -1
@@ -208,6 +211,13 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 			}
 			return appendNumericBinary(dst, x), nil
 		}
+	case bytdb.TInterval:
+		if x, ok := v.(bytdb.Interval); ok {
+			if format == fmtText {
+				return x.AppendText(dst), nil
+			}
+			return appendIntervalBinary(dst, x), nil
+		}
 	}
 	return appendByKind(dst, v, format)
 }
@@ -274,6 +284,9 @@ func kindFits(v any, t bytdb.ColType) bool {
 	case bytdb.TNumeric:
 		_, ok := v.(bytdb.Decimal)
 		return ok
+	case bytdb.TInterval:
+		_, ok := v.(bytdb.Interval)
+		return ok
 	}
 	return true
 }
@@ -295,6 +308,8 @@ func appendByKind(dst []byte, v any, format int) ([]byte, error) {
 			// (deep-look D-24, D-55).
 			return bytdb.AppendFloat(dst, x), nil
 		case bytdb.Decimal:
+			return x.AppendText(dst), nil
+		case bytdb.Interval:
 			return x.AppendText(dst), nil
 		case string:
 			return append(dst, x...), nil
@@ -370,6 +385,8 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			return s, nil
 		case oidNumeric:
 			return bytdb.ParseDecimal(s)
+		case oidInterval:
+			return bytdb.ParseInterval(s)
 		}
 		return s, nil
 	}
@@ -439,8 +456,33 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 		return string(raw[1:]), nil
 	case oidNumeric:
 		return decodeNumericBinary(raw)
+	case oidInterval:
+		return decodeIntervalBinary(raw)
 	}
 	return nil, serr.New("unsupported binary parameter type", "oid", fmt.Sprint(oid))
+}
+
+// --- interval binary wire format ---
+//
+// interval_send's layout: the clock as int64 microseconds, then days and
+// months as int32s, all big-endian — 16 bytes, the three fields as
+// stored (bytdb.Interval), so the format is a straight copy both ways.
+
+func appendIntervalBinary(dst []byte, iv bytdb.Interval) []byte {
+	dst = binary.BigEndian.AppendUint64(dst, uint64(iv.Micros))
+	dst = binary.BigEndian.AppendUint32(dst, uint32(iv.Days))
+	return binary.BigEndian.AppendUint32(dst, uint32(iv.Months))
+}
+
+func decodeIntervalBinary(raw []byte) (bytdb.Interval, error) {
+	if len(raw) != 16 {
+		return bytdb.Interval{}, serr.New("bad binary interval parameter")
+	}
+	return bytdb.Interval{
+		Micros: int64(binary.BigEndian.Uint64(raw)),
+		Days:   int32(binary.BigEndian.Uint32(raw[8:])),
+		Months: int32(binary.BigEndian.Uint32(raw[12:])),
+	}, nil
 }
 
 // --- text[] binary wire format ---

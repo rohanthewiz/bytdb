@@ -233,6 +233,15 @@ const (
 	arithUndecided arithKind = iota
 	arithJSONB               // jsonb || jsonb, jsonb - key
 	arithPlain               // text concatenation or arithmetic
+	// The interval operators whose operands' runtime values cannot say
+	// which operator was meant (N-053): a timestamp is an int64, so
+	// int64 - int64 could be bigint subtraction or timestamp -
+	// timestamp, and int64 - Interval could be a timestamp minus an
+	// interval or the parser's 0 - E for unary minus. Typing decides
+	// and records it here; evaluation dispatches on it.
+	arithTsMinusTs   // timestamp - timestamp: an interval
+	arithTsInterval  // timestamp ± interval, interval + timestamp: a timestamp
+	arithIntervalNeg // -interval (the parser's 0 - E)
 )
 
 // ExSub is a scalar subquery, executed lazily per row with the
@@ -637,6 +646,9 @@ type ColDef struct {
 	MaxLen int
 	// Precision and Scale are numeric(p, s) (0, 0: unconstrained).
 	Precision, Scale int32
+	// IntervalTypmod is an interval column's modifier (interval day to
+	// second(3)); 0 when none (see bytdb.Column.IntervalTypmod).
+	IntervalTypmod int32
 	// Unique marks a UNIQUE column constraint — sugar the executor
 	// lowers to a single-column unique index named table_col_key.
 	Unique bool
@@ -901,8 +913,10 @@ type AlterColumnType struct {
 	MaxLen    int
 	Precision int32 // numeric(p, s); 0, 0 when unconstrained or not numeric
 	Scale     int32
-	Using     Expr
-	UsingText string
+	// IntervalTypmod is the new interval modifier; 0 when none.
+	IntervalTypmod int32
+	Using          Expr
+	UsingText      string
 }
 
 // AlterColumnRestart is ALTER TABLE t ALTER [COLUMN] c RESTART

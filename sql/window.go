@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -712,13 +713,21 @@ func resolveFrame(env *exEnv, w *ExWindow) (frameSpec, error) {
 	fs := frameSpec{mode: w.Frame.Mode, start: w.Frame.Start.Type, end: w.Frame.End.Type, exclude: w.Frame.Exclude}
 	var err error
 	if fs.hasRangeOffsets() {
-		if t := exprType(env.sc, w.OrderBy[0].Ex); t != bytdb.TInt && t != bytdb.TFloat {
+		// Numeric keys take numeric distances; timestamp and interval
+		// keys take interval ones (N-053), as Postgres's in_range
+		// support functions for those types do: RANGE BETWEEN INTERVAL
+		// '7 days' PRECEDING AND CURRENT ROW over a timestamp. A date
+		// key would too in Postgres; see the plan's follow-ups.
+		t := exprType(env.sc, w.OrderBy[0].Ex)
+		switch t {
+		case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp, bytdb.TInterval:
+		default:
 			return fs, serr.New("RANGE with offset PRECEDING/FOLLOWING is not supported for column type " + string(t))
 		}
-		if fs.startNum, err = rangeOffset(env, w.Frame.Start.Offset, "starting"); err != nil {
+		if fs.startNum, err = rangeOffset(env, w.Frame.Start.Offset, "starting", t); err != nil {
 			return fs, err
 		}
-		fs.endNum, err = rangeOffset(env, w.Frame.End.Offset, "ending")
+		fs.endNum, err = rangeOffset(env, w.Frame.End.Offset, "ending", t)
 		return fs, err
 	}
 	if fs.startOff, err = frameOffset(env, w.Frame.Start.Offset, "starting"); err != nil {
@@ -757,7 +766,7 @@ func frameOffset(env *exEnv, e Expr, which string) (int64, error) {
 // distance on the sort key, which unlike a row count may be
 // fractional. Negative (and NaN — no ordered distance) sizes get
 // Postgres' runtime wording.
-func rangeOffset(env *exEnv, e Expr, which string) (any, error) {
+func rangeOffset(env *exEnv, e Expr, which string, keyType bytdb.ColType) (any, error) {
 	if e == nil {
 		return nil, nil
 	}
@@ -767,6 +776,23 @@ func rangeOffset(env *exEnv, e Expr, which string) (any, error) {
 	}
 	if v == nil {
 		return nil, serr.New("frame " + which + " offset must not be null")
+	}
+	if keyType == bytdb.TTimestamp || keyType == bytdb.TInterval {
+		// An interval distance; an untyped '1 day' reads as one, as
+		// Postgres resolves the offset to the in_range function's type.
+		if s, ok := v.(string); ok {
+			if v, err = bytdb.ParseInterval(s); err != nil {
+				return nil, err
+			}
+		}
+		iv, ok := v.(bytdb.Interval)
+		if !ok {
+			return nil, serr.New("frame " + which + " offset must be an interval")
+		}
+		if iv.Cmp(bytdb.Interval{}) < 0 {
+			return nil, serr.New("invalid preceding or following size in window function")
+		}
+		return iv, nil
 	}
 	f, ok := asFloat(v)
 	if !ok {
@@ -1077,6 +1103,9 @@ func segPos(segs []seg, k int) int {
 // same "NaN is within any distance of NaN, and of nothing else" that
 // Postgres' float in_range implements.
 func rangeThreshold(v, off any, sub bool) any {
+	if iv, ok := off.(bytdb.Interval); ok {
+		return intervalThreshold(v, iv, sub)
+	}
 	vi, vok := v.(int64)
 	oi, ook := off.(int64)
 	if vok && ook {
@@ -1097,6 +1126,50 @@ func rangeThreshold(v, off any, sub bool) any {
 		return vf - of
 	}
 	return vf + of
+}
+
+// intervalThreshold is rangeThreshold for an interval distance (N-053):
+// a timestamp key moves on the calendar (timestamp ± interval), an
+// interval key by interval arithmetic. A threshold that leaves its
+// type's range lies past every key, and saturates to the extreme on
+// that side (±Inf against a timestamp's int64, the extreme interval
+// against an interval), as the integer path does; Postgres raises
+// "out of range" there instead. An infinite timestamp key stays
+// infinite, so it is within any distance of its own infinity.
+func intervalThreshold(v any, off bytdb.Interval, sub bool) any {
+	switch x := v.(type) {
+	case int64:
+		var t int64
+		var err error
+		if sub {
+			t, err = interval.SubFrom(x, off)
+		} else {
+			t, err = interval.AddTo(x, off)
+		}
+		if err != nil {
+			if sub {
+				return math.Inf(-1)
+			}
+			return math.Inf(1)
+		}
+		return t
+	case bytdb.Interval:
+		var t bytdb.Interval
+		var err error
+		if sub {
+			t, err = x.Sub(off)
+		} else {
+			t, err = x.Add(off)
+		}
+		if err != nil {
+			if sub {
+				return bytdb.Interval{Months: math.MinInt32, Days: math.MinInt32, Micros: math.MinInt64}
+			}
+			return bytdb.Interval{Months: math.MaxInt32, Days: math.MaxInt32, Micros: math.MaxInt64}
+		}
+		return t
+	}
+	return v
 }
 
 // assignValueFrame fills FIRST_VALUE/LAST_VALUE/NTH_VALUE for one

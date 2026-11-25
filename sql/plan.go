@@ -400,6 +400,10 @@ func litFits(v any, t bytdb.ColType) bool {
 		// and the residual comparison rejects every row anyway.
 		b, ok := v.([]byte)
 		return ok && len(b) == 16
+	case bytdb.TInterval:
+		// Keys order by span, as the comparison does (N-053).
+		_, ok := v.(bytdb.Interval)
+		return ok
 	}
 	return false // TBytes, arrays, jsonb: no ordered key pushdown
 }

@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 )
 
 // typeName is the SQL spelling of a column type, as the shell shows it
@@ -53,6 +54,8 @@ func typeName(t bytdb.ColType) string {
 		return "jsonb"
 	case bytdb.TNumeric:
 		return "numeric"
+	case bytdb.TInterval:
+		return "interval"
 	}
 	return string(t)
 }
@@ -66,6 +69,8 @@ func columnTypeName(c bytdb.Column) string {
 		return "varchar(" + strconv.Itoa(c.MaxLen) + ")"
 	case c.Type == bytdb.TNumeric:
 		return bytdb.NumericTypeName(c)
+	case c.Type == bytdb.TInterval && c.IntervalTypmod != 0:
+		return "interval" + interval.FormatTypmod(c.IntervalTypmod)
 	}
 	return typeName(c.Type)
 }
@@ -117,6 +122,8 @@ func displayValue(v any, t bytdb.ColType) (s string, ok bool) {
 	case float64:
 		return formatFloat(x), true
 	case bytdb.Decimal:
+		return x.String(), true
+	case bytdb.Interval:
 		return x.String(), true
 	case string:
 		return x, true

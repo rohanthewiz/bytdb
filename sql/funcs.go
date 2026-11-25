@@ -37,6 +37,7 @@ import (
 
 	"github.com/rohanthewiz/bytdb"
 	"github.com/rohanthewiz/bytdb/decimal"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -282,6 +283,19 @@ func textArgs(ret bytdb.ColType, intArgs ...int) func(f *funcCall) (bytdb.ColTyp
 		}
 		return ret, nil
 	}
+}
+
+// intervalFunc types a one-interval-argument function returning an
+// interval (justify_*): an untyped literal is read as an interval.
+func intervalFunc(f *funcCall) (bytdb.ColType, error) {
+	switch f.types[0] {
+	case bytdb.TInterval, tyNull:
+	case tyUnknown:
+		f.castArg(0, "interval")
+	default:
+		return "", noFunc(f.name, f.types)
+	}
+	return bytdb.TInterval, nil
 }
 
 // temporalArg makes argument i a timestamp for evaluation: a date
@@ -850,8 +864,17 @@ func init() {
 			if !textOrUnknown(f.types[0]) {
 				return "", noFunc(f.name, f.types)
 			}
+			if f.types[1] == bytdb.TInterval {
+				return bytdb.TFloat, nil
+			}
 			return bytdb.TFloat, temporalArg(f, 1)
 		}, eval: func(a []any) (any, error) {
+			if iv, ok := a[1].(bytdb.Interval); ok {
+				// EXTRACT lowers to date_part, so both come here: a
+				// float8, as timestamps' are in bytdb (Postgres 14+'s
+				// EXTRACT is numeric; the values agree).
+				return iv.Part(str(a[0]))
+			}
 			micros, ok := a[1].(int64)
 			if !ok {
 				return nil, serr.New("timestamp argument expected")
@@ -862,8 +885,14 @@ func init() {
 			if !textOrUnknown(f.types[0]) {
 				return "", noFunc(f.name, f.types)
 			}
+			if f.types[1] == bytdb.TInterval {
+				return bytdb.TInterval, nil
+			}
 			return bytdb.TTimestamp, temporalArg(f, 1)
 		}, eval: func(a []any) (any, error) {
+			if iv, ok := a[1].(bytdb.Interval); ok {
+				return iv.Trunc(str(a[0]))
+			}
 			micros, ok := a[1].(int64)
 			if !ok {
 				return nil, serr.New("timestamp argument expected")
@@ -883,6 +912,83 @@ func init() {
 			return toChar(micros, str(a[1])), nil
 		}},
 		// to_timestamp(seconds since the epoch).
+		// --- intervals (N-053) ---
+		"justify_days": {min: 1, max: 1, typ: intervalFunc, eval: func(a []any) (any, error) {
+			return a[0].(bytdb.Interval).JustifyDays()
+		}},
+		"justify_hours": {min: 1, max: 1, typ: intervalFunc, eval: func(a []any) (any, error) {
+			return a[0].(bytdb.Interval).JustifyHours()
+		}},
+		"justify_interval": {min: 1, max: 1, typ: intervalFunc, eval: func(a []any) (any, error) {
+			return a[0].(bytdb.Interval).JustifyInterval()
+		}},
+		// make_interval(years, months, weeks, days, hours, mins, secs):
+		// the parser fills every parameter (namedArgFuncs), so seven
+		// arguments arrive; fewer when called positionally with a short
+		// list, the rest defaulting to 0.
+		"make_interval": {min: 0, max: 7, typ: func(f *funcCall) (bytdb.ColType, error) {
+			for i, t := range f.types {
+				switch {
+				case i == 6 && numericOrUnknown(t):
+					if t != bytdb.TFloat && t != tyNull {
+						f.castArg(i, "float8")
+					}
+				case t == bytdb.TInt || t == tyNull:
+				case t == tyUnknown:
+					f.castArg(i, "bigint")
+				default:
+					return "", noFunc(f.name, f.types)
+				}
+			}
+			return bytdb.TInterval, nil
+		}, eval: func(a []any) (any, error) {
+			var ints [6]int64
+			for i := range min(len(a), 6) {
+				ints[i] = a[i].(int64)
+			}
+			var secs float64
+			if len(a) == 7 {
+				secs, _ = num(a[6])
+			}
+			return interval.Make(ints[0], ints[1], ints[2], ints[3], ints[4], ints[5], secs)
+		}},
+		// age(t1, t2) is the symbolic difference (years, months, days);
+		// age(t) measures from today's midnight, as Postgres's
+		// age(current_date, t) does (bytdb's day is the UTC one).
+		"age": {min: 1, max: 2, typ: func(f *funcCall) (bytdb.ColType, error) {
+			for i := range f.types {
+				if err := temporalArg(f, i); err != nil {
+					return "", err
+				}
+			}
+			return bytdb.TInterval, nil
+		}, eval: func(a []any) (any, error) {
+			t1, ok1 := a[0].(int64)
+			if len(a) == 1 {
+				u := time.Now().UTC()
+				midnight := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).UnixMicro()
+				return interval.Age(midnight, t1)
+			}
+			t2, ok2 := a[1].(int64)
+			if !ok1 || !ok2 {
+				return nil, serr.New("timestamp arguments expected")
+			}
+			return interval.Age(t1, t2)
+		}},
+		// isfinite: every Postgres 16 interval is finite; a timestamp or
+		// date is unless it is ±infinity.
+		"isfinite": {min: 1, max: 1, typ: func(f *funcCall) (bytdb.ColType, error) {
+			if f.types[0] == bytdb.TInterval {
+				return bytdb.TBool, nil
+			}
+			return bytdb.TBool, temporalArg(f, 0)
+		}, eval: func(a []any) (any, error) {
+			if us, ok := a[0].(int64); ok {
+				return us != bytdb.TimestampInfinity && us != bytdb.TimestampNegInfinity, nil
+			}
+			return true, nil
+		}},
+
 		"to_timestamp": {min: 1, max: 1, typ: floatResultAs(bytdb.TTimestamp), eval: func(a []any) (any, error) {
 			x, ok := num(a[0])
 			if !ok {

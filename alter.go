@@ -49,6 +49,9 @@ type ColumnTypeChange struct {
 	// re-checks every row like any type change: values round to the new
 	// scale, and one that overflows the new precision fails the ALTER.
 	Precision, Scale int32
+	// IntervalTypmod is an interval column's new modifier (0 = plain
+	// interval; see Column.IntervalTypmod).
+	IntervalTypmod int32
 
 	// Using, when non-nil, computes each row's new value from the whole
 	// old row — the engine side of SQL's USING expression, which may
@@ -103,6 +106,7 @@ func (e *Engine) AlterColumnType(table, column string, ch ColumnTypeChange) erro
 		newCol := oldCol
 		newCol.Type, newCol.MaxLen = ch.Type, ch.MaxLen
 		newCol.Precision, newCol.Scale = ch.Precision, ch.Scale
+		newCol.IntervalTypmod = ch.IntervalTypmod
 		if err := validMaxLen(newCol); err != nil {
 			return nil, serr.Wrap(err, "table", table)
 		}
@@ -111,7 +115,8 @@ func (e *Engine) AlterColumnType(table, column string, ch ColumnTypeChange) erro
 				"table", table, "column", column, "type", string(ch.Type))
 		}
 		if ch.Using == nil && oldCol.Type == ch.Type && oldCol.MaxLen == ch.MaxLen &&
-			oldCol.Precision == ch.Precision && oldCol.Scale == ch.Scale {
+			oldCol.Precision == ch.Precision && oldCol.Scale == ch.Scale &&
+			oldCol.IntervalTypmod == ch.IntervalTypmod {
 			return nil, nil // nothing changes; Postgres also skips the rewrite
 		}
 		if err := refuseFKColumn(e, tx, old, ord, "change the type of"); err != nil {
@@ -431,6 +436,8 @@ func sqlTypeName(t ColType) string {
 		return "jsonb"
 	case TNumeric:
 		return "numeric"
+	case TInterval:
+		return "interval"
 	}
 	return string(t)
 }
@@ -485,20 +492,15 @@ func assignmentCast(from, to ColType) func(any) (any, error) {
 		return func(v any) (any, error) {
 			days := v.(int64)
 			const microsPerDay = 86400 * 1_000_000
-			if days > math.MaxInt64/microsPerDay || days < math.MinInt64/microsPerDay {
+			if days != DateInfinity && days != DateNegInfinity &&
+				(days > math.MaxInt64/microsPerDay || days < math.MinInt64/microsPerDay) {
 				return nil, serr.New("date out of range for timestamp")
 			}
-			return days * microsPerDay, nil
+			return DateToTimestamp(days), nil
 		}
 	case from == TTimestamp && to == TDate:
 		return func(v any) (any, error) {
-			const microsPerDay = 86400 * 1_000_000
-			m := v.(int64)
-			d := m / microsPerDay
-			if m%microsPerDay < 0 { // floor, not truncation toward the epoch
-				d--
-			}
-			return d, nil
+			return TimestampToDate(v.(int64)), nil // floored; infinities kept
 		}
 	}
 	return nil
@@ -529,6 +531,8 @@ func castToText(v any, t ColType) (string, error) {
 		return FormatUUID(v.([]byte)), nil
 	case TNumeric:
 		return v.(Decimal).String(), nil
+	case TInterval:
+		return v.(Interval).String(), nil
 	}
 	return "", serr.New("no text form for column type", "type", string(t))
 }
@@ -593,6 +597,8 @@ func castDefault(oldCol, newCol *Column) (string, error) {
 		out = "'" + strings.ReplaceAll(x, "'", "''") + "'"
 	case Decimal:
 		out = x.String() // read back exactly by decodeDefaultLiteral
+	case Interval:
+		out = "'" + x.String() + "'" // interval text has no quotes to escape
 	default:
 		// []byte (bytea, uuid) has no literal form default.go reads.
 		return "", fail(nil)

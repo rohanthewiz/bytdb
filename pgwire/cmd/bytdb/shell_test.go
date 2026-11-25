@@ -487,3 +487,38 @@ INSERT INTO m (k) VALUES (2.5);
 	}
 	mustContain(t, out, `"k":"-Infinity"`, `"k":0`, `"k":2.5`, `"v":1.50`, `"k":"NaN"`, `"v":"-Infinity"`)
 }
+
+// TestDumpInterval (N-053): interval columns dump with their type
+// modifiers and their values as quoted Postgres text, an interval key
+// restores in span order with the fields as written, a modifier's
+// DEFAULT survives, and JSON renders intervals as strings, as to_json
+// does.
+func TestDumpInterval(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src.bytdb"), filepath.Join(dir, "dst.bytdb")
+	if _, errOut, code := runShell(t, `
+CREATE TABLE lease (k interval PRIMARY KEY, m interval minute DEFAULT '5', p interval day to second(2));
+INSERT INTO lease VALUES ('1 mon', '1 day 02:03:04', '00:00:01.555'), ('-1 days +02:00:00', NULL, 'P1DT2H'), ('36:00:00', '90', NULL);
+INSERT INTO lease (k) VALUES ('00:00:00.000001');
+`, "-batch", src); code != 0 {
+		t.Fatalf("setup: code %d stderr %s", code, errOut)
+	}
+	dump, errOut, code := runShell(t, "", src, ".dump")
+	if code != 0 {
+		t.Fatalf("dump: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, dump, "k interval", "m interval minute DEFAULT '5'", "p interval day to second(2)",
+		"'-1 days +02:00:00', NULL, '1 day 02:00:00'", "'00:00:00.000001', '00:05:00', NULL",
+		"'36:00:00', '01:30:00', NULL", "'1 mon', '1 day 02:03:00', '00:00:01.56'")
+	if _, errOut, code = runShell(t, dump, "-batch", dst); code != 0 {
+		t.Fatalf("restore: code %d stderr %s", code, errOut)
+	}
+	if again, _, _ := runShell(t, "", dst, ".dump"); again != dump {
+		t.Errorf("dump of the restored database differs.\nfirst:\n%s\nsecond:\n%s", dump, again)
+	}
+	out, errOut, code := runShell(t, "", dst, "-json", "-c", "SELECT k, m FROM lease ORDER BY k")
+	if code != 0 {
+		t.Fatalf("json: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, out, `"k":"-1 days +02:00:00"`, `"m":"00:05:00"`, `"k":"1 mon"`)
+}

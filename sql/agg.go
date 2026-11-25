@@ -58,15 +58,20 @@ type accum struct {
 	sawFloat bool // a float value actually arrived at runtime
 	// hasDec: sumD holds part of the total — a numeric input arrived,
 	// or AVG's integer total outgrew int64 and was folded in (N-048).
-	hasDec   bool
-	sawDec   bool // a numeric value arrived (not just a fold)
-	numArg   bool // the argument is statically numeric: the total is exact even if only integers arrive
-	sorted   bool // items are in spec.order's order; collect clears it
-	boolVal  bool // bool_and / bool_or running result once count > 0
-	count    int64
-	sumI     int64
-	sumF     float64      // the float inputs only; see floatTotal
-	sumD     *decimal.Sum // exact part of the total beyond sumI; see exactTotal (nil until needed)
+	hasDec  bool
+	sawDec  bool // a numeric value arrived (not just a fold)
+	numArg  bool // the argument is statically numeric: the total is exact even if only integers arrive
+	sorted  bool // items are in spec.order's order; collect clears it
+	boolVal bool // bool_and / bool_or running result once count > 0
+	count   int64
+	sumI    int64
+	sumF    float64      // the float inputs only; see floatTotal
+	sumD    *decimal.Sum // exact part of the total beyond sumI; see exactTotal (nil until needed)
+	// sumIv is an interval argument's running total (N-053), and sawIv
+	// that one arrived: sum(interval) is an interval, avg(interval) that
+	// total / count, as Postgres's interval_avg computes it.
+	sumIv    bytdb.Interval
+	sawIv    bool
 	min, max any
 
 	// spec holds the call's static parts, shared by pointer: every
@@ -191,6 +196,12 @@ func (a *accum) add(env *exEnv, vals []any) error {
 				return decimalErr(err)
 			}
 			a.hasDec, a.sawDec = true, true
+		case bytdb.Interval:
+			t, err := a.sumIv.Add(n)
+			if err != nil {
+				return err // interval out of range
+			}
+			a.sumIv, a.sawIv = t, true
 		case float64:
 			// intSum is a STATIC property (the argument's declared type is
 			// int), but an expression argument can yield a float at runtime
@@ -204,12 +215,17 @@ func (a *accum) add(env *exEnv, vals []any) error {
 			return serr.New(a.fn.name()+" requires a numeric argument",
 				"got", fmt.Sprintf("%T", v))
 		}
+	// A later value equal to the current one replaces it, as Postgres's
+	// min and max transition functions do (numeric_smaller and the like
+	// return the new argument unless the old is strictly smaller). That
+	// decides which spelling comes back when equal values differ in it:
+	// 1.0 and 1.00, '1 mon' and '30 days'.
 	case AggMin:
-		if c, ok := compareVals(v, a.min); a.min == nil || (ok && c < 0) {
+		if c, ok := compareVals(v, a.min); a.min == nil || (ok && c <= 0) {
 			a.min = v
 		}
 	case AggMax:
-		if c, ok := compareVals(v, a.max); a.max == nil || (ok && c > 0) {
+		if c, ok := compareVals(v, a.max); a.max == nil || (ok && c >= 0) {
 			a.max = v
 		}
 	case AggBoolAnd, AggBoolOr:
@@ -361,6 +377,8 @@ func (a *accum) value() any {
 		// yield a wider kind than its first branch suggests, and the
 		// narrower total would silently drop those rows.
 		switch {
+		case a.sawIv:
+			return a.sumIv
 		case a.sawFloat:
 			return a.floatTotal()
 		case a.hasDec || a.numArg:
@@ -372,6 +390,13 @@ func (a *accum) value() any {
 	case AggAvg:
 		if a.count == 0 {
 			return nil
+		}
+		if a.sawIv {
+			avg, err := a.sumIv.Div(float64(a.count))
+			if err != nil {
+				return nil // count > 0: Div cannot fail by zero, and a quotient never outgrows its dividend
+			}
+			return avg
 		}
 		// numeric over integers and numerics (Postgres: avg(bigint) and
 		// avg(numeric) are numeric), with numeric division's scale;
@@ -832,7 +857,7 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 			return 0, err
 		}
 		t := q.sc.column(ord).Type
-		if (n.Fn == AggSum || n.Fn == AggAvg) && !numericType(t) {
+		if (n.Fn == AggSum || n.Fn == AggAvg) && !numericType(t) && t != bytdb.TInterval {
 			return 0, serr.New(n.Fn.name()+" requires a numeric column",
 				"column", n.Col.String(), "type", string(t))
 		}

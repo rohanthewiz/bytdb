@@ -5,7 +5,7 @@ references point at the proof.
 
 ## Column types
 
-Eleven storage types, with the Postgres aliases you'd expect
+Twelve storage types, with the Postgres aliases you'd expect
 (`sql/parser.go`, `typeName`):
 
 | Declared as | Stored as | Notes |
@@ -18,6 +18,7 @@ Eleven storage types, with the Postgres aliases you'd expect
 | `BYTEA`, `BYTES` | `[]byte` | |
 | `TIMESTAMP`, `TIMESTAMPTZ` | `int64` µs since epoch, UTC | one type: the `WITH/WITHOUT TIME ZONE` distinction parses and folds away; presents as `timestamptz` on the wire. Text input: ISO 8601 with or without seconds, fraction or offset, a trailing `UTC`/`Z` or IANA zone name (`'2024-02-29 12:00 America/New_York'`), and `epoch`, `now`, `today`, `tomorrow`, `yesterday`, `infinity`, `-infinity` (stored as the extreme instants, so they sort last and first) |
 | `DATE` | `int64` days since epoch | timestamp text is accepted as in Postgres: the date as written, time and zone dropped (`'2024-01-02 23:30:00-05'` is 2024-01-02); so a `time.Time` binds to a date column as its UTC day. Also `'2024-2-9'`, `'20240229'` and the special words above |
+| `INTERVAL`, with optional fields (`INTERVAL DAY TO SECOND`, `INTERVAL MINUTE`) and `(p)` | `bytdb.Interval`: months, days, µs | Postgres's interval: the three fields stay apart (a month moves a timestamp by a calendar month, a day by a calendar day), and values compare by span, a month counting 30 days and a day 24 hours, so `'1 mon' = '30 days'` (one key in a unique index) while each reads back as written. Every Postgres input form (`'1 day 02:00'`, `'1.5 hours'`, `'@ 3 days ago'`, `'1-6'`, ISO 8601 `'P1DT2H'` and `'P0001-02-03T04:05:06'`) and the default `postgres` output style; a field qualifier truncates and reads a bare number in its last unit (`interval '5' minute` is 5 minutes), `(p)` rounds the seconds. `timestamp ± interval` follows the calendar (Jan 31 + 1 mon = Feb 29), `date ± interval` is a timestamp, `timestamp - timestamp` an interval of days and time, `interval * / number`, `sum`/`avg`/`min`/`max`, and `justify_days/hours/interval`, `make_interval` (with `days => 7` named arguments), `age`, `date_part`/`EXTRACT`, `date_trunc` and `isfinite` over intervals. Bad text is 22007, a field overflow 22015, an out-of-range result 22008. OID 1186 in both wire formats; the `database/sql` driver returns the text (`"1 day 02:00:00"`), the Go API an `Interval` (`Row.Interval`, which also takes a `time.Duration` on insert) |
 | `UUID` | 16 bytes | dashed, braced (`{…}`) or 32-hex input; lowercase dashed output; `gen_random_uuid()` |
 | `JSONB` (`JSON` is an alias) | canonical document text | compact, keys sorted — one spelling per document, so `=` is document equality |
 | `TEXT[]` (`VARCHAR[]`) | canonical Postgres array-literal text | one-dimensional; OID 1009 in both wire formats |
@@ -32,7 +33,9 @@ scans. `now()`, `transaction_timestamp()`, `statement_timestamp()`,
 There is deliberately **no** time-of-day type and no array element type
 other than text — see [Gotchas](gotchas.md). Numeric's arithmetic,
 rounding and division scales are checked digit for digit against
-Postgres 16 (`sql/difftest/corpus/77_numeric.sql`).
+Postgres 16 (`sql/difftest/corpus/77_numeric.sql`), and so is interval's
+input, output and arithmetic: 9,331 cases captured from Postgres 16.9
+(`interval/testdata/golden.tsv`) plus `sql/difftest/corpus/81_interval.sql`.
 
 ## Tables and constraints
 
@@ -631,8 +634,10 @@ and `CURRENT ROW`; the single-bound form (`ROWS 2 PRECEDING`) means
 peer groups (needs `ORDER BY`), and in `RANGE` mode `CURRENT ROW`
 spans the current row's peers while an offset is a *distance measured
 on the sort key* (Postgres 11 semantics, `last_5min` above): it needs
-exactly one numeric `ORDER BY` column, may be fractional
-(`RANGE 0.5 PRECEDING`, over int keys too), flips direction under
+exactly one numeric, timestamp or interval `ORDER BY` column, may be
+fractional (`RANGE 0.5 PRECEDING`, over int keys too) or, over a
+timestamp or interval key, an interval (`RANGE BETWEEN INTERVAL '7 days'
+PRECEDING AND CURRENT ROW`, moved on the calendar), flips direction under
 `DESC`, and treats a NULL sort key as within any distance of NULL
 only — a NULL row's offset frame is its peer group, and non-NULL rows
 never reach the NULLs through an offset bound. Offsets must be
@@ -773,11 +778,13 @@ text (OID 1009 in both wire formats). No array operators (`@>`, `&&`),
   `op ANY(...)` / `op ALL(...)` with `ARRAY[...]`, subqueries, or `'{...}'`
   literals
 - `::` casts and `CAST(x AS t)` (int family, text family, bool,
-  float, numeric, timestamp/date, uuid, jsonb, reg* types; `character
-  varying`, `timestamp with time zone` and modifiers such as `varchar(10)`
-  parse, the modifiers unapplied except `numeric(p, s)`, which rounds and
-  range-checks as in Postgres), and typed literals `date '…'`,
-  `timestamp '…'`, `uuid '…'`, …
+  float, numeric, timestamp/date, interval, uuid, jsonb, reg* types;
+  `character varying`, `timestamp with time zone` and modifiers such as
+  `varchar(10)` parse, the modifiers unapplied except `numeric(p, s)`,
+  which rounds and range-checks as in Postgres, and interval's fields and
+  precision, which truncate and round), and typed literals `date '…'`,
+  `timestamp '…'`, `uuid '…'`, `interval '…'` with an optional field
+  (`interval '90' minute`), …
 - String constants: `'…'`, `E'…'`, dollar quotes `$$…$$` / `$tag$…$tag$`,
   and constants continued across a newline (`'foo'` newline `'bar'`);
   unquoted identifiers may be non-ASCII; `public.t.col` names a column
@@ -812,10 +819,13 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
     TRAILING] [chars] FROM s)`), `replace strpos` (and `POSITION(a IN b)`),
     `split_part repeat reverse lpad rpad initcap starts_with md5 ascii chr
     octet_length concat concat_ws`;
-  - date/time: `EXTRACT(field FROM x)` / `date_part`, `date_trunc`,
-    `to_char` (the date/time template patterns), `to_timestamp(seconds)`,
-    `make_date`, `x AT TIME ZONE z` (the wall time in z, as bytdb's one
-    timestamp type);
+  - date/time: `EXTRACT(field FROM x)` / `date_part`, `date_trunc`
+    (timestamps and intervals), `to_char` (the date/time template
+    patterns), `to_timestamp(seconds)`, `make_date`, `x AT TIME ZONE z`
+    (the wall time in z, as bytdb's one timestamp type), `age(t1[, t2])`,
+    `justify_days`, `justify_hours`, `justify_interval`,
+    `make_interval(years, months, weeks, days, hours, mins, secs)` (named
+    arguments too: `make_interval(days => 7)`), `isfinite`;
   - jsonb: `jsonb_typeof`, `jsonb_array_length`.
 
   An unknown function, or one given arguments of types it does not take
@@ -1066,7 +1076,8 @@ Tested against real clients, not just protocol specs:
   Down, Steps, Force and Drop. For atlas v1.3, only the connect probe and
   advisory lock work: its schema inspection needs catalog tables bytdb lacks
   (`pg_depend`, `pg_enum`, set-returning functions in the select list, …).
-  goose's newer table locker needs `interval`, which bytdb does not have.
+  goose's table locker (`lock.NewPostgresTableLocker`) acquires, renews,
+  releases and sweeps leases with its `now() + $n::interval` statements (N-053).
   GORM's `DropColumn` of an indexed column drops the index with it, and its
   `DropTable` of a parent before its child (`DROP TABLE … CASCADE`) drops
   the child's foreign key, as in Postgres (N-056).

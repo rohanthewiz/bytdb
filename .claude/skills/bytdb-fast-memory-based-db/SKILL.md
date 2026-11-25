@@ -136,8 +136,9 @@ WHERE/ON/HAVING, INSERT/UPDATE values, `BETWEEN` bounds, and
 
 Types: `int`, `float`, `numeric`/`decimal(p,s)` (exact, typmod
 enforced), `text`/`varchar(n)` (length enforced), `bool`,
-`bytea`, `timestamp[tz]`, `date`, `uuid`, `text[]`, `jsonb` — jsonb
-with `-> ->> #> #>> @> <@ ? ?| ?& || -` and canonical-text equality.
+`bytea`, `timestamp[tz]`, `date`, `interval` (with field qualifiers
+and `(p)`), `uuid`, `text[]`, `jsonb` — jsonb with `-> ->> #> #>> @>
+<@ ? ?| ?& || -` and canonical-text equality.
 
 Constraints: PRIMARY KEY, NOT NULL, CHECK, UNIQUE, and foreign keys
 (MATCH SIMPLE; NO ACTION/RESTRICT or `ON DELETE CASCADE` — cascades
@@ -316,8 +317,14 @@ bytes, 64 hex chars, or base64 of 32).
   text with `bytdb.ErrText(err)`.
 - `numeric` / `decimal(p,s)` is exact (Go value `bytdb.Decimal`,
   `Row.Decimal`; the `database/sql` driver returns its text, "19.99";
-  decimal literals like `1.5` are numeric, as in Postgres). No numeric
-  `NaN`/`Infinity`; `sqrt`/`ln`/`exp`/`power` of a numeric return float8.
+  decimal literals like `1.5` are numeric, as in Postgres), with
+  Postgres 14+'s `NaN`/`Infinity`.
+- `interval` is Postgres's (Go value `bytdb.Interval`: months, days,
+  µs; `Row.Interval`; inserts also take a `time.Duration`; the
+  `database/sql` driver returns its text, "1 day 02:00:00"). It compares
+  by span (`'1 mon' = '30 days'`), `timestamp ± interval` follows the
+  calendar, and `timestamp - timestamp` is an interval (it was a bigint
+  of microseconds before N-053).
 - Not implemented: RIGHT/FULL joins, triggers, arrays
   beyond `text[]`, jsonb indexing, COPY, live HA/failover (replication
   is async recovery, see above). Datasets must fit in RAM.

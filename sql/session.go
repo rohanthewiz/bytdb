@@ -527,6 +527,12 @@ func (s *Session) setVar(sv *SetVar) (*Result, error) {
 		delete(s.vars, sv.Name)
 		return &Result{Tag: sv.Tag}, nil
 	}
+	if err := intervalStyleErr(sv); err != nil {
+		if s.tx != nil {
+			s.aborted = true
+		}
+		return nil, err
+	}
 	if s.vars == nil {
 		s.vars = map[string]string{}
 	}
@@ -602,6 +608,19 @@ func (s *Session) discard(st *Discard) (*Result, error) {
 		s.db.seq.reset()
 	}
 	return &Result{Tag: command(st)}, nil
+}
+
+// intervalStyleErr refuses SET intervalstyle to anything but postgres
+// (N-053). Intervals print in the postgres style only; Postgres also has
+// postgres_verbose, sql_standard and iso_8601, and accepting those while
+// printing postgres style anyway would hand a client text in a format it
+// did not ask for. nil for every other statement.
+func intervalStyleErr(sv *SetVar) error {
+	if sv.Name != "intervalstyle" || sv.IsDefault || strings.EqualFold(strings.TrimSpace(sv.Value), "postgres") {
+		return nil
+	}
+	return serr.New(`invalid value for parameter "intervalstyle": "`+sv.Value+`"`,
+		"hint", "bytdb writes intervals in the postgres style only")
 }
 
 // deallocateStmt runs DEALLOCATE [PREPARE] name | ALL against the wire

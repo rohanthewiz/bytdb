@@ -106,6 +106,13 @@ func sqlstate(msg string, hasPos bool) string {
 		strings.Contains(msg, "a primary key is required"),
 		strings.HasSuffix(msg, `" is in a primary key`):
 		return "42P16" // invalid_table_definition
+	// Interval input (N-053) takes datetime.c's codes, not the generic
+	// 22P02: a malformed interval is invalid_datetime_format, a field
+	// that overflows its unit interval_field_overflow.
+	case strings.Contains(msg, "invalid input syntax for type interval"):
+		return "22007" // invalid_datetime_format
+	case strings.Contains(msg, "interval field value out of range"):
+		return "22015" // interval_field_overflow
 	// Every per-type literal parse failure (int, float, bool, bytea,
 	// date, timestamp, uuid, json) shares this wording, as in Postgres.
 	case strings.Contains(msg, "invalid input syntax for type"):
@@ -138,9 +145,22 @@ func sqlstate(msg string, hasPos bool) string {
 	// holding the deprecated error still maps to the code it had.
 	case msg == "numeric NaN and Infinity are not supported":
 		return "0A000" // feature_not_supported
-	// to_timestamp of a NaN, float8's or (since N-051) numeric's.
-	case msg == "timestamp cannot be NaN":
+	// to_timestamp of a NaN, float8's or (since N-051) numeric's; and
+	// interval and timestamp arithmetic leaving their ranges (N-053).
+	case msg == "timestamp cannot be NaN",
+		msg == "interval out of range",
+		msg == "timestamp out of range",
+		msg == "cannot subtract infinite timestamps":
 		return "22008" // datetime_field_overflow
+	// A negative (or NaN) RANGE frame offset, numeric or interval.
+	case msg == "invalid preceding or following size in window function":
+		return "22013" // invalid_preceding_or_following_size
+	// extract / date_part / date_trunc units: a known unit that a type
+	// has no use for, and a word that is no unit at all.
+	case strings.HasPrefix(msg, `unit "`) && strings.Contains(msg, `" not supported for type `):
+		return "0A000" // feature_not_supported
+	case strings.HasPrefix(msg, `unit "`) && strings.Contains(msg, `" not recognized for type `):
+		return "22023" // invalid_parameter_value
 	// Bind-time parameter decoding (values.go). A malformed binary value
 	// is Postgres's 22P03; a malformed text value is the same 22P02 as a
 	// bad literal. The space count pins the text form to "bad <type>

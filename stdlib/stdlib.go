@@ -1010,8 +1010,8 @@ func (r *rows) ColumnTypeScanType(i int) reflect.Type {
 		return reflect.TypeFor[[]byte]()
 	case bytdb.TTimestamp, bytdb.TDate:
 		return reflect.TypeFor[time.Time]()
-	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric:
-		// numeric arrives as its exact text, see convert.
+	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric, bytdb.TInterval:
+		// numeric and interval arrive as their text, see convert.
 		return reflect.TypeFor[string]()
 	}
 	return reflect.TypeFor[any]()
@@ -1075,6 +1075,14 @@ func convert(v any, t bytdb.ColType) (driver.Value, error) {
 	}
 	if d, ok := v.(bytdb.Decimal); ok { // a numeric under an untyped column
 		return d.String(), nil
+	}
+	// An interval (N-053) arrives as its Postgres text ("1 day
+	// 02:00:00"), as pgx's and lib/pq's drivers deliver one through
+	// database/sql: driver.Value has no interval kind, and a
+	// time.Duration could not hold months or days, which are not fixed
+	// lengths of time. bytdb.ParseInterval reads the text back.
+	if iv, ok := v.(bytdb.Interval); ok {
+		return iv.String(), nil
 	}
 	switch tv := v.(type) {
 	case nil:

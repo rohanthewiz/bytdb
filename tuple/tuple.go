@@ -5,7 +5,8 @@
 // key-value store and answer range queries with key scans.
 //
 // Supported element types (after normalization): nil (NULL), bool,
-// int64, float64, string, []byte, decimal.Decimal. Inputs of any Go integer width are
+// int64, float64, string, []byte, decimal.Decimal, interval.Interval.
+// Inputs of any Go integer width are
 // normalized to int64, float32 to float64. Every NaN normalizes to one
 // canonical NaN, which sorts above +Inf (Postgres's order: NaN is
 // greater than every number and equal to itself). Negative zero
@@ -18,7 +19,8 @@
 // byte an earlier version wrote.
 //
 // Elements of different types order by type tag: NULL < false < true <
-// ints < floats < bytes < strings < decimals. Within a typed column only one tag
+// ints < floats < bytes < strings < decimals < intervals. Within a typed
+// column only one tag
 // ever appears, so cross-type order only matters for NULL, which sorts
 // before everything. A tuple that is a prefix of another sorts first,
 // matching byte order of the encodings.
@@ -33,6 +35,7 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb/decimal"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -54,7 +57,24 @@ const (
 	// both rank as tagDecimal.
 	tagDecimal       byte = 0x08
 	tagDecimalScaled byte = 0x09
+	// Intervals (N-053) follow the decimal pattern: Postgres compares
+	// intervals by span, a month counting 30 days and a day 24 hours, so
+	// '1 mon' = '30 days' = '720 hours' — one key, as a unique index
+	// must see them — while each reads back as written. A key
+	// (tagInterval) encodes the span alone: 16 bytes, the 128-bit
+	// two's-complement span big-endian with its sign bit flipped, so
+	// byte order is span order. A stored value (tagIntervalFields)
+	// encodes the three fields instead, 4+4+8 bytes, each sign-flipped
+	// big-endian. A key decodes to the justified fields of its span
+	// (interval.FromSpan), which re-encode to the same key; that is all
+	// an index entry's primary key needs, and a primary-key column's
+	// own fields come from the row value (it is written there too).
+	tagInterval       byte = 0x0A
+	tagIntervalFields byte = 0x0B
 )
+
+// intervalBodyLen is both interval forms' body length after the tag.
+const intervalBodyLen = 16
 
 // Decimal body, after the tag:
 //
@@ -149,6 +169,11 @@ func appendVals(buf []byte, mask byte, vals []any, keepNegZero bool) ([]byte, er
 			buf = appendDecimal(buf, mask, d, keepNegZero)
 			continue
 		}
+		if iv, ok := v.(interval.Interval); ok {
+			// Likewise: a stored value keeps the fields, a key the span.
+			buf = appendInterval(buf, mask, iv, keepNegZero)
+			continue
+		}
 		n, err := normalize(v)
 		if err != nil {
 			return nil, err
@@ -241,6 +266,53 @@ func appendDecimal(buf []byte, mask byte, d decimal.Decimal, withScale bool) []b
 		buf = append(buf, sb[0]^mask, sb[1]^mask)
 	}
 	return buf
+}
+
+// appendInterval appends one interval element (see tagInterval);
+// fields selects the stored-value form.
+func appendInterval(buf []byte, mask byte, iv interval.Interval, fields bool) []byte {
+	var b [1 + intervalBodyLen]byte
+	if fields {
+		b[0] = tagIntervalFields
+		binary.BigEndian.PutUint32(b[1:], uint32(iv.Months)^(1<<31))
+		binary.BigEndian.PutUint32(b[5:], uint32(iv.Days)^(1<<31))
+		binary.BigEndian.PutUint64(b[9:], uint64(iv.Micros)^(1<<63))
+	} else {
+		b[0] = tagInterval
+		hi, lo := iv.Span()
+		binary.BigEndian.PutUint64(b[1:], uint64(hi)^(1<<63))
+		binary.BigEndian.PutUint64(b[9:], lo)
+	}
+	for _, c := range b {
+		buf = append(buf, c^mask)
+	}
+	return buf
+}
+
+// decodeInterval reads one interval body (either form) whose stored
+// bytes are XOR mask.
+func decodeInterval(data []byte, mask byte, fields bool) (interval.Interval, []byte, error) {
+	if len(data) < intervalBodyLen {
+		return interval.Interval{}, nil, serr.New("tuple: truncated interval element")
+	}
+	var b [intervalBodyLen]byte
+	for i := range b {
+		b[i] = data[i] ^ mask
+	}
+	rest := data[intervalBodyLen:]
+	if fields {
+		return interval.Interval{
+			Months: int32(binary.BigEndian.Uint32(b[0:]) ^ (1 << 31)),
+			Days:   int32(binary.BigEndian.Uint32(b[4:]) ^ (1 << 31)),
+			Micros: int64(binary.BigEndian.Uint64(b[8:]) ^ (1 << 63)),
+		}, rest, nil
+	}
+	hi := int64(binary.BigEndian.Uint64(b[0:]) ^ (1 << 63))
+	lo := binary.BigEndian.Uint64(b[8:])
+	if !interval.ValidSpan(hi, lo) {
+		return interval.Interval{}, nil, serr.New("tuple: interval span out of range")
+	}
+	return interval.FromSpan(hi, lo), rest, nil
 }
 
 // decScan is one decimal element's parts as scanDecimal validated them.
@@ -479,6 +551,12 @@ func decodeOne(data []byte, mask byte) (v any, rest []byte, err error) {
 			return nil, nil, err
 		}
 		return d, rest, nil
+	case tagInterval, tagIntervalFields:
+		iv, rest, err := decodeInterval(data, mask, tag == tagIntervalFields)
+		if err != nil {
+			return nil, nil, err
+		}
+		return iv, rest, nil
 	}
 	return nil, nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
@@ -516,6 +594,11 @@ func Skip(data []byte) (rest []byte, err error) {
 		return data[end+2:], nil
 	case tagDecimal, tagDecimalScaled:
 		return skipDecimal(data, tag == tagDecimalScaled)
+	case tagInterval, tagIntervalFields:
+		// Decoding validates a key's span; it builds a plain struct, so
+		// reusing it here costs no allocation.
+		_, rest, err := decodeInterval(data, 0x00, tag == tagIntervalFields)
+		return rest, err
 	}
 	return nil, serr.New("tuple: unknown type tag", "tag", fmt.Sprintf("0x%02x", tag))
 }
@@ -661,6 +744,8 @@ func compareValues(av, bv any) int {
 		return cmp.Compare(t, b.(string))
 	case decimal.Decimal:
 		return t.Cmp(b.(decimal.Decimal))
+	case interval.Interval:
+		return t.Cmp(b.(interval.Interval)) // by span, as the key encodes
 	}
 	return 0 // nil, false, true carry their value in the rank
 }
@@ -684,6 +769,8 @@ func rank(v any) int {
 		return int(tagString)
 	case decimal.Decimal:
 		return int(tagDecimal)
+	case interval.Interval:
+		return int(tagInterval)
 	}
 	panic(fmt.Sprintf("tuple: unrankable type %T", v))
 }
@@ -691,7 +778,7 @@ func rank(v any) int {
 // normalize maps supported inputs onto the canonical element types.
 func normalize(v any) (any, error) {
 	switch t := v.(type) {
-	case nil, bool, int64, string, []byte, decimal.Decimal:
+	case nil, bool, int64, string, []byte, decimal.Decimal, interval.Interval:
 		return t, nil
 	case int:
 		return int64(t), nil

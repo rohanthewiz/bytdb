@@ -28,7 +28,8 @@ var ErrUnsupportedValue = errors.New("unsupported value type")
 
 // NormalizeValue reduces a Go value to the kinds the engine stores and
 // compares: nil, int64, float64, string, bool, []byte, time.Time,
-// []string (a text[] value), or Decimal (a numeric value). It accepts
+// []string (a text[] value), Decimal (a numeric value), or Interval. It
+// accepts
 // what callers naturally hold:
 //
 //	type UserID int64 / type Code string   named types, by reflect kind
@@ -43,7 +44,7 @@ var ErrUnsupportedValue = errors.New("unsupported value type")
 // common path pays nothing for the reflection.
 func NormalizeValue(v any) (any, error) {
 	switch x := v.(type) {
-	case nil, int64, float64, string, bool, []byte, time.Time, []string, Decimal:
+	case nil, int64, float64, string, bool, []byte, time.Time, []string, Decimal, Interval:
 		return v, nil
 	case driver.Valuer:
 		dv, err := x.Value()
@@ -142,6 +143,14 @@ func (r Row) String(name string) (string, bool) {
 // form ("19.99"); Float64 converts when exactness is not needed.
 func (r Row) Decimal(name string) (Decimal, bool) {
 	v, ok := r.Col(name).(Decimal)
+	return v, ok
+}
+
+// Interval returns an interval column's value; ok is false for NULL, a
+// missing column, or another type. Its String is the Postgres text form
+// ("1 day 02:00:00").
+func (r Row) Interval(name string) (Interval, bool) {
+	v, ok := r.Col(name).(Interval)
 	return v, ok
 }
 

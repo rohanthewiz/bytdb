@@ -54,6 +54,7 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -102,6 +103,8 @@ func pgTypeName(t bytdb.ColType) string {
 		return "jsonb"
 	case bytdb.TNumeric:
 		return "numeric"
+	case bytdb.TInterval:
+		return "interval"
 	case tyUnknown:
 		return "unknown"
 	}
@@ -537,18 +540,16 @@ func (t *typer) insert(s *Insert) (Statement, error) {
 	if desc == nil {
 		return s, nil
 	}
-	var colTypes []bytdb.ColType
+	var cols []bytdb.Column
 	if s.Cols == nil {
-		for _, col := range desc.Columns {
-			colTypes = append(colTypes, col.Type)
-		}
+		cols = desc.Columns
 	} else {
 		for _, name := range s.Cols {
 			i := desc.ColIndex(name)
 			if i < 0 {
 				return s, nil
 			}
-			colTypes = append(colTypes, desc.Columns[i].Type)
+			cols = append(cols, desc.Columns[i])
 		}
 	}
 	ts := &tscope{sc: tableScope(s.Table, desc)}
@@ -558,10 +559,10 @@ func (t *typer) insert(s *Insert) (Statement, error) {
 	for i, row := range s.Rows {
 		var r []any
 		for j, v := range row {
-			if j >= len(colTypes) {
+			if j >= len(cols) {
 				break // arity: the engine reports it
 			}
-			nv, err := t.value(v, colTypes[j], ts)
+			nv, err := t.value(v, cols[j], ts)
 			if err != nil {
 				return nil, err
 			}
@@ -731,7 +732,7 @@ func (t *typer) assignments(desc *bytdb.TableDesc, set map[string]any, setEx map
 		if i < 0 {
 			continue
 		}
-		nv, err := t.value(v, desc.Columns[i].Type, ts)
+		nv, err := t.value(v, desc.Columns[i], ts)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -751,7 +752,7 @@ func (t *typer) assignments(desc *bytdb.TableDesc, set map[string]any, setEx map
 		if i < 0 {
 			continue
 		}
-		nv, err := t.value(ex, desc.Columns[i].Type, ts)
+		nv, err := t.value(ex, desc.Columns[i], ts)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -771,7 +772,17 @@ func (t *typer) assignments(desc *bytdb.TableDesc, set map[string]any, setEx map
 // value types one value headed for a column of type ct: a plain literal
 // converts to the column's type; an expression is typed and, if its
 // result is still an untyped literal, converted too.
-func (t *typer) value(v any, ct bytdb.ColType, ts *tscope) (any, error) {
+func (t *typer) value(v any, col bytdb.Column, ts *tscope) (any, error) {
+	ct := col.Type
+	// Interval text bound for a column with a type modifier reads with
+	// the modifier (N-053): '5' is 5 minutes in an interval minute
+	// column, not 5 seconds truncated away, so it cannot be converted by
+	// type alone like every other literal.
+	if ct == bytdb.TInterval && col.IntervalTypmod != 0 {
+		if s, ok := untypedText(v); ok {
+			return interval.ParseTypmod(s, col.IntervalTypmod)
+		}
+	}
 	switch x := v.(type) {
 	case defaultMarker:
 		return v, nil
@@ -793,6 +804,20 @@ func (t *typer) value(v any, ct bytdb.ColType, ts *tscope) (any, error) {
 		return v, nil
 	}
 	return coerceLit(v, ct)
+}
+
+// untypedText is a value's text when it is an untyped string literal,
+// bare (an INSERT ... VALUES constant) or as an expression.
+func untypedText(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case *ExLit:
+		if s, ok := x.Val.(string); ok && x.Typ == "" {
+			return s, true
+		}
+	}
+	return "", false
 }
 
 // sameValue reports whether a typed value is still the original one: a
@@ -1094,7 +1119,7 @@ func (t *typer) cmpPair(op PredOp, l Expr, lt bytdb.ColType, r Expr, rt bytdb.Co
 func dateToTimestamp(e Expr) Expr {
 	if lit, ok := e.(*ExLit); ok {
 		if days, ok := lit.Val.(int64); ok {
-			return &ExLit{Val: days * 86_400_000_000, Name: lit.Name, Typ: bytdb.TTimestamp}
+			return &ExLit{Val: bytdb.DateToTimestamp(days), Name: lit.Name, Typ: bytdb.TTimestamp}
 		}
 	}
 	return &ExCast{E: e, Type: "timestamp", From: bytdb.TDate}
@@ -1862,27 +1887,39 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 	if n.Op == "-" && (lt == bytdb.TJSONB) {
 		return rebuilt(bytdb.TJSONB)
 	}
-	// An untyped literal operand takes its sibling's numeric type (or
-	// an integer, beside a date: date + '1').
+	// An untyped literal operand takes the type Postgres's operator
+	// resolution would give it beside its typed sibling:
+	//
+	//	sibling     op          literal reads as
+	//	date        any         integer (date + '1'; Postgres finds that
+	//	                        ambiguous, bytdb has always taken it)
+	//	timestamp   +           interval  (now() + '1 day': timestamp +
+	//	                        interval is the only + a timestamp has)
+	//	timestamp   -           timestamp (now() - '2024-01-01' is an
+	//	                        interval; same-type wins in Postgres)
+	//	interval    + -         interval  ('1 day' + '1 hour')
+	//	interval    * /         float8    (the scale factor)
+	//	anything else           the sibling's own type
 	if lt == tyUnknown && concrete(rt) {
-		target := rt
-		if temporalType(rt) {
-			target = bytdb.TInt
-		}
+		target := unknownArithTarget(rt, n.Op)
 		if l, err = t.coerceTo(l, target); err != nil {
 			return nil, "", err
 		}
 		lt = target
 	}
 	if rt == tyUnknown && concrete(lt) {
-		target := lt
-		if temporalType(lt) {
-			target = bytdb.TInt
-		}
+		target := unknownArithTarget(lt, n.Op)
 		if r, err = t.coerceTo(r, target); err != nil {
 			return nil, "", err
 		}
 		rt = target
+	}
+	// rebuiltKind is rebuilt with an operator kind the typing decided
+	// (the interval operators, whose runtime operands are ambiguous; see
+	// arithKind).
+	rebuiltKind := func(k arithKind, typ bytdb.ColType) (Expr, bytdb.ColType, error) {
+		kind = k
+		return rebuilt(typ)
 	}
 	switch {
 	case !concrete(lt) || !concrete(rt):
@@ -1894,9 +1931,12 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 	case lt == bytdb.TDate && rt == bytdb.TDate && n.Op == "-":
 		return rebuilt(bytdb.TInt)
 	case lt == bytdb.TTimestamp && rt == bytdb.TTimestamp && n.Op == "-":
-		// Postgres yields an interval, which bytdb lacks; the difference
-		// in microseconds is what this has always returned.
-		return rebuilt(bytdb.TInt)
+		// An interval of days and clock time, as Postgres's timestamp_mi
+		// (N-053, plan Q8). Before bytdb had intervals this was the
+		// difference in microseconds, a bigint.
+		return rebuiltKind(arithTsMinusTs, bytdb.TInterval)
+	case lt == bytdb.TInterval || rt == bytdb.TInterval:
+		return t.intervalArith(n, l, lt, r, rt, rebuilt, rebuiltKind)
 	case temporalType(lt) || temporalType(rt):
 		// timestamp + integer is the plan's decision Q1: refused as in
 		// Postgres rather than read as microseconds.
@@ -1905,4 +1945,70 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 		return rebuilt(widerNumeric(lt, rt))
 	}
 	return nil, "", noOperator(n.Op, lt, rt)
+}
+
+// unknownArithTarget is the type an untyped literal takes beside an
+// operand of type sib under arithmetic operator op (see arith's table).
+func unknownArithTarget(sib bytdb.ColType, op string) bytdb.ColType {
+	switch sib {
+	case bytdb.TDate:
+		return bytdb.TInt
+	case bytdb.TTimestamp:
+		if op == "+" {
+			return bytdb.TInterval
+		}
+	case bytdb.TInterval:
+		if op == "*" || op == "/" {
+			return bytdb.TFloat
+		}
+	}
+	return sib
+}
+
+// intervalArith types the arithmetic operators with an interval operand
+// (N-053), in Postgres's terms:
+//
+//	timestamp ± interval, interval + timestamp   timestamp
+//	date ± interval, interval + date             timestamp (the date at midnight)
+//	interval ± interval                          interval
+//	-interval                                    interval
+//	interval * number, number * interval         interval
+//	interval / number                            interval
+//
+// A number may be an integer, numeric or float; Postgres converts it to
+// float8 (interval_mul and interval_div take a float8), and so does
+// evaluation. Anything else is "operator does not exist".
+func (t *typer) intervalArith(n *ExArith, l Expr, lt bytdb.ColType, r Expr, rt bytdb.ColType,
+	rebuilt func(bytdb.ColType) (Expr, bytdb.ColType, error),
+	rebuiltKind func(arithKind, bytdb.ColType) (Expr, bytdb.ColType, error)) (Expr, bytdb.ColType, error) {
+	op := n.Op
+	// The parser reads unary minus as 0 - E. A literal 0 minus an
+	// interval is that; Postgres has no integer - interval operator, so
+	// nothing else could have meant it.
+	if op == "-" && rt == bytdb.TInterval && lt == bytdb.TInt {
+		if lit, ok := n.L.(*ExLit); ok && lit.Val == int64(0) {
+			return rebuiltKind(arithIntervalNeg, bytdb.TInterval)
+		}
+	}
+	// A date meets an interval as its midnight timestamp, as Postgres's
+	// date + interval does (the cast is implicit there).
+	if lt == bytdb.TDate && rt == bytdb.TInterval && (op == "+" || op == "-") {
+		l, lt = dateToTimestamp(l), bytdb.TTimestamp
+		n = &ExArith{Op: op, L: l, R: r, Kind: n.Kind}
+	}
+	if lt == bytdb.TInterval && rt == bytdb.TDate && op == "+" {
+		r, rt = dateToTimestamp(r), bytdb.TTimestamp
+		n = &ExArith{Op: op, L: l, R: r, Kind: n.Kind}
+	}
+	switch {
+	case lt == bytdb.TTimestamp && rt == bytdb.TInterval && (op == "+" || op == "-"),
+		lt == bytdb.TInterval && rt == bytdb.TTimestamp && op == "+":
+		return (&ExArith{Op: op, L: l, R: r, Kind: arithTsInterval}), bytdb.TTimestamp, nil
+	case lt == bytdb.TInterval && rt == bytdb.TInterval && (op == "+" || op == "-"):
+		return rebuiltKind(arithPlain, bytdb.TInterval)
+	case lt == bytdb.TInterval && numericType(rt) && (op == "*" || op == "/"),
+		numericType(lt) && rt == bytdb.TInterval && op == "*":
+		return rebuiltKind(arithPlain, bytdb.TInterval)
+	}
+	return nil, "", noOperator(op, lt, rt)
 }

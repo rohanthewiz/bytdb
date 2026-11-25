@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/btypedb"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
@@ -272,11 +273,8 @@ func updateRow(e *Engine, tx *btypedb.Tx[string, []byte], ids *idCounters, desc 
 		if touched != nil {
 			touched[ord] = true
 		}
-		cv, err := coerce(v, desc.Columns[ord].Type)
+		cv, err := coerceColumn(v, &desc.Columns[ord])
 		if err != nil {
-			return nil, false, serr.Wrap(err, "table", desc.Name, "column", col)
-		}
-		if cv, err = enforceTypmod(cv, &desc.Columns[ord]); err != nil {
 			return nil, false, serr.Wrap(err, "table", desc.Name, "column", col)
 		}
 		if cv == nil {
@@ -601,11 +599,8 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 	out := make([]any, len(vals))
 	for i, v := range vals {
 		c := desc.Columns[i]
-		cv, err := coerce(v, c.Type)
+		cv, err := coerceColumn(v, &c)
 		if err != nil {
-			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
-		}
-		if cv, err = enforceTypmod(cv, &c); err != nil {
 			return nil, serr.Wrap(err, "table", desc.Name, "column", c.Name)
 		}
 		if cv == nil {
@@ -810,6 +805,21 @@ func coerce(v any, t ColType) (any, error) {
 		if ok {
 			return d, nil
 		}
+	case TInterval:
+		// time.Duration is matched here, before NormalizeValue would
+		// reduce it to a bare int64 (which no interval reads as: an
+		// integer could be any unit, so it is refused, as Postgres has
+		// no integer-to-interval cast).
+		switch x := v.(type) {
+		case Interval:
+			return x, nil
+		case time.Duration:
+			return interval.FromMicros(x.Microseconds()), nil
+		case string:
+			return ParseInterval(x)
+		case []byte:
+			return ParseInterval(string(x))
+		}
 	}
 	// The value is not one of the shapes above as is. A named type
 	// (type UserID int64), a pointer, a driver.Valuer, an unsigned or
@@ -894,11 +904,12 @@ func encodeRowValue(desc *TableDesc, row []any) ([]byte, error) {
 	buf := []byte{}
 	var err error
 	for i := range desc.Columns {
-		// Key columns live in the key, except numeric ones: a key
-		// collapses a decimal's display scale (1.50 and 1.5 are one key),
-		// so the row value carries the scaled value too, and decodeRow,
-		// which reads the value after the key, lets it win.
-		if row[i] == nil || (desc.isPK(i) && desc.Columns[i].Type != TNumeric) {
+		// Key columns live in the key, except key-lossy ones (keyLossy):
+		// a key collapses a decimal's display scale (1.50 and 1.5 are one
+		// key) and an interval's fields ('1 mon' and '30 days' are one
+		// key), so the row value carries the value as written too, and
+		// decodeRow, which reads the value after the key, lets it win.
+		if row[i] == nil || (desc.isPK(i) && !keyLossy(desc.Columns[i].Type)) {
 			continue
 		}
 		// AppendValue, not Append: a stored float keeps -0's sign

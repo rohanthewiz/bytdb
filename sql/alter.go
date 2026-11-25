@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -32,7 +33,8 @@ func (d *DB) execAlterColumnType(s *AlterColumnType) (*Result, error) {
 		return nil, serr.New(`column "`+s.Col+`" of relation "`+s.Table+`" does not exist`,
 			"table", s.Table, "column", s.Col)
 	}
-	ch := bytdb.ColumnTypeChange{Type: s.Type, MaxLen: s.MaxLen, Precision: s.Precision, Scale: s.Scale}
+	ch := bytdb.ColumnTypeChange{Type: s.Type, MaxLen: s.MaxLen, Precision: s.Precision, Scale: s.Scale,
+		IntervalTypmod: s.IntervalTypmod}
 
 	// An identity USING is left off, so the engine sees that nothing
 	// changes and skips the table rewrite. Its no-op shortcut needs Using
@@ -167,7 +169,8 @@ func rowEnvFor(d *DB, table string) func(bytdb.Row) *exEnv {
 // change with no USING, applies the automatic cast, and refuses when
 // there is none.
 func usingIsIdentity(s *AlterColumnType, col bytdb.Column) bool {
-	if col.Type != s.Type || col.MaxLen != s.MaxLen || col.Precision != s.Precision || col.Scale != s.Scale {
+	if col.Type != s.Type || col.MaxLen != s.MaxLen || col.Precision != s.Precision || col.Scale != s.Scale ||
+		col.IntervalTypmod != s.IntervalTypmod {
 		return false
 	}
 	isCol := func(e Expr) bool {
@@ -195,6 +198,11 @@ func usingIsIdentity(s *AlterColumnType, col bytdb.Column) bool {
 	// must match the column's own. A bare numeric cast changes nothing.
 	if isNumericCast(cast.Type) && cast.Type != "numeric" && cast.Type != "decimal" {
 		return cast.Type == fmt.Sprintf("numeric(%d,%d)", s.Precision, s.Scale)
+	}
+	// An interval cast's modifier applies as well (N-053); a bare
+	// ::interval changes nothing.
+	if tm, ok := intervalCastTypmod(cast.Type); ok && tm != interval.NoTypmod {
+		return tm == s.IntervalTypmod
 	}
 	return true
 }

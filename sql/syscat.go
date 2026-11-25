@@ -228,9 +228,14 @@ func typeOID(t bytdb.ColType) int64 {
 		return 3802
 	case bytdb.TNumeric:
 		return 1700
+	case bytdb.TInterval:
+		return pgInterval
 	}
 	return 25 // text
 }
+
+// pgInterval is interval's pg_type oid.
+const pgInterval = 1186
 
 // typeLen is pg_type.typlen / pg_attribute.attlen.
 func typeLen(t bytdb.ColType) int64 {
@@ -241,7 +246,7 @@ func typeLen(t bytdb.ColType) int64 {
 		return 8
 	case bytdb.TDate:
 		return 4
-	case bytdb.TUUID:
+	case bytdb.TUUID, bytdb.TInterval:
 		return 16
 	}
 	return -1
@@ -270,6 +275,8 @@ func sqlTypeName(t bytdb.ColType) string {
 		return "jsonb"
 	case bytdb.TNumeric:
 		return "numeric"
+	case bytdb.TInterval:
+		return "interval"
 	}
 	return "text"
 }
@@ -298,6 +305,8 @@ func udtName(t bytdb.ColType) string {
 		return "jsonb"
 	case bytdb.TNumeric:
 		return "numeric"
+	case bytdb.TInterval:
+		return "interval"
 	}
 	return "text"
 }
@@ -601,6 +610,7 @@ var sysTables = map[string]*sysTableDef{
 				{1082, "date", 4, "D"}, {1114, "timestamp", 8, "D"},
 				{1184, "timestamptz", 8, "D"}, {2950, "uuid", 16, "U"},
 				{3802, "jsonb", -1, "U"}, {1700, "numeric", -1, "N"},
+				{pgInterval, "interval", 16, "T"},
 			} {
 				rows = append(rows, []any{t.oid, t.name, oidPGCatalog, t.len, "b", t.cat, int64(0)})
 			}
@@ -1044,6 +1054,7 @@ var sysTables = map[string]*sysTableDef{
 			sysCol("character_maximum_length", bytdb.TInt),
 			sysCol("numeric_precision", bytdb.TInt), sysCol("numeric_precision_radix", bytdb.TInt),
 			sysCol("numeric_scale", bytdb.TInt), sysCol("datetime_precision", bytdb.TInt),
+			sysCol("interval_type", bytdb.TString), sysCol("interval_precision", bytdb.TInt),
 			sysCol("is_identity", bytdb.TString), sysCol("identity_generation", bytdb.TString),
 			// The rest of Postgres's identity family, in its order. GORM's
 			// Migrator.ColumnTypes (gorm.io/driver/postgres) selects
@@ -1067,7 +1078,7 @@ var sysTables = map[string]*sysTableDef{
 			for _, desc := range descs {
 				n += len(desc.Columns)
 			}
-			const width = 24
+			const width = 26
 			slab := make([]any, 0, n*width)
 			rows := make([][]any, 0, n)
 			for _, desc := range descs {
@@ -1110,7 +1121,7 @@ var sysTables = map[string]*sysTableDef{
 					slab = append(slab,
 						sysDatabase, "public", desc.Name, c.Name,
 						int64(i+1), dflt, nullable, colDataType(c), colUdtName(c),
-						maxLen, prec, radix, scale, datetimePrecision(c.Type),
+						maxLen, prec, radix, scale, colDatetimePrecision(c), colIntervalType(c), nil,
 						"NO", nil, nil, nil, nil, nil, "NO", "NEVER", nil, "YES",
 					)
 					rows = append(rows, slab[start:len(slab):len(slab)])
@@ -1126,7 +1137,7 @@ var sysTables = map[string]*sysTableDef{
 					rows = append(rows, []any{
 						sysDatabase, "public", v.name, c.Name,
 						int64(j + 1), nil, "YES", sqlTypeName(c.Type), udtName(c.Type),
-						nil, prec, radix, scale, datetimePrecision(c.Type),
+						nil, prec, radix, scale, colDatetimePrecision(c), colIntervalType(c), nil,
 						"NO", nil, nil, nil, nil, nil, "NO", "NEVER", nil, "NO",
 					})
 				}

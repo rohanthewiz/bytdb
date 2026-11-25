@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/serr"
 )
 
@@ -1108,6 +1109,7 @@ func (p *parser) colDef() (ColDef, bool, []CheckDef, error) {
 			return fail(err)
 		}
 		col.MaxLen, col.Precision, col.Scale = mods.MaxLen, mods.Precision, mods.Scale
+		col.IntervalTypmod = mods.IntervalTypmod
 	}
 	pk := false
 	var checks []CheckDef
@@ -1324,6 +1326,17 @@ func (p *parser) defaultLiteral(col string) (any, error) {
 	if p.cur().kind == tParam {
 		return nil, serr.New("placeholders are not allowed in DEFAULT", "column", col)
 	}
+	// INTERVAL '1 day' is a constant too; the text alone is kept, and
+	// converted to the column's type (and its modifier) like any quoted
+	// default. A qualifier on the literal is accepted and, as with the
+	// :: annotations below, the column's own modifier is what applies.
+	if t := p.cur(); t.kind == tIdent && t.text == "interval" {
+		if e, ok, err := p.intervalLiteral(); err != nil {
+			return nil, err
+		} else if ok {
+			return e.(*ExCast).E.(*ExLit).Val, p.defaultCasts(col)
+		}
+	}
 	v, err := p.literal()
 	if err != nil {
 		return nil, serr.New("DEFAULT must be a constant", "column", col)
@@ -1381,6 +1394,8 @@ func renderLit(v any) string {
 		return strconv.FormatBool(n)
 	case string:
 		return "'" + strings.ReplaceAll(n, "'", "''") + "'"
+	case bytdb.Interval:
+		return "'" + n.String() + "'" // interval text has no quotes to double
 	}
 	return "null"
 }
@@ -1439,6 +1454,20 @@ var serialTypes = map[string]bool{
 // numeric / decimal / dec are handled here rather than in typeNameBase
 // because their modifier is two numbers, carried in typeMods.
 func (p *parser) typeName() (typ bytdb.ColType, mods typeMods, err error) {
+	if t := p.cur(); t.kind == tIdent && t.text == "interval" {
+		p.advance()
+		tm, err := p.intervalMods()
+		if err != nil {
+			return "", typeMods{}, err
+		}
+		if p.cur().kind == tOp && p.cur().text == "[" {
+			return "", typeMods{}, serr.New("only text[] arrays are supported", "type", "interval[]")
+		}
+		if tm != interval.NoTypmod {
+			mods.IntervalTypmod = tm
+		}
+		return bytdb.TInterval, mods, nil
+	}
 	if t := p.cur(); t.kind == tIdent && numericTypeNames[t.text] {
 		p.advance()
 		prec, scale, err := p.numericMods()
@@ -1476,6 +1505,108 @@ func (p *parser) typeName() (typ bytdb.ColType, mods typeMods, err error) {
 type typeMods struct {
 	MaxLen           int
 	Precision, Scale int32
+	IntervalTypmod   int32 // 0: none (interval.NoTypmod is not stored)
+}
+
+// intervalMods parses the modifiers that may follow INTERVAL (the word
+// already consumed), returning the typmod (interval.NoTypmod when there
+// are none). Postgres's grammar:
+//
+//	INTERVAL ( p )
+//	INTERVAL YEAR | MONTH | DAY | HOUR | MINUTE | SECOND [( p )]
+//	INTERVAL YEAR TO MONTH | DAY TO HOUR | DAY TO MINUTE | DAY TO SECOND [( p )]
+//	INTERVAL HOUR TO MINUTE | HOUR TO SECOND [( p )] | MINUTE TO SECOND [( p )]
+//
+// A precision goes only with all fields or a range ending in SECOND.
+func (p *parser) intervalMods() (int32, error) {
+	prec := func() (int, error) {
+		t := p.cur()
+		if t.kind != tNumber {
+			return 0, p.unexpected("an interval precision")
+		}
+		n, err := strconv.Atoi(t.text)
+		if err != nil {
+			return 0, serr.New("invalid INTERVAL type modifier", "got", t.text)
+		}
+		p.advance()
+		return n, p.expectOp(")")
+	}
+	if p.acceptOp("(") {
+		n, err := prec()
+		if err != nil {
+			return 0, err
+		}
+		return interval.Typmod("", n)
+	}
+	first := ""
+	for _, w := range []string{"year", "month", "day", "hour", "minute", "second"} {
+		if p.acceptKw(w) {
+			first = w
+			break
+		}
+	}
+	if first == "" {
+		return interval.NoTypmod, nil
+	}
+	q := first
+	if p.acceptKw("to") {
+		last := ""
+		for _, w := range []string{"month", "hour", "minute", "second"} {
+			if p.acceptKw(w) {
+				last = w
+				break
+			}
+		}
+		if last == "" {
+			return 0, p.unexpected("an interval field after TO")
+		}
+		q += " to " + last
+	}
+	n := -1
+	if strings.HasSuffix(q, "second") && p.acceptOp("(") {
+		var err error
+		if n, err = prec(); err != nil {
+			return 0, err
+		}
+	}
+	tm, err := interval.Typmod(q, n)
+	if err != nil {
+		return 0, serr.New(err.Error())
+	}
+	return tm, nil
+}
+
+// intervalCastType is the cast type string for an interval with typmod
+// tm: "interval", "interval(3)", "interval day to second(3)" — the
+// format_type spelling, which intervalCastTypmod reads back.
+func intervalCastType(tm int32) string { return "interval" + interval.FormatTypmod(tm) }
+
+// intervalCastTypmod reads a cast type string back to its interval
+// typmod; ok is false when typ is not an interval type.
+func intervalCastTypmod(typ string) (tm int32, ok bool) {
+	rest, ok := strings.CutPrefix(typ, "interval")
+	if !ok {
+		return 0, false
+	}
+	if rest == "" {
+		return interval.NoTypmod, true
+	}
+	if rest[0] != ' ' && rest[0] != '(' {
+		return 0, false // "intervalx" is some other name
+	}
+	q, prec := strings.TrimSpace(rest), -1
+	if i := strings.IndexByte(q, '('); i >= 0 {
+		n, err := strconv.Atoi(strings.TrimSuffix(q[i+1:], ")"))
+		if err != nil {
+			return 0, false
+		}
+		q, prec = strings.TrimSpace(q[:i]), n
+	}
+	tm, err := interval.Typmod(q, prec)
+	if err != nil {
+		return 0, false
+	}
+	return tm, true
 }
 
 // numericTypeNames are the spellings of Postgres's numeric type.
@@ -2138,7 +2269,7 @@ func (p *parser) alterColumnType(table, col string) (Statement, error) {
 		return nil, err
 	}
 	st := &AlterColumnType{Table: table, Col: col, Type: typ, MaxLen: mods.MaxLen,
-		Precision: mods.Precision, Scale: mods.Scale}
+		Precision: mods.Precision, Scale: mods.Scale, IntervalTypmod: mods.IntervalTypmod}
 	if p.acceptKw("using") {
 		start := p.cur().pos
 		if st.Using, err = p.expression(); err != nil {
@@ -4378,6 +4509,19 @@ func (p *parser) castType() (string, error) {
 			name = "char"
 		}
 	}
+	// interval's modifiers (N-053) apply too: '1 day 02:30'::interval
+	// hour is 1 day 02:00:00. They ride in the type string the same way,
+	// spelled as format_type spells them.
+	if name == "interval" {
+		tm, err := p.intervalMods()
+		if err != nil {
+			return "", err
+		}
+		if p.acceptOp("[") {
+			return "", serr.New("array casts are not supported", "type", "interval[]")
+		}
+		return intervalCastType(tm), nil
+	}
 	// numeric(p, s) is the one modifier a cast applies (N-048): the
 	// cast rounds to the scale and refuses an overflow, which is how
 	// SQL rounds money (avg(x)::numeric(10,2)). It rides in the type
@@ -4747,6 +4891,9 @@ func (p *parser) funcCall(name string) (Expr, error) {
 	if p.acceptOp(")") {
 		return f, nil
 	}
+	if params, ok := namedArgFuncs[name]; ok {
+		return p.namedArgCall(f, params)
+	}
 	for {
 		var a Expr
 		if t := p.cur(); t.kind == tIdent && t.text == "select" {
@@ -4767,6 +4914,64 @@ func (p *parser) funcCall(name string) (Expr, error) {
 			break
 		}
 	}
+	return f, p.expectOp(")")
+}
+
+// namedArgFuncs are the functions called with named arguments (name =>
+// value), with their parameter names in order. Postgres allows the
+// notation for any function; bytdb only for make_interval, whose
+// every parameter has a default and which is mostly written that way
+// (make_interval(days => 7)).
+var namedArgFuncs = map[string][]string{
+	"make_interval": {"years", "months", "weeks", "days", "hours", "mins", "secs"},
+}
+
+// namedArgCall parses the rest of a call to a namedArgFuncs function
+// (cur is just past '('): positional arguments first, then named ones,
+// as Postgres requires. Every parameter not given takes its default, 0,
+// so evaluation always sees the full positional list.
+func (p *parser) namedArgCall(f *ExFunc, params []string) (Expr, error) {
+	args := make([]Expr, len(params))
+	named := false
+	for i := 0; ; i++ {
+		if t := p.cur(); t.kind == tIdent && p.tokAt(1).kind == tOp && p.tokAt(1).text == "=>" {
+			pos := slices.Index(params, t.text)
+			if pos < 0 {
+				return nil, serr.New("function " + f.Name + " has no parameter named \"" + t.text + "\"")
+			}
+			if args[pos] != nil {
+				return nil, serr.New("argument name \"" + t.text + "\" used more than once")
+			}
+			p.advance()
+			p.advance()
+			e, err := p.expression()
+			if err != nil {
+				return nil, err
+			}
+			args[pos], named = e, true
+		} else {
+			if named {
+				return nil, serr.New("positional argument cannot follow named argument")
+			}
+			if i >= len(params) {
+				return nil, serr.New("function " + f.Name + " takes at most " + strconv.Itoa(len(params)) + " arguments")
+			}
+			e, err := p.expression()
+			if err != nil {
+				return nil, err
+			}
+			args[i] = e
+		}
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	for i := range args {
+		if args[i] == nil {
+			args[i] = &ExLit{Val: int64(0)}
+		}
+	}
+	f.Args = args
 	return f, p.expectOp(")")
 }
 
@@ -5326,6 +5531,9 @@ var typedLitTypes = map[string]bool{
 // nothing, when the tokens are not that shape.
 func (p *parser) typedLiteral() (Expr, bool, error) {
 	t := p.cur()
+	if t.kind == tIdent && t.text == "interval" {
+		return p.intervalLiteral()
+	}
 	if t.kind != tIdent || !typedLitTypes[t.text] {
 		return nil, false, nil
 	}
@@ -5345,6 +5553,38 @@ func (p *parser) typedLiteral() (Expr, bool, error) {
 	s := p.cur().text
 	p.advance()
 	return &ExCast{E: &ExLit{Val: s}, Type: typ}, true, nil
+}
+
+// intervalLiteral parses INTERVAL 'text' [qualifier] and INTERVAL (p)
+// 'text' as a cast of the text, the qualifier becoming the cast's type
+// modifier: INTERVAL '5' MINUTE reads '5' as minutes. ok is false,
+// consuming nothing, when no string follows (INTERVAL is then some other
+// use of the word).
+func (p *parser) intervalLiteral() (Expr, bool, error) {
+	n := 1
+	if p.tokAt(1).kind == tOp && p.tokAt(1).text == "(" {
+		n = 4 // interval ( p ) 'text'
+	}
+	if p.tokAt(n).kind != tString {
+		return nil, false, nil
+	}
+	p.advance() // interval
+	tm := interval.NoTypmod
+	if n == 4 {
+		var err error
+		if tm, err = p.intervalMods(); err != nil {
+			return nil, true, err
+		}
+	}
+	s := p.cur().text
+	p.advance()
+	if tm == interval.NoTypmod {
+		var err error
+		if tm, err = p.intervalMods(); err != nil {
+			return nil, true, err
+		}
+	}
+	return &ExCast{E: &ExLit{Val: s}, Type: intervalCastType(tm)}, true, nil
 }
 
 // nullsOrder parses an ORDER BY key's optional NULLS FIRST | NULLS LAST

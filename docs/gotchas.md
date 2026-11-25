@@ -149,7 +149,10 @@ Parse-time rejections with pointed errors:
 | FK `MATCH FULL/PARTIAL`, `ON UPDATE CASCADE`, `ON DELETE/UPDATE SET NULL/DEFAULT` | `MATCH SIMPLE` with `NO ACTION`/`RESTRICT`/`ON DELETE CASCADE` only — rejected rather than silently weakened |
 | `TRUNCATE ... CASCADE` | Name every referencing table: `TRUNCATE parent, child` (the error's HINT lists them) |
 | `ON CONFLICT ON CONSTRAINT name`, index predicates in the conflict target | Name the columns: `ON CONFLICT (col, ...)` |
-| Time-of-day, `CHAR(n)`, interval, `money`, `bit`, `citext` | `TIME` → use `TIMESTAMP`; `money` → `numeric(p,2)` |
+| Time-of-day, `CHAR(n)`, `money`, `bit`, `citext` | `TIME` → use `TIMESTAMP`; `money` → `numeric(p,2)` |
+| `'infinity'::interval` (Postgres 17+), `SET intervalstyle` other than `postgres` (refused, 22023), `to_char(interval, …)` | Intervals follow Postgres 16: finite, printed in the default `postgres` style |
+| `EXTRACT(… FROM interval)` as numeric | float8 here, as `EXTRACT` over a timestamp already is; the values agree |
+| `RANGE … PRECEDING/FOLLOWING` with an interval offset over a `date` key | Order by the date cast to `timestamptz`, or use a timestamp column; timestamp and interval keys work |
 | `round(int)`, `ceil(int)`, `trunc(int)`, `sign(int)` result type | bigint here, double precision in Postgres (values agree); `round(int, n)` is numeric in both |
 | Array types other than `TEXT[]`; multi-dimensional arrays; array `@>`/`&&`/`unnest`/subscripts | One-dimensional text arrays with `= ANY(col)`, `array_to_string`, `array_length` |
 | `jsonb_set`, `jsonb_build_*`, `jsonb_agg`, `to_jsonb`, jsonpath (`@?` `@@`), `#-`, jsonb indexes | Read-modify-write with `\|\|` and `-`; the operator family covers reads |
@@ -210,8 +213,8 @@ Four semantic notes that surprise people (all Postgres-faithful):
   `COALESCE`, arithmetic, `CHECK`, subqueries, CTEs and views), and a
   literal that cannot take the type is `invalid input syntax` (22P02).
   Pairings Postgres has no operator for are refused the same way:
-  `1 = true`, `timestamp + 1` (write `+ interval` math in your application,
-  or use dates: `date + 1` is the next day), and `integer || integer`.
+  `1 = true`, `timestamp + 1` (write `timestamp + interval '1 day'`, or use
+  dates: `date + 1` is the next day), and `integer || integer`.
   Two pairings Postgres refuses are accepted on purpose: an integer against
   a `date` or `timestamp` (compared as the day or microsecond count), and
   raw 16-byte `bytea` against a `uuid`.

@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/rohanthewiz/bytdb"
+	"github.com/rohanthewiz/bytdb/interval"
 )
 
 func init() {
@@ -52,6 +53,9 @@ func colTypmod(c bytdb.Column) any {
 	}
 	if c.Type == bytdb.TNumeric && c.Precision > 0 {
 		return bytdb.NumericTypmod(c) // numeric(p, s): ((p << 16) | s) + 4
+	}
+	if c.Type == bytdb.TInterval && c.IntervalTypmod != 0 {
+		return int64(c.IntervalTypmod) // Postgres's own packing (interval.Typmod)
 	}
 	return typmodNone
 }
@@ -110,6 +114,34 @@ func datetimePrecision(t bytdb.ColType) any {
 		return int64(0)
 	}
 	return nil
+}
+
+// colDatetimePrecision is datetimePrecision for one column: an interval
+// reports its declared fractional-second precision, or 6 when it has
+// none (information_schema's _pg_datetime_precision).
+func colDatetimePrecision(c bytdb.Column) any {
+	if c.Type != bytdb.TInterval {
+		return datetimePrecision(c.Type)
+	}
+	if c.IntervalTypmod != 0 && c.IntervalTypmod&0xFFFF != 0xFFFF {
+		return int64(c.IntervalTypmod & 0xFFFF)
+	}
+	return int64(6)
+}
+
+// colIntervalType is information_schema.columns.interval_type: an
+// interval column's field qualifier in upper case ("DAY TO SECOND",
+// "DAY TO SECOND(3)"), NULL without one — the part of format_type after
+// "interval ", as _pg_interval_type extracts it.
+func colIntervalType(c bytdb.Column) any {
+	if c.Type != bytdb.TInterval || c.IntervalTypmod == 0 {
+		return nil
+	}
+	q, ok := strings.CutPrefix(interval.FormatTypmod(c.IntervalTypmod), " ")
+	if !ok {
+		return nil // interval(p): a precision only
+	}
+	return strings.ToUpper(q)
 }
 
 // serialDefault is the nextval default an identity column reports, its

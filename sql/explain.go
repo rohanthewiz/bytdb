@@ -533,6 +533,12 @@ func typedLitText(v any, t bytdb.ColType) (string, bool) {
 			return "", false
 		}
 		txt = bytdb.FormatUUID(b)
+	case bytdb.TInterval:
+		iv, ok := v.(bytdb.Interval)
+		if !ok {
+			return "", false
+		}
+		txt = iv.String()
 	default:
 		return "", false
 	}
@@ -555,6 +561,8 @@ func placeholderVal(t bytdb.ColType) any {
 		return []byte{}
 	case bytdb.TUUID:
 		return make([]byte, 16)
+	case bytdb.TInterval:
+		return bytdb.Interval{}
 	}
 	return ""
 }

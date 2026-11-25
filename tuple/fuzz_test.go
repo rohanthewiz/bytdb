@@ -2,11 +2,13 @@ package tuple
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"math/big"
 	"testing"
 
 	"github.com/rohanthewiz/bytdb/decimal"
+	"github.com/rohanthewiz/bytdb/interval"
 )
 
 // Fuzz targets for the codec — the correctness foundation of the whole
@@ -39,6 +41,13 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{decimal.MustParse("0.000123"), int64(1), decimal.MustParse("-7")},
 		{decimal.NaN()}, {decimal.Inf(1)}, {decimal.Inf(-1)}, // N-051
 		{decimal.Inf(-1), decimal.MustParse("-7"), decimal.NaN()},
+		// N-053: interval key (span) and stored (fields) forms, the
+		// extremes included.
+		{interval.Interval{Months: 1}}, {interval.Interval{Days: 30}},
+		{interval.Interval{Months: -1, Days: 2, Micros: -3}},
+		{interval.Interval{Months: math.MaxInt32, Days: math.MaxInt32, Micros: math.MaxInt64}},
+		{interval.Interval{Months: math.MinInt32, Days: math.MinInt32, Micros: math.MinInt64}},
+		{int64(1), interval.Interval{Micros: 1}, "x"},
 	}
 	for _, vals := range seeds {
 		enc, err := Encode(vals...)
@@ -72,6 +81,9 @@ func FuzzTupleRoundTrip(f *testing.F) {
 		{tagDecimalScaled, decNaN, 0x00},    // N-051: special value, truncated scale
 		{tagDecimalScaled, decNegInf, 0, 7}, // a crafted nonzero scale on a special value
 		{tagDecimal, decNaN + 1},            // first class past NaN
+		{tagInterval, 0x80, 0, 0},           // N-053: truncated span
+		{tagIntervalFields, 0, 0, 0, 0, 0},  // truncated fields
+		{tagInterval, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0}, // span beyond any interval
 	} {
 		f.Add(corrupt)
 	}
@@ -202,6 +214,13 @@ var boundaryVals = []any{
 	decimal.MustParse("1"), decimal.MustParse("1.000"), decimal.MustParse("1.1"), decimal.MustParse("10"),
 	decimal.MustParse("99.99"), decimal.MustParse("100"), decimal.MustParse("1e40"),
 	decimal.Inf(-1), decimal.Inf(1), decimal.NaN(), // N-051
+	// N-053: equal spans with different fields, and the extremes.
+	interval.Interval{Months: math.MinInt32, Days: math.MinInt32, Micros: math.MinInt64},
+	interval.Interval{Days: -1}, interval.Interval{Micros: -1}, interval.Interval{},
+	interval.Interval{Micros: 1}, interval.Interval{Days: 1}, interval.Interval{Micros: 86_400_000_000},
+	interval.Interval{Months: 1}, interval.Interval{Days: 30}, interval.Interval{Days: 29, Micros: 86_400_000_000},
+	interval.Interval{Months: 1, Micros: -1}, interval.Interval{Months: math.MaxInt32},
+	interval.Interval{Months: math.MaxInt32, Days: math.MaxInt32, Micros: math.MaxInt64},
 }
 
 // genTuple deterministically maps raw fuzz bytes onto a tuple of
@@ -212,7 +231,7 @@ var boundaryVals = []any{
 func genTuple(data []byte) []any {
 	var vals []any
 	for len(data) > 0 && len(vals) < 6 {
-		sel := data[0] % 8
+		sel := data[0] % 9
 		data = data[1:]
 		switch sel {
 		case 0:
@@ -283,6 +302,31 @@ func genTuple(data []byte) []any {
 				coef.Neg(coef)
 			}
 			vals = append(vals, decimal.New(coef, int32(flags>>1%8)))
+		case 8: // interval: a small-magnitude form byte, then raw fields
+			// from up to 16 payload bytes. The form byte keeps fields
+			// small often, so equal spans built from different fields
+			// (1 mon vs 30 days) actually meet.
+			var form byte
+			if len(data) > 0 {
+				form = data[0]
+				data = data[1:]
+			}
+			var raw [16]byte
+			n := copy(raw[:], data)
+			data = consume(data, n)
+			iv := interval.Interval{
+				Months: int32(binary.BigEndian.Uint32(raw[0:])),
+				Days:   int32(binary.BigEndian.Uint32(raw[4:])),
+				Micros: int64(binary.BigEndian.Uint64(raw[8:])),
+			}
+			if form&1 == 1 {
+				iv = interval.Interval{
+					Months: int32(int8(raw[0])) % 3,
+					Days:   int32(int8(raw[1])) % 61,
+					Micros: int64(int8(raw[2])) % 3 * 86_400_000_000,
+				}
+			}
+			vals = append(vals, iv)
 		}
 	}
 	return vals

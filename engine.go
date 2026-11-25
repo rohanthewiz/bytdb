@@ -31,6 +31,7 @@ import (
 
 	"github.com/rohanthewiz/btypedb"
 	"github.com/rohanthewiz/bytdb/decimal"
+	"github.com/rohanthewiz/bytdb/interval"
 	"github.com/rohanthewiz/bytdb/tuple"
 	"github.com/rohanthewiz/serr"
 )
@@ -88,7 +89,31 @@ const (
 	// representation can do. Column.Precision / Column.Scale carry a
 	// numeric(p, s) declaration.
 	TNumeric ColType = "numeric"
+	// TInterval is Postgres's interval (N-053), with its own runtime
+	// value, Interval: months, days and microseconds kept apart, since
+	// each moves a timestamp differently. Its tuple encoding follows
+	// numeric's split: keys encode the span (a month counted as 30 days,
+	// a day as 24 hours), so '1 mon' and '30 days' are one key as they
+	// are equal in Postgres, while stored values keep the fields as
+	// written. Column.IntervalTypmod carries a declaration such as
+	// interval day to second(3).
+	TInterval ColType = "interval"
 )
+
+// Interval is the runtime value of a TInterval column (see package
+// interval). Insert accepts it, a time.Duration (truncated to whole
+// microseconds, all in the clock field) and interval text ('1 day
+// 02:00', 'P1DT2H', '3 hours ago').
+type Interval = interval.Interval
+
+// ParseInterval reads Postgres interval text into an Interval.
+func ParseInterval(s string) (Interval, error) { return interval.Parse(s) }
+
+// keyLossy reports whether a type's key encoding drops part of the
+// value — numeric's display scale, interval's split into fields — so a
+// primary-key column of the type is also written into the row value,
+// where decodeRow reads the value as written.
+func keyLossy(t ColType) bool { return t == TNumeric || t == TInterval }
 
 // Decimal is the runtime value of a TNumeric column: an exact decimal
 // with a display scale (see package decimal). Insert accepts it, any Go
@@ -138,6 +163,15 @@ type Column struct {
 	// columns.
 	Precision int32 `json:"precision,omitempty"`
 	Scale     int32 `json:"scale,omitempty"`
+	// IntervalTypmod is an interval column's type modifier, the
+	// qualifier and precision of interval day to second(3), as the
+	// atttypmod value Postgres reports for it (interval.Typmod builds
+	// one); 0 is a plain interval, since no real modifier is 0. Every
+	// write zeroes the fields right of the qualifier's last one and
+	// rounds the clock to the precision, and interval text is read with
+	// the qualifier in mind ('5' is five minutes in an interval minute
+	// column). Only valid on interval columns.
+	IntervalTypmod int32 `json:"interval_typmod,omitempty"`
 }
 
 // CheckDesc is one CHECK constraint: a SQL boolean expression over the

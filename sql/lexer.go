@@ -432,7 +432,8 @@ func scanOp(src string, i int) string {
 	if i+1 < len(src) {
 		switch two := src[i : i+2]; two {
 		case "!=", "<>", "<=", ">=", "!~", "~*", "::", "||",
-			"->", "#>", "@>", "<@", "?|", "?&":
+			"->", "#>", "@>", "<@", "?|", "?&",
+			"=>": // named function arguments: make_interval(days => 7)
 			return two
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/rohanthewiz/bytdb/decimal"
+	"github.com/rohanthewiz/bytdb/interval"
 )
 
 func TestRoundTrip(t *testing.T) {
@@ -557,4 +558,60 @@ func mustAppendValue(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return enc
+}
+
+// TestIntervalForms pins N-053's two interval forms: a key encodes the
+// span, so equal spans written with different fields are one key and
+// keys order by span; a stored value keeps the fields; both decode to
+// interval.Interval, and a key re-encodes to itself.
+func TestIntervalForms(t *testing.T) {
+	mon := interval.Interval{Months: 1}
+	days := interval.Interval{Days: 30}
+	hours := interval.Interval{Micros: 720 * 3_600_000_000}
+	k1, _ := Encode(mon)
+	k2, _ := Encode(days)
+	k3, _ := Encode(hours)
+	if !bytes.Equal(k1, k2) || !bytes.Equal(k2, k3) {
+		t.Fatalf("equal spans encode differently:\n% x\n% x\n% x", k1, k2, k3)
+	}
+	v1, _ := AppendValue(nil, mon)
+	v2, _ := AppendValue(nil, days)
+	if bytes.Equal(v1, v2) {
+		t.Fatal("stored forms of 1 mon and 30 days are identical")
+	}
+	got, err := Decode(v1)
+	if err != nil || got[0] != mon {
+		t.Fatalf("stored form round trip: %v %v", got, err)
+	}
+	// A key decodes to the justified fields of its span.
+	got, err = Decode(k3)
+	if err != nil || got[0] != mon {
+		t.Fatalf("key decode: %#v %v, want %#v", got, err, mon)
+	}
+	// Span order: -1 day < -1 µs < 0 < 23:59:59 < 1 day < 1 mon - 1 µs < 1 mon.
+	ordered := []interval.Interval{
+		{Days: -1}, {Micros: -1}, {}, {Micros: 86_399_000_000}, {Days: 1},
+		{Months: 1, Micros: -1}, {Months: 1},
+	}
+	for i := 1; i < len(ordered); i++ {
+		a, _ := Encode(ordered[i-1])
+		b, _ := Encode(ordered[i])
+		if bytes.Compare(a, b) >= 0 {
+			t.Errorf("%v does not sort before %v", ordered[i-1], ordered[i])
+		}
+		da, _ := AppendDesc(nil, ordered[i-1])
+		db, _ := AppendDesc(nil, ordered[i])
+		if bytes.Compare(da, db) <= 0 {
+			t.Errorf("desc: %v does not sort after %v", ordered[i-1], ordered[i])
+		}
+	}
+	// Skip walks both forms.
+	both := append(append([]byte(nil), k1...), v1...)
+	rest, err := Skip(both)
+	if err != nil || !bytes.Equal(rest, v1) {
+		t.Fatalf("skip key form: %v", err)
+	}
+	if rest, err = Skip(rest); err != nil || len(rest) != 0 {
+		t.Fatalf("skip value form: %v", err)
+	}
 }

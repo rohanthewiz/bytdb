@@ -381,6 +381,8 @@ func kindOf(v any) bytdb.ColType {
 		return bytdb.TFloat
 	case bytdb.Decimal:
 		return bytdb.TNumeric
+	case bytdb.Interval:
+		return bytdb.TInterval
 	case bool:
 		return bytdb.TBool
 	case []byte:
@@ -431,6 +433,11 @@ func compareVals(a, b any) (int, bool) {
 			return av.Cmp(decimal.FromInt64(bv)), true
 		case float64:
 			return cmpFloat(av.Float64(), bv), true
+		}
+	case bytdb.Interval:
+		// By span, as Postgres compares intervals: '1 mon' = '30 days'.
+		if bv, ok := b.(bytdb.Interval); ok {
+			return av.Cmp(bv), true
 		}
 	case string:
 		if bv, ok := b.(string); ok {
@@ -821,6 +828,8 @@ func litType(v any) bytdb.ColType {
 		return bytdb.TFloat
 	case bytdb.Decimal:
 		return bytdb.TNumeric
+	case bytdb.Interval:
+		return bytdb.TInterval
 	case bool:
 		return bytdb.TBool
 	case []byte:
@@ -949,7 +958,7 @@ func columnDefaults(desc *bytdb.TableDesc) ([]any, error) {
 				return nil, serr.Wrap(err, "op", "parse column default", "column", c.Name)
 			}
 		}
-		if out[i], err = coerceLit(v, c.Type); err != nil {
+		if out[i], err = coerceLitCol(v, c); err != nil {
 			return nil, serr.Wrap(err, "op", "parse column default", "column", c.Name)
 		}
 	}

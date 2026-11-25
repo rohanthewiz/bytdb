@@ -712,7 +712,8 @@ func (s *Stmt) ExecCtx(ctx context.Context, args ...any) (*Result, error) {
 // and nothing else).
 func toEngineColumn(c ColDef) (bytdb.Column, error) {
 	col := bytdb.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull,
-		Identity: c.Identity, MaxLen: c.MaxLen, Precision: c.Precision, Scale: c.Scale}
+		Identity: c.Identity, MaxLen: c.MaxLen, Precision: c.Precision, Scale: c.Scale,
+		IntervalTypmod: c.IntervalTypmod}
 	if c.HasDefault {
 		text, err := renderDefault(c.Default, c.Type, c.Name)
 		if err != nil {
@@ -745,6 +746,13 @@ func renderDefault(v any, typ bytdb.ColType, colName string) (string, error) {
 	cv, err := coerceLit(v, typ)
 	if err != nil {
 		return "", serr.Wrap(err, "clause", "DEFAULT", "column", colName)
+	}
+	if s, ok := v.(string); ok && typ == bytdb.TInterval {
+		// The text is stored as written: the engine reads it with the
+		// column's modifier ('5' is 5 minutes in an interval minute
+		// column), which a value parsed here without it would lose.
+		// Parsing it above checked that it reads at all.
+		return renderLit(s), nil
 	}
 	return renderLit(cv), nil
 }
@@ -1245,6 +1253,9 @@ func (d *DB) dispatch(st Statement, args []any) (*Result, error) {
 		// Session does for parameters without bytdb semantics.
 		if s.Name == "statement_timeout" {
 			return nil, serr.New("SET statement_timeout requires a Session")
+		}
+		if err := intervalStyleErr(s); err != nil {
+			return nil, err
 		}
 		return &Result{Tag: s.Tag}, nil
 	}
