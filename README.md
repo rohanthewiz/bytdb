@@ -58,8 +58,9 @@ the sizing details.
   (`ON CONFLICT`), `RETURNING`, foreign keys with `ON DELETE CASCADE`,
   CHECK/UNIQUE/NOT NULL constraints, SERIAL identity columns,
   sequences, transactions with savepoints, and `EXPLAIN`.
-- **Postgres-grade types** — `timestamp[tz]`, `date`, `uuid`, `text[]`,
-  and `jsonb` with the everyday operator family
+- **Postgres-grade types** — `timestamp[tz]`, `date`, `interval`,
+  `numeric`, `money`, `citext`, `bit`/`varbit`, `uuid`, `text[]`, and
+  `jsonb` with the everyday operator family
   (`->` `->>` `#>` `#>>` `@>` `<@` `?` `?|` `?&` `||` `-`).
 - **Introspectable** — a virtual `pg_catalog` and `information_schema`
   answer the queries ORMs and psql actually send: `\dt`, `\d <table>`,
@@ -409,12 +410,15 @@ explicit ROWS/RANGE/GROUPS frames, RANGE offsets on the sort key, and
 frame EXCLUDE).
 
 Types: int, float, exact `numeric`/`decimal(p,s)`, string/text, bool,
-bytes, `timestamp`, `timestamptz`, `date`, `uuid`, `text[]`, and
-`jsonb` — the date/time and UUID types stored so they order
-chronologically in keys and indexes, `numeric` with Postgres's
-rounding, division scales and `1.0 = 1.00` equality (decimal literals
-are numeric, so `0.1 + 0.2` is `0.3`), `jsonb` in a canonical rendering
-so plain `=` is document equality.
+bytes, `timestamp`, `timestamptz`, `date`, `interval`, `money`,
+`citext`, `bit(n)`/`varbit(n)`, `uuid`, `text[]`, and `jsonb` — the
+date/time and UUID types stored so they order chronologically in keys
+and indexes, `numeric` with Postgres's rounding, division scales and
+`1.0 = 1.00` equality (decimal literals are numeric, so `0.1 + 0.2` is
+`0.3`), `interval` with its calendar arithmetic (`'1 mon' = '30 days'`
+as values, Jan 31 + 1 mon = Feb 29 on a timestamp), `citext` comparing
+and keying without regard to case, `jsonb` in a canonical rendering so
+plain `=` is document equality.
 
 The full feature inventory — every constraint, function, and
 statement, with its exact semantics — lives in

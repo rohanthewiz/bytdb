@@ -1,7 +1,13 @@
 # Plan: `interval`, `money`, `citext` and `bit` / `varbit` (N-053)
 
-**Status (2026-11-25): phases 1–4 (interval, money, citext, bit)
-done**; phase 5 (docs and close) to go.
+**Status (2026-11-25): all five phases implemented**, decisions Q1–Q10
+as written. Commits: a783702 (interval), a948f92 (money), a7aa830
+(citext), d31c99b (bit), then docs. Postgres 16.9 goldens: 9,331
+interval cases (interval/testdata) and 2,739 money cases
+(testdata/money); corpus files 81_interval, 82_money, 83_citext and
+84_bit match Postgres 16; a three-mode pgx wire check per type differs
+only where bytdb's integers are int8 (N-058) and where Postgres raises
+a constant's error at plan time rather than execution (same SQLSTATE).
 The user chose all four types, phased, with a real money type rather
 than a numeric(p,2) alias (2026-11-25).
 
@@ -72,6 +78,30 @@ days'` is common in application SQL.
    refused-types row, add Q6/Q9 deviations), README, the bytdb skill. A
    pgx three-mode `/verify` wire check against PG per type. Next-list:
    close N-053, raise what Q9 deferred.
+
+## As built (deviations from the phases above)
+
+- Interval: RANGE frames with interval offsets work over timestamp and
+  interval keys (not planned, needed for rolling windows); over a date
+  key they are still refused. EXTRACT on an interval is float8, as it
+  already is on a timestamp. `make_interval` takes named arguments
+  (`days => 7`), the only function that does. interval * float8 is
+  computed unfused, as x86-64 Postgres computes it; five golden cases
+  from the arm64 reference match only under fused multiply-add.
+- money: an integer or numeric assigned to money is whole units in SQL
+  (Postgres's casts); the Go API's money value is int64 cents. Money
+  parameters cross the wire as text so the two never meet.
+- citext: functions take citext as text, so citext's own
+  case-insensitive strpos/replace/regexp overloads are case-sensitive
+  here.
+- bit: the bitwise operators came with integer versions (& | # ~ << >>
+  were not lexed at all before). No bit_and/bit_or/bit_xor aggregates
+  and no overlay().
+- Fixed on the way: date 'infinity' to timestamp; a window function in
+  the select list dropping the typed operator kind; a later UNION arm's
+  untyped literal not taking the first arm's type; typed literals
+  losing their type in a select list; a bound time.Time under an
+  explicit ::timestamptz.
 
 ## Out of scope
 
