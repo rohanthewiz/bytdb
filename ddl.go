@@ -15,6 +15,7 @@ var validTypes = map[ColType]bool{
 	TBool: true, TInt: true, TFloat: true, TString: true, TBytes: true,
 	TTimestamp: true, TDate: true, TUUID: true, TTextArray: true,
 	TJSONB: true, TNumeric: true, TInterval: true, TMoney: true, TCIText: true,
+	TBit: true, TVarBit: true,
 }
 
 // CreateTable registers a table. pk names the primary-key columns in
@@ -121,8 +122,8 @@ func validMaxLen(c Column) error {
 	if c.MaxLen == 0 {
 		return nil
 	}
-	if c.Type != TString {
-		return serr.New("length limit is only valid on string columns",
+	if c.Type != TString && c.Type != TBit && c.Type != TVarBit {
+		return serr.New("length limit is only valid on string and bit columns",
 			"column", c.Name, "type", string(c.Type))
 	}
 	if c.MaxLen < 0 {

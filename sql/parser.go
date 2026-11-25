@@ -1576,6 +1576,46 @@ func (p *parser) intervalMods() (int32, error) {
 	return tm, nil
 }
 
+// bitCastType is the cast type string for bit(n) or varbit(n): "bit",
+// "bit(4)", "varbit", "varbit(4)". castColType and castVal read it back
+// (bitCastSpec).
+func bitCastType(varying bool, n int) string {
+	name := "bit"
+	if varying {
+		name = "varbit"
+	}
+	if n > 0 {
+		return name + "(" + strconv.Itoa(n) + ")"
+	}
+	return name
+}
+
+// bitCastSpec reads a bit cast type string: varying, and n (bit's
+// default 1, varbit's 0 for unlimited). ok is false for other types.
+func bitCastSpec(typ string) (varying bool, n int, ok bool) {
+	name, rest := typ, ""
+	if i := strings.IndexByte(typ, '('); i >= 0 {
+		name, rest = typ[:i], strings.TrimSuffix(typ[i+1:], ")")
+	}
+	switch name {
+	case "bit":
+	case "varbit":
+		varying = true
+	default:
+		return false, 0, false
+	}
+	if rest != "" {
+		v, err := strconv.Atoi(rest)
+		if err != nil {
+			return false, 0, false
+		}
+		n = v
+	} else if !varying {
+		n = 1
+	}
+	return varying, n, true
+}
+
 // intervalCastType is the cast type string for an interval with typmod
 // tm: "interval", "interval(3)", "interval day to second(3)" — the
 // format_type spelling, which intervalCastTypmod reads back.
@@ -1722,6 +1762,26 @@ func (p *parser) typeNameBase() (typ bytdb.ColType, maxLen int, err error) {
 		return bytdb.TUUID, 0, nil
 	case "money":
 		return bytdb.TMoney, 0, nil
+	case "bit":
+		// bit(n), a bare bit being bit(1); BIT VARYING(n) is varbit.
+		typ, def := bytdb.TBit, 1
+		if p.acceptKw("varying") {
+			typ, def = bytdb.TVarBit, 0
+		}
+		n, err := p.bitLength()
+		if err != nil {
+			return "", 0, err
+		}
+		if n == 0 {
+			n = def
+		}
+		return typ, n, nil
+	case "varbit":
+		n, err := p.bitLength()
+		if err != nil {
+			return "", 0, err
+		}
+		return bytdb.TVarBit, n, nil
 	case "citext":
 		// The citext extension's type. CREATE EXTENSION is accepted and
 		// ignored, so the type is simply always there.
@@ -1738,6 +1798,24 @@ func (p *parser) typeNameBase() (typ bytdb.ColType, maxLen int, err error) {
 			"pos", fmt.Sprint(t.pos))
 	}
 	return "", 0, serr.New("unknown column type", "type", t.text, "pos", fmt.Sprint(t.pos))
+}
+
+// bitLength parses bit's and varbit's optional "(n)", n at least 1 as
+// Postgres requires; absent reads as 0.
+func (p *parser) bitLength() (int, error) {
+	if !p.acceptOp("(") {
+		return 0, nil
+	}
+	t := p.cur()
+	if t.kind != tNumber {
+		return 0, p.unexpected("a length")
+	}
+	n, err := strconv.Atoi(t.text)
+	if err != nil || n < 1 {
+		return 0, serr.New("length for type bit must be at least 1", "got", t.text)
+	}
+	p.advance()
+	return n, p.expectOp(")")
 }
 
 // typeLength parses an optional "(n)" type modifier; n must be a
@@ -3752,6 +3830,12 @@ func lowerItem(e Expr) SelectItem {
 		}
 		return SelectItem{Agg: n.Fn, Col: n.Col, Star: n.Star}
 	case *ExLit:
+		if n.Typ != "" {
+			// A literal that carries its type (B'0101' is bit, though its
+			// value is '0'/'1' text) stays an expression, so the column is
+			// described by that type rather than by the value's Go kind.
+			return SelectItem{Ex: e}
+		}
 		name := n.Name
 		if name == "" {
 			name = "?column?"
@@ -4335,7 +4419,8 @@ func (p *parser) exprOther() (Expr, error) {
 			return e, p.done(d)
 		}
 		switch t.text {
-		case "||", "->", "->>", "#>", "#>>":
+		case "||", "->", "->>", "#>", "#>>",
+			"&", "|", "#", "<<", ">>": // bitwise, on integers and bit strings (N-053)
 		default:
 			return e, p.done(d)
 		}
@@ -4439,6 +4524,21 @@ func (p *parser) exprUnary() (Expr, error) {
 		}
 		return e, nil
 	}
+	if t.kind == tOp && t.text == "~" {
+		// Bitwise NOT (N-053): ~5, ~B'1100'. Read as the operator "~"
+		// with a placeholder left operand, as unary minus reads as 0 - E;
+		// binary ~ (regex match) is a predicate and never reaches here.
+		p.advance()
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
+		e, err := p.exprUnary()
+		if err != nil {
+			return nil, err
+		}
+		return &ExArith{Op: "~", L: &ExLit{Val: int64(0)}, R: e}, p.done(p.lastDepth + 1)
+	}
 	return p.exprPostfix()
 }
 
@@ -4518,6 +4618,17 @@ func (p *parser) castType() (string, error) {
 	// interval's modifiers (N-053) apply too: '1 day 02:30'::interval
 	// hour is 1 day 02:00:00. They ride in the type string the same way,
 	// spelled as format_type spells them.
+	// bit(n) and bit varying(n) apply their lengths, padding or
+	// truncating (N-053); a bare ::bit is bit(1), a bare ::varbit
+	// unlimited. The type string is "bit(n)" or "varbit(n)".
+	if name == "bit" || name == "varbit" {
+		varying := name == "varbit" || p.acceptKw("varying")
+		n, err := p.bitLength()
+		if err != nil {
+			return "", err
+		}
+		return bitCastType(varying, n), nil
+	}
 	if name == "interval" {
 		tm, err := p.intervalMods()
 		if err != nil {
@@ -4604,6 +4715,15 @@ func (p *parser) primary() (Expr, error) {
 		return &ExLit{Val: v, Name: name}, nil
 	}
 	t := p.cur()
+	if t.kind == tBits {
+		// B'0101' / X'1F': a bit constant of exactly its own length.
+		p.advance()
+		bits, err := bytdb.ParseBits(t.text)
+		if err != nil {
+			return nil, err
+		}
+		return &ExLit{Val: bits, Typ: bytdb.TBit}, nil
+	}
 	if t.kind == tNumber || t.kind == tString || t.kind == tParam ||
 		(t.kind == tIdent && (t.text == "true" || t.text == "false" || t.text == "null")) {
 		v, err := p.literal()
@@ -5356,6 +5476,14 @@ func (p *parser) literal() (any, error) {
 		}
 		p.advance()
 		return t.text, nil
+	case tBits:
+		// A bit constant where a bare literal is read (DEFAULT, VALUES):
+		// its '0'/'1' text, which a bit column then takes as written.
+		if neg {
+			return nil, p.unexpected("a number after '-'")
+		}
+		p.advance()
+		return bytdb.ParseBits(t.text)
 	case tIdent:
 		if !neg {
 			switch t.text {

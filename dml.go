@@ -626,7 +626,17 @@ func coerceRow(desc *TableDesc, vals []any) ([]any, error) {
 // insignificant. The limit counts characters, not bytes, as Postgres
 // does, so multi-byte text is not short-changed.
 func enforceMaxLen(v any, c *Column) (any, error) {
-	if c.MaxLen <= 0 {
+	if c.Type == TBit || c.Type == TVarBit {
+		// bit(n) takes exactly n bits, bit varying(n) at most n; neither
+		// truncates on assignment (only an explicit cast does).
+		if s, ok := v.(string); ok {
+			if err := CheckBitsLen(s, BitColumnLen(c), c.Type == TVarBit); err != nil {
+				return nil, err
+			}
+		}
+		return v, nil
+	}
+	if c.MaxLen <= 0 || c.Type != TString {
 		return v, nil
 	}
 	s, ok := v.(string)
@@ -804,6 +814,16 @@ func coerce(v any, t ColType) (any, error) {
 		}
 		if ok {
 			return d, nil
+		}
+	case TBit, TVarBit:
+		// The stored form is one '0'/'1' per bit; text input is bit_in's
+		// (binary, or x-prefixed hex). The length is enforced with the
+		// column in hand (enforceMaxLen).
+		switch x := v.(type) {
+		case string:
+			return ParseBits(x)
+		case []byte:
+			return ParseBits(string(x))
 		}
 	case TCIText:
 		switch x := v.(type) {

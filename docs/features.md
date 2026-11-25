@@ -5,7 +5,7 @@ references point at the proof.
 
 ## Column types
 
-Fourteen storage types, with the Postgres aliases you'd expect
+Sixteen storage types, with the Postgres aliases you'd expect
 (`sql/parser.go`, `typeName`):
 
 | Declared as | Stored as | Notes |
@@ -16,6 +16,7 @@ Fourteen storage types, with the Postgres aliases you'd expect
 | `MONEY` | `int64` cents | Postgres's money with its `en_US`/`C` text: `$1,234.56`, `-$1,234.56`. Input as `cash_in` reads it (`'(1.50)'`, `'1.50-'`, `'$ 1,000'`, a third fraction digit rounds), out-of-range is 22003. An integer or numeric assigned to money is whole units (`5` is `$5.00`), float8 has no cast; money ± money, money × or ÷ an integer (exact on cents), money × or ÷ float8 or numeric (rounded half to even to cents), money ÷ money is float8; casts to and from numeric; `sum`, `min`, `max`, `cash_words`. OID 790 in both wire formats (binary is the int8 of cents); the `database/sql` driver returns the text, the Go API the cents (`Insert` takes a Go integer as cents, a `Decimal` as units, or money text). `lc_monetary` is not modelled |
 | `TEXT`, `STRING`, `VARCHAR(n)` | `string` | the `(n)` limit is **enforced** on every write, Postgres wording, SQLSTATE 22001 |
 | `CITEXT` | `bytdb.CIText`, the text as written | the citext extension's case-insensitive text (`CREATE EXTENSION citext` is accepted and not needed): equality, ordering, `GROUP BY`/`DISTINCT`, joins, unique and primary-key indexes, foreign keys and upserts ignore case (`'ABC' = 'abc'`, one key), and every value reads back as written. `LIKE`, `ILIKE` and `~` on a citext ignore case. citext against `text` is text against text (case-sensitive), as in Postgres; functions and `\|\|` take citext as text and return text; `min`/`max` return citext. Lowercasing is Unicode simple case mapping; comparison is then byte order (bytdb's C collation). A fixed oid (2100000000; Postgres assigns one per database), named `citext` in `pg_type`; text in both wire formats; `Row.String` returns its text |
+| `BIT(n)`, `BIT VARYING(n)`, `VARBIT(n)` | `string` of `'0'`/`'1'` | bit strings, one character per bit (whose byte order is Postgres's bit-string order, so keys and comparison need nothing new). `bit(n)` takes exactly n bits on every write and a bare `bit` is `bit(1)`; `varbit(n)` takes at most n (22026 / 22001 otherwise), while an explicit cast pads or truncates (`B'101'::bit(5)` is `10100`). Constants `B'0101'` and `X'1F'`, text in binary or `x`-hex; `& \| #` (equal lengths), `~`, `<< >>`, `\|\|`; `length`, `bit_length`, `octet_length`, `bit_count`, `get_bit`, `set_bit`, `substring`, `position`; casts to and from `int`/`bigint` (two's complement) and text. OIDs 1560 / 1562 in both wire formats (binary is a bit count and packed bytes); the Go value is the `'0'`/`'1'` string |
 | `BOOL`, `BOOLEAN` | `bool` | text input as Postgres reads it: `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`, and unique prefixes (`t`, `fa`, `y`); an integer `0`/`1` is also accepted (SQLite booleans, `database/sql`'s `driver.Bool` rule); any other integer is refused. Unlike Postgres, this includes a literal `VALUES (1)` |
 | `BYTEA`, `BYTES` | `[]byte` | |
 | `TIMESTAMP`, `TIMESTAMPTZ` | `int64` µs since epoch, UTC | one type: the `WITH/WITHOUT TIME ZONE` distinction parses and folds away; presents as `timestamptz` on the wire. Text input: ISO 8601 with or without seconds, fraction or offset, a trailing `UTC`/`Z` or IANA zone name (`'2024-02-29 12:00 America/New_York'`), and `epoch`, `now`, `today`, `tomorrow`, `yesterday`, `infinity`, `-infinity` (stored as the extreme instants, so they sort last and first) |
@@ -775,7 +776,8 @@ text (OID 1009 in both wire formats). No array operators (`@>`, `&&`),
 - Comparisons `= != <> < <= > >=`, `IS [NOT] NULL`, `IS [NOT] TRUE |
   FALSE | UNKNOWN`, `IS [NOT] DISTINCT FROM`, regex `~ !~ ~* !~*`; row
   comparisons `(a, b) = (1, 2)`, `<>`, and `(a, b) [NOT] IN ((1, 2), ...)`
-- Three-valued `AND` / `OR` / `NOT`; arithmetic `+ - * / %`; string `||`
+- Three-valued `AND` / `OR` / `NOT`; arithmetic `+ - * / %`; string `||`;
+  bitwise `& | # ~ << >>` on integers and bit strings
 - `CASE WHEN`, `IN` / `NOT IN` (including `IN (SELECT ...)`), `BETWEEN`,
   `op ANY(...)` / `op ALL(...)` with `ARRAY[...]`, subqueries, or `'{...}'`
   literals
@@ -820,7 +822,7 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
     right`, `trim`/`btrim`/`ltrim`/`rtrim` (and `TRIM([BOTH|LEADING|
     TRAILING] [chars] FROM s)`), `replace strpos` (and `POSITION(a IN b)`),
     `split_part repeat reverse lpad rpad initcap starts_with md5 ascii chr
-    octet_length concat concat_ws`;
+    octet_length bit_length concat concat_ws`;
   - date/time: `EXTRACT(field FROM x)` / `date_part`, `date_trunc`
     (timestamps and intervals), `to_char` (the date/time template
     patterns), `to_timestamp(seconds)`, `make_date`, `x AT TIME ZONE z`

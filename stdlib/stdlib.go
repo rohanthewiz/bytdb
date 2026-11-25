@@ -1011,7 +1011,7 @@ func (r *rows) ColumnTypeScanType(i int) reflect.Type {
 	case bytdb.TTimestamp, bytdb.TDate:
 		return reflect.TypeFor[time.Time]()
 	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric, bytdb.TInterval, bytdb.TMoney,
-		bytdb.TCIText:
+		bytdb.TCIText, bytdb.TBit, bytdb.TVarBit:
 		// numeric, interval and money arrive as their text, see convert.
 		return reflect.TypeFor[string]()
 	}

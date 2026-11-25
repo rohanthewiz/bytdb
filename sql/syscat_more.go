@@ -57,6 +57,9 @@ func colTypmod(c bytdb.Column) any {
 	if c.Type == bytdb.TInterval && c.IntervalTypmod != 0 {
 		return int64(c.IntervalTypmod) // Postgres's own packing (interval.Typmod)
 	}
+	if c.Type == bytdb.TBit || (c.Type == bytdb.TVarBit && c.MaxLen > 0) {
+		return int64(bytdb.BitColumnLen(&c)) // bit(n)'s typmod is n, no header
+	}
 	return typmodNone
 }
 

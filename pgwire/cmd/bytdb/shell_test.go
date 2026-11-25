@@ -583,3 +583,29 @@ INSERT INTO u VALUES ('Ada', 'ADA@x.org', 'x'), ('grace', 'Grace''s@x.org', NULL
 		t.Errorf("a login equal ignoring case was accepted after restore (%s)", errOut)
 	}
 }
+
+// TestDumpBit (N-053): bit and bit varying columns dump with their
+// lengths and their bits as quoted text, and restore (a varbit key in
+// bit-string order).
+func TestDumpBit(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src.bytdb"), filepath.Join(dir, "dst.bytdb")
+	if _, errOut, code := runShell(t, `
+CREATE TABLE b (k varbit PRIMARY KEY, f bit(4), one bit, v bit varying(3));
+INSERT INTO b VALUES (B'10', B'1010', B'1', '11'), (B'', X'F', NULL, ''), (B'0111', '0000', '0', NULL);
+`, "-batch", src); code != 0 {
+		t.Fatalf("setup: code %d stderr %s", code, errOut)
+	}
+	dump, errOut, code := runShell(t, "", src, ".dump")
+	if code != 0 {
+		t.Fatalf("dump: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, dump, "k bit varying", "f bit(4)", "one bit(1)", "v bit varying(3)",
+		"('', '1111', NULL, '')", "('0111', '0000', '0', NULL)", "('10', '1010', '1', '11')")
+	if _, errOut, code = runShell(t, dump, "-batch", dst); code != 0 {
+		t.Fatalf("restore: code %d stderr %s", code, errOut)
+	}
+	if again, _, _ := runShell(t, "", dst, ".dump"); again != dump {
+		t.Errorf("dump of the restored database differs.\nfirst:\n%s\nsecond:\n%s", dump, again)
+	}
+}

@@ -973,6 +973,10 @@ func aggArgCheck(fn AggFunc, arg, sep bytdb.ColType) error {
 		if arg == bytdb.TMoney {
 			return noFunc(fn.name(), []bytdb.ColType{arg}) // as in Postgres
 		}
+	case AggMin, AggMax:
+		if bitType(arg) {
+			return noFunc(fn.name(), []bytdb.ColType{arg}) // Postgres has no min/max(bit)
+		}
 	case AggStringAgg:
 		// citext aggregates as text, its implicit cast (N-053).
 		textual := func(t bytdb.ColType) bool { return !concrete(t) || t == bytdb.TString || t == bytdb.TCIText }

@@ -20,6 +20,11 @@ const (
 	tNumber         // integer or float literal
 	tOp             // operator or punctuation
 	tParam          // $1-style placeholder
+	// tBits is a bit-string constant, B'0101' or X'1F' (N-053). Its text
+	// is the body with a "b" or "x" prefix, unvalidated: the parser reads
+	// it with bytdb.ParseBits, so a bad digit is Postgres's 22P02 data
+	// error rather than a syntax error at a position.
+	tBits
 )
 
 type token struct {
@@ -51,6 +56,14 @@ func lex(src string) ([]token, error) {
 				return nil, serr.New("unterminated block comment", "pos", fmt.Sprint(i))
 			}
 			i += n
+		case (c == 'b' || c == 'B' || c == 'x' || c == 'X') && i+1 < len(src) && src[i+1] == '\'':
+			// B'...' and X'...' bit-string constants.
+			text, n, err := scanQuoted(src[i+1:], '\'')
+			if err != nil {
+				return nil, serr.Wrap(err, "pos", fmt.Sprint(i))
+			}
+			toks = append(toks, token{tBits, string(c|0x20) + text, i})
+			i += 1 + n
 		case (c == 'e' || c == 'E') && i+1 < len(src) && src[i+1] == '\'':
 			// E'...' escape-string literal (\n, \t, \\, '', \', ...)
 			text, n, err := scanEString(src[i+1:])
@@ -433,13 +446,15 @@ func scanOp(src string, i int) string {
 		switch two := src[i : i+2]; two {
 		case "!=", "<>", "<=", ">=", "!~", "~*", "::", "||",
 			"->", "#>", "@>", "<@", "?|", "?&",
+			"<<", ">>", // bit shifts (N-053)
 			"=>": // named function arguments: make_interval(days => 7)
 			return two
 		}
 	}
 	switch src[i] {
 	case '=', '<', '>', '(', ')', ',', ';', '*', '.', '+', '-',
-		'~', '[', ']', '/', '%', '?':
+		'~', '[', ']', '/', '%', '?',
+		'&', '|', '#': // bitwise and, or, xor (N-053)
 		return string(src[i])
 	}
 	return ""

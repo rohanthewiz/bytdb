@@ -109,6 +109,10 @@ func pgTypeName(t bytdb.ColType) string {
 		return "money"
 	case bytdb.TCIText:
 		return "citext"
+	case bytdb.TBit:
+		return "bit"
+	case bytdb.TVarBit:
+		return "bit varying"
 	case tyUnknown:
 		return "unknown"
 	}
@@ -1104,6 +1108,9 @@ func compatible(op string, l, r bytdb.ColType) error {
 	if (l == bytdb.TUUID && r == bytdb.TBytes) || (l == bytdb.TBytes && r == bytdb.TUUID) {
 		return nil
 	}
+	if bitType(l) && bitType(r) {
+		return nil // bit and bit varying compare (and convert) freely
+	}
 	textual := func(t bytdb.ColType) bool {
 		return t == bytdb.TString || t == bytdb.TJSONB || t == bytdb.TTextArray
 	}
@@ -1840,10 +1847,27 @@ func (t *typer) funcExpr(n *ExFunc, ts *tscope) (Expr, bytdb.ColType, error) {
 		}
 		typ = bytdb.TString
 	case "length", "char_length", "character_length":
-		if len(argTypes) != 1 || !(textOrUnknown(argTypes[0]) || (n.Name == "length" && argTypes[0] == bytdb.TBytes)) {
+		// length of a bit string is its bit count, which is the length
+		// of its '0'/'1' text (N-053).
+		if len(argTypes) != 1 || !(textOrUnknown(argTypes[0]) ||
+			(n.Name == "length" && (argTypes[0] == bytdb.TBytes || bitType(argTypes[0])))) {
 			return nil, "", noFunc(n.Name, argTypes)
 		}
 		typ = bytdb.TInt
+	case "bit_length", "octet_length":
+		// Over a bit string these count bits and bytes of the bits, not
+		// of the '0'/'1' text that holds them: bit_length is length, and
+		// octet_length is (length + 7) / 8 (N-053). Rewritten here, so no
+		// function needs to know its argument's static type.
+		if len(argTypes) == 1 && bitType(argTypes[0]) {
+			length := &ExFunc{Name: "length", Args: []Expr{args[0]}}
+			if n.Name == "bit_length" {
+				return length, bytdb.TInt, nil
+			}
+			return &ExArith{Op: "/", L: &ExArith{Op: "+", L: length, R: &ExLit{Val: int64(7)}, Kind: arithPlain},
+				R: &ExLit{Val: int64(8)}, Kind: arithPlain}, bytdb.TInt, nil
+		}
+		fallthrough
 	default:
 		if f, ok := scalarFuncs[n.Name]; ok {
 			if len(args) < f.min || (f.max >= 0 && len(args) > f.max) {
@@ -1918,6 +1942,27 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 	case "||":
 		if lt == bytdb.TJSONB || rt == bytdb.TJSONB {
 			return rebuilt(bytdb.TJSONB)
+		}
+		// bit || bit concatenates the bits (a varbit); an untyped literal
+		// beside one is a bit string too (N-053). The runtime values are
+		// '0'/'1' strings, so plain concatenation is the operator.
+		if bitType(lt) || bitType(rt) {
+			if lt == tyUnknown {
+				if l, err = t.coerceTo(l, bytdb.TVarBit); err != nil {
+					return nil, "", err
+				}
+				lt = bytdb.TVarBit
+			}
+			if rt == tyUnknown {
+				if r, err = t.coerceTo(r, bytdb.TVarBit); err != nil {
+					return nil, "", err
+				}
+				rt = bytdb.TVarBit
+			}
+			if bitType(lt) && bitType(rt) {
+				kind = arithPlain
+				return rebuilt(bytdb.TVarBit)
+			}
 		}
 		if lt == bytdb.TTextArray || rt == bytdb.TTextArray {
 			return rebuilt(bytdb.TTextArray)
@@ -1996,6 +2041,8 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 		return t.intervalArith(n, l, lt, r, rt, rebuilt, rebuiltKind)
 	case lt == bytdb.TMoney || rt == bytdb.TMoney:
 		return moneyArith(n.Op, l, lt, r, rt)
+	case bitwiseOp(n.Op):
+		return bitwiseArith(n, l, lt, r, rt, rebuilt, rebuiltKind)
 	case temporalType(lt) || temporalType(rt):
 		// timestamp + integer is the plan's decision Q1: refused as in
 		// Postgres rather than read as microseconds.
@@ -2004,6 +2051,47 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 		return rebuilt(widerNumeric(lt, rt))
 	}
 	return nil, "", noOperator(n.Op, lt, rt)
+}
+
+// bitType reports whether t is a bit-string type.
+func bitType(t bytdb.ColType) bool { return t == bytdb.TBit || t == bytdb.TVarBit }
+
+// bitwiseOp reports whether op is one of the bitwise operators.
+func bitwiseOp(op string) bool {
+	switch op {
+	case "&", "|", "#", "~", "<<", ">>":
+		return true
+	}
+	return false
+}
+
+// bitwiseArith types & | # ~ << >> (N-053): on integers they are
+// integer operators; on bit strings & | # take two (of equal length at
+// run time), ~ one, and << >> a bit string and an integer count, all
+// returning bit (Postgres's result type even for varbit operands). ~ is
+// unary, parsed as "~" with a placeholder left operand.
+func bitwiseArith(n *ExArith, l Expr, lt bytdb.ColType, r Expr, rt bytdb.ColType,
+	rebuilt func(bytdb.ColType) (Expr, bytdb.ColType, error),
+	rebuiltKind func(arithKind, bytdb.ColType) (Expr, bytdb.ColType, error)) (Expr, bytdb.ColType, error) {
+	op := n.Op
+	if op == "~" {
+		switch {
+		case rt == bytdb.TInt:
+			return rebuiltKind(arithPlain, bytdb.TInt)
+		case bitType(rt):
+			return rebuiltKind(arithBit, bytdb.TBit)
+		}
+		return nil, "", serr.New("operator does not exist: ~ " + pgTypeName(rt))
+	}
+	switch {
+	case lt == bytdb.TInt && rt == bytdb.TInt:
+		return rebuiltKind(arithPlain, bytdb.TInt)
+	case (op == "<<" || op == ">>") && bitType(lt) && rt == bytdb.TInt:
+		return rebuiltKind(arithBit, bytdb.TBit)
+	case op != "<<" && op != ">>" && bitType(lt) && bitType(rt):
+		return rebuiltKind(arithBit, bytdb.TBit)
+	}
+	return nil, "", noOperator(op, lt, rt)
 }
 
 // unknownArithTarget is the type an untyped literal takes beside an

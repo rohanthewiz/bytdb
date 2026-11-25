@@ -442,6 +442,10 @@ func sqlTypeName(t ColType) string {
 		return "money"
 	case TCIText:
 		return "citext"
+	case TBit:
+		return "bit"
+	case TVarBit:
+		return "bit varying"
 	}
 	return string(t)
 }
@@ -492,6 +496,11 @@ func assignmentCast(from, to ColType) func(any) (any, error) {
 		return func(v any) (any, error) { return numericToFloat(v.(Decimal)), nil }
 	case from == TNumeric && to == TInt:
 		return func(v any) (any, error) { return numericToInt(v.(Decimal)) }
+	// bit and bit varying convert to each other implicitly; the new
+	// column's length is then enforced on every row (enforceMaxLen),
+	// as an assignment to it is in Postgres.
+	case (from == TBit || from == TVarBit) && (to == TBit || to == TVarBit):
+		return func(v any) (any, error) { return v, nil }
 	// citext and text cast both ways without USING (citext's casts are
 	// implicit to text and assignment from it), keeping the characters.
 	case from == TString && to == TCIText:
@@ -534,8 +543,9 @@ func castToText(v any, t ColType) (string, error) {
 		// Postgres's float8 output, NaN and the infinities included (a
 		// float column can hold NaN since deep-look D-36).
 		return FormatFloat(v.(float64)), nil
-	case TString, TTextArray, TJSONB:
-		// Arrays and jsonb already hold their canonical text.
+	case TString, TTextArray, TJSONB, TBit, TVarBit:
+		// Arrays and jsonb already hold their canonical text, bit
+		// strings their '0'/'1' text.
 		return v.(string), nil
 	case TBytes:
 		return `\x` + hex.EncodeToString(v.([]byte)), nil

@@ -137,7 +137,7 @@ WHERE/ON/HAVING, INSERT/UPDATE values, `BETWEEN` bounds, and
 Types: `int`, `float`, `numeric`/`decimal(p,s)` (exact, typmod
 enforced), `text`/`varchar(n)` (length enforced), `bool`,
 `bytea`, `timestamp[tz]`, `date`, `interval` (with field qualifiers
-and `(p)`), `money`, `citext`, `uuid`, `text[]`, `jsonb` — jsonb with `-> ->> #>
+and `(p)`), `money`, `citext`, `bit(n)`/`varbit(n)`, `uuid`, `text[]`, `jsonb` — jsonb with `-> ->> #>
 #>> @> <@ ? ?| ?& || -` and canonical-text equality.
 
 Constraints: PRIMARY KEY, NOT NULL, CHECK, UNIQUE, and foreign keys

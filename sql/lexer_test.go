@@ -98,7 +98,9 @@ func TestLexNestedBlockComments(t *testing.T) {
 }
 
 func TestLexErrors(t *testing.T) {
-	for _, src := range []string{`'unterminated`, `"unterminated`, `/* open`, `a & b`} {
+	// A character that is no operator ("a & b" served until N-053 made &
+	// the bitwise AND).
+	for _, src := range []string{`'unterminated`, `"unterminated`, `/* open`, "a ` b"} {
 		if _, err := lex(src); err == nil {
 			t.Errorf("lex(%q): expected error", src)
 		}

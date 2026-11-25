@@ -249,6 +249,9 @@ const (
 	arithMoney      // money ± money, money * / integer, integer * money
 	arithMoneyFloat // money * / float8 (or numeric), float8 * money
 	arithMoneyDiv   // money / money: float8
+	// arithBit is & | # ~ << >> on bit strings (N-053), whose runtime
+	// values are '0'/'1' strings — text to the untyped evaluator.
+	arithBit
 )
 
 // ExSub is a scalar subquery, executed lazily per row with the

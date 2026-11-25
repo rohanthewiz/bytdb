@@ -267,6 +267,8 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 			return timeArith(n.Kind, n.Op, l, r)
 		case arithMoney, arithMoneyFloat, arithMoneyDiv:
 			return moneyEval(n.Kind, n.Op, l, r)
+		case arithBit:
+			return bitEval(n.Op, l, r)
 		}
 		return arith(n.Op, l, r)
 	case *ExAgg:
@@ -854,6 +856,20 @@ func arith(op string, l, r any) (any, error) {
 				return nil, serr.New("division by zero")
 			}
 			return li % ri, nil
+		// Bitwise (N-053). Shift counts wrap to 0..63, as the int8 shifts
+		// do on the hardware Postgres runs on: 1 << 64 is 1.
+		case "&":
+			return li & ri, nil
+		case "|":
+			return li | ri, nil
+		case "#":
+			return li ^ ri, nil
+		case "~":
+			return ^ri, nil // unary: li is the parser's placeholder
+		case "<<":
+			return li << (uint64(ri) & 63), nil
+		case ">>":
+			return li >> (uint64(ri) & 63), nil
 		}
 	}
 	// numeric (N-048): exact when both operands are exact (a Decimal and
@@ -917,6 +933,33 @@ func intervalArith(op string, iv bytdb.Interval, other any) (any, error) {
 		return iv.Div(f)
 	}
 	return nil, serr.New("operator does not exist: interval "+op+" number", "op", op)
+}
+
+// bitEval evaluates the bit-string operators (arithBit): the values are
+// '0'/'1' strings; << and >> take an integer count; ~ is unary (its
+// left operand is the parser's placeholder).
+func bitEval(op string, l, r any) (any, error) {
+	switch op {
+	case "~":
+		b, ok := r.(string)
+		if !ok {
+			return nil, serr.New("bit string operand expected", "op", op)
+		}
+		return bytdb.BitsNot(b), nil
+	case "<<", ">>":
+		b, bok := l.(string)
+		n, nok := r.(int64)
+		if !bok || !nok {
+			return nil, serr.New("bit string and integer operands expected", "op", op)
+		}
+		return bytdb.BitsShift(b, n, op == "<<"), nil
+	}
+	a, aok := l.(string)
+	b, bok := r.(string)
+	if !aok || !bok {
+		return nil, serr.New("bit string operands expected", "op", op)
+	}
+	return bytdb.BitsOp(op, a, b)
 }
 
 // moneyEval evaluates the operators typing marked as money ones (see
@@ -1172,6 +1215,22 @@ func castValFrom(env *exEnv, v any, from bytdb.ColType, typ string) (any, error)
 		}
 	case from == bytdb.TMoney || (to == bytdb.TMoney && from == bytdb.TFloat):
 		return nil, serr.New("cannot cast type " + pgTypeName(from) + " to " + pgTypeName(to))
+	// A bit string's runtime value is its '0'/'1' text, which castVal
+	// would read as a decimal number; bit -> int4/int8 reads the bits
+	// (N-053). Postgres has no other casts out of bit, and none from
+	// bit varying to an integer.
+	case from == bytdb.TBit && to == bytdb.TInt:
+		if b, ok := v.(string); ok {
+			switch typ {
+			case "int", "int4", "integer":
+				return bytdb.BitsToInt(b, 32)
+			case "bigint", "int8":
+				return bytdb.BitsToInt(b, 64)
+			}
+		}
+		return nil, serr.New("cannot cast type bit to " + typ)
+	case bitType(from) && !bitType(to) && to != bytdb.TString:
+		return nil, serr.New("cannot cast type " + pgTypeName(from) + " to " + pgTypeName(to))
 	}
 	return castVal(env, v, typ)
 }
@@ -1333,6 +1392,9 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 	if tm, ok := intervalCastTypmod(typ); ok {
 		return castToInterval(v, tm)
 	}
+	if varying, n, ok := bitCastSpec(typ); ok {
+		return castToBits(v, varying, n)
+	}
 	if typ == "citext" {
 		switch x := v.(type) {
 		case nil:
@@ -1354,6 +1416,29 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 		return moneyAssign(v)
 	}
 	return nil, serr.New("unsupported cast", "type", typ)
+}
+
+// castToBits is E::bit(n) or E::varbit(n) (N-053): text parses as bit
+// text, an integer becomes its low n bits (bit(n) only), and the length
+// applies as an explicit cast does — bit(n) pads with zeros or
+// truncates, varbit(n) only truncates.
+func castToBits(v any, varying bool, n int) (any, error) {
+	switch x := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		bits, err := bytdb.ParseBits(x)
+		if err != nil {
+			return nil, err
+		}
+		return bytdb.FitBits(bits, n, varying), nil
+	case int64:
+		if varying {
+			return nil, serr.New("cannot cast type bigint to bit varying")
+		}
+		return bytdb.IntToBits(x, n), nil
+	}
+	return nil, serr.New("cannot cast to bit", "from", fmt.Sprintf("%T", v))
 }
 
 // castToInterval is E::interval[modifier] (N-053): text parses (a bare
@@ -1666,6 +1751,15 @@ func formatType(typid, typmod any) any {
 		name = "jsonb"
 	case 790:
 		name = "money"
+	case 1560, 1562:
+		// bit(n) and bit varying(n): the typmod is n itself.
+		name = "bit"
+		if oid == 1562 {
+			name = "bit varying"
+		}
+		if m, ok := typmod.(int64); ok && m > 0 {
+			return fmt.Sprintf("%s(%d)", name, m)
+		}
 	case bytdb.CITextOID:
 		name = "citext"
 	case 1186:
@@ -2301,6 +2395,9 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 			if lt == bytdb.TJSONB || rt == bytdb.TJSONB {
 				return bytdb.TJSONB
 			}
+			if bitType(lt) && bitType(rt) {
+				return bytdb.TVarBit // bit || bit (N-053)
+			}
 			return bytdb.TString
 		case "-":
 			if lt == bytdb.TJSONB || rt == bytdb.TJSONB {
@@ -2319,6 +2416,8 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 			return bytdb.TFloat
 		case lt == bytdb.TMoney || rt == bytdb.TMoney:
 			return bytdb.TMoney
+		case n.Kind == arithBit:
+			return bytdb.TBit
 		case n.Kind == arithIntervalNeg || n.Kind == arithTsMinusTs:
 			return bytdb.TInterval
 		case n.Kind == arithTsInterval:
@@ -2454,6 +2553,12 @@ func castColType(typ string) bytdb.ColType {
 	}
 	if _, ok := intervalCastTypmod(typ); ok { // interval, interval day to second(3)
 		return bytdb.TInterval
+	}
+	if varying, _, ok := bitCastSpec(typ); ok {
+		if varying {
+			return bytdb.TVarBit
+		}
+		return bytdb.TBit
 	}
 	return bytdb.TString
 }

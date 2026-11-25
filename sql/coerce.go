@@ -128,6 +128,10 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 		return bytdb.ParseMoney(s)
 	case bytdb.TCIText:
 		return bytdb.CIText(s), nil
+	case bytdb.TBit, bytdb.TVarBit:
+		// No length here: a comparison takes the bits as written, and a
+		// column write enforces its own (bit(n) exactly, varbit(n) at most).
+		return bytdb.ParseBits(s)
 	}
 	return s, nil
 }

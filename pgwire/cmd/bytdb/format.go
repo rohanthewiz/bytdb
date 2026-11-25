@@ -60,6 +60,10 @@ func typeName(t bytdb.ColType) string {
 		return "money"
 	case bytdb.TCIText:
 		return "citext"
+	case bytdb.TBit:
+		return "bit"
+	case bytdb.TVarBit:
+		return "bit varying"
 	}
 	return string(t)
 }
@@ -75,6 +79,10 @@ func columnTypeName(c bytdb.Column) string {
 		return bytdb.NumericTypeName(c)
 	case c.Type == bytdb.TInterval && c.IntervalTypmod != 0:
 		return "interval" + interval.FormatTypmod(c.IntervalTypmod)
+	case c.Type == bytdb.TBit:
+		return "bit(" + strconv.Itoa(bytdb.BitColumnLen(&c)) + ")"
+	case c.Type == bytdb.TVarBit && c.MaxLen > 0:
+		return "bit varying(" + strconv.Itoa(c.MaxLen) + ")"
 	}
 	return typeName(c.Type)
 }

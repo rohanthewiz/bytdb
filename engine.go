@@ -110,6 +110,13 @@ const (
 	// its tuple encoding keys the lowercase form ('ABC' and 'abc' are
 	// one key) and stores the text as written.
 	TCIText ColType = "citext"
+	// TBit and TVarBit are Postgres's bit(n) and bit varying(n) (N-053),
+	// riding on a string of '0'/'1' characters whose byte order is the
+	// bit strings' order (see bits.go). Column.MaxLen is n: bit(n) takes
+	// exactly n bits (0 reads as bit(1), the bare "bit"), bit varying(n)
+	// at most n (0: unlimited).
+	TBit    ColType = "bit"
+	TVarBit ColType = "varbit"
 )
 
 // CIText is the runtime value of a TCIText column (see package citext):
@@ -175,7 +182,8 @@ type Column struct {
 	// (0 = unbounded). Enforced on every insert and update with
 	// Postgres semantics: overflow errors, except overflow that is all
 	// spaces, which truncates silently (the SQL standard's one
-	// concession). Only valid on string columns.
+	// concession). Valid on string columns, and as the n of bit(n) and
+	// bit varying(n) (see TBit).
 	MaxLen int `json:"max_len,omitempty"`
 	// Precision and Scale are a numeric column's numeric(p, s) typmod.
 	// Precision 0 means unconstrained (plain numeric: any value, scale

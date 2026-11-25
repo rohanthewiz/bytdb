@@ -35,6 +35,8 @@ const (
 	oidJSONB       = 3802
 	oidInterval    = 1186
 	oidMoney       = 790
+	oidBit         = 1560
+	oidVarBit      = 1562
 )
 
 // Postgres's date/time binary formats count from 2000-01-01 rather
@@ -81,6 +83,10 @@ func oidForType(t bytdb.ColType) uint32 {
 		return oidMoney
 	case bytdb.TCIText:
 		return bytdb.CITextOID
+	case bytdb.TBit:
+		return oidBit
+	case bytdb.TVarBit:
+		return oidVarBit
 	}
 	return oidText
 }
@@ -223,6 +229,14 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 			}
 			return appendIntervalBinary(dst, x), nil
 		}
+	case bytdb.TBit, bytdb.TVarBit:
+		// The '0'/'1' text, or bit_send's length-prefixed packed bits.
+		if x, ok := v.(string); ok {
+			if format == fmtText {
+				return append(dst, x...), nil
+			}
+			return bytdb.BitsAppendBinary(dst, x), nil
+		}
 	case bytdb.TCIText:
 		// citext's text and binary forms are both the text's bytes
 		// (citext_send is textsend).
@@ -308,6 +322,9 @@ func kindFits(v any, t bytdb.ColType) bool {
 		return ok
 	case bytdb.TCIText:
 		_, ok := v.(bytdb.CIText)
+		return ok
+	case bytdb.TBit, bytdb.TVarBit:
+		_, ok := v.(string)
 		return ok
 	}
 	return true
@@ -415,6 +432,8 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			return bytdb.ParseInterval(s)
 		case bytdb.CITextOID:
 			return bytdb.CIText(s), nil
+		case oidBit, oidVarBit:
+			return bytdb.ParseBits(s)
 		case oidMoney:
 			// Kept as money text: the SQL layer reads an integer bound to
 			// money as whole units (Postgres's int-to-money cast), so cents
@@ -497,6 +516,8 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 		return decodeIntervalBinary(raw)
 	case bytdb.CITextOID:
 		return bytdb.CIText(raw), nil // citext_recv is textrecv
+	case oidBit, oidVarBit:
+		return bytdb.BitsFromBinary(raw)
 	case oidMoney:
 		// cash_recv: the cents as an int8, handed on as exact money text
 		// for the reason above.

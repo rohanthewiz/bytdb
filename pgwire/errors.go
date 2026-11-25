@@ -119,7 +119,7 @@ func sqlstate(msg string, hasPos bool) string {
 		return "22P02" // invalid_text_representation
 	// Arithmetic range and domain errors, numeric's (N-048) and the
 	// integer ones that predate it, which used to fall through to XX000.
-	case msg == "bigint out of range",
+	case msg == "bigint out of range", msg == "integer out of range",
 		msg == "numeric field overflow",
 		msg == "value overflows numeric format",
 		msg == "money out of range",
@@ -155,6 +155,23 @@ func sqlstate(msg string, hasPos bool) string {
 		msg == "timestamp out of range",
 		msg == "cannot subtract infinite timestamps":
 		return "22008" // datetime_field_overflow
+	// Bit strings (N-053): bit_in's digit errors, the length rules of
+	// bit(n) (exact) and bit varying(n) (at most), the bitwise operators'
+	// equal-size rule, and get_bit/set_bit's arguments.
+	case strings.HasSuffix(msg, `is not a valid binary digit`),
+		strings.HasSuffix(msg, `is not a valid hexadecimal digit`):
+		return "22P02" // invalid_text_representation
+	case strings.HasPrefix(msg, "bit string length ") && strings.Contains(msg, " does not match type bit("),
+		strings.HasPrefix(msg, "cannot AND bit strings"),
+		strings.HasPrefix(msg, "cannot OR bit strings"),
+		strings.HasPrefix(msg, "cannot XOR bit strings"):
+		return "22026" // string_data_length_mismatch
+	case strings.HasPrefix(msg, "bit string too long for type bit varying("):
+		return "22001" // string_data_right_truncation
+	case strings.HasPrefix(msg, "bit index ") && strings.Contains(msg, " out of valid range"):
+		return "2202E" // array_subscript_error
+	case msg == "new bit must be 0 or 1":
+		return "22023" // invalid_parameter_value
 	// A negative (or NaN) RANGE frame offset, numeric or interval.
 	case msg == "invalid preceding or following size in window function":
 		return "22013" // invalid_preceding_or_following_size

@@ -551,6 +551,12 @@ func typedLitText(v any, t bytdb.ColType) (string, bool) {
 			return "", false
 		}
 		txt = strings.ReplaceAll(string(c), "'", "''")
+	case bytdb.TBit, bytdb.TVarBit:
+		b, ok := v.(string)
+		if !ok {
+			return "", false
+		}
+		txt = b
 	default:
 		return "", false
 	}

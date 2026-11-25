@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -282,6 +283,45 @@ func textArgs(ret bytdb.ColType, intArgs ...int) func(f *funcCall) (bytdb.ColTyp
 			}
 		}
 		return ret, nil
+	}
+}
+
+// bitFunc types a function whose first argument is a bit string (an
+// untyped literal read as one) and whose arguments at intArgs are
+// integers, returning ret.
+func bitFunc(ret bytdb.ColType, intArgs ...int) func(f *funcCall) (bytdb.ColType, error) {
+	return func(f *funcCall) (bytdb.ColType, error) {
+		for i, t := range f.types {
+			switch {
+			case slices.Contains(intArgs, i):
+				if t != bytdb.TInt && t != tyNull && t != tyUnknown {
+					return "", noFunc(f.name, f.types)
+				}
+				if t == tyUnknown {
+					f.castArg(i, "bigint")
+				}
+			case bitType(t) || t == tyNull:
+			case t == tyUnknown:
+				f.castArg(i, "varbit")
+			default:
+				return "", noFunc(f.name, f.types)
+			}
+		}
+		return ret, nil
+	}
+}
+
+// bitOrText types a text function that also takes bit strings: when its
+// first argument is one, every non-integer argument must be one (an
+// untyped literal read as one) and the result is bitRet; otherwise the
+// text typing applies.
+func bitOrText(text func(*funcCall) (bytdb.ColType, error), bitRet bytdb.ColType, intArgs ...int) func(*funcCall) (bytdb.ColType, error) {
+	bits := bitFunc(bitRet, intArgs...)
+	return func(f *funcCall) (bytdb.ColType, error) {
+		if len(f.types) > 0 && bitType(f.types[0]) {
+			return bits(f)
+		}
+		return text(f)
 	}
 }
 
@@ -665,7 +705,9 @@ func init() {
 		"least":    {min: 1, max: -1, nullSafe: true, eval: extremum(false)},
 
 		// --- strings ---
-		"substring": {min: 2, max: 3, typ: textArgs(bytdb.TString, 1, 2), eval: func(a []any) (any, error) {
+		// substring of a bit string is a bit string (Postgres's bitsubstr
+		// returns bit): the same positions over its '0'/'1' text (N-053).
+		"substring": {min: 2, max: 3, typ: bitOrText(textArgs(bytdb.TString, 1, 2), bytdb.TBit, 1, 2), eval: func(a []any) (any, error) {
 			r := runes(str(a[0]))
 			from, err := intArg(a[1])
 			if err != nil {
@@ -717,7 +759,8 @@ func init() {
 		"ltrim":   {min: 1, max: 2, typ: textArgs(bytdb.TString), eval: trimFn(true, false)},
 		"rtrim":   {min: 1, max: 2, typ: textArgs(bytdb.TString), eval: trimFn(false, true)},
 		"replace": {min: 3, max: 3, typ: textArgs(bytdb.TString), eval: func(a []any) (any, error) { return strings.ReplaceAll(str(a[0]), str(a[1]), str(a[2])), nil }},
-		"strpos": {min: 2, max: 2, typ: textArgs(bytdb.TInt), eval: func(a []any) (any, error) {
+		// strpos is also POSITION(b IN a) — for bit strings too (N-053).
+		"strpos": {min: 2, max: 2, typ: bitOrText(textArgs(bytdb.TInt), bytdb.TInt), eval: func(a []any) (any, error) {
 			s, sub := str(a[0]), str(a[1])
 			i := strings.Index(s, sub)
 			if i < 0 {
@@ -812,6 +855,19 @@ func init() {
 				return nil, serr.New("requested character too large for encoding")
 			}
 			return string(rune(n)), nil
+		}},
+		// bit_length of text or bytea is 8 bits per byte. Over a bit
+		// string the typing pass rewrites it to the bit count first.
+		"bit_length": {min: 1, max: 1, typ: func(f *funcCall) (bytdb.ColType, error) {
+			if t := f.types[0]; !textOrUnknown(t) && t != bytdb.TBytes {
+				return "", noFunc(f.name, f.types)
+			}
+			return bytdb.TInt, nil
+		}, eval: func(a []any) (any, error) {
+			if b, ok := a[0].([]byte); ok {
+				return 8 * int64(len(b)), nil
+			}
+			return 8 * int64(len(str(a[0]))), nil
 		}},
 		"octet_length": {min: 1, max: 1, typ: func(f *funcCall) (bytdb.ColType, error) {
 			if t := f.types[0]; !textOrUnknown(t) && t != bytdb.TBytes {
@@ -912,6 +968,42 @@ func init() {
 			return toChar(micros, str(a[1])), nil
 		}},
 		// to_timestamp(seconds since the epoch).
+		// --- bit strings (N-053): the values are '0'/'1' text ---
+		"get_bit": {min: 2, max: 2, typ: bitFunc(bytdb.TInt, 1), eval: func(a []any) (any, error) {
+			b := a[0].(string)
+			n, err := intArg(a[1])
+			if err != nil {
+				return nil, err
+			}
+			if n < 0 || n >= int64(len(b)) {
+				return nil, serr.New(fmt.Sprintf("bit index %d out of valid range (0..%d)", n, len(b)-1))
+			}
+			return int64(b[n] - '0'), nil
+		}},
+		"set_bit": {min: 3, max: 3, typ: bitFunc(bytdb.TBit, 1, 2), eval: func(a []any) (any, error) {
+			b := a[0].(string)
+			n, err := intArg(a[1])
+			if err != nil {
+				return nil, err
+			}
+			v, err := intArg(a[2])
+			if err != nil {
+				return nil, err
+			}
+			if n < 0 || n >= int64(len(b)) {
+				return nil, serr.New(fmt.Sprintf("bit index %d out of valid range (0..%d)", n, len(b)-1))
+			}
+			if v != 0 && v != 1 {
+				return nil, serr.New("new bit must be 0 or 1")
+			}
+			out := []byte(b)
+			out[n] = '0' + byte(v)
+			return string(out), nil
+		}},
+		"bit_count": {min: 1, max: 1, typ: bitFunc(bytdb.TInt), eval: func(a []any) (any, error) {
+			return int64(strings.Count(a[0].(string), "1")), nil
+		}},
+
 		// --- money (N-053) ---
 		"cash_words": {min: 1, max: 1, typ: func(f *funcCall) (bytdb.ColType, error) {
 			switch f.types[0] {
