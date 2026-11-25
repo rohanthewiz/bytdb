@@ -98,6 +98,12 @@ const (
 	// written. Column.IntervalTypmod carries a declaration such as
 	// interval day to second(3).
 	TInterval ColType = "interval"
+	// TMoney is Postgres's money (N-053): a whole number of cents in an
+	// int64, the way timestamps ride on int64 microseconds, so keys and
+	// comparisons need nothing new. Its text ($1,234.56), its arithmetic
+	// (money × float8 rounds back to cents, money / money is float8) and
+	// its casts are the SQL layer's, through the helpers in money.go.
+	TMoney ColType = "money"
 )
 
 // Interval is the runtime value of a TInterval column (see package

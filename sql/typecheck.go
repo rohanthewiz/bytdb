@@ -105,6 +105,8 @@ func pgTypeName(t bytdb.ColType) string {
 		return "numeric"
 	case bytdb.TInterval:
 		return "interval"
+	case bytdb.TMoney:
+		return "money"
 	case tyUnknown:
 		return "unknown"
 	}
@@ -783,6 +785,26 @@ func (t *typer) value(v any, col bytdb.Column, ts *tscope) (any, error) {
 			return interval.ParseTypmod(s, col.IntervalTypmod)
 		}
 	}
+	// A number assigned to money is whole units (N-053), and a
+	// money column's runtime value is cents, so a typed integer or
+	// numeric expression gets Postgres's assignment cast; float8 has
+	// none. (Untyped literals and bare constants convert below, in
+	// coerceLit.)
+	if ct == bytdb.TMoney {
+		if e, ok := v.(Expr); ok {
+			ex, typ, err := t.expr(e, ts)
+			if err != nil {
+				return nil, err
+			}
+			switch typ {
+			case bytdb.TInt, bytdb.TNumeric:
+				return &ExCast{E: ex, Type: "money", From: typ}, nil
+			case bytdb.TFloat:
+				return nil, serr.New(`column "`+col.Name+`" is of type money but expression is of type double precision`,
+					"hint", "You will need to rewrite or cast the expression.")
+			}
+		}
+	}
 	switch x := v.(type) {
 	case defaultMarker:
 		return v, nil
@@ -802,6 +824,9 @@ func (t *typer) value(v any, col bytdb.Column, ts *tscope) (any, error) {
 			t.note(x, ct)
 		}
 		return v, nil
+	}
+	if ct == bytdb.TMoney {
+		return moneyAssign(v) // a constant: numbers are whole units
 	}
 	return coerceLit(v, ct)
 }
@@ -1937,6 +1962,8 @@ func (t *typer) arith(n *ExArith, ts *tscope) (Expr, bytdb.ColType, error) {
 		return rebuiltKind(arithTsMinusTs, bytdb.TInterval)
 	case lt == bytdb.TInterval || rt == bytdb.TInterval:
 		return t.intervalArith(n, l, lt, r, rt, rebuilt, rebuiltKind)
+	case lt == bytdb.TMoney || rt == bytdb.TMoney:
+		return moneyArith(n.Op, l, lt, r, rt)
 	case temporalType(lt) || temporalType(rt):
 		// timestamp + integer is the plan's decision Q1: refused as in
 		// Postgres rather than read as microseconds.
@@ -1961,8 +1988,48 @@ func unknownArithTarget(sib bytdb.ColType, op string) bytdb.ColType {
 		if op == "*" || op == "/" {
 			return bytdb.TFloat
 		}
+	case bytdb.TMoney:
+		// money * '2' scales (money has no money * money); money / '2'
+		// is money / money, the same-type rule.
+		if op == "*" {
+			return bytdb.TFloat
+		}
 	}
 	return sib
+}
+
+// moneyArith types the arithmetic operators with a money operand
+// (N-053), as Postgres defines them:
+//
+//	money ± money                                   money
+//	money * integer, integer * money, money / integer   money (exact on cents)
+//	money * float8, float8 * money, money / float8  money (rounded to cents)
+//	money / money                                   float8
+//
+// A numeric operand converts to float8 first, as Postgres's implicit
+// numeric-to-float8 cast makes money * 1.5 resolve. There is no unary
+// minus and nothing else ("operator does not exist").
+func moneyArith(op string, l Expr, lt bytdb.ColType, r Expr, rt bytdb.ColType) (Expr, bytdb.ColType, error) {
+	toFloat := func(e Expr, t bytdb.ColType) Expr {
+		if t == bytdb.TNumeric {
+			return &ExCast{E: e, Type: "float8", From: t}
+		}
+		return e
+	}
+	fl := func(t bytdb.ColType) bool { return t == bytdb.TFloat || t == bytdb.TNumeric }
+	switch {
+	case lt == bytdb.TMoney && rt == bytdb.TMoney && (op == "+" || op == "-"):
+		return &ExArith{Op: op, L: l, R: r, Kind: arithMoney}, bytdb.TMoney, nil
+	case lt == bytdb.TMoney && rt == bytdb.TMoney && op == "/":
+		return &ExArith{Op: op, L: l, R: r, Kind: arithMoneyDiv}, bytdb.TFloat, nil
+	case lt == bytdb.TMoney && rt == bytdb.TInt && (op == "*" || op == "/"),
+		lt == bytdb.TInt && rt == bytdb.TMoney && op == "*":
+		return &ExArith{Op: op, L: l, R: r, Kind: arithMoney}, bytdb.TMoney, nil
+	case lt == bytdb.TMoney && fl(rt) && (op == "*" || op == "/"),
+		fl(lt) && rt == bytdb.TMoney && op == "*":
+		return &ExArith{Op: op, L: toFloat(l, lt), R: toFloat(r, rt), Kind: arithMoneyFloat}, bytdb.TMoney, nil
+	}
+	return nil, "", noOperator(op, lt, rt)
 }
 
 // intervalArith types the arithmetic operators with an interval operand

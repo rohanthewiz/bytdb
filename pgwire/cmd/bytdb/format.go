@@ -56,6 +56,8 @@ func typeName(t bytdb.ColType) string {
 		return "numeric"
 	case bytdb.TInterval:
 		return "interval"
+	case bytdb.TMoney:
+		return "money"
 	}
 	return string(t)
 }
@@ -86,7 +88,7 @@ func shortTypeName(t bytdb.ColType) string {
 
 // isNumeric reports whether a column type right-aligns in box output.
 func isNumeric(t bytdb.ColType) bool {
-	return t == bytdb.TInt || t == bytdb.TFloat || t == bytdb.TNumeric
+	return t == bytdb.TInt || t == bytdb.TFloat || t == bytdb.TNumeric || t == bytdb.TMoney
 }
 
 // displayValue renders v for a human. ok is false for SQL NULL, so each
@@ -109,6 +111,10 @@ func displayValue(v any, t bytdb.ColType) (s string, ok bool) {
 	case bytdb.TUUID:
 		if x, ok := v.([]byte); ok && len(x) == 16 {
 			return bytdb.FormatUUID(x), true
+		}
+	case bytdb.TMoney:
+		if x, ok := v.(int64); ok {
+			return bytdb.FormatMoney(x), true
 		}
 	}
 	switch x := v.(type) {
@@ -181,8 +187,8 @@ func sqlLiteral(v any, t bytdb.ColType) string {
 		}
 		return "false"
 	case int64:
-		if t == bytdb.TTimestamp || t == bytdb.TDate {
-			break // an int64 instant must be spelled as its text form
+		if t == bytdb.TTimestamp || t == bytdb.TDate || t == bytdb.TMoney {
+			break // an instant or an amount of cents is spelled as its text
 		}
 		return strconv.FormatInt(x, 10)
 	case float64:
@@ -243,7 +249,7 @@ func jsonValue(v any, t bytdb.ColType) string {
 		}
 		return "false"
 	case int64:
-		if t != bytdb.TTimestamp && t != bytdb.TDate {
+		if t != bytdb.TTimestamp && t != bytdb.TDate && t != bytdb.TMoney {
 			return strconv.FormatInt(x, 10)
 		}
 	case float64:

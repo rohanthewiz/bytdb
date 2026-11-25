@@ -539,6 +539,12 @@ func typedLitText(v any, t bytdb.ColType) (string, bool) {
 			return "", false
 		}
 		txt = iv.String()
+	case bytdb.TMoney:
+		n, ok := v.(int64)
+		if !ok {
+			return "", false
+		}
+		txt = bytdb.FormatMoney(n)
 	default:
 		return "", false
 	}
@@ -551,7 +557,7 @@ func typedLitText(v any, t bytdb.ColType) (string, bool) {
 // uuids 16 bytes at runtime (litFits pushes exactly those).
 func placeholderVal(t bytdb.ColType) any {
 	switch t {
-	case bytdb.TInt, bytdb.TTimestamp, bytdb.TDate:
+	case bytdb.TInt, bytdb.TTimestamp, bytdb.TDate, bytdb.TMoney:
 		return int64(0)
 	case bytdb.TFloat:
 		return 0.0

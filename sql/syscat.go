@@ -230,6 +230,8 @@ func typeOID(t bytdb.ColType) int64 {
 		return 1700
 	case bytdb.TInterval:
 		return pgInterval
+	case bytdb.TMoney:
+		return 790
 	}
 	return 25 // text
 }
@@ -242,7 +244,7 @@ func typeLen(t bytdb.ColType) int64 {
 	switch t {
 	case bytdb.TBool:
 		return 1
-	case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp:
+	case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp, bytdb.TMoney:
 		return 8
 	case bytdb.TDate:
 		return 4
@@ -277,6 +279,8 @@ func sqlTypeName(t bytdb.ColType) string {
 		return "numeric"
 	case bytdb.TInterval:
 		return "interval"
+	case bytdb.TMoney:
+		return "money"
 	}
 	return "text"
 }
@@ -307,6 +311,8 @@ func udtName(t bytdb.ColType) string {
 		return "numeric"
 	case bytdb.TInterval:
 		return "interval"
+	case bytdb.TMoney:
+		return "money"
 	}
 	return "text"
 }
@@ -610,7 +616,7 @@ var sysTables = map[string]*sysTableDef{
 				{1082, "date", 4, "D"}, {1114, "timestamp", 8, "D"},
 				{1184, "timestamptz", 8, "D"}, {2950, "uuid", 16, "U"},
 				{3802, "jsonb", -1, "U"}, {1700, "numeric", -1, "N"},
-				{pgInterval, "interval", 16, "T"},
+				{pgInterval, "interval", 16, "T"}, {790, "money", 8, "N"},
 			} {
 				rows = append(rows, []any{t.oid, t.name, oidPGCatalog, t.len, "b", t.cat, int64(0)})
 			}

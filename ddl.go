@@ -14,7 +14,7 @@ import (
 var validTypes = map[ColType]bool{
 	TBool: true, TInt: true, TFloat: true, TString: true, TBytes: true,
 	TTimestamp: true, TDate: true, TUUID: true, TTextArray: true,
-	TJSONB: true, TNumeric: true, TInterval: true,
+	TJSONB: true, TNumeric: true, TInterval: true, TMoney: true,
 }
 
 // CreateTable registers a table. pk names the primary-key columns in

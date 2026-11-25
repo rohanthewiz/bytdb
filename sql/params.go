@@ -525,7 +525,7 @@ func bindExpr(e Expr, b *binder) Expr {
 		}
 		return &c
 	case *ExArith:
-		return &ExArith{Op: n.Op, L: bindExpr(n.L, b), R: bindExpr(n.R, b)}
+		return &ExArith{Op: n.Op, L: bindExpr(n.L, b), R: bindExpr(n.R, b), Kind: n.Kind}
 	case *ExSub:
 		return &ExSub{Sel: bindSelect(n.Sel, b)}
 	}

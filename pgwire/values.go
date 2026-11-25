@@ -34,6 +34,7 @@ const (
 	oidJSON        = 114  // accepted on input; columns present as jsonb
 	oidJSONB       = 3802
 	oidInterval    = 1186
+	oidMoney       = 790
 )
 
 // Postgres's date/time binary formats count from 2000-01-01 rather
@@ -76,6 +77,8 @@ func oidForType(t bytdb.ColType) uint32 {
 		return oidNumeric
 	case bytdb.TInterval:
 		return oidInterval
+	case bytdb.TMoney:
+		return oidMoney
 	}
 	return oidText
 }
@@ -86,7 +89,7 @@ func typeSize(t bytdb.ColType) int {
 	switch t {
 	case bytdb.TBool:
 		return 1
-	case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp:
+	case bytdb.TInt, bytdb.TFloat, bytdb.TTimestamp, bytdb.TMoney:
 		return 8
 	case bytdb.TDate:
 		return 4
@@ -218,6 +221,14 @@ func appendValue(dst []byte, v any, format int, t bytdb.ColType) ([]byte, error)
 			}
 			return appendIntervalBinary(dst, x), nil
 		}
+	case bytdb.TMoney:
+		// Cents: cash_out's text, or cash_send's int8.
+		if x, ok := v.(int64); ok {
+			if format == fmtText {
+				return bytdb.AppendMoney(dst, x), nil
+			}
+			return binary.BigEndian.AppendUint64(dst, uint64(x)), nil
+		}
 	}
 	return appendByKind(dst, v, format)
 }
@@ -266,7 +277,7 @@ func kindFits(v any, t bytdb.ColType) bool {
 	case bytdb.TBool:
 		_, ok := v.(bool)
 		return ok
-	case bytdb.TInt, bytdb.TTimestamp, bytdb.TDate:
+	case bytdb.TInt, bytdb.TTimestamp, bytdb.TDate, bytdb.TMoney:
 		_, ok := v.(int64)
 		return ok
 	case bytdb.TFloat:
@@ -387,6 +398,15 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 			return bytdb.ParseDecimal(s)
 		case oidInterval:
 			return bytdb.ParseInterval(s)
+		case oidMoney:
+			// Kept as money text: the SQL layer reads an integer bound to
+			// money as whole units (Postgres's int-to-money cast), so cents
+			// decoded here would be multiplied again. Text is unambiguous,
+			// and the parse below only rejects bad input early.
+			if _, err := bytdb.ParseMoney(s); err != nil {
+				return nil, err
+			}
+			return s, nil
 		}
 		return s, nil
 	}
@@ -458,6 +478,13 @@ func decodeParam(raw []byte, format int, oid uint32) (any, error) {
 		return decodeNumericBinary(raw)
 	case oidInterval:
 		return decodeIntervalBinary(raw)
+	case oidMoney:
+		// cash_recv: the cents as an int8, handed on as exact money text
+		// for the reason above.
+		if len(raw) != 8 {
+			return nil, serr.New("bad binary money parameter")
+		}
+		return bytdb.FormatMoney(int64(binary.BigEndian.Uint64(raw))), nil
 	}
 	return nil, serr.New("unsupported binary parameter type", "oid", fmt.Sprint(oid))
 }

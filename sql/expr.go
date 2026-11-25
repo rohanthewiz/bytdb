@@ -265,6 +265,8 @@ func evalEx(env *exEnv, e Expr) (any, error) {
 		switch n.Kind {
 		case arithTsMinusTs, arithTsInterval, arithIntervalNeg:
 			return timeArith(n.Kind, n.Op, l, r)
+		case arithMoney, arithMoneyFloat, arithMoneyDiv:
+			return moneyEval(n.Kind, n.Op, l, r)
 		}
 		return arith(n.Op, l, r)
 	case *ExAgg:
@@ -917,6 +919,52 @@ func intervalArith(op string, iv bytdb.Interval, other any) (any, error) {
 	return nil, serr.New("operator does not exist: interval "+op+" number", "op", op)
 }
 
+// moneyEval evaluates the operators typing marked as money ones (see
+// arithKind and moneyArith): money values are int64 cents.
+func moneyEval(kind arithKind, op string, l, r any) (any, error) {
+	switch kind {
+	case arithMoneyDiv:
+		a, aok := l.(int64)
+		b, bok := r.(int64)
+		if !aok || !bok {
+			return nil, serr.New("money operands expected", "op", op)
+		}
+		return bytdb.MoneyDivMoney(a, b)
+	case arithMoneyFloat:
+		// money * f, f * money, money / f.
+		c, cok := l.(int64)
+		other := r
+		if !cok {
+			c, cok = r.(int64)
+			other = l
+		}
+		f, fok := asFloat(other)
+		if !cok || !fok {
+			return nil, serr.New("money and float operands expected", "op", op)
+		}
+		if op == "/" {
+			return bytdb.MoneyDivFloat(c, f)
+		}
+		return bytdb.MoneyMulFloat(c, f)
+	}
+	a, aok := l.(int64)
+	b, bok := r.(int64)
+	if !aok || !bok {
+		return nil, serr.New("money operands expected", "op", op)
+	}
+	switch op {
+	case "+":
+		return bytdb.MoneyAdd(a, b)
+	case "-":
+		return bytdb.MoneySub(a, b)
+	case "*":
+		return bytdb.MoneyMulInt(a, b)
+	case "/":
+		return bytdb.MoneyDivInt(a, b)
+	}
+	return nil, serr.New("unhandled money operator", "op", op)
+}
+
 // timeArith evaluates the operators typing marked as timestamp/interval
 // ones (see arithKind): timestamp values are int64 microseconds.
 func timeArith(kind arithKind, op string, l, r any) (any, error) {
@@ -1054,6 +1102,10 @@ func typedText(v any, t bytdb.ColType) string {
 		if x, ok := v.([]byte); ok && len(x) == 16 {
 			return bytdb.FormatUUID(x)
 		}
+	case bytdb.TMoney:
+		if x, ok := v.(int64); ok {
+			return bytdb.FormatMoney(x)
+		}
 	}
 	return valText(v)
 }
@@ -1104,6 +1156,19 @@ func castValFrom(env *exEnv, v any, from bytdb.ColType, typ string) (any, error)
 	case (to == bytdb.TInt || to == bytdb.TFloat) && temporalType(from):
 		// Postgres has no cast from date or timestamp to a number; the
 		// runtime value would silently be the day or microsecond count.
+		return nil, serr.New("cannot cast type " + pgTypeName(from) + " to " + pgTypeName(to))
+	// money (N-053): its runtime value is cents, so a cast out of it
+	// must say what the cents mean. money -> numeric is the amount
+	// (scale 2), money -> money is the value itself (castVal would read
+	// an int64 as whole units), and Postgres has no money -> integer or
+	// float8 cast, nor float8 -> money.
+	case from == bytdb.TMoney && to == bytdb.TMoney:
+		return v, nil
+	case from == bytdb.TMoney && to == bytdb.TNumeric:
+		if c, ok := v.(int64); ok {
+			return castToNumeric(bytdb.MoneyToDecimal(c), typ)
+		}
+	case from == bytdb.TMoney || (to == bytdb.TMoney && from == bytdb.TFloat):
 		return nil, serr.New("cannot cast type " + pgTypeName(from) + " to " + pgTypeName(to))
 	}
 	return castVal(env, v, typ)
@@ -1265,6 +1330,15 @@ func castVal(env *exEnv, v any, typ string) (any, error) {
 	}
 	if tm, ok := intervalCastTypmod(typ); ok {
 		return castToInterval(v, tm)
+	}
+	if typ == "money" {
+		// An untyped or numeric source: text is money text, a number is
+		// whole units (see moneyAssign). A money source never gets here:
+		// castValFrom passes it through.
+		if v == nil {
+			return nil, nil
+		}
+		return moneyAssign(v)
 	}
 	return nil, serr.New("unsupported cast", "type", typ)
 }
@@ -1577,6 +1651,8 @@ func formatType(typid, typmod any) any {
 		name = "uuid"
 	case 3802:
 		name = "jsonb"
+	case 790:
+		name = "money"
 	case 1186:
 		// interval's typmod is Postgres's own packing of field range and
 		// precision (see interval.Typmod).
@@ -1745,14 +1821,18 @@ func runScalarSub(env *exEnv, sel *Select) (any, error) {
 				return nil, err
 			}
 			t := fp.sc.column(ord).Type
-			if (it.Agg == AggSum || it.Agg == AggAvg) && !numericType(t) && t != bytdb.TInterval {
+			if err := aggArgCheck(it.Agg, t, ""); err != nil {
+				return nil, err // avg(money), as Postgres words it
+			}
+			if (it.Agg == AggSum || it.Agg == AggAvg) && !numericType(t) && t != bytdb.TInterval && t != bytdb.TMoney {
 				return nil, serr.New(it.Agg.name()+" requires a numeric column",
 					"column", it.Col.String())
 			}
 			if err := aggArgCheck(it.Agg, t, ""); err != nil {
 				return nil, err
 			}
-			acc.ord, acc.intSum, acc.numArg = ord, t == bytdb.TInt, t == bytdb.TNumeric
+			acc.ord, acc.intSum, acc.numArg = ord, intSumType(t), t == bytdb.TNumeric
+			acc.money = t == bytdb.TMoney
 			acc.spec = &accumSpec{elemType: t} // array_agg renders by it
 		} else if it.Agg != AggCount {
 			return nil, serr.New("only COUNT takes *", "function", it.Agg.name())
@@ -2216,6 +2296,14 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 		// a timestamp or date the result is a timestamp, otherwise an
 		// interval; timestamp - timestamp is an interval.
 		switch {
+		case n.Kind == arithMoneyDiv:
+			return bytdb.TFloat
+		case n.Kind == arithMoney || n.Kind == arithMoneyFloat:
+			return bytdb.TMoney
+		case lt == bytdb.TMoney && rt == bytdb.TMoney && n.Op == "/":
+			return bytdb.TFloat
+		case lt == bytdb.TMoney || rt == bytdb.TMoney:
+			return bytdb.TMoney
 		case n.Kind == arithIntervalNeg || n.Kind == arithTsMinusTs:
 			return bytdb.TInterval
 		case n.Kind == arithTsInterval:
@@ -2247,6 +2335,9 @@ func exprType(sc *scope, e Expr) bytdb.ColType {
 func sumAvgType(fn AggFunc, arg bytdb.ColType) bytdb.ColType {
 	if arg == bytdb.TInterval && (fn == AggSum || fn == AggAvg) {
 		return bytdb.TInterval // interval totals and averages (N-053)
+	}
+	if arg == bytdb.TMoney && fn == AggSum {
+		return bytdb.TMoney // money totals; avg(money) does not exist (aggArgCheck)
 	}
 	switch fn {
 	case AggSum:
@@ -2332,6 +2423,8 @@ func castColType(typ string) bytdb.ColType {
 		return bytdb.TDate
 	case "uuid":
 		return bytdb.TUUID
+	case "money":
+		return bytdb.TMoney
 	case "json", "jsonb":
 		return bytdb.TJSONB
 	case "text[]", "varchar[]", "character varying[]":

@@ -805,6 +805,21 @@ func coerce(v any, t ColType) (any, error) {
 		if ok {
 			return d, nil
 		}
+	case TMoney:
+		// The Go API's money value is cents (see money.go): a Go integer
+		// is cents, a Decimal is currency units, text is money text. A
+		// float has no money meaning that survives rounding (Postgres
+		// has no float8-to-money cast either), so it is refused.
+		switch x := v.(type) {
+		case int64:
+			return x, nil
+		case Decimal:
+			return MoneyFromDecimal(x)
+		case string:
+			return ParseMoney(x)
+		case []byte:
+			return ParseMoney(string(x))
+		}
 	case TInterval:
 		// time.Duration is matched here, before NormalizeValue would
 		// reduce it to a bare int64 (which no interval reads as: an

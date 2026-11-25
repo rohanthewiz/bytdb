@@ -1101,6 +1101,29 @@ func (d *DB) execInsert(s *Insert) (*Result, error) {
 				copy(row, r)
 				rows[i] = row
 			}
+			// A query column landing in a money column is converted as
+			// Postgres's assignment cast does (N-053): an integer or
+			// numeric is whole units, the runtime value is cents.
+			for j, qt := range qres.Types {
+				ord := j
+				if ords != nil {
+					ord = ords[j]
+				}
+				if ord >= len(desc.Columns) || desc.Columns[ord].Type != bytdb.TMoney || qt == bytdb.TMoney {
+					continue
+				}
+				if qt == bytdb.TFloat {
+					return serr.New(`column "`+desc.Columns[ord].Name+`" is of type money but expression is of type double precision`,
+						"hint", "You will need to rewrite or cast the expression.")
+				}
+				for _, row := range rows {
+					if j < len(row) && row[j] != nil {
+						if row[j], err = moneyAssign(row[j]); err != nil {
+							return err
+						}
+					}
+				}
+			}
 		}
 		// Without a column list, rows shorter than the table fill its
 		// first columns and the rest take their defaults — Postgres's

@@ -55,6 +55,7 @@ type accum struct {
 	distinct bool
 	seen     map[string]bool // per group; allocated by newGroup
 	intSum   bool
+	money    bool // the argument is money: an int64 total of cents, "money out of range" on overflow
 	sawFloat bool // a float value actually arrived at runtime
 	// hasDec: sumD holds part of the total — a numeric input arrived,
 	// or AVG's integer total outgrew int64 and was folded in (N-048).
@@ -179,6 +180,9 @@ func (a *accum) add(env *exEnv, vals []any) error {
 			// instead, and keeps going.
 			if (n > 0 && a.sumI > math.MaxInt64-n) || (n < 0 && a.sumI < math.MinInt64-n) {
 				if a.fn == AggSum && a.intSum && !a.sawDec {
+					if a.money {
+						return serr.New("money out of range")
+					}
 					return errIntRange()
 				}
 				if err := a.foldInt(); err != nil {
@@ -849,7 +853,8 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 			return 0, err
 		}
 		argType = exprType(q.sc, n.Arg)
-		a.argEx, a.intSum, a.numArg = n.Arg, argType == bytdb.TInt, argType == bytdb.TNumeric
+		a.argEx, a.intSum, a.numArg = n.Arg, intSumType(argType), argType == bytdb.TNumeric
+		a.money = argType == bytdb.TMoney
 		key = "e:" + txt
 	case !n.Star:
 		ord, err := q.sc.resolve(n.Col)
@@ -857,11 +862,15 @@ func (q *aggQuery) accumFor(n *ExAgg) (int, error) {
 			return 0, err
 		}
 		t := q.sc.column(ord).Type
-		if (n.Fn == AggSum || n.Fn == AggAvg) && !numericType(t) && t != bytdb.TInterval {
+		if err := aggArgCheck(n.Fn, t, ""); err != nil {
+			return 0, err // avg(money), as Postgres words it
+		}
+		if (n.Fn == AggSum || n.Fn == AggAvg) && !numericType(t) && t != bytdb.TInterval && t != bytdb.TMoney {
 			return 0, serr.New(n.Fn.name()+" requires a numeric column",
 				"column", n.Col.String(), "type", string(t))
 		}
-		a.ord, a.intSum, a.numArg = ord, t == bytdb.TInt, t == bytdb.TNumeric
+		a.ord, a.intSum, a.numArg = ord, intSumType(t), t == bytdb.TNumeric
+		a.money = t == bytdb.TMoney
 		argType = t
 		key = fmt.Sprintf("c%d", ord)
 	}
@@ -951,8 +960,16 @@ func (q *aggQuery) extendAccum(a *accumSpec, n *ExAgg, argType bytdb.ColType, ar
 // aggArgCheck refuses argument types an aggregate has no form for, in
 // Postgres's words (42883, "function string_agg(bigint, text) does not
 // exist"). An unknown type passes: the value is checked per row.
+// intSumType reports whether SUM over type t totals in int64: integers,
+// and money, whose runtime value is int64 cents (N-053).
+func intSumType(t bytdb.ColType) bool { return t == bytdb.TInt || t == bytdb.TMoney }
+
 func aggArgCheck(fn AggFunc, arg, sep bytdb.ColType) error {
 	switch fn {
+	case AggAvg:
+		if arg == bytdb.TMoney {
+			return noFunc(fn.name(), []bytdb.ColType{arg}) // as in Postgres
+		}
 	case AggStringAgg:
 		if concrete(arg) && arg != bytdb.TString || concrete(sep) && sep != bytdb.TString {
 			return noFunc(fn.name(), []bytdb.ColType{arg, sep})

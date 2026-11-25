@@ -522,3 +522,36 @@ INSERT INTO lease (k) VALUES ('00:00:00.000001');
 	}
 	mustContain(t, out, `"k":"-1 days +02:00:00"`, `"m":"00:05:00"`, `"k":"1 mon"`)
 }
+
+// TestDumpMoney (N-053): money columns dump as quoted money text (bare
+// digits would read back as dollars, not cents), a money key and a
+// money DEFAULT survive the round trip, and JSON renders money as a
+// string, as Postgres's to_json does.
+func TestDumpMoney(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src.bytdb"), filepath.Join(dir, "dst.bytdb")
+	if _, errOut, code := runShell(t, `
+CREATE TABLE acct (k money PRIMARY KEY, bal money DEFAULT 2.5);
+INSERT INTO acct VALUES ('$1,234.56', '(7)'), ('-0.01', NULL), ('-92233720368547758.08', '92233720368547758.07');
+INSERT INTO acct (k) VALUES (12);
+`, "-batch", src); code != 0 {
+		t.Fatalf("setup: code %d stderr %s", code, errOut)
+	}
+	dump, errOut, code := runShell(t, "", src, ".dump")
+	if code != 0 {
+		t.Fatalf("dump: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, dump, "k money", "bal money DEFAULT '$2.50'", "'-$0.01', NULL", "'$12.00', '$2.50'",
+		"'$1,234.56', '-$7.00'", "'-$92,233,720,368,547,758.08', '$92,233,720,368,547,758.07'")
+	if _, errOut, code = runShell(t, dump, "-batch", dst); code != 0 {
+		t.Fatalf("restore: code %d stderr %s", code, errOut)
+	}
+	if again, _, _ := runShell(t, "", dst, ".dump"); again != dump {
+		t.Errorf("dump of the restored database differs.\nfirst:\n%s\nsecond:\n%s", dump, again)
+	}
+	out, errOut, code := runShell(t, "", dst, "-json", "-c", "SELECT k, bal FROM acct ORDER BY k")
+	if code != 0 {
+		t.Fatalf("json: code %d stderr %s", code, errOut)
+	}
+	mustContain(t, out, `"k":"-$0.01"`, `"bal":"$2.50"`, `"k":"$1,234.56"`)
+}

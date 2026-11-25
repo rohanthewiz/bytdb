@@ -242,6 +242,13 @@ const (
 	arithTsMinusTs   // timestamp - timestamp: an interval
 	arithTsInterval  // timestamp ± interval, interval + timestamp: a timestamp
 	arithIntervalNeg // -interval (the parser's 0 - E)
+	// money (N-053) is an int64 of cents at runtime, so its operators
+	// are typed apart from bigint's: their overflow is "money out of
+	// range", a float factor rounds back to cents, and money / money is
+	// a float8 ratio rather than integer division.
+	arithMoney      // money ± money, money * / integer, integer * money
+	arithMoneyFloat // money * / float8 (or numeric), float8 * money
+	arithMoneyDiv   // money / money: float8
 )
 
 // ExSub is a scalar subquery, executed lazily per row with the

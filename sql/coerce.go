@@ -37,6 +37,27 @@ func coerceLitCol(v any, c *bytdb.Column) (any, error) {
 	return coerceLit(v, c.Type)
 }
 
+// moneyAssign converts a constant assigned to money (N-053): an integer
+// or numeric is whole units, as Postgres's int-to-money and
+// numeric-to-money casts read it (5 is $5.00, 1.255 is $1.26), text is
+// money text, and a float has no cast. The result is the runtime value,
+// cents. It is only for values that are still SQL constants or typed
+// integers being assigned — never for an already-evaluated money value,
+// which is an int64 of cents too and must not be multiplied again
+// (coerceLit, which runtime paths call, leaves numbers alone for that
+// reason).
+func moneyAssign(v any) (any, error) {
+	switch x := v.(type) {
+	case int64:
+		return bytdb.MoneyFromInt(x)
+	case bytdb.Decimal:
+		return bytdb.MoneyFromDecimal(x)
+	case float64:
+		return nil, serr.New("cannot cast type double precision to money")
+	}
+	return coerceLit(v, bytdb.TMoney)
+}
+
 // coerceLit converts a string value to a non-string column type's
 // value kind, per Postgres literal syntax. Non-strings and string
 // columns pass through. A bound time.Time converts here too — only
@@ -103,6 +124,8 @@ func coerceLit(v any, t bytdb.ColType) (any, error) {
 		return bytdb.CanonJSONB(s)
 	case bytdb.TInterval:
 		return bytdb.ParseInterval(s)
+	case bytdb.TMoney:
+		return bytdb.ParseMoney(s)
 	}
 	return s, nil
 }

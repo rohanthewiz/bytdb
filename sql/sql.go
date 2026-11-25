@@ -743,9 +743,20 @@ func renderDefault(v any, typ bytdb.ColType, colName string) (string, error) {
 		}
 		return string(ed), nil
 	}
-	cv, err := coerceLit(v, typ)
+	var cv any
+	var err error
+	if typ == bytdb.TMoney {
+		cv, err = moneyAssign(v) // DEFAULT 5 is $5.00
+	} else {
+		cv, err = coerceLit(v, typ)
+	}
 	if err != nil {
 		return "", serr.Wrap(err, "clause", "DEFAULT", "column", colName)
+	}
+	if c, ok := cv.(int64); ok && typ == bytdb.TMoney {
+		// Money text, quoted: bare digits would be cents to the engine
+		// and dollars to SQL.
+		return renderLit(bytdb.FormatMoney(c)), nil
 	}
 	if s, ok := v.(string); ok && typ == bytdb.TInterval {
 		// The text is stored as written: the engine reads it with the

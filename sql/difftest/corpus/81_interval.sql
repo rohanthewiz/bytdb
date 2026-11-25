@@ -108,6 +108,9 @@ select id, count(*) over (order by v range between interval '1 day' preceding an
 -- @error 22013
 select count(*) over (order by t range between interval '-1 day' preceding and current row) from ts;
 
+-- @ordered
+select id, t - timestamptz '2024-01-01 00:00+00', count(*) over () from ts where id < 5 order by id;
+
 -- Casts.
 select interval '1 day 02:00'::text, '1 day'::interval::text, cast('2 weeks' as interval), ('1 day'::interval)::interval hour;
 select interval '1 day' || ' later';

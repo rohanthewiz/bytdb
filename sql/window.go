@@ -206,7 +206,11 @@ func rewriteWindows(e Expr, sc *scope, out *[]*ExWindow) Expr {
 		}
 		return c
 	case *ExArith:
-		return &ExArith{Op: n.Op, L: rw(n.L), R: rw(n.R)}
+		// Kind is the typing pass's operator decision (jsonb, and the
+		// interval and money operators whose runtime operands are
+		// ambiguous); dropping it made a windowed SELECT evaluate
+		// timestamp - timestamp as bigint and money * 1.5 as float.
+		return &ExArith{Op: n.Op, L: rw(n.L), R: rw(n.R), Kind: n.Kind}
 	}
 	return e
 }
@@ -1247,9 +1251,10 @@ func assignAggFrame(env *exEnv, sc *scope, w *ExWindow, fr *framer, base [][]any
 	if w.Arg != nil {
 		argType = exprType(sc, w.Arg)
 	}
-	intSum, numArg := argType == bytdb.TInt, argType == bytdb.TNumeric
+	intSum, numArg := intSumType(argType), argType == bytdb.TNumeric
 	newAcc := func() *accum {
-		a := &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum, numArg: numArg, distinct: w.Distinct}
+		a := &accum{fn: w.Agg, ord: -1, argEx: w.Arg, intSum: intSum, numArg: numArg, distinct: w.Distinct,
+			money: argType == bytdb.TMoney}
 		if a.distinct {
 			// Dedup state is per accumulation: the anchored fast path
 			// reuses one accumulator over a growing frame (its seen set

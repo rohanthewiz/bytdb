@@ -438,6 +438,8 @@ func sqlTypeName(t ColType) string {
 		return "numeric"
 	case TInterval:
 		return "interval"
+	case TMoney:
+		return "money"
 	}
 	return string(t)
 }
@@ -488,6 +490,14 @@ func assignmentCast(from, to ColType) func(any) (any, error) {
 		return func(v any) (any, error) { return numericToFloat(v.(Decimal)), nil }
 	case from == TNumeric && to == TInt:
 		return func(v any) (any, error) { return numericToInt(v.(Decimal)) }
+	// money's assignment casts (N-053): to and from numeric, and from
+	// an integer (whole units: 5 is $5.00).
+	case from == TMoney && to == TNumeric:
+		return func(v any) (any, error) { return MoneyToDecimal(v.(int64)), nil }
+	case from == TNumeric && to == TMoney:
+		return func(v any) (any, error) { return MoneyFromDecimal(v.(Decimal)) }
+	case from == TInt && to == TMoney:
+		return func(v any) (any, error) { return MoneyFromInt(v.(int64)) }
 	case from == TDate && to == TTimestamp:
 		return func(v any) (any, error) {
 			days := v.(int64)
@@ -533,6 +543,8 @@ func castToText(v any, t ColType) (string, error) {
 		return v.(Decimal).String(), nil
 	case TInterval:
 		return v.(Interval).String(), nil
+	case TMoney:
+		return FormatMoney(v.(int64)), nil
 	}
 	return "", serr.New("no text form for column type", "type", string(t))
 }
@@ -586,6 +598,12 @@ func castDefault(oldCol, newCol *Column) (string, error) {
 		return "", fail(err)
 	}
 	var out string
+	if n, ok := v.(int64); ok && newCol.Type == TMoney {
+		// Money text, not the bare cents: a quoted '$5.00' reads the
+		// same through the engine and the SQL layer, where a bare 500
+		// would be cents to one and dollars to the other.
+		v = FormatMoney(n)
+	}
 	switch x := v.(type) {
 	case int64:
 		out = strconv.FormatInt(x, 10)

@@ -121,7 +121,10 @@ func sqlstate(msg string, hasPos bool) string {
 	// integer ones that predate it, which used to fall through to XX000.
 	case msg == "bigint out of range",
 		msg == "numeric field overflow",
-		msg == "value overflows numeric format":
+		msg == "value overflows numeric format",
+		msg == "money out of range",
+		msg == "value out of range: overflow",
+		strings.HasSuffix(msg, `is out of range for type money`):
 		return "22003" // numeric_value_out_of_range
 	case msg == "division by zero":
 		return "22012" // division_by_zero

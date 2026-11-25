@@ -5,7 +5,7 @@ references point at the proof.
 
 ## Column types
 
-Twelve storage types, with the Postgres aliases you'd expect
+Thirteen storage types, with the Postgres aliases you'd expect
 (`sql/parser.go`, `typeName`):
 
 | Declared as | Stored as | Notes |
@@ -13,6 +13,7 @@ Twelve storage types, with the Postgres aliases you'd expect
 | `INT`, `INTEGER`, `BIGINT`, `INT2/4/8`, `SMALLINT` | `int64` | |
 | `FLOAT`, `FLOAT4/8`, `REAL`, `DOUBLE PRECISION` | `float64` | |
 | `NUMERIC`, `DECIMAL`, `DEC`, with optional `(p)` / `(p, s)` | `bytdb.Decimal`, exact | arbitrary precision with a display scale, as Postgres's numeric: `1.0 = 1.00` (one key in a unique index) but each reads back as written. `numeric(p, s)` rounds half away from zero to `s` places on every write and refuses a value needing more than `p - s` integer digits (`numeric field overflow`, 22003, with Postgres's DETAIL); negative `s` and `s > p` work as in Postgres 15+. A literal with a point or an exponent (`1.5`, `1e3`) is numeric, so `0.1 + 0.2` is exactly `0.3`; `int` ∘ `numeric` is numeric, `numeric` ∘ `float8` is float8. Division keeps at least 16 significant digits (`1/3.0` = `0.33333333333333333333`), `avg` over integers or numerics is numeric. OID 1700 in both wire formats; the `database/sql` driver returns the exact text (`"19.99"`), the Go API a `Decimal` (`Row.Decimal`). `'NaN'`, `'Infinity'` and `'-Infinity'` work as in Postgres 14+: NaN equals itself and sorts above everything (one key in a unique index), the infinities fit unconstrained `numeric` but not `numeric(p, s)` (22003), arithmetic, `sum`/`avg` and the math functions follow Postgres's rules (`Infinity - Infinity` is NaN, `1 / Infinity` is 0), casting either to an integer is 0A000, and both wire formats carry them |
+| `MONEY` | `int64` cents | Postgres's money with its `en_US`/`C` text: `$1,234.56`, `-$1,234.56`. Input as `cash_in` reads it (`'(1.50)'`, `'1.50-'`, `'$ 1,000'`, a third fraction digit rounds), out-of-range is 22003. An integer or numeric assigned to money is whole units (`5` is `$5.00`), float8 has no cast; money ± money, money × or ÷ an integer (exact on cents), money × or ÷ float8 or numeric (rounded half to even to cents), money ÷ money is float8; casts to and from numeric; `sum`, `min`, `max`, `cash_words`. OID 790 in both wire formats (binary is the int8 of cents); the `database/sql` driver returns the text, the Go API the cents (`Insert` takes a Go integer as cents, a `Decimal` as units, or money text). `lc_monetary` is not modelled |
 | `TEXT`, `STRING`, `VARCHAR(n)` | `string` | the `(n)` limit is **enforced** on every write, Postgres wording, SQLSTATE 22001 |
 | `BOOL`, `BOOLEAN` | `bool` | text input as Postgres reads it: `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`, and unique prefixes (`t`, `fa`, `y`); an integer `0`/`1` is also accepted (SQLite booleans, `database/sql`'s `driver.Bool` rule); any other integer is refused. Unlike Postgres, this includes a literal `VALUES (1)` |
 | `BYTEA`, `BYTES` | `[]byte` | |
@@ -778,7 +779,7 @@ text (OID 1009 in both wire formats). No array operators (`@>`, `&&`),
   `op ANY(...)` / `op ALL(...)` with `ARRAY[...]`, subqueries, or `'{...}'`
   literals
 - `::` casts and `CAST(x AS t)` (int family, text family, bool,
-  float, numeric, timestamp/date, interval, uuid, jsonb, reg* types;
+  float, numeric, money, timestamp/date, interval, uuid, jsonb, reg* types;
   `character varying`, `timestamp with time zone` and modifiers such as
   `varchar(10)` parse, the modifiers unapplied except `numeric(p, s)`,
   which rounds and range-checks as in Postgres, and interval's fields and
@@ -826,7 +827,8 @@ DELETE FROM t WHERE EXISTS (SELECT 1 FROM dead WHERE dead.t_id = t.id)
     `justify_days`, `justify_hours`, `justify_interval`,
     `make_interval(years, months, weeks, days, hours, mins, secs)` (named
     arguments too: `make_interval(days => 7)`), `isfinite`;
-  - jsonb: `jsonb_typeof`, `jsonb_array_length`.
+  - jsonb: `jsonb_typeof`, `jsonb_array_length`;
+  - money: `cash_words`.
 
   An unknown function, or one given arguments of types it does not take
   (`upper(1)`), is refused when the statement is prepared — SQLSTATE 42883,

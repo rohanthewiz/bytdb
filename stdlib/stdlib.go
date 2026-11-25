@@ -1010,8 +1010,8 @@ func (r *rows) ColumnTypeScanType(i int) reflect.Type {
 		return reflect.TypeFor[[]byte]()
 	case bytdb.TTimestamp, bytdb.TDate:
 		return reflect.TypeFor[time.Time]()
-	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric, bytdb.TInterval:
-		// numeric and interval arrive as their text, see convert.
+	case bytdb.TString, bytdb.TUUID, bytdb.TTextArray, bytdb.TJSONB, bytdb.TNumeric, bytdb.TInterval, bytdb.TMoney:
+		// numeric, interval and money arrive as their text, see convert.
 		return reflect.TypeFor[string]()
 	}
 	return reflect.TypeFor[any]()
@@ -1056,6 +1056,13 @@ func convert(v any, t bytdb.ColType) (driver.Value, error) {
 	case bytdb.TUUID:
 		if b, ok := v.([]byte); ok {
 			return bytdb.FormatUUID(b), nil
+		}
+	case bytdb.TMoney:
+		// Money (N-053) arrives as its text ("$1,234.56"), as pgx's and
+		// lib/pq's drivers deliver it: the int64 underneath is cents,
+		// which a caller scanning into an int would misread as dollars.
+		if n, ok := v.(int64); ok {
+			return bytdb.FormatMoney(n), nil
 		}
 	}
 	// A numeric (N-048) arrives as its exact text ("19.99"), as it does

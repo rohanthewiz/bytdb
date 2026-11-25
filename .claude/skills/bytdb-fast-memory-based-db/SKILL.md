@@ -137,8 +137,8 @@ WHERE/ON/HAVING, INSERT/UPDATE values, `BETWEEN` bounds, and
 Types: `int`, `float`, `numeric`/`decimal(p,s)` (exact, typmod
 enforced), `text`/`varchar(n)` (length enforced), `bool`,
 `bytea`, `timestamp[tz]`, `date`, `interval` (with field qualifiers
-and `(p)`), `uuid`, `text[]`, `jsonb` — jsonb with `-> ->> #> #>> @>
-<@ ? ?| ?& || -` and canonical-text equality.
+and `(p)`), `money`, `uuid`, `text[]`, `jsonb` — jsonb with `-> ->> #>
+#>> @> <@ ? ?| ?& || -` and canonical-text equality.
 
 Constraints: PRIMARY KEY, NOT NULL, CHECK, UNIQUE, and foreign keys
 (MATCH SIMPLE; NO ACTION/RESTRICT or `ON DELETE CASCADE` — cascades
@@ -325,6 +325,10 @@ bytes, 64 hex chars, or base64 of 32).
   by span (`'1 mon' = '30 days'`), `timestamp ± interval` follows the
   calendar, and `timestamp - timestamp` is an interval (it was a bigint
   of microseconds before N-053).
+- `money` is int64 cents with `$1,234.56` text (en_US). SQL assigns an
+  integer as whole units (`5` is `$5.00`), as Postgres does; the Go API
+  (`Insert`, `Row`) uses cents, and the `database/sql` driver returns
+  the text.
 - Not implemented: RIGHT/FULL joins, triggers, arrays
   beyond `text[]`, jsonb indexing, COPY, live HA/failover (replication
   is async recovery, see above). Datasets must fit in RAM.

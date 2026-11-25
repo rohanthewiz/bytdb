@@ -160,3 +160,17 @@ func TestIntervalStyleSetting(t *testing.T) {
 	}
 	exec(t, d, `reset intervalstyle`)
 }
+
+// TestIntervalInWindowedSelect: a window function in the select list
+// sends the items through rewriteWindows, which used to rebuild every
+// arithmetic node without its typed operator kind — so ts - ts beside
+// count(*) over () came back as bigint microseconds.
+func TestIntervalInWindowedSelect(t *testing.T) {
+	d := openDB(t)
+	exec(t, d, `create table w (id int primary key, ts timestamptz)`)
+	exec(t, d, `insert into w values (1, '2024-01-02 00:00+00')`)
+	res := exec(t, d, `select ts - '2024-01-01 00:00+00'::timestamptz, count(*) over () from w`)
+	if got := ivText(t, res.Rows[0][0]); got != "1 day" {
+		t.Errorf("windowed ts - ts = %s", got)
+	}
+}

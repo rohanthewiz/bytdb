@@ -912,6 +912,20 @@ func init() {
 			return toChar(micros, str(a[1])), nil
 		}},
 		// to_timestamp(seconds since the epoch).
+		// --- money (N-053) ---
+		"cash_words": {min: 1, max: 1, typ: func(f *funcCall) (bytdb.ColType, error) {
+			switch f.types[0] {
+			case bytdb.TMoney, tyNull:
+			case tyUnknown:
+				f.castArg(0, "money")
+			default:
+				return "", noFunc(f.name, f.types)
+			}
+			return bytdb.TString, nil
+		}, eval: func(a []any) (any, error) {
+			return bytdb.MoneyWords(a[0].(int64)), nil
+		}},
+
 		// --- intervals (N-053) ---
 		"justify_days": {min: 1, max: 1, typ: intervalFunc, eval: func(a []any) (any, error) {
 			return a[0].(bytdb.Interval).JustifyDays()
